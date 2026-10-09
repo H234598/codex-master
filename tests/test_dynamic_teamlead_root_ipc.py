@@ -226,7 +226,7 @@ def test_exchange_protocol_exposes_only_zero_argument_operation() -> None:
 
 def test_root_control_module_has_no_transport_or_root_service_imports_or_calls() -> None:
     path = Path(__file__).resolve().parents[1] / (
-        "src/codex_master/dynamic_teamlead_root_ipc.py"
+        "src/the_hive/dynamic_teamlead_root_ipc.py"
     )
     tree = ast.parse(path.read_text(encoding="utf-8"))
     forbidden = {

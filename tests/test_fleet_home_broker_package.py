@@ -18,7 +18,7 @@ from the_hive.fleet_home_broker_package import (
 )
 
 
-MODULE = Path(__file__).parents[1] / "src/codex_master/fleet_home_broker_package.py"
+MODULE = Path(__file__).parents[1] / "src/the_hive/fleet_home_broker_package.py"
 
 
 def _digest(data: bytes) -> str:

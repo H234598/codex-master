@@ -175,8 +175,8 @@ def test_no_production_callable_accepts_injected_authority_capability() -> None:
     forbidden = ("ledger", "issuer", "gate", "callback", "claim")
 
     for relative in (
-        "src/codex_master/dynamic_teamlead_a3_runner.py",
-        "src/codex_master/fleet_root_system_bus.py",
+        "src/the_hive/dynamic_teamlead_a3_runner.py",
+        "src/the_hive/fleet_root_system_bus.py",
     ):
         path = root / relative
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

@@ -7,7 +7,7 @@ from the_hive.masterjet_runtime import MasterjetRuntime
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[1] / "src/codex_master/dynamic_teamlead_start.py"
+    Path(__file__).resolve().parents[1] / "src/the_hive/dynamic_teamlead_start.py"
 )
 
 

@@ -245,7 +245,7 @@ def _response(
         if result is BrokerResultCode.OK:
             attestation = HomeAttestation(
                 status.binding,
-                "/run/codex-master-agent/home",
+                "/run/the-hive-agent/home",
                 DirectoryIdentity(0, 1, 0o40700),
                 status.binding.policy.projection_digest,
                 status.binding.principal.mcs_pair,
@@ -271,7 +271,7 @@ def _response(
             status,
             HomeAttestation(
                 status.binding,
-                "/run/codex-master-agent/home",
+                "/run/the-hive-agent/home",
                 DirectoryIdentity(0, 1, 0o40700),
                 status.binding.policy.projection_digest,
                 status.binding.principal.mcs_pair,

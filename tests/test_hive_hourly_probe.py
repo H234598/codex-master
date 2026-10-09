@@ -35,6 +35,82 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_NON_F25_COMMIT = "a" * 40
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
+STAGE_SERVER_BOOTSTRAP = (
+    "import runpy, sys\n"
+    "from pathlib import Path\n"
+    "root = Path(sys.argv[1])\n"
+    "sys.path.insert(0, str(root / 'src'))\n"
+    "sys.argv = [str(root / 'src' / 'the_hive' / 'server.py'), *sys.argv[2:]]\n"
+    "runpy.run_module('the_hive.server', run_name='__main__', alter_sys=True)\n"
+)
+MCP_STAGE_RESPONSE = (
+    '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",'
+    '"capabilities":{"tools":{},"resources":{},"prompts":{}},'
+    '"serverInfo":{"name":"the-hive-mcp","version":"1"}}}\n'
+    '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"runtime_status",'
+    '"description":"Inspect runtime status","inputSchema":{"type":"object",'
+    '"properties":{},"additionalProperties":false}}]}}\n'
+)
+
+
+def _offline_stage_diagnostic(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    home: Path,
+    runtime_layout: RuntimeLayout,
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    input_data: bytes = b"",
+) -> BoundedProcessResult:
+    """Replace only external diagnostic processes for installer unit tests."""
+
+    prefix = ["/usr/bin/python3", "-I", "-B", "-c", STAGE_SERVER_BOOTSTRAP, str(cwd)]
+    suffix = arguments[len(prefix):]
+    if (
+        arguments[:len(prefix)] != prefix
+        or suffix not in (["--runtime-status-mcp"], ["hive", "status"], ["hive", "doctor"])
+        or not isinstance(runtime_layout, RuntimeLayout)
+        or runtime_layout.root != cwd
+        or not home.is_absolute()
+        or cwd.parent != home / ".local" / "lib"
+        or not cwd.name.startswith(".the-hive-runtime.stage.")
+        or timeout_seconds != 45.0
+        or stdout_limit != 256 * 1024
+        or stderr_limit != 64 * 1024
+    ):
+        raise ValueError("unexpected_stage_diagnostic")
+    if suffix == ["--runtime-status-mcp"]:
+        requests = [json.loads(line) for line in input_data.splitlines()]
+        if requests != [
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "the-hive-runtime-status", "version": "1"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ]:
+            raise ValueError("unexpected_stage_diagnostic")
+        output = MCP_STAGE_RESPONSE
+    else:
+        if input_data != b"":
+            raise ValueError("unexpected_stage_diagnostic")
+        output = '{"status":"ready","raw_output":"not_returned"}\n'
+    return BoundedProcessResult(returncode=0, stdout=output, stderr="")
+
+
+
+def _offline_installer() -> dict[str, object]:
+    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    installer["_validate_runtime_image_stage"].__globals__["run_bounded"] = (
+        _offline_stage_diagnostic
+    )
+    return installer
+
 
 def _write_authorized_queen_registry(home: Path) -> None:
     registry = home / ".local" / "state" / "codex-master-mcp" / "teamleaders.json"
@@ -936,9 +1012,7 @@ def test_attested_runtime_materializes_hourly_without_runtime_directory_self_bin
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
         lambda _repository: "a" * 40  # type: ignore[index]
     )
@@ -1393,9 +1467,7 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
         lambda _repository: (  # type: ignore[index]
             "a" * 40
@@ -1503,6 +1575,27 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
     assert not (home / ".local" / "lib" / "codex-master-hive-probe").exists()
     assert not (home / ".local" / "bin" / "codex-master-mcp").exists()
 
+
+@pytest.mark.skipif(
+    os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1",
+    reason="requires explicit user-systemd integration opt-in",
+)
+def test_internal_attested_runtime_cli_and_legacy_probe_live(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = _offline_installer()
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
+        lambda _repository: "a" * 40
+    )
+    installed = installer["_install_attested_runtime"](home=home)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    generation = installed["generation"]
+    runtime_root = release_root / "generations" / generation
+    installed_cli = runtime_root / "bin" / "the-hive-mcp"
+    legacy_probe = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
     environment = {
         "HOME": str(home),
         "PATH": "/attacker/path",
@@ -1573,9 +1666,7 @@ def test_pricing_inventory_runtime_materialization_is_attested_and_upgrade_safe(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     release_commit = {"value": "a" * 40}
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
@@ -1788,9 +1879,7 @@ def test_pricing_stable_launcher_waits_for_the_runtime_publish_lock(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
@@ -1846,9 +1935,7 @@ def test_pricing_runtime_replacement_rejects_unsafe_owned_targets(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     release_commit = {"value": "a" * 40}
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
@@ -1893,9 +1980,7 @@ def test_pricing_runtime_rolls_back_the_complete_pair_on_timer_failure(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     release_commit = {"value": "a" * 40}
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
@@ -1949,9 +2034,7 @@ def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     release_commit = {"value": "a" * 40}
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
@@ -2015,9 +2098,7 @@ def test_internal_attested_runtime_api_rolls_back_unit_pair_after_timer_material
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     release_commit = {"value": "a" * 40}
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
@@ -2077,9 +2158,7 @@ def test_legacy_probe_refuses_tampered_release_metadata_before_running_the_entry
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
@@ -2147,9 +2226,7 @@ def test_legacy_probe_rejects_tampered_digest_derived_files(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
@@ -2196,9 +2273,7 @@ def test_legacy_probe_never_imports_runtime_image_before_attestation(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
@@ -2249,9 +2324,7 @@ def test_legacy_probe_rejects_preexisting_image_bytecode_fail_closed(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
@@ -2292,9 +2365,7 @@ def test_legacy_probe_executes_the_attested_entry_by_pinned_descriptor(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
@@ -2370,6 +2441,10 @@ def test_stage_validation_uses_the_shared_hive_diagnostic_budget(
     assert observed_timeouts == [7.25, 7.25, 7.25]
 
 
+@pytest.mark.skipif(
+    os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1",
+    reason="requires explicit user-systemd integration opt-in",
+)
 def test_hourly_probe_from_a_complete_image_checks_runtime_status_without_recursion(
     tmp_path: Path, runtime_image
 ) -> None:
@@ -2560,9 +2635,7 @@ def test_runtime_spawn_helper_build_fails_closed_before_image_publication(
 def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen_home(
     tmp_path: Path,
 ) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
-    )
+    installer = _offline_installer()
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
@@ -2576,6 +2649,7 @@ def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen
     legacy_libexec = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
     legacy_libexec.parent.mkdir(mode=0o700, parents=True)
     legacy_libexec.write_text("legacy libexec\n", encoding="utf-8")
+    legacy_libexec.chmod(0o755)
     foreign_bin_target = home / "foreign-mcp"
     foreign_bin_target.write_text("legacy bin target\n", encoding="utf-8")
     legacy_bin = home / ".local" / "bin" / "codex-master-mcp"
@@ -2715,6 +2789,7 @@ def test_named_runtime_generation_publish_failure_keeps_the_attested_current_poi
     home.mkdir(mode=0o700)
     _create_hook_session_pin_store(home)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
+    release_root.parent.mkdir(mode=0o700)
     first = tmp_path / ".the-hive-runtime.stage.first"
     first.mkdir(mode=0o700)
     installer["_build_runtime_image"](

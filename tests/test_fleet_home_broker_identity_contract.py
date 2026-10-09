@@ -196,7 +196,7 @@ def test_import_closure_rejects_non_root_or_writable_identity():
 
 
 def test_identity_production_imports_are_stdlib_or_pb1_only():
-    source = Path("src/codex_master/fleet_home_broker_identity_contract.py").read_text()
+    source = Path("src/the_hive/fleet_home_broker_identity_contract.py").read_text()
     tree = ast.parse(source)
     allowed = {"dataclasses", "enum", "re", "typing", "the_hive.fleet_home_broker_protocol"}
     for node in ast.walk(tree):

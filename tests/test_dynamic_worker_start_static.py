@@ -12,7 +12,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "src/codex_master/dynamic_worker_start.py"
+MODULE_PATH = ROOT / "src/the_hive/dynamic_worker_start.py"
 FUNCTION_TEST_PATH = ROOT / "tests/test_dynamic_worker_start.py"
 PARENT_FUNCTION_AST_SHA256_V1 = {
     "dynamic_worker_start._RedactedNonSerializable.__repr__": (

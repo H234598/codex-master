@@ -949,7 +949,7 @@ def test_registry_cas_next_checkpoint_gate_blocks_before_status_leak_or_write(ca
 
 
 def test_new_module_imports_only_offline_contract_boundaries():
-    source = (ROOT / "src/codex_master/fleet_home_broker.py").read_text()
+    source = (ROOT / "src/the_hive/fleet_home_broker.py").read_text()
     tree = ast.parse(source)
     imported = {
         node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)

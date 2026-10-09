@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
@@ -109,7 +111,7 @@ def test_agent_pool_installer_gate_reports_the_runtime_lifecycle_boundary(
         [
             "git", "-C", str(checkout), "-c", "user.name=CI workflow test",
             "-c", "user.email=ci-workflow-test@example.invalid", "commit",
-            "--no-gpg-sign", "--quiet", "-m", "test fixture",
+            "--no-gpg-sign", "--allow-empty", "--quiet", "-m", "test fixture",
         ],
         check=True,
     )
@@ -128,7 +130,7 @@ def test_agent_pool_installer_gate_reports_the_runtime_lifecycle_boundary(
     )
 
     ci_home = runner_temp / "codex-agent-pool-ci-home"
-    assert completed.returncode == 1, completed.stderr
+    assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
     assert json.loads(completed.stdout) == {
         "raw_output": "not_returned",
@@ -137,11 +139,40 @@ def test_agent_pool_installer_gate_reports_the_runtime_lifecycle_boundary(
     assert not (ci_home / ".local").exists()
 
 
-def test_agent_pool_ci_smoke_derives_all_three_direct_wrapper_bindings_from_current() -> None:
-    step = workflow_step_run("Check agent pool installer")
-
-    assert "./scripts/the-hive-hive-hourly-probe-install --home \"${home}\"" in step
-    assert 'pointer="${release_root}/.the-hive-release-pointers.json"' in step
-    assert 'mcp="${release_root}/generations/${generation}/bin/the-hive-mcp"' in step
-    assert '"${mcp}" "${release_root}" "${generation}" "${manifest_digest}"' in step
-    assert "codex-master-hive-hourly-probe-install" not in step
+@pytest.mark.parametrize(
+    ("exit_code", "payload", "stderr", "mutate"),
+    (
+        (0, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "", False),
+        (2, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "", False),
+        (1, {"status": "installed", "raw_output": "not_returned"}, "", False),
+        (1, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "unexpected stderr", False),
+        (1, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "", True),
+    ),
+)
+def test_agent_pool_ci_gate_rejects_wrong_exit_payload_stderr_or_mutation(
+    tmp_path: Path, exit_code: int, payload: dict[str, str], stderr: str, mutate: bool,
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    wrapper = scripts / "the-hive-hive-hourly-probe-install"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        + ("pathlib.Path(sys.argv[2], '.local').mkdir()\n" if mutate else "")
+        + f"print({json.dumps(payload)!r})\n"
+        + f"sys.stderr.write({stderr!r})\n"
+        + f"raise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    completed = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", workflow_step_run("Check agent pool installer")],
+        cwd=tmp_path,
+        env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0

@@ -122,64 +122,26 @@ jobs:
           set -eu
           home="${RUNNER_TEMP}/codex-agent-pool-ci-home"
           mkdir -m 700 "${home}"
-          ./scripts/the-hive-hive-hourly-probe-install --home "${home}"
-          release_root="${home}/.local/lib/the-hive-runtime"
-          pointer="${release_root}/.the-hive-release-pointers.json"
-          binding="$(
-            python3 - "${pointer}" <<'PY'
+          report="${RUNNER_TEMP}/codex-agent-pool-installer-report.json"
+          errors="${RUNNER_TEMP}/codex-agent-pool-installer-stderr"
+          status=0
+          ./scripts/the-hive-hive-hourly-probe-install --home "${home}" >"${report}" 2>"${errors}" || status=$?
+          test "${status}" -eq 1
+          python3 - "${home}" "${report}" "${errors}" <<'PYTHON'
           import json
+          import pathlib
           import sys
 
-          pointers = json.loads(open(sys.argv[1], encoding="utf-8").read())
-          current = pointers.get("current") if isinstance(pointers, dict) else None
-          if (
-              not isinstance(current, dict)
-              or set(pointers) != {"schema_version", "current", "previous"}
-              or pointers.get("schema_version") != 1
-              or set(current) != {"generation", "manifest_digest"}
-              or not isinstance(current.get("generation"), str)
-              or not current["generation"]
-              or "/" in current["generation"]
-              or current["generation"] in {".", ".."}
-              or not isinstance(current.get("manifest_digest"), str)
-              or not current["manifest_digest"].startswith("sha256:")
-              or len(current["manifest_digest"]) != 71
-          ):
-              raise SystemExit("invalid release binding")
-          print(current["generation"], current["manifest_digest"])
-          PY
-          )"
-          read -r generation manifest_digest <<< "${binding}"
-          mcp="${release_root}/generations/${generation}/bin/the-hive-mcp"
-          spec="${RUNNER_TEMP}/codex-agent-pool-ci.json"
-          target="${RUNNER_TEMP}/codex-agents-ci"
-          cat > "${spec}" <<'JSON'
-          {
-            "schema_version": 1,
-            "pool_root": "${HOME}/.codex-agents-ci",
-            "codex_bin": "/bin/echo",
-            "series": [
-              {
-                "prefix": "ci",
-                "count": 1,
-                "template": "ci1",
-                "authenticated": []
-              }
-            ],
-            "aliases": {
-              "ci": "ci1"
-            },
-            "shared_assets": [],
-            "runtime_dirs": [
-              "sessions"
-            ],
-            "auth": {
-              "policy": "preserve_existing_only",
-              "copy": []
-            }
+          home, report, errors = map(pathlib.Path, sys.argv[1:])
+          expected = {
+              "status": "runtime_lifecycle_cutover_required",
+              "raw_output": "not_returned",
           }
-          JSON
-          HOME="${home}" "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool validate --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          HOME="${home}" ./scripts/install-agent-pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          HOME="${home}" "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool status --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          HOME="${home}" "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool destroy_pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo --yes --force --remove-root
+          if json.loads(report.read_text(encoding="utf-8")) != expected:
+              raise SystemExit("unexpected installer boundary payload")
+          if errors.read_bytes():
+              raise SystemExit("unexpected installer stderr")
+          if any(home.iterdir()):
+              raise SystemExit("installer boundary mutated the temporary home")
+          print(json.dumps(expected, sort_keys=True))
+          PYTHON

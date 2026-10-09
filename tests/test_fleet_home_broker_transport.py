@@ -149,7 +149,7 @@ def _ok_reply(request_id=REQUEST_ID):
     )
     attestation = HomeAttestation(
         binding,
-        "/run/codex-master-agent/home",
+        "/run/the-hive-agent/home",
         DirectoryIdentity(0, 1, 0o40700),
         PROJECTION_DIGEST,
         "c0,c1",

@@ -3,9 +3,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER_PATH = ROOT / "src/codex_master/server.py"
-CATALOG_PATH = ROOT / "src/codex_master/control_catalog.py"
-START_PATH = ROOT / "src/codex_master/dynamic_teamlead_start.py"
+SERVER_PATH = ROOT / "src/the_hive/server.py"
+CATALOG_PATH = ROOT / "src/the_hive/control_catalog.py"
+START_PATH = ROOT / "src/the_hive/dynamic_teamlead_start.py"
 
 
 def _module(path: Path) -> ast.Module:

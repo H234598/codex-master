@@ -806,7 +806,7 @@ def test_pb_s1_modules_have_no_forbidden_imports_or_nondeterministic_calls():
     import pathlib
 
     for name in ("fleet_home_broker_protocol.py", "fleet_home_broker_emulator.py"):
-        source = pathlib.Path("src/codex_master", name).read_text()
+        source = pathlib.Path("src/the_hive", name).read_text()
         assert "fleet_home_recovery" not in source
         for forbidden in (
             "datetime.now",

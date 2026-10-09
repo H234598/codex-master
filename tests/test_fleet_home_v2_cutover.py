@@ -25,7 +25,7 @@ from the_hive.fleet_home_v2_cutover import (
 )
 
 
-CORE_PATH = Path(__file__).resolve().parents[1] / "src/codex_master/fleet_home_v2_cutover.py"
+CORE_PATH = Path(__file__).resolve().parents[1] / "src/the_hive/fleet_home_v2_cutover.py"
 _ENTROPY_SEED = 100
 
 

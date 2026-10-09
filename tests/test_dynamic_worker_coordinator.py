@@ -105,7 +105,7 @@ FUNCTION_TEST_MATRIX_V1: dict[str, str] = {
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
-    / "src/codex_master/dynamic_worker_coordinator.py"
+    / "src/the_hive/dynamic_worker_coordinator.py"
 )
 
 
@@ -1190,12 +1190,12 @@ def test_function_matrix_ast_imports_public_surface_and_nodes_are_exact() -> Non
     imports: set[str] = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            definitions.add(f"codex_master.dynamic_worker_coordinator.{node.name}")
+            definitions.add(f"the_hive.dynamic_worker_coordinator.{node.name}")
         elif isinstance(node, ast.ClassDef):
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     definitions.add(
-                        "codex_master.dynamic_worker_coordinator."
+                        "the_hive.dynamic_worker_coordinator."
                         f"{node.name}.{child.name}"
                     )
                 elif isinstance(child, ast.AnnAssign) and isinstance(
@@ -1204,7 +1204,7 @@ def test_function_matrix_ast_imports_public_surface_and_nodes_are_exact() -> Non
                     annotation = ast.unparse(child.annotation)
                     if "Callable" in annotation:
                         callable_fields.add(
-                            "codex_master.dynamic_worker_coordinator."
+                            "the_hive.dynamic_worker_coordinator."
                             f"{node.name}.{child.target.id}"
                         )
         if isinstance(node, ast.Import):

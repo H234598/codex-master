@@ -8,7 +8,7 @@ import pytest
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[1] / "src/codex_master/dynamic_worker_start.py"
+    Path(__file__).resolve().parents[1] / "src/the_hive/dynamic_worker_start.py"
 )
 
 FUNCTION_TEST_MATRIX_V1: dict[str, str] = {

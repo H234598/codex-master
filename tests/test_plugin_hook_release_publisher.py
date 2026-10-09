@@ -10,6 +10,7 @@ import stat
 import pytest
 
 import the_hive.runtime_layout as runtime_layout
+import the_hive.runtime_process as runtime_process
 from the_hive.hook_session_pin_store import HookSessionPinStoreV1
 from the_hive.runtime_layout import (
     RuntimeLayout,
@@ -19,10 +20,121 @@ from the_hive.runtime_layout import (
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_MANIFEST_COMMIT = "a" * 40
+STAGE_SERVER_BOOTSTRAP = (
+    "import runpy, sys\n"
+    "from pathlib import Path\n"
+    "root = Path(sys.argv[1])\n"
+    "sys.path.insert(0, str(root / 'src'))\n"
+    "sys.argv = [str(root / 'src' / 'the_hive' / 'server.py'), *sys.argv[2:]]\n"
+    "runpy.run_module('the_hive.server', run_name='__main__', alter_sys=True)\n"
+)
+MCP_STAGE_RESPONSE = (
+    '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",'
+    '"capabilities":{"tools":{},"resources":{},"prompts":{}},'
+    '"serverInfo":{"name":"the-hive-mcp","version":"1"}}}\n'
+    '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"runtime_status",'
+    '"description":"Inspect runtime status","inputSchema":{"type":"object",'
+    '"properties":{},"additionalProperties":false}}]}}\n'
+)
+
+
+def _offline_stage_diagnostic(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    home: Path,
+    runtime_layout: RuntimeLayout,
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    input_data: bytes = b"",
+) -> runtime_process.BoundedProcessResult:
+    """Replace only external diagnostic processes for publisher unit tests."""
+
+    prefix = ["/usr/bin/python3", "-I", "-B", "-c", STAGE_SERVER_BOOTSTRAP, str(cwd)]
+    suffix = arguments[len(prefix):]
+    if (
+        arguments[:len(prefix)] != prefix
+        or suffix not in (["--runtime-status-mcp"], ["hive", "status"], ["hive", "doctor"])
+        or not isinstance(runtime_layout, RuntimeLayout)
+        or runtime_layout.root != cwd
+        or not home.is_absolute()
+        or cwd.parent != home / ".local" / "lib"
+        or not cwd.name.startswith(".the-hive-runtime.stage.")
+        or timeout_seconds != 45.0
+        or stdout_limit != 256 * 1024
+        or stderr_limit != 64 * 1024
+    ):
+        raise ValueError("unexpected_stage_diagnostic")
+    if suffix == ["--runtime-status-mcp"]:
+        requests = [json.loads(line) for line in input_data.splitlines()]
+        if requests != [
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "the-hive-runtime-status", "version": "1"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ]:
+            raise ValueError("unexpected_stage_diagnostic")
+        output = MCP_STAGE_RESPONSE
+    else:
+        if input_data != b"":
+            raise ValueError("unexpected_stage_diagnostic")
+        output = '{"status":"ready","raw_output":"not_returned"}\n'
+    return runtime_process.BoundedProcessResult(returncode=0, stdout=output, stderr="")
 
 
 def _installer() -> dict[str, object]:
-    return runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    installer["_validate_runtime_image_stage"].__globals__["run_bounded"] = (
+        _offline_stage_diagnostic
+    )
+    return installer
+
+
+def test_publisher_fixture_rejects_unexpected_diagnostic_without_external_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def external_process_forbidden(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("external_process_forbidden")
+
+    monkeypatch.setattr(runtime_process, "run_bounded", external_process_forbidden)
+    installer = _installer()
+    runner = installer["_validate_runtime_image_stage"].__globals__["run_bounded"]
+    with pytest.raises(ValueError, match="^unexpected_stage_diagnostic$"):
+        runner(
+            ["/usr/bin/false"],
+            cwd=tmp_path,
+            home=tmp_path,
+            runtime_layout=None,
+            timeout_seconds=45.0,
+            stdout_limit=256 * 1024,
+            stderr_limit=64 * 1024,
+        )
+
+
+def test_publisher_stage_rejects_malformed_mcp_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = _installer()
+    stage = _stage(installer, tmp_path, "malformed-mcp")
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setitem(
+        installer["_validate_runtime_image_stage"].__globals__,
+        "run_bounded",
+        lambda *_args, **_kwargs: runtime_process.BoundedProcessResult(
+            returncode=0, stdout="{}\n", stderr=""
+        ),
+    )
+    with pytest.raises(installer["InstallError"], match="^install_stage_validation_failed$"):
+        installer["_validate_runtime_image_stage"](stage=stage, home=home)
+    assert stage.is_dir()
+    assert not (home / ".local" / "lib" / "the-hive-runtime").exists()
 
 
 def _stage(installer: dict[str, object], root: Path, generation: str) -> Path:
@@ -726,7 +838,6 @@ def test_pre_pricing_legacy_upgrade_rolls_back_postrename_failure(
     installer = _installer()
     home = tmp_path / "home"
     (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
-    generation = "c7efc03f00eee1933f86808902d109f81bad446e"
     release_root, old_pointer = _materialize_pre_pricing_legacy_release(
         installer, home, monkeypatch
     )
@@ -823,10 +934,13 @@ def test_post_visibility_pointer_failure_restores_pointer_mcp_and_units(
     release_root = _release_root(tmp_path)
     units = tmp_path / "units"
     units.mkdir(mode=0o700)
+    live_bin = release_root.parents[2] / ".local" / "bin"
+    live_bin.mkdir(mode=0o700)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "one"),
         release_root=release_root,
         live_unit_dir=units,
+        live_bin=live_bin,
     )
     pointer = release_root / ".the-hive-release-pointers.json"
     stable_mcp = release_root / "the-hive-mcp"
@@ -857,7 +971,7 @@ def test_post_visibility_pointer_failure_restores_pointer_mcp_and_units(
         installer["InstallError"], match="install_release_pointer_write_failed"
     ):  # type: ignore[index]
         installer["_publish_runtime_generation"](  # type: ignore[operator]
-            stage=second, release_root=release_root
+            stage=second, release_root=release_root, live_unit_dir=units, live_bin=live_bin
         )
     assert (
         pointer.read_bytes(),
@@ -873,10 +987,13 @@ def test_late_pointer_failure_restores_the_prior_hourly_unit_pair(
     release_root = _release_root(tmp_path)
     units = tmp_path / "units"
     units.mkdir(mode=0o700)
+    live_bin = release_root.parents[2] / ".local" / "bin"
+    live_bin.mkdir(mode=0o700)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "one"),
         release_root=release_root,
         live_unit_dir=units,
+        live_bin=live_bin,
     )
     names = (
         "the-hive-hive-hourly-probe.service",
@@ -897,7 +1014,7 @@ def test_late_pointer_failure_restores_the_prior_hourly_unit_pair(
         installer["InstallError"], match="install_release_pointer_write_failed"
     ):  # type: ignore[index]
         installer["_publish_runtime_generation"](  # type: ignore[operator]
-            stage=second, release_root=release_root, live_unit_dir=units
+            stage=second, release_root=release_root, live_unit_dir=units, live_bin=live_bin
         )
 
     assert tuple((units / name).read_bytes() for name in names) == before
@@ -910,12 +1027,15 @@ def test_legacy_launcher_write_failure_rolls_back_the_complete_cutover(
     release_root = _release_root(tmp_path)
     units = tmp_path / "units"
     units.mkdir(mode=0o700)
+    live_bin = release_root.parents[2] / ".local" / "bin"
+    live_bin.mkdir(mode=0o700)
     libexec = release_root.parents[2] / ".local" / "libexec"
     libexec.mkdir(mode=0o700, parents=True)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "one"),
         release_root=release_root,
         live_unit_dir=units,
+        live_bin=live_bin,
         live_libexec=libexec,
     )
     pointer = release_root / ".the-hive-release-pointers.json"
@@ -953,6 +1073,7 @@ def test_legacy_launcher_write_failure_rolls_back_the_complete_cutover(
             stage=_stage(installer, tmp_path, "two"),
             release_root=release_root,
             live_unit_dir=units,
+            live_bin=live_bin,
             live_libexec=libexec,
         )
 
@@ -973,12 +1094,15 @@ def test_post_launcher_unit_attestation_failure_rolls_back_complete_cutover(
     release_root = _release_root(tmp_path)
     units = tmp_path / "units"
     units.mkdir(mode=0o700)
+    live_bin = release_root.parents[2] / ".local" / "bin"
+    live_bin.mkdir(mode=0o700)
     libexec = release_root.parents[2] / ".local" / "libexec"
     libexec.mkdir(mode=0o700, parents=True)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "one"),
         release_root=release_root,
         live_unit_dir=units,
+        live_bin=live_bin,
         live_libexec=libexec,
     )
     pointer = release_root / ".the-hive-release-pointers.json"
@@ -1010,6 +1134,7 @@ def test_post_launcher_unit_attestation_failure_rolls_back_complete_cutover(
             stage=_stage(installer, tmp_path, "two"),
             release_root=release_root,
             live_unit_dir=units,
+            live_bin=live_bin,
             live_libexec=libexec,
         )
 

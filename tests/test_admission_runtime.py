@@ -58,6 +58,15 @@ def materialize_probe_record(
         "reason_codes": [],
         "mutation_performed": False,
         "raw_output": "not_returned",
+        "global_pilot_readiness": {
+            "schema_version": 1,
+            "pilot": "ready",
+            "generation_id": "c" * 32,
+            "freshness": "fresh",
+            "candidate_count": 1,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        },
     }
     if probe_state in {"shadow", "disabled"}:
         runtime["mode"] = probe_state
@@ -73,6 +82,10 @@ def materialize_probe_record(
     reference = datetime.now(timezone.utc)
     layout = Mock(spec=RuntimeLayout)
     layout.mcp_entrypoint = command
+    layout.read_attested_file.return_value = (
+        b'{"principals":[{"principal_id":"queen-one","class_id":"koenigin",'
+        b'"repo_id":"codex-master"}]}'
+    )
     monkeypatch.setattr(
         hourly_probe_module,
         "_runtime_status_json",
@@ -90,6 +103,11 @@ def materialize_probe_record(
                 "raw_output": "not_returned",
             },
             True,
+            {
+                "code": "ok",
+                "exit_code": 0,
+                "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+            },
         ),
     )
     run_probe(
