@@ -488,6 +488,34 @@ def test_publisher_does_not_prune_after_a_visible_immutable_cutover(
     )
 
 
+@pytest.mark.parametrize("missing", ["units", "bin"])
+def test_publish_rejects_an_incomplete_live_unit_and_launcher_pair(
+    tmp_path: Path, missing: str
+) -> None:
+    installer = _installer()
+    release_root = _publisher_release_root(tmp_path)
+    units = tmp_path / "units"
+    bindir = tmp_path / "bin"
+    units.mkdir(mode=0o700)
+    bindir.mkdir(mode=0o700)
+    stage = _stage(installer, tmp_path, "incomplete-pair")
+
+    with pytest.raises(
+        installer["InstallError"], match="^install_stage_validation_failed$"
+    ):
+        installer["_publish_runtime_generation"](
+            stage=stage,
+            release_root=release_root,
+            live_unit_dir=None if missing == "units" else units,
+            live_bin=None if missing == "bin" else bindir,
+        )
+
+    assert stage.exists()
+    assert not release_root.exists()
+    assert not tuple(units.iterdir())
+    assert not tuple(bindir.iterdir())
+
+
 def test_retention_keeps_attested_unit_bound_generations_without_visible_pruning(
     tmp_path: Path,
 ) -> None:
@@ -495,6 +523,8 @@ def test_retention_keeps_attested_unit_bound_generations_without_visible_pruning
     release_root = _publisher_release_root(tmp_path)
     units = tmp_path / "units"
     units.mkdir(mode=0o700)
+    bindir = tmp_path / "bin"
+    bindir.mkdir(mode=0o700)
     for generation in ("one", "two"):
         installer["_publish_runtime_generation"](  # type: ignore[operator]
             stage=_stage(installer, tmp_path, generation),
@@ -521,6 +551,7 @@ def test_retention_keeps_attested_unit_bound_generations_without_visible_pruning
         stage=_stage(installer, tmp_path, "three"),
         release_root=release_root,
         live_unit_dir=units,
+        live_bin=bindir,
     )
     pointers = json.loads(
         (release_root / ".the-hive-release-pointers.json").read_text(encoding="utf-8")
@@ -561,6 +592,7 @@ def test_retention_keeps_attested_unit_bound_generations_without_visible_pruning
         stage=_stage(installer, tmp_path, "four"),
         release_root=release_root,
         live_unit_dir=units,
+        live_bin=bindir,
     )
     assert {item.name for item in (release_root / "generations").iterdir()} == {
         "one",
@@ -572,6 +604,7 @@ def test_retention_keeps_attested_unit_bound_generations_without_visible_pruning
         stage=_stage(installer, tmp_path, "five"),
         release_root=release_root,
         live_unit_dir=units,
+        live_bin=bindir,
     )
     assert {item.name for item in (release_root / "generations").iterdir()} == {
         "one",
