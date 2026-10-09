@@ -1226,7 +1226,12 @@ def test_actual_public_status_does_not_emit_runtime_import_bytecode_or_mutate_ho
         path.relative_to(home): (path.lstat().st_dev, path.lstat().st_ino, path.lstat().st_mode)
         for path in home.rglob("*")
     }
-    sys.modules.pop("the_hive.runtime_layout", None)
+    import the_hive
+
+    # Force a fresh import here, then restore both import caches so later tests
+    # retain the same RuntimeLayout class they imported during collection.
+    monkeypatch.delitem(sys.modules, "the_hive.runtime_layout", raising=False)
+    monkeypatch.delattr(the_hive, "runtime_layout", raising=False)
     monkeypatch.setattr(sys, "pycache_prefix", str(cache))
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
 
