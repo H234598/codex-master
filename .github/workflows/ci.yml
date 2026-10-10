@@ -39,10 +39,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
             python3-selinux \
+            python3-yaml tmux \
             build-essential pkg-config libdbus-1-dev libgirepository-2.0-dev libcairo2-dev \
             gir1.2-glib-2.0 dbus \
             groff-base
           # SELinux is a native distro binding, not the similarly named PyPI shim.
+
+      - name: Expose native SELinux binding to test Python
+        run: |
+          native_site="${RUNNER_TEMP}/the-hive-native-python"
+          mkdir -m 700 "${native_site}"
+          test -f /usr/lib/python3/dist-packages/selinux/__init__.py
+          ln -s /usr/lib/python3/dist-packages/selinux "${native_site}/selinux"
+          PYTHONPATH="${native_site}" python -c 'import selinux; assert callable(selinux.is_selinux_enabled)'
+          echo "THE_HIVE_TEST_NATIVE_PYTHON=${native_site}" >> "${GITHUB_ENV}"
 
       - name: Fetch pinned Codex Usage producer source
         env:
@@ -57,7 +67,7 @@ jobs:
           echo "THE_HIVE_TEST_CODEX_USAGE_ROOT=${producer_root}" >> "${GITHUB_ENV}"
 
       - name: Install test dependencies
-        run: python -m pip install --disable-pip-version-check ".[test,test-index]"
+        run: python -m pip install --disable-pip-version-check "setuptools>=69" ".[test,test-index]"
 
       - name: Validate plugin manifests
         run: |
@@ -145,7 +155,7 @@ jobs:
 
       - name: Run remaining unit tests with Python 3.12
         run: >-
-          PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src:/usr/lib/python3/dist-packages"
+          PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src:${THE_HIVE_TEST_NATIVE_PYTHON}"
           python -m pytest -q --ignore=tests/test_usage_snapshot.py
 
       - name: Check CLI wrapper syntax

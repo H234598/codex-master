@@ -66,7 +66,7 @@ def _pool_authority_evidence(*, provider: str = "openai") -> UsageEvidenceV2:
 def _repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         ["git", "-C", str(root), "config", "remote.origin.url", "https://github.com/example/repo.git"],
         check=True,
@@ -457,6 +457,11 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
     pool_root = sandbox / "pool"
     for directory in (home, state_root, pool_root):
         directory.mkdir(mode=0o700)
+    gemini_bin = sandbox / "gemini-bin"
+    gemini_bin.mkdir(mode=0o700)
+    gemini = gemini_bin / "gemini"
+    gemini.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gemini.chmod(0o700)
 
     child = textwrap.dedent(
         """
@@ -686,7 +691,9 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
             success_reads, success_calls, success_status, success_base_id, success_callback_ids = run_case("success", ("gemini", "gemini"))
             drift_reads, drift_calls, drift_status, drift_base_id, drift_callback_ids = run_case("drift", ("gemini", "other-provider"))
 
-        assert (success_reads, success_calls, success_status) == (2, 1, "test_only_port")
+        assert (success_reads, success_calls, success_status) == (2, 1, "test_only_port"), (
+            success_reads, success_calls, success_status
+        )
         assert (success_base_id, success_callback_ids) == ("admission-success", ("admission-success",))
         assert (drift_reads, drift_calls, drift_status) == (2, 0, "denied")
         assert (drift_base_id, drift_callback_ids) == ("admission-drift", ())
@@ -701,6 +708,7 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
             "CODEX_AGENT_POOL_ROOT": str(pool_root),
             "D166_COMPOSITION_ROOT": str(sandbox),
             "D166_COMPOSITION_REPOSITORY": str(repository),
+            "PATH": f"{gemini_bin}{os.pathsep}{os.environ.get('PATH', '')}",
             "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
         }
     )

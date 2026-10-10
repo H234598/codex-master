@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tomllib
 
 import pytest
 
@@ -13,6 +14,10 @@ WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
+
+
+def project_metadata() -> dict:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
 
 def workflow_step_run(name: str) -> str:
@@ -28,7 +33,9 @@ def workflow_step_run(name: str) -> str:
 def test_ruff_gate_is_pinned_and_non_mutating() -> None:
     workflow = workflow_text()
 
-    assert "ruff==0.16.3" in workflow
+    assert "ruff==0.16.3" in project_metadata()["project"]["optional-dependencies"]["test"]
+    assert '".[test,test-index]"' in workflow.split("      - name: Install test dependencies\n", 1)[1].split("\n      - name:", 1)[0]
+    assert workflow.index("      - name: Install test dependencies") < workflow.index("      - name: Lint Python sources")
     assert "ruff check --select E4,E7,E9,F --output-format=github ." in workflow
     assert not re.search(r"^\s*run:\s*ruff\s+check\b.*\s--fix(?:\s|$)", workflow, re.MULTILINE)
 
@@ -38,7 +45,9 @@ def test_ci_installs_agent_api_crypto_dependencies_before_collection() -> None:
 
     dependency_step = workflow.split("      - name: Install test dependencies\n", 1)[1]
     dependency_step = dependency_step.split("\n      - name:", 1)[0]
-    assert "PyJWT[crypto]>=2.9,<3" in dependency_step
+    assert "PyJWT[crypto]>=2.9,<3" in project_metadata()["project"]["dependencies"]
+    assert '".[test,test-index]"' in dependency_step
+    assert workflow.index("      - name: Install test dependencies") < workflow.index("      - name: Run remaining unit tests")
 
 
 def test_plugin_manifest_gate_requires_the_hive_identity_without_a_legacy_alias() -> (
@@ -61,7 +70,7 @@ def test_cli_wrapper_syntax_gate_covers_the_stable_hook_launcher() -> None:
 def test_manpage_gate_builds_and_renders_repository_source() -> None:
     workflow = workflow_text()
 
-    assert "sudo apt-get install --no-install-recommends --yes groff-base" in workflow
+    assert "groff-base" in workflow_step_run("Install Linux dependencies")
     assert './scripts/the-hive-manpage build --output-dir "${RUNNER_TEMP}/the-hive-man"' in workflow
     assert "groff -man -Tutf8 man/man1/the-hive-mcp.1 >/dev/null" in workflow
 

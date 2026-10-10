@@ -329,8 +329,11 @@ def test_v2_runtime_principals_are_frozen_and_slotted() -> None:
     assert isinstance(principal, FleetRuntimePrincipalV2)
     with pytest.raises(FrozenInstanceError):
         principal.enabled = False  # type: ignore[misc]
-    with pytest.raises(AttributeError):
+    # Slotted frozen dataclasses reject unknown fields with TypeError on Python 3.12.
+    with pytest.raises((AttributeError, TypeError)):
         principal.extra = "nope"  # type: ignore[attr-defined]
+    assert not hasattr(principal, "extra")
+    assert not hasattr(principal, "__dict__")
 
 
 def test_v2_runtime_principal_repr_and_str_are_redacted() -> None:

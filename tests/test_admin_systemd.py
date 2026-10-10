@@ -309,7 +309,7 @@ def test_systemd_tree_has_no_legacy_product_identifier() -> None:
         return text
 
     assert all(
-        token not in path.as_posix()
+        token not in path.relative_to(systemd_root).as_posix()
         and token not in r3_text(path)
         for path in systemd_root.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts

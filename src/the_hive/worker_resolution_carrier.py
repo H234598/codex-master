@@ -162,7 +162,7 @@ class WorkerResolutionCarrierV2(_RedactedNonSerializable):
     def __getattribute__(self, name: str) -> object:
         if name == "_payload":
             raise TypeError("worker resolution carriers are not serializable")
-        return super().__getattribute__(name)
+        return object.__getattribute__(self, name)
 
     @property
     def ticket_id(self) -> str:
@@ -218,7 +218,7 @@ class WorkerRegistryReservationV2(_RedactedNonSerializable):
     def __getattribute__(self, name: str) -> object:
         if name == "_payload":
             raise TypeError("worker resolution carriers are not serializable")
-        return super().__getattribute__(name)
+        return object.__getattribute__(self, name)
 
     @property
     def principal_id(self) -> str:

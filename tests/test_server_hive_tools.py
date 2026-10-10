@@ -1546,8 +1546,31 @@ def test_red_probe_allows_existing_g_migration_journal_recovery(
 
 def test_red_probe_recovers_a_pending_q_transaction_before_journal_blocks_new_apply(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    import hashlib
+
     recovered: list[object] = []
+    state_root = tmp_path / "state"
+    pool_root = tmp_path / "pool"
+    pool_root.mkdir(mode=0o700)
+    monkeypatch.setattr(server, "STATE_ROOT", state_root)
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", pool_root)
+    journal = server.FleetRecoveryJournal(
+        schema_version=1,
+        journal_id="a" * 32,
+        operation=server.RecoveryOperation.SERIES_APPLY,
+        pool_root_digest=hashlib.sha256(
+            server._pool_root_digest_text(pool_root).encode("utf-8")
+        ).hexdigest(),
+        expected_generation=1,
+        planned_generation=2,
+        authoritative_generation=None,
+        phase=server.RecoveryPhase.PREPARED,
+        entries=(),
+        blocking_error_codes=(),
+    )
+    server._fleet_store_recovery_journal(journal)
 
     def blocked_probe(**_kwargs: object) -> None:
         raise server.AgentError("hive_spawn_probe_blocked")

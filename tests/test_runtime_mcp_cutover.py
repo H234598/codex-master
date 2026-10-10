@@ -19,6 +19,8 @@ import the_hive.server as server
 from the_hive.hook_session_pin_store import HookSessionPinStoreV1
 from the_hive.runtime_layout import RuntimeLayout
 
+REAL_EUID = os.geteuid()
+
 
 def _write(root: Path, relative: str, content: str, mode: int = 0o644) -> None:
     path = root / relative
@@ -615,7 +617,7 @@ def test_install_rejects_missing_client_config_without_mutation(
     executable.chmod(0o700)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -663,7 +665,7 @@ def test_missing_config_race_never_deletes_a_foreign_replacement(
         return original_stat(path, *args, **kwargs)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -703,7 +705,7 @@ def test_binding_pins_cli_and_client_config_across_a_dot_codex_swap(
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "attacker-config"))
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -804,7 +806,7 @@ def test_binding_keeps_the_pinned_native_payload_across_a_name_replacement(
     replacement.chmod(0o700)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -835,7 +837,7 @@ def test_binding_revalidation_rejects_a_closed_native_payload_fd(
     native.chmod(0o700)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -897,7 +899,7 @@ def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
         )
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -956,7 +958,7 @@ def test_binding_rejects_missing_client_config_without_creating_it(
     executable.chmod(0o700)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -981,7 +983,7 @@ def test_registration_inspection_does_not_create_a_missing_client_config_directo
     executable.chmod(0o700)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -1021,7 +1023,7 @@ def test_doctor_client_binding_unavailable_keeps_safe_core_checks_without_state(
     }
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -1128,7 +1130,7 @@ def test_doctor_canonical_cli_unavailable_keeps_core_checks_and_cause(
     state_root = tmp_path / "state"
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -1209,7 +1211,7 @@ def test_binding_rejects_a_symlinked_client_config_directory(tmp_path: Path) -> 
     executable.chmod(0o700)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
@@ -1443,7 +1445,7 @@ def test_binding_rejects_a_native_payload_swapped_to_a_symlink_before_open(
         return real_open(path, flags, *args, **kwargs)
 
     with (
-        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(server.os, "geteuid", return_value=REAL_EUID),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),

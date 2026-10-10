@@ -14,18 +14,18 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "src/the_hive/dynamic_worker_start.py"
 FUNCTION_TEST_PATH = ROOT / "tests/test_dynamic_worker_start.py"
-PARENT_FUNCTION_AST_SHA256_V1 = {
+PARENT_FUNCTION_SOURCE_SHA256_V1 = {
     "dynamic_worker_start._RedactedNonSerializable.__repr__": (
-        "65b005994386624bdb41781623937f1288e728c23620b5046a46a2a026062f06"
+        "d033125cb50cf03f109a06db7a84ed7289c30dc7f971e9cff9cb2987ba85c2f8"
     ),
     "dynamic_worker_start._RedactedNonSerializable.__reduce_ex__": (
-        "80decd7b7307e771d639d4449ca51f23cb798e39a61d5e667734e336ead042b8"
+        "b39d43f2729f415faa601d760455c4cd22e08c86b50353df910a3ec7d1200df8"
     ),
     "dynamic_worker_start._DynamicWorkerStartResult.to_public": (
-        "33b46e687c171cfaa0200fcf8743b44db1bcf32b29e9a8c037fb9cea321201f2"
+        "643f2cdea0718902d59e40f7402c32914695fb1b4ad921e14e6096b11cd46fcf"
     ),
     "dynamic_worker_start.dynamic_worker_start": (
-        "89640f473eff329a9271c1be009de898baab11960b5178f7fe720230ce987ab1"
+        "a6d8f55656f4f8a6c36ff5eff7bf05e4ef9197700c70e84285bded03e38fd109"
     ),
 }
 
@@ -58,8 +58,9 @@ def _function_dumps(tree: ast.Module) -> dict[str, str]:
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
             name = ".".join(("dynamic_worker_start", *stack, node.name))
-            dump = ast.dump(node, include_attributes=False)
-            found[name] = hashlib.sha256(dump.encode()).hexdigest()
+            # ast.dump changed its empty-field rendering in Python 3.14.
+            source = ast.unparse(node)
+            found[name] = hashlib.sha256(source.encode()).hexdigest()
             stack.append(node.name)
             self.generic_visit(node)
             stack.pop()
@@ -213,7 +214,7 @@ def test_positive_import_and_a3_call_gate_is_exact() -> None:
 
 
 def test_function_matrix_matches_parent_ast_diff_and_callable_ports_exactly() -> None:
-    parent = PARENT_FUNCTION_AST_SHA256_V1
+    parent = PARENT_FUNCTION_SOURCE_SHA256_V1
     candidate_tree = _module_tree()
     candidate = _function_dumps(candidate_tree)
     changed = {

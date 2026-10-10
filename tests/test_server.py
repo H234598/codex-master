@@ -240,6 +240,20 @@ def _green_hive_probe_for_server_unit_contracts(
 ) -> None:
     """Keep unrelated server unit tests behind a valid capacity precondition."""
 
+    from the_hive.hive import hourly_probe
+
+    probe_root = tmp_path / "capacity-probe"
+    probe_root.mkdir(mode=0o700)
+    probe_lock = probe_root / hourly_probe.PROBE_GATE_LOCK_NAME
+    probe_lock.write_bytes(b"")
+    probe_lock.chmod(0o600)
+    monkeypatch.setattr(
+        server_module,
+        "probe_capacity_lock",
+        lambda: hourly_probe.probe_capacity_lock(
+            state_file=probe_root / hourly_probe.STATE_FILE_NAME
+        ),
+    )
     monkeypatch.setattr(
         server_module,
         "read_probe_gate",
@@ -33893,6 +33907,8 @@ class CliLifecycleTest(unittest.TestCase):
                 "the_hive.server.require_fleet_recovery_ready"
             ), patch(
                 "the_hive.server._require_model_runner_admission"
+            ), patch(
+                "the_hive.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL}
             ), server_module.temporary_agent_inventory(inventory):
                 result = send_agent("a", "hello", True)
 
@@ -36065,7 +36081,11 @@ class AgentPoolManagementTest(unittest.TestCase):
     def test_agent_pool_wrapper_quotes_codex_bin_special_chars_as_data(self) -> None:
         from the_hive import server as server_module
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"HOME": tmpdir}
+        ), patch.object(server_module, "STATE_ROOT", Path(tmpdir) / "state"), patch.object(
+            server_module, "LOCK_DIR", Path(tmpdir) / "state" / "locks"
+        ):
             tmp = Path(tmpdir)
             pool = tmp / "agents"
             spec_path = self._write_spec(tmp, pool)
@@ -36102,7 +36122,11 @@ class AgentPoolManagementTest(unittest.TestCase):
     def test_agent_pool_wrapper_falls_back_when_requested_affinity_is_unavailable(self) -> None:
         from the_hive import server as server_module
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"HOME": tmpdir}
+        ), patch.object(server_module, "STATE_ROOT", Path(tmpdir) / "state"), patch.object(
+            server_module, "LOCK_DIR", Path(tmpdir) / "state" / "locks"
+        ):
             tmp = Path(tmpdir)
             pool = tmp / "agents"
             bin_dir = tmp / "bin"
@@ -36131,7 +36155,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 timeout=5,
-                env={"PATH": test_path},
+                env={"PATH": test_path, "HOME": tmpdir},
             )
 
             self.assertTrue(result["ok"])
@@ -36159,7 +36183,11 @@ class AgentPoolManagementTest(unittest.TestCase):
     def test_agent_pool_wrapper_treats_command_name_as_data_not_exec_option(self) -> None:
         from the_hive import server as server_module
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"HOME": tmpdir}
+        ), patch.object(server_module, "STATE_ROOT", Path(tmpdir) / "state"), patch.object(
+            server_module, "LOCK_DIR", Path(tmpdir) / "state" / "locks"
+        ):
             tmp = Path(tmpdir)
             pool = tmp / "agents"
             bin_dir = tmp / "bin"
@@ -36183,7 +36211,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     timeout=5,
-                    env={"PATH": test_path},
+                    env={"PATH": test_path, "HOME": tmpdir},
                 )
 
             self.assertTrue(result["ok"])
