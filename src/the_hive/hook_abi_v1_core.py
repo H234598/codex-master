@@ -1154,3 +1154,11 @@ def dispatch_hook_v1(
 
 
 __all__ = ["AttestedHookDispatchV1", "HookAbiV1Error", "dispatch_hook_v1"]
+
+def cutover_pin_exchange_v1(stdin_bytes):
+    if os.geteuid() != 0 or len(stdin_bytes) > _MAX_EVENT_BYTES:
+        raise _invalid()
+    raw = _read_regular(Path(_PIN_STORE_TARGET), modes={0o644}, maximum=_MAX_HOOK_BYTES,
+                        owner_uid=0, owner_gid=0)
+    store_type, _ = _pin_store_api(raw)
+    store_type.cutover_exchange(json.loads(stdin_bytes, object_pairs_hook=_unique_object))

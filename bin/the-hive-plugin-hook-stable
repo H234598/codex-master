@@ -3,7 +3,7 @@ set -euo pipefail
 
 (( $# == 1 )) || exit 64
 case "$1" in
-  native_bee_event|native_spawn_admission) ;;
+  native_bee_event|native_spawn_admission|cutover_pin_exchange) ;;
   *) exit 64 ;;
 esac
 
@@ -80,6 +80,8 @@ def _load_dispatch():
     module.__file__ = str(_ABI_CORE)
     sys.modules[module.__name__] = module
     exec(compile(_read_root_owned_core(), str(_ABI_CORE), "exec"), module.__dict__)
+    if sys.argv[1] == "cutover_pin_exchange":
+        return module.cutover_pin_exchange_v1
     dispatch = module.__dict__.get("dispatch_hook_v1")
     if not callable(dispatch):
         raise ValueError("ABI core API absent")
@@ -115,6 +117,9 @@ def _restore_original_standard_input(raw):
 dispatch_result = None
 try:
     hook_name = sys.argv[1]
+    if hook_name == "cutover_pin_exchange":
+        _load_dispatch()(sys.stdin.buffer.read(_MAX_EVENT_BYTES + 1))
+        raise SystemExit(0)
     plugin_root = Path(sys.argv[2])
     if not plugin_root.is_absolute():
         raise ValueError("relative plugin root")

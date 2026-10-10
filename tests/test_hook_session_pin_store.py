@@ -54,6 +54,31 @@ def test_pin_store_creates_private_nofollow_lock_and_digest_bound_binding(
     assert store.bindings() == {"session-a": binding}
 
 
+def test_cutover_retirement_preserves_reference_and_denies_id_reuse(tmp_path):
+    from the_hive import hook_session_pin_store as pins
+    store = _store(tmp_path)
+    original = _bind(store)
+    path = store.state_root / pins._binding_name('session-a')
+    raw = path.read_bytes()
+    retired = {'schema': 'HookSessionRetirementV1', 'session_id': 'session-a',
+               'original_sha256': 'sha256:' + hashlib.sha256(raw).hexdigest(),
+               'transaction_id': 'a' * 64, 'retired_at_unix_ns': 20, 'lifecycle_sha256': 'sha256:' + 'b' * 64}
+    retired = store._with_digest(retired)
+    path.write_bytes(pins._canonical_json(retired))
+    assert store.bindings() == {}
+    assert store.retained_generations(now_unix_ns=30) == set()
+    with pytest.raises(HookSessionPinStoreError):
+        _bind(store, now=30)
+    with pytest.raises(HookSessionPinStoreError):
+        store.resume_session(session_id='session-a', generation=original['generation'],
+                             runtime_manifest_digest=original['runtime_manifest_digest'], hooks=HOOKS, now_unix_ns=30)
+    assert path.read_bytes() == pins._canonical_json(retired)
+    retired['original_sha256'] = 'sha256:' + 'd' * 64
+    path.write_bytes(pins._canonical_json(retired))
+    with pytest.raises(HookSessionPinStoreError):
+        store.bindings()
+
+
 def test_session_end_retains_exactly_24_hours_and_stop_style_touches_do_not_release(
     tmp_path: Path,
 ) -> None:
