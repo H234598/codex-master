@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":11,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":12,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -37,6 +37,30 @@ Ein vorhandenes grünes Testergebnis darf nur bei unveränderten relevanten Inpu
 und noch gültigem Evidence-Reuse-Fenster wiederverwendet werden. Andernfalls den
 Test neu ausführen. Vorgeschriebene Voll- und Release-Gates bleiben verbindlich
 und werden einmal am passenden Gate ausgeführt.
+
+## Sprache in Dokumenten für Menschen
+
+Für die Userin oder andere Menschen bestimmte Dokumente dürfen keine
+Caveman-Sprache enthalten. Sie müssen in vollständigen, grammatisch korrekten
+und gut verständlichen Sätzen verfasst werden. Die Regel gilt hiveweit
+unabhängig von Rolle, Provider, Klasse, Repository und Dokumentformat. Sie
+umfasst insbesondere Pläne, Spezifikationen, Analysen, Reviews, Berichte,
+Anleitungen, Entscheidungsvorlagen und Dokumente mit Fragen.
+
+Diese Regel hat für Dokumente für Menschen Vorrang vor allgemeinen Caveman-
+und Kürzevorgaben. Telegrammstil, künstliche Wortverkürzungen und
+unverständliche Aneinanderreihungen von Kennungen sind verboten.
+Zusammenhänge, Entscheidungen, Folgen und notwendige Fachbegriffe müssen so
+erklärt werden, dass das Dokument ohne zusätzliche mündliche Erläuterung
+verständlich ist. Kürze darf nicht zulasten von Lesbarkeit, Vollständigkeit
+oder technischer Genauigkeit gehen.
+
+Technische Bezeichner, Code, Befehle, Pfade, maschinenlesbare Daten und
+wörtliche Zitate bleiben unverändert. Aussagekräftige Überschriften und
+übersichtliche Listen sind erlaubt. Vor jeder Dokumentübergabe muss die
+Sprache geprüft werden. Die bestehenden Regeln zur Dokumentvollständigkeit,
+zum Feld `priority` und zum Erhalt von Antworten, Fragestatus und Annotationen
+gelten weiterhin.
 
 ## Userfragen und Prioritätsfeld
 

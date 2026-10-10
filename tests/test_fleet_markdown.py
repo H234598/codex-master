@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from the_hive import fleet_markdown, server as server_module
+from the_hive import fleet_markdown, fleet_registry, server as server_module
 from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from the_hive.hive_policy import (
     MAX_COMMON_POLICY_BYTES,
@@ -412,7 +412,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 11
+    assert metadata.generation == 12
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -438,7 +438,7 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":11,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":12,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -466,7 +466,7 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
         assert required_inline_link in primary
         assert obsolete_line not in primary
         assert projection.metadata.common_digest == contract.common_digest
-        assert projection.metadata.generation == contract.generation == 11
+        assert projection.metadata.generation == contract.generation == 12
 
 
 def test_both_provider_projections_keep_annotation_marker_sidecars_read_only() -> None:
@@ -487,7 +487,7 @@ def test_both_provider_projections_keep_annotation_marker_sidecars_read_only() -
         assert primary.startswith(contract.common_bytes)
         for fragment in required_fragments:
             assert fragment in normalized_primary
-        assert projection.metadata.generation == contract.generation == 11
+        assert projection.metadata.generation == contract.generation == 12
 
 
 def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> (
@@ -570,14 +570,14 @@ def test_both_provider_projections_carry_identical_inline_and_multi_source_guard
         assert projection.metadata.common_digest == contract.common_digest
 
 
-def test_both_provider_projections_carry_same_generation_eleven_policy_bytes() -> None:
+def test_both_provider_projections_carry_same_generation_twelve_policy_bytes() -> None:
     contract = load_common_policy()
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
         projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary[: len(contract.common_bytes)] == contract.common_bytes
-        assert projection.metadata.generation == contract.generation == 11
+        assert projection.metadata.generation == contract.generation == 12
 
 
 def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> None:
@@ -612,7 +612,7 @@ def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> N
         assert primary.startswith(contract.common_bytes)
         for fragment in required_fragments:
             assert fragment in primary
-        assert projection.metadata.generation == contract.generation == 11
+        assert projection.metadata.generation == contract.generation == 12
 
 
 def test_both_provider_projections_carry_side_effect_free_external_plan_handoff():
@@ -640,7 +640,7 @@ def test_both_provider_projections_carry_side_effect_free_external_plan_handoff(
             assert fragment in normalized_primary
         for backend in (b"wl-copy", b"xclip", b"xsel"):
             assert backend not in primary
-        assert projection.metadata.generation == contract.generation == 11
+        assert projection.metadata.generation == contract.generation == 12
 
 
 def test_both_provider_projections_carry_unencoded_local_file_link_contract() -> None:
@@ -723,17 +723,35 @@ def test_malformed_common_header_error_propagates_without_policy_fallback(
         fleet_markdown.fleet_markdown_artifacts(_agent())
 
 
-@pytest.mark.parametrize("runner", [RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI])
-def test_priority_policy_materializes_all_profiles_without_changing_question_history(
+@pytest.mark.parametrize("provider", list(Provider))
+def test_document_policies_materialize_all_profiles_without_changing_question_history(
     tmp_path: Path,
-    runner: RunnerKind,
+    provider: Provider,
 ) -> None:
     contract = load_common_policy()
-    profiles = server_module._known_runtime_skill_profiles("test_invalid_profile")
+    runner = fleet_registry._PROVIDER_RULES[provider][0]
+    profiles = server_module._known_runtime_skill_profiles("test_invalid_profile") | {
+        path.stem for path in (_MARKDOWN_ROOT / "classes").glob("*.md")
+    }
+    required_language_contract = (
+        "Für die Userin oder andere Menschen bestimmte Dokumente dürfen keine Caveman-Sprache enthalten",
+        "vollständigen, grammatisch korrekten und gut verständlichen Sätzen",
+        "hiveweit unabhängig von Rolle, Provider, Klasse, Repository und Dokumentformat",
+        "Pläne, Spezifikationen, Analysen, Reviews, Berichte, Anleitungen, Entscheidungsvorlagen und Dokumente mit Fragen",
+        "Vorrang vor allgemeinen Caveman- und Kürzevorgaben",
+        "Telegrammstil, künstliche Wortverkürzungen und unverständliche Aneinanderreihungen von Kennungen sind verboten",
+        "Zusammenhänge, Entscheidungen, Folgen und notwendige Fachbegriffe müssen so erklärt werden, dass das Dokument ohne zusätzliche mündliche Erläuterung verständlich ist",
+        "Kürze darf nicht zulasten von Lesbarkeit, Vollständigkeit oder technischer Genauigkeit gehen",
+        "Technische Bezeichner, Code, Befehle, Pfade, maschinenlesbare Daten und wörtliche Zitate bleiben unverändert",
+        "Aussagekräftige Überschriften und übersichtliche Listen sind erlaubt",
+        "Vor jeder Dokumentübergabe muss die Sprache geprüft werden",
+        "Die bestehenden Regeln zur Dokumentvollständigkeit, zum Feld `priority` und zum Erhalt von Antworten, Fragestatus und Annotationen gelten weiterhin",
+    )
     for profile in sorted(profiles):
         home = tmp_path / profile
         agent = replace(
             _agent(runner, profile),
+            provider=provider,
             home=home,
             runner_path=home
             / ("gemini" if runner is RunnerKind.GEMINI_CLI else "codex"),
@@ -748,6 +766,8 @@ def test_priority_policy_materializes_all_profiles_without_changing_question_his
         primary = home / projection.metadata.provider_artifact_name
         primary_bytes = primary.read_bytes()
         normalized = " ".join(primary_bytes.decode("utf-8").split())
+        for meaning in required_language_contract:
+            assert meaning in normalized
         assert "im YAML-Frontmatter genau ein top-level-Feld `priority`" in normalized
         assert (
             "Fragen in Plänen, Analysen, Reports und Entscheidungsdokumenten"
@@ -758,16 +778,23 @@ def test_priority_policy_materializes_all_profiles_without_changing_question_his
             primary_bytes
             == projection.artifacts[projection.metadata.provider_artifact_name]
         )
+        assert projection.metadata.class_profile == profile
+        class_bytes = (home / projection.metadata.class_artifact_name).read_bytes()
+        assert class_bytes == projection.artifacts[projection.metadata.class_artifact_name]
+        assert b"## Sprache in Dokumenten" not in class_bytes
         marker = json.loads((home / server_module.FLEET_AGENT_MARKER_FILE).read_bytes())
         assert marker["common_policy"] == {
             "schema_version": 1,
-            "generation": 11,
+            "generation": 12,
             "digest": hashlib.sha256(contract.common_bytes).hexdigest(),
         }
         assert (
             marker["files"][projection.metadata.provider_artifact_name]
             == hashlib.sha256(primary_bytes).hexdigest()
+            == projection.metadata.provider_artifact_digest
         )
+        assert marker["common_policy"]["digest"] == contract.common_digest
+        assert marker["common_policy"]["generation"] == projection.metadata.generation
 
         preserved = {}
         for filename, priority in (("report.md", "high"), ("plan.md", "null")):
