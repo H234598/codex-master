@@ -52,7 +52,7 @@ def _validated_retirement(value, *, expected_name):
             or value["schema"] != _RETIREMENT_SCHEMA or not _safe_session_id(value["session_id"])
             or _binding_name(value["session_id"]) != expected_name
             or not all(_safe_digest(value[x]) for x in ["original_sha256", "lifecycle_sha256", "content_digest"])
-            or not re.fullmatch(r"[0-9a-f]{64}", value["transaction_id"])
+            or not isinstance(value["transaction_id"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["transaction_id"])
             or not _safe_time(value["retired_at_unix_ns"])
             or value["content_digest"] != _content_digest(value)):
         raise _invalid()
@@ -668,7 +668,7 @@ class HookSessionPinStoreV1:
     @staticmethod
     def cutover_exchange(request):
         """Only the immutable root ABI calls this with inherited journal capabilities."""
-        if os.geteuid() != 0 or set(request) != {"pin_fd", "backup_fd", "journal_fd", "lock_fd", "index"}:
+        if os.geteuid() != 0 or set(request) != {"pin_fd", "backup_fd", "journal_fd", "lock_fd", "index", "locks", "journal_lock"}:
             raise _invalid()
         pin, backup, journal, lock = [request[x] for x in ["pin_fd", "backup_fd", "journal_fd", "lock_fd"]]
         def ident(item):
@@ -699,10 +699,20 @@ class HookSessionPinStoreV1:
         state = json.loads(raw, object_pairs_hook=_unique_object)
         receipt = state["quiescence"]
         entry = state["steps"][request["index"]]
+        if len(request["locks"]) != len(receipt["locks"]) or request["locks"][-1] != lock:
+            raise _invalid()
+        for descriptor, item in zip(request["locks"], receipt["locks"]):
+            if os.readlink(f"/proc/self/fd/{descriptor}") != item["path"] or ident(os.fstat(descriptor)) != item["expected"]["id"]:
+                raise _invalid()
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if ident(os.fstat(request["journal_lock"])) != ident(os.stat("lock", dir_fd=journal, follow_symlinks=False)):
+            raise _invalid()
+        fcntl.flock(request["journal_lock"], fcntl.LOCK_EX | fcntl.LOCK_NB)
         if (entry.get("kind") != "pin_retirement" or entry["status"] not in ["intent", "undo_intent"]
                 or state["phase"] not in ["inhibition", "rollback"]
                 or receipt["plan"] != state["plan"] or receipt["closed"] is not True
                 or receipt["scope"] != "forced_closed_Hive_writers_only"
+                or receipt["boot_id"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
                 or not 0 <= time.time_ns() - receipt["at_unix_ns"] <= 60 * 1_000_000_000
                 or any(x["closed_identity"][2:] != [0, 0, 0] or ident(Path(x["path"]).lstat()) != x["closed_identity"] for x in receipt["fences"])):
             raise _invalid()
