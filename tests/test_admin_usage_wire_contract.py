@@ -2,37 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
-import sys
 
 import pytest
 
-USAGE_SRC = Path(
-    "/run/media/teladi/SSD3/codex-worktrees/worktrees/codex-usage/"
-    "outbound-hostagent-20260830/src"
-)
-sys.path.insert(0, str(USAGE_SRC))
-
-from codex_usage.masterjet_client import _encode_request, _step_up_challenge  # noqa: E402
-from codex_usage.masterjet_contracts import (  # noqa: E402
+from codex_usage.masterjet_client import _encode_request, _step_up_challenge
+from codex_usage.masterjet_contracts import (
     ControlContractError,
     parse_operation_status,
     parse_secret_ingress_receipt,
     parse_secret_ingress_session,
 )
 
-from the_hive.admin_contracts import (  # noqa: E402
+from the_hive.admin_contracts import (
     AdminContractError,
     parse_admin_request,
     public_agent_result,
 )
-from test_admin_http import (  # noqa: E402
+from test_admin_http import (
     _headers,
     _request,
     _running_server,
     _totp,
 )
-from test_admin_service import principal, service_at  # noqa: E402
+from test_admin_service import principal, service_at
 
 
 def test_real_usage_mutation_requests_match_canonical_admin_parser() -> None:

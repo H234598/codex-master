@@ -15,6 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "ruff==0.16.3",
+    "jsonschema>=4.0",
+]
 google-identity = [
     "google-auth>=2.35",
     "google-auth-oauthlib>=1.2",

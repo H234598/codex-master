@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ctypes
 import os
+import platform
 import re
 import select
 from threading import Lock
@@ -457,14 +458,18 @@ class _OpenHow(ctypes.Structure):
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
-_OPENAT2 = _LIBC.openat2
-_OPENAT2.argtypes = (
+_SYSCALL = _LIBC.syscall
+_SYSCALL.argtypes = (
+    ctypes.c_long,
     ctypes.c_int,
     ctypes.c_char_p,
     ctypes.POINTER(_OpenHow),
     ctypes.c_size_t,
 )
-_OPENAT2.restype = ctypes.c_int
+_SYSCALL.restype = ctypes.c_long
+_OPENAT2_SYSCALL = 437 if (
+    platform.system() == "Linux" and platform.machine() in {"x86_64", "aarch64"}
+) else None
 
 
 def _fail(code: str) -> None:
@@ -474,6 +479,7 @@ def _fail(code: str) -> None:
 def _openat2(parent_fd: int, name: str, flags: int) -> int:
     if (
         type(parent_fd) is not int
+        or _OPENAT2_SYSCALL is None
         or type(name) is not str
         or not name
         or name.startswith("/")
@@ -484,7 +490,9 @@ def _openat2(parent_fd: int, name: str, flags: int) -> int:
     if len(encoded) > MAX_CHPB_MESSAGE_BYTES:
         _fail("path_binding_invalid")
     how = _OpenHow(flags, 0, _RESOLVE)
-    fd = _OPENAT2(parent_fd, encoded, ctypes.byref(how), ctypes.sizeof(how))
+    fd = _SYSCALL(
+        _OPENAT2_SYSCALL, parent_fd, encoded, ctypes.byref(how), ctypes.sizeof(how)
+    )
     if fd < 0:
         _fail("path_binding_invalid")
     return fd

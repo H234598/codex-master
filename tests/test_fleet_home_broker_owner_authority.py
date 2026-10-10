@@ -109,6 +109,20 @@ def _native_label(fd: int) -> tuple[str, str]:
         selinux.context_free(context)
 
 
+@pytest.fixture
+def offline_selinux_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw_context = "system_u:object_r:fixture_object_t:s0"
+
+    def read_context(fd: int) -> tuple[int, str]:
+        os.fstat(fd)
+        return len(raw_context), raw_context
+
+    monkeypatch.setattr(selinux, "fgetfilecon_raw", read_context)
+    monkeypatch.setattr(
+        selinux, "security_check_context_raw", lambda raw: 0 if raw == raw_context else -1
+    )
+
+
 def test_layout_schema_accepts_only_all_explicit_fixture_roles_and_canonical_bytes() -> None:
     payload = _fixture_payload()
 
@@ -309,6 +323,10 @@ def test_issued_authority_repr_and_str_are_fixed_and_redacted(tmp_path) -> None:
         os.close(root_fd)
 
 
+@pytest.mark.skipif(
+    selinux.is_selinux_enabled() != 1,
+    reason="native FD label observation requires an active kernel SELinux policy",
+)
 def test_fd_selinux_label_uses_native_fd_observation_without_closing_fd(tmp_path) -> None:
     fixture = tmp_path / "label-fixture"
     fixture.write_bytes(b"fixture")
@@ -338,7 +356,7 @@ def test_fd_selinux_label_requires_explicit_type_and_range_arguments() -> None:
 
 
 def test_fd_selinux_label_accepts_explicit_none_range_binding(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, offline_selinux_context
 ) -> None:
     fixture = tmp_path / "label-fixture"
     fixture.write_bytes(b"fixture")
@@ -359,7 +377,9 @@ def test_fd_selinux_label_accepts_explicit_none_range_binding(
         os.close(fd)
 
 
-def test_fd_selinux_label_rejects_type_or_range_drift_without_fallback(tmp_path) -> None:
+def test_fd_selinux_label_rejects_type_or_range_drift_without_fallback(
+    tmp_path, offline_selinux_context
+) -> None:
     fixture = tmp_path / "label-fixture"
     fixture.write_bytes(b"fixture")
     fd = os.open(fixture, os.O_RDONLY | os.O_NOFOLLOW)
@@ -405,7 +425,7 @@ def test_fd_selinux_label_rejects_type_or_range_drift_without_fallback(tmp_path)
     ),
 )
 def test_fd_selinux_label_fails_closed_for_native_read_or_context_failures(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, patch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, patch, offline_selinux_context
 ) -> None:
     fixture = tmp_path / "label-fixture"
     fixture.write_bytes(b"fixture")
@@ -419,6 +439,27 @@ def test_fd_selinux_label_fails_closed_for_native_read_or_context_failures(
                 fd,
                 expected_type=expected_type,
                 expected_mls_range=expected_range,
+            )
+        os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+def test_fd_selinux_label_fails_closed_when_policy_is_unavailable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, offline_selinux_context
+) -> None:
+    fixture = tmp_path / "label-fixture"
+    fixture.write_bytes(b"fixture")
+    fd = os.open(fixture, os.O_RDONLY | os.O_NOFOLLOW)
+
+    def policy_unavailable(_raw: str) -> int:
+        raise FileNotFoundError("SELinux policy is unavailable")
+
+    monkeypatch.setattr(selinux, "security_check_context_raw", policy_unavailable)
+    try:
+        with pytest.raises(OwnerAuthorityError, match="SELinux object label is invalid"):
+            FdSelinuxObjectLabelV1.observe(
+                fd, expected_type="fixture_object_t", expected_mls_range="s0"
             )
         os.fstat(fd)
     finally:

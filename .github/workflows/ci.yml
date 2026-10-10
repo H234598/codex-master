@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -17,20 +17,47 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: Set up pinned producer Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.12"
+          python-version: "3.14.8"
 
-      - name: Install test dependencies
-        run: >-
-          python -m pip install --disable-pip-version-check pytest ruff==0.16.3 jsonschema "PyJWT[crypto]>=2.9,<3"
-          tree-sitter==0.26.0 tree-sitter-javascript==0.25.0 tree-sitter-typescript==0.23.2
+      - name: Install pinned offline producer build backend
+        run: |
+          # The producer executes this interpreter by FD with -I.
+          python -m pip install --disable-pip-version-check "pytest>=8.0" \
+            "setuptools @ https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl#sha256=51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670"
+          echo "THE_HIVE_TEST_CODEX_USAGE_PYTHON=${pythonLocation}/bin/python3.14" >> "${GITHUB_ENV}"
 
-      - name: Install manpage renderer
+      - name: Set up test Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes groff-base
+          sudo apt-get install --no-install-recommends --yes \
+            python3-selinux \
+            build-essential pkg-config libdbus-1-dev libgirepository-2.0-dev libcairo2-dev \
+            gir1.2-glib-2.0 dbus \
+            groff-base
+          # SELinux is a native distro binding, not the similarly named PyPI shim.
+
+      - name: Fetch pinned Codex Usage producer source
+        env:
+          CODEX_USAGE_COMMIT: f495de4fdae9e99d474a65129028984efb8b555d
+        run: |
+          producer_root="${RUNNER_TEMP}/codex-usage-test-source"
+          git init "${producer_root}"
+          git -C "${producer_root}" remote add origin https://github.com/H234598/codex-usage.git
+          git -C "${producer_root}" fetch --depth=1 origin "${CODEX_USAGE_COMMIT}"
+          git -C "${producer_root}" checkout --detach FETCH_HEAD
+          test "$(git -C "${producer_root}" rev-parse HEAD)" = "${CODEX_USAGE_COMMIT}"
+          echo "THE_HIVE_TEST_CODEX_USAGE_ROOT=${producer_root}" >> "${GITHUB_ENV}"
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check ".[test,test-index]"
 
       - name: Validate plugin manifests
         run: |
@@ -111,8 +138,15 @@ jobs:
           node --check cinnamon/applets/the-hive@H234598/applet.js
           node --test tests/test_cinnamon_applet.mjs
 
-      - name: Run unit tests
-        run: PYTHONPATH=src python -m pytest -q
+      - name: Run pinned producer contract tests with Python 3.14
+        run: >-
+          PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src"
+          "${THE_HIVE_TEST_CODEX_USAGE_PYTHON}" -m pytest -q tests/test_usage_snapshot.py
+
+      - name: Run remaining unit tests with Python 3.12
+        run: >-
+          PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src:/usr/lib/python3/dist-packages"
+          python -m pytest -q --ignore=tests/test_usage_snapshot.py
 
       - name: Check CLI wrapper syntax
         run: bash -n ./bin/the-hive-mcp ./bin/the-hive-mcp-stable ./bin/the-hive-plugin-hook-stable

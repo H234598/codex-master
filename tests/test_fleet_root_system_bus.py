@@ -2890,6 +2890,25 @@ def test_openat2_rejects_symlink_and_non_directory(tmp_path: Path) -> None:
         os.close(root)
 
 
+def test_openat2_opens_directory_with_native_syscall(tmp_path: Path) -> None:
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    root = os.open(tmp_path, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        child = _openat2(root, "directory", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            assert os.fstat(child).st_ino == directory.stat().st_ino
+        finally:
+            os.close(child)
+    finally:
+        os.close(root)
+
+
+def test_openat2_rejects_unsupported_syscall_architecture(monkeypatch) -> None:
+    monkeypatch.setattr(system_bus, "_OPENAT2_SYSCALL", None)
+    assert_code("path_binding_invalid", lambda: _openat2(0, "directory", os.O_PATH))
+
+
 def test_host_coordination_failure_and_success_ownership(
     private_bus: PrivateBus,
 ) -> None:
