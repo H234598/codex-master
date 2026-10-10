@@ -1359,12 +1359,17 @@ def test_materialization_claim_is_durable_before_projection_decrypt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = synced_service(tmp_path)
+    # Observe the foreground materialization without a concurrent janitor decrypt.
+    service._janitor_stop.set()  # noqa: SLF001
     runtime_fd = open_private_runtime(tmp_path / "runtime")
     observed: list[bool] = []
+    real_decrypt = CredentialVault._decrypt_record  # noqa: SLF001
 
     def crash_at_decrypt(
         _vault: CredentialVault, _raw: bytes, _account_ref: str
     ) -> tuple[int, int, bytes]:
+        if _vault is not service._vault:  # noqa: SLF001
+            return real_decrypt(_vault, _raw, _account_ref)
         try:
             document = json.loads(
                 (tmp_path / "vault" / "materialization-claims.json").read_text(
@@ -1539,6 +1544,12 @@ def test_parallel_context_and_service_finalization_never_double_closes_fd(
         "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
     )
     context.__enter__()
+    # This race has exactly two participants; janitor finalization is covered separately.
+    service._janitor_stop.set()  # noqa: SLF001
+    janitor = service._janitor_thread  # noqa: SLF001
+    assert janitor is not None
+    janitor.join(timeout=15)
+    assert not janitor.is_alive()
     entry = next(iter(service._materializations))  # noqa: SLF001
     owned_runtime_fd = entry._runtime_fd  # noqa: SLF001
     close_barrier = threading.Barrier(2)
