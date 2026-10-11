@@ -768,11 +768,38 @@ def test_document_policies_materialize_all_profiles_without_changing_question_hi
         normalized = " ".join(primary_bytes.decode("utf-8").split())
         for meaning in required_language_contract:
             assert meaning in normalized
-        assert "im YAML-Frontmatter genau ein top-level-Feld `priority`" in normalized
-        assert (
-            "Fragen in Plänen, Analysen, Reports und Entscheidungsdokumenten"
-            in normalized
+        required_priority_contract = (
+            'Jedes Markdown-Dokument mit Fragen an die Userin oder mit Entscheidungen',
+            'im YAML-Frontmatter genau ein top-level-Feld `priority`',
+            '`Offene-Frage`- und `codex-question`-Notizen',
+            'auch reine Entscheidungsdokumente',
+            'hiveweit für alle Rollen, Provider, Klassen, Repositories und Lifecycles',
+            'unabhängig vom Fragestatus',
+            '`priority: niedrig` gilt, wenn die Frage oder Entscheidung das Weiterarbeiten nie blockiert',
+            '`priority: mittel` setzt einen späteren, aufschiebbaren Arbeitsstopp voraus',
+            'voraussichtlich noch mindestens einen Tag weitergearbeitet werden kann',
+            'keine grundlegenden Strukturveränderungen betroffen sind',
+            '`priority: hoch` gilt bei grundlegenden Strukturveränderungen auch ohne unmittelbaren Arbeitsstopp',
+            'bei unmittelbar blockierter Weiterarbeit',
+            'realistisch innerhalb eines Tages drohenden Arbeitsstopp ohne Antwort',
+            'Die Kriterien für `hoch` haben Vorrang',
+            'höchste zutreffende Einstufung den einzigen Dokumentwert',
+            'Tagesprognose muss auf dem tatsächlichen Arbeitsplan beruhen',
+            'Keine Zeitangaben erfinden',
+            'Ein unbekannter Zeithorizont belegt weder `mittel` noch allein `hoch`',
+            'Ein bisheriger `null`-Platzhalter ersetzt keine anhand der Kriterien mögliche Einstufung',
+            'Tatsächlich fehlende Entscheidungsgrundlagen und die dadurch offene Einstufung müssen ausdrücklich benannt werden',
+            'Beim Erstellen, Bearbeiten und vor der Übergabe ist die Einstufung zu prüfen',
+            'Abweichende bestehende Werte sind nachvollziehbar zu korrigieren',
+            'Unveränderte historische Dokumente dürfen nicht pauschal rückwirkend umklassifiziert werden',
+            'Fehlende oder doppelte top-level-Felder sind unzulässig',
+            'Antworten, Fragestatus und Annotation-Marker bleiben erhalten',
+            'auch beim Fortsetzen oder Resumen',
         )
+        for meaning in required_priority_contract:
+            assert meaning in normalized, (provider, profile, meaning)
+        assert "Bestehende Prioritätswerte bleiben erhalten" not in normalized
+        assert "noch keine Priorität festgelegt ist, `priority: null`" not in normalized
         assert primary_bytes.startswith(contract.common_bytes)
         assert (
             primary_bytes
@@ -796,14 +823,32 @@ def test_document_policies_materialize_all_profiles_without_changing_question_hi
         assert marker["common_policy"]["digest"] == contract.common_digest
         assert marker["common_policy"]["generation"] == projection.metadata.generation
 
+        # Check the complete approved waiting policy in the actually written file.
+        heading = "## Hive-weites Warten auf blockierende Antworten\n\n"
+        artifact = primary_bytes.decode("utf-8")
+        assert artifact.count(heading) == 1, (provider, profile)
+        waiting_body = artifact.split(heading, 1)[1].split("\n## ", 1)[0].strip()
+        paragraphs = waiting_body.split("\n\n")
+        assert len(paragraphs) == 6, (provider, profile)
+        rule_body = "\n".join(" ".join(paragraph.split()) for paragraph in paragraphs)
+        assert hashlib.sha256(rule_body.encode("utf-8")).hexdigest() == (
+            "87fae4588f2a76dccd4a6ca269641af4db197808dcf7d70868e331700d1becbf"
+        ), (provider, profile)
+
         preserved = {}
-        for filename, priority in (("report.md", "high"), ("plan.md", "null")):
+        for filename, priority in (("report.md", "high"), ("plan.md", "null"), ("decision.md", "niedrig")):
             question = home / filename
             question.write_text(
                 f'---\npriority: {priority}\nstatus: answered\n---\n# Plan\n<mark data-annotation-id="question-1">Proceed?</mark>\n\n## Answer\nApproved.\n',
                 encoding="utf-8",
             )
             preserved[question] = (question.read_bytes(), question.stat().st_ino)
+        sidecar = home / ".obsidian/plugins/annotation-marker/annotations/plan.md.json"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_bytes(
+            b'{"data-annotation-id":"question-1","color":2,"note":"Approved."}\n'
+        )
+        preserved[sidecar] = (sidecar.read_bytes(), sidecar.stat().st_ino)
         history = home / "sessions" / "history.jsonl"
         history.parent.mkdir(mode=0o700)
         history.write_bytes(
@@ -811,6 +856,11 @@ def test_document_policies_materialize_all_profiles_without_changing_question_hi
         )
         preserved[history] = (history.read_bytes(), history.stat().st_ino)
         preserved[primary] = (primary_bytes, primary.stat().st_ino)
+
+        # Pure rendering must not modify historical documents or sidecars.
+        assert fleet_markdown.fleet_markdown_projection(agent) == projection
+        for path, snapshot in preserved.items():
+            assert (path.read_bytes(), path.stat().st_ino) == snapshot
 
         # The existing safe writer is idempotent and owns only policy artifacts.
         assert not server_module._fleet_write_home(home, artifacts)

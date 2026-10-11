@@ -64,22 +64,81 @@ gelten weiterhin.
 
 ## Userfragen und Prioritätsfeld
 
-Jedes Dokument mit an den User gerichteten Fragen enthält im YAML-Frontmatter
-genau ein top-level-Feld `priority`. Das umfasst `Offene-Frage`- und
-`codex-question`-Notizen sowie Fragen in Plänen, Analysen, Reports und
-Entscheidungsdokumenten. Die Regel gilt hiveweit für alle Rollen, Provider,
+Jedes Markdown-Dokument mit Fragen an die Userin oder mit Entscheidungen
+enthält im YAML-Frontmatter genau ein top-level-Feld `priority`. Das umfasst
+`Offene-Frage`- und `codex-question`-Notizen sowie Fragen oder Entscheidungen
+in Plänen, Analysen, Reports und Entscheidungsvorlagen, auch reine
+Entscheidungsdokumente. Die Regel gilt hiveweit für alle Rollen, Provider,
 Klassen, Repositories und Lifecycles, unabhängig vom Fragestatus.
 
-Bestehende Prioritätswerte bleiben erhalten. Wenn noch keine Priorität
-festgelegt ist, `priority: null` verwenden; keine Rangfolge erfinden. Beim
-Erstellen oder Bearbeiten eines betroffenen Dokuments das fehlende Feld
-ergänzen. Fehlende oder doppelte top-level-Felder sind unzulässig; keine
-vorhandene Priorität stillschweigend überschreiben.
+`priority: niedrig` gilt, wenn die Frage oder Entscheidung das Weiterarbeiten
+nie blockiert.
 
-Vor der Übergabe genau einmal prüfen, dass jedes betroffene Dokument genau
-ein top-level-Feld `priority` enthält. Antworten, Fragestatus und
-Annotation-Marker bleiben erhalten. Diese Regel gilt auch beim Fortsetzen
-oder Resumen.
+`priority: mittel` setzt einen späteren, aufschiebbaren Arbeitsstopp voraus.
+Diese Einstufung gilt nur, wenn voraussichtlich noch mindestens einen Tag
+weitergearbeitet werden kann und keine grundlegenden Strukturveränderungen
+betroffen sind.
+
+`priority: hoch` gilt bei grundlegenden Strukturveränderungen auch ohne
+unmittelbaren Arbeitsstopp, bei unmittelbar blockierter Weiterarbeit oder
+bei einem realistisch innerhalb eines Tages drohenden Arbeitsstopp ohne
+Antwort.
+
+Die Kriterien für `hoch` haben Vorrang vor `mittel` und `niedrig`. Bei mehreren
+Fragen oder Entscheidungen bestimmt die höchste zutreffende Einstufung den
+einzigen Dokumentwert. Die Tagesprognose muss auf dem tatsächlichen
+Arbeitsplan beruhen. Keine Zeitangaben erfinden. Ein unbekannter Zeithorizont
+belegt weder `mittel` noch allein `hoch`.
+
+Beim Erstellen, Bearbeiten und vor der Übergabe ist die Einstufung zu prüfen.
+Ein bisheriger `null`-Platzhalter ersetzt keine anhand der Kriterien mögliche
+Einstufung. Tatsächlich fehlende Entscheidungsgrundlagen und die dadurch
+offene Einstufung müssen ausdrücklich benannt werden, statt eine Rangfolge
+zu erfinden. Abweichende bestehende Werte sind nachvollziehbar zu korrigieren.
+Unveränderte historische Dokumente dürfen nicht pauschal rückwirkend
+umklassifiziert werden. Fehlende oder doppelte top-level-Felder sind
+unzulässig. Antworten, Fragestatus und Annotation-Marker bleiben erhalten.
+Diese Regel gilt auch beim Fortsetzen oder Resumen.
+
+## Hive-weites Warten auf blockierende Antworten
+
+- Muss Arbeit wegen einer unbeantworteten Frage oder Entscheidung unterbrochen
+  werden, darf der Auftrag nicht unbeobachtet vollständig beendet werden. Halte
+  den betroffenen Schritt wartend und führe unabhängig mögliche Arbeit weiter.
+  Schweigen ist weder eine Antwort noch eine Freigabe.
+
+- Miss die Wartezeit ab dem dokumentierten Beginn der tatsächlichen
+  Unterbrechung durch diese Frage. Prüfe bis zu fünf Stunden Wartezeit alle 30
+  Minuten, ab fünf Stunden stündlich und ab 30 Stunden alle fünf Stunden. Beide
+  Schwellen beziehen sich auf denselben ursprünglichen Wartebeginn; die zweite
+  Schwelle bedeutet nicht weitere 30 Stunden nach der ersten.
+
+- Sichere Fragekennung, maßgebliche Antwortquelle, betroffenen Auftrag
+  beziehungsweise Goal, ursprünglichen Wartebeginn, letzte Prüfung und nächste
+  Fälligkeit dauerhaft. Resume, Kontextwechsel, Neustart oder eine unveränderte
+  Prüfung setzen die Wartezeit nicht zurück. Erzeuge keine doppelten Fragen,
+  Timer oder parallelen Wiederaufnahmen.
+
+- Prüfe bei Fälligkeit die tatsächliche Antwort und zugehörige Annotationen,
+  nicht nur einen alten Statusbericht. Ist eine verwertbare Antwort vorhanden,
+  übernimm sie innerhalb ihres tatsächlichen Umfangs und setze die passende
+  Arbeit fort. Falls dafür nötig und vom vorhandenen Produkt unterstützt,
+  verwende `/goal resume`. Eine ablehnende Antwort wird respektiert; eine
+  unklare Antwort ist keine stillschweigende Freigabe. Markiere eine Antwort
+  erst nach ihrer tatsächlichen Übernahme als verarbeitet.
+
+- Nutze für Prüfungen ohne laufende Session einen vorhandenen dauerhaften
+  Scheduling- beziehungsweise Wiederaufnahmemechanismus. Ein beendeter Turn,
+  ein bloßer Markdownvermerk oder eine kurze Sleep-Schleife beweist keinen
+  Hintergrundauftrag. Kann die Umgebung die Wiederaufnahme nicht gewährleisten,
+  benenne diese konkrete Grenze, statt eine aktive Überwachung zu behaupten.
+  Übergeordnete Plattformregeln zum Goalstatus bleiben verbindlich; ein solcher
+  Statuswechsel ersetzt nicht die notwendige Wiederaufnahmeplanung.
+
+- Eine ausdrücklich angeordnete Pause oder Beendigung darf nicht durch
+  automatische Wiederaufnahme übergangen werden. Die neue Wartepolitik gilt
+  Hive-weit unabhängig von Rolle, Provider und Repository; die Prioritäts-,
+  Antworterhaltungs- und Dokumentsprachregeln bleiben bestehen.
 
 ## Public documentation OPSEC
 

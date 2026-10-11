@@ -723,26 +723,52 @@ def test_user_question_priority_policy_materializes_for_both_providers(
     policy = " ".join(projection.artifact_bytes.decode("utf-8").split())
 
     required_meanings = (
-        "Jedes Dokument mit an den User gerichteten Fragen",
-        "im YAML-Frontmatter genau ein top-level-Feld `priority`",
-        "`Offene-Frage`- und `codex-question`-Notizen",
-        "Fragen in Plänen, Analysen, Reports und Entscheidungsdokumenten",
-        "hiveweit für alle Rollen, Provider, Klassen, Repositories und Lifecycles",
-        "unabhängig vom Fragestatus",
-        "Bestehende Prioritätswerte bleiben erhalten",
-        "noch keine Priorität festgelegt ist, `priority: null`",
-        "keine Rangfolge erfinden",
-        "Beim Erstellen oder Bearbeiten eines betroffenen Dokuments das fehlende Feld ergänzen",
-        "Fehlende oder doppelte top-level-Felder sind unzulässig",
-        "Vor der Übergabe genau einmal prüfen",
-        "Antworten, Fragestatus und Annotation-Marker bleiben erhalten",
-        "auch beim Fortsetzen oder Resumen",
+        'Jedes Markdown-Dokument mit Fragen an die Userin oder mit Entscheidungen',
+        'im YAML-Frontmatter genau ein top-level-Feld `priority`',
+        '`Offene-Frage`- und `codex-question`-Notizen',
+        'auch reine Entscheidungsdokumente',
+        'hiveweit für alle Rollen, Provider, Klassen, Repositories und Lifecycles',
+        'unabhängig vom Fragestatus',
+        '`priority: niedrig` gilt, wenn die Frage oder Entscheidung das Weiterarbeiten nie blockiert',
+        '`priority: mittel` setzt einen späteren, aufschiebbaren Arbeitsstopp voraus',
+        'voraussichtlich noch mindestens einen Tag weitergearbeitet werden kann',
+        'keine grundlegenden Strukturveränderungen betroffen sind',
+        '`priority: hoch` gilt bei grundlegenden Strukturveränderungen auch ohne unmittelbaren Arbeitsstopp',
+        'bei unmittelbar blockierter Weiterarbeit',
+        'realistisch innerhalb eines Tages drohenden Arbeitsstopp ohne Antwort',
+        'Die Kriterien für `hoch` haben Vorrang',
+        'höchste zutreffende Einstufung den einzigen Dokumentwert',
+        'Tagesprognose muss auf dem tatsächlichen Arbeitsplan beruhen',
+        'Keine Zeitangaben erfinden',
+        'Ein unbekannter Zeithorizont belegt weder `mittel` noch allein `hoch`',
+        'Ein bisheriger `null`-Platzhalter ersetzt keine anhand der Kriterien mögliche Einstufung',
+        'Tatsächlich fehlende Entscheidungsgrundlagen und die dadurch offene Einstufung müssen ausdrücklich benannt werden',
+        'Beim Erstellen, Bearbeiten und vor der Übergabe ist die Einstufung zu prüfen',
+        'Abweichende bestehende Werte sind nachvollziehbar zu korrigieren',
+        'Unveränderte historische Dokumente dürfen nicht pauschal rückwirkend umklassifiziert werden',
+        'Fehlende oder doppelte top-level-Felder sind unzulässig',
+        'Antworten, Fragestatus und Annotation-Marker bleiben erhalten',
+        'auch beim Fortsetzen oder Resumen',
     )
     for meaning in required_meanings:
         assert meaning in policy
+    assert "Bestehende Prioritätswerte bleiben erhalten" not in policy
+    assert "noch keine Priorität festgelegt ist, `priority: null`" not in policy
     assert projection.artifact_bytes.startswith(contract.common_bytes)
     assert projection.common_digest == hashlib.sha256(contract.common_bytes).hexdigest()
     assert (
         projection.artifact_digest
         == hashlib.sha256(projection.artifact_bytes).hexdigest()
+    )
+
+    # Bind all six approved paragraphs; this checks text transport, not a scheduler.
+    artifact = projection.artifact_bytes.decode("utf-8")
+    heading = "## Hive-weites Warten auf blockierende Antworten\n\n"
+    assert artifact.count(heading) == 1
+    waiting_body = artifact.split(heading, 1)[1].split("\n## ", 1)[0].strip()
+    paragraphs = waiting_body.split("\n\n")
+    assert len(paragraphs) == 6
+    rule_body = "\n".join(" ".join(paragraph.split()) for paragraph in paragraphs)
+    assert hashlib.sha256(rule_body.encode("utf-8")).hexdigest() == (
+        "87fae4588f2a76dccd4a6ca269641af4db197808dcf7d70868e331700d1becbf"
     )
