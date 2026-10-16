@@ -140,6 +140,13 @@ Diese Regel gilt auch beim Fortsetzen oder Resumen.
   Hive-weit unabhängig von Rolle, Provider und Repository; die Prioritäts-,
   Antworterhaltungs- und Dokumentsprachregeln bleiben bestehen.
 
+## Hive-weite Prüf- und Berichtskette ohne künstliche Reparaturschleifen
+
+- Künstliche Zeitgrenzen in der Prüf- und Berichtskette dürfen keine unnötigen Reparaturschleifen auslösen.
+- Ein selbst gesetztes Prüf-, Review-, Warte- oder Berichtszeitfenster und sein Ablauf belegen für sich keinen Produktfehler. Fehlende oder verspätete Rückmeldungen sind als offene Evidenz zu behandeln, nicht als bestätigter Defekt oder grüner Abschluss.
+- Vorliegende gültige Ergebnisse und laufende Arbeit bleiben erhalten. Setze am belegten Stand fort; verlängere ein frei gewähltes Zeitfenster bei Bedarf, statt allein wegen seines Ablaufs Arbeit neu zu starten, Quellen zu ändern oder zusätzliche Reparaturrunden zu eröffnen. Eine neue Reparatur braucht einen konkret belegten Fehler oder eine begründete Fehlerannahme.
+- Tatsächliche Sicherheits-, Plattform-, Ressourcen-, Eigentums- und verbindliche Produktgrenzen bleiben wirksam. Ein harter Abbruch wird als solcher berichtet und erteilt weder Reparatur- noch Umgehungsautorität. Die festgelegten Antwortprüfintervalle bleiben unverändert; notwendige Prüfnachweise dürfen weder entfallen noch als bestanden erfunden werden.
+
 ## Public documentation OPSEC
 
 For all documentation work, treat published documentation as public and
