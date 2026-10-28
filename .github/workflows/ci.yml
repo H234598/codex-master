@@ -157,7 +157,6 @@ jobs:
       - name: Run remaining unit tests with Python 3.12
         run: |
           set -eu
-          umask 077
           pytest_parent="$(mktemp -d "${HOME}/.the-hive-pytest.XXXXXX")"
           chmod 700 "${pytest_parent}"
           pytest_tmp="${pytest_parent}/basetemp"
