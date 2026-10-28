@@ -21,7 +21,11 @@ import pytest
 from the_hive import server
 
 
-CODEX = Path("/home/teladi/.codex/packages/app-server-daemon/releases/0.161.0-x86_64-unknown-linux-musl/bin/codex")
+CODEX = Path(os.environ.get(
+    "HIVE_CODEX_BINARY",
+    "/home/teladi/.codex/packages/app-server-daemon/releases/0.161.0-x86_64-unknown-linux-musl/bin/codex",
+))
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 HIVE_BUNDLE_FILES = (
     "release-binding.json", ".codex-plugin/plugin.json", ".mcp.json", ".app.json",
     "hooks/hooks.json", "hooks/native_bee_event.py", "hooks/native_spawn_admission.py",
@@ -41,23 +45,99 @@ def _run(argv: list[str], *, env: dict[str, str], cwd: Path,
     )
 
 
-def _wait_own_scope_empty(unit: str, home: Path, env: dict[str, str], root: Path) -> None:
-    identity = b"CODEX_HOME=" + os.fsencode(home) + b"\0"
+def _pin_own_scope_cgroup(
+    control_group: str, *, root: Path = CGROUP_ROOT,
+) -> tuple[str, Path, int, int]:
+    relative = Path(control_group)
+    if (not relative.is_absolute() or not relative.parts[1:]
+            or any(part in {".", ".."} for part in relative.parts)):
+        raise AssertionError("own scope returned an invalid cgroup path")
+    path = root.joinpath(*relative.parts[1:])
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise AssertionError("own scope cgroup is not a directory")
+        return control_group, path, info.st_dev, info.st_ino
+    finally:
+        os.close(descriptor)
+
+
+def _read_cgroup_file_at(directory_fd: int, name: str) -> bytes:
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd
+    )
+    try:
+        data = os.read(descriptor, 4097)
+        if len(data) > 4096 or os.read(descriptor, 1):
+            raise AssertionError("own scope cgroup file exceeded its bound")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def _own_scope_cgroup_empty(
+    identity: tuple[str, Path, int, int], *, missing_is_empty: bool = False,
+) -> bool:
+    _control_group, path, device, inode = identity
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+    except FileNotFoundError:
+        return missing_is_empty
+    except OSError:
+        return False
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISDIR(info.st_mode)
+                or (info.st_dev, info.st_ino) != (device, inode)):
+            return False
+        events = _read_cgroup_file_at(descriptor, "cgroup.events").decode("ascii")
+        processes = _read_cgroup_file_at(descriptor, "cgroup.procs").split()
+        populated = [line for line in events.splitlines()
+                     if line.startswith("populated ")]
+        return populated == ["populated 0"] and not processes
+    except (OSError, UnicodeError, AssertionError):
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _systemd_properties(result: subprocess.CompletedProcess[str]) -> dict[str, str]:
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in properties:
+            return {}
+        properties[key] = value
+    return properties
+
+
+def _wait_own_scope_empty(
+    unit: str, identity: tuple[str, Path, int, int] | None,
+    env: dict[str, str], root: Path,
+) -> None:
+    if identity is None:
+        raise AssertionError("own scope cgroup identity unavailable; holding test tree")
     for _ in range(50):
         state = _run(["systemctl", "--user", "show", unit,
-                      "-p", "ActiveState", "-p", "ControlGroup"], env=env, cwd=root)
-        pids = []
-        for proc in Path("/proc").glob("[0-9]*"):
-            try:
-                if identity in (proc / "environ").read_bytes():
-                    pids.append(proc.name)
-            except OSError:
-                pass
-        if (state.returncode == 0 and "ActiveState=inactive" in state.stdout
-                and "ControlGroup=\n" in state.stdout and not pids):
-            return
+                      "-p", "ActiveState", "-p", "ControlGroup", "-p", "LoadState"],
+                     env=env, cwd=root)
+        properties = _systemd_properties(state)
+        inactive = state.returncode == 0 and properties.get("ActiveState") == "inactive"
+        control_group = properties.get("ControlGroup", "")
+        if inactive:
+            if (control_group in {"", identity[0]}
+                    and _own_scope_cgroup_empty(
+                        identity,
+                        missing_is_empty=properties.get("LoadState") == "not-found",
+                    )):
+                return
         time.sleep(0.1)
-    pytest.fail(f"own scope/home processes did not drain: {unit}; pids={pids}")
+    pytest.fail(f"own scope cgroup did not drain: {unit}")
 
 
 def _fixture_plugin(root: Path, home: Path) -> None:
@@ -198,6 +278,57 @@ def _installed_pin_active(pin_root: Path, session_id: str) -> bool:
             and binding.get("ended_at_unix_ns") is None)
 
 
+def test_own_scope_empty_requires_same_cgroup_inode(tmp_path: Path) -> None:
+    cgroup = tmp_path / "the-hive.slice" / "fixture.scope"
+    cgroup.mkdir(parents=True)
+    (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+    (cgroup / "cgroup.procs").write_text("")
+
+    identity = _pin_own_scope_cgroup("/the-hive.slice/fixture.scope", root=tmp_path)
+    assert _own_scope_cgroup_empty(identity)
+
+    (cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+    (cgroup / "cgroup.procs").write_text("123\n")
+    assert not _own_scope_cgroup_empty(identity)
+
+    cgroup.rename(cgroup.with_name("old.scope"))
+    cgroup.mkdir()
+    (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+    (cgroup / "cgroup.procs").write_text("")
+    assert not _own_scope_cgroup_empty(identity)
+
+
+def test_run_requires_a_finite_child_process_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def capture_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", capture_run)
+    _run(["fixture-command"], env={}, cwd=tmp_path)
+
+    timeout = observed.get("timeout")
+    assert isinstance(timeout, (int, float)) and 0 < timeout <= 60
+
+
+def test_scope_cleanup_rejects_missing_identity_after_unit_disappears(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "ActiveState=inactive\nControlGroup=\nLoadState=not-found\n", ""
+        ),
+    )
+
+    with pytest.raises(AssertionError, match="identity"):
+        _wait_own_scope_empty("hive-cli-fixture-own.scope", None, {}, tmp_path)
+
+
 def test_installed_probe_requires_active_pin(tmp_path: Path) -> None:
     session_id = "own-session"
     pin = tmp_path / (hashlib.sha256(session_id.encode()).hexdigest() + ".json")
@@ -243,11 +374,13 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
     version = _run([str(CODEX), "--no-daemon", "--version"], env=env, cwd=root)
     if version.stdout.strip() != "codex-cli 0.161.0":
         pytest.skip("Codex CLI 0.161.0 unavailable")
-    if _run(["systemctl", "--user", "show-environment"], env=env, cwd=root).returncode:
+    if _run(["systemctl", "--user", "show", "--property=Version"],
+            env=env, cwd=root).returncode:
         pytest.skip("systemd user manager unavailable")
 
     requests: list[dict] = []
     active_cgroups: list[str] = []
+    active_cgroup_identities: list[tuple[str, Path, int, int]] = []
     unit = ""
     scope_safe_to_remove = True
 
@@ -258,10 +391,16 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(payload)
             observed = _run(
-                ["systemctl", "--user", "show", unit, "-p", "ControlGroup", "--value"],
+                ["systemctl", "--user", "show", unit, "-p", "ControlGroup",
+                 "-p", "InvocationID", "-p", "LoadState"],
                 env=env, cwd=root,
             )
-            active_cgroups.append(observed.stdout.strip())
+            properties = _systemd_properties(observed)
+            assert observed.returncode == 0 and properties.get("LoadState") == "loaded"
+            control_group = properties.get("ControlGroup", "")
+            assert control_group.endswith("/" + unit)
+            active_cgroups.append(control_group)
+            active_cgroup_identities.append(_pin_own_scope_cgroup(control_group))
             data = _event_stream(len(requests))
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -288,6 +427,19 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
             [str(CODEX), "--no-daemon", "plugin", "marketplace", "add", str(root)],
             [str(CODEX), "--no-daemon", "plugin", "add", "fixture-plugin@local-fixture"],
         ):
+            if command[2:4] == ["plugin", "add"]:
+                scanner = Path(
+                    "/home/teladi/.codex/plugins/cache/openai-curated-remote/"
+                    "agent-skillguard/0.1.5/scripts/skillguard.py"
+                )
+                scan = _run(
+                    [sys.executable, str(scanner), "scan",
+                     str(root / "plugins" / "fixture-plugin"), "--format", "json"],
+                    env=env, cwd=root,
+                )
+                assert scan.returncode == 0, scan.stderr[-500:]
+                report = json.loads(scan.stdout)
+                assert report["summary"]["active_findings"] == 0
             result = _run(command, env=env, cwd=root)
             assert result.returncode == 0, result.stderr[-500:]
         wrapper = home / "codex"
@@ -316,7 +468,9 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
                 thread_id = thread_id or started[0]
                 assert started[0] == thread_id
                 assert any(event.get("type") == "turn.completed" for event in events)
-                _wait_own_scope_empty(unit, home, env, root)
+                _wait_own_scope_empty(
+                    unit, active_cgroup_identities[turn], env, root
+                )
                 assert active_cgroups[turn].endswith("/" + unit)
                 scope = Path("/sys/fs/cgroup" + active_cgroups[turn])
                 assert not scope.exists() or not (scope / "cgroup.procs").read_text().strip()
@@ -324,7 +478,11 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
                 try:
                     _run(["systemctl", "--user", "stop", unit], env=env, cwd=root)
                 finally:
-                    _wait_own_scope_empty(unit, home, env, root)
+                    identity = (
+                        active_cgroup_identities[turn]
+                        if len(active_cgroup_identities) > turn else None
+                    )
+                    _wait_own_scope_empty(unit, identity, env, root)
                     scope_safe_to_remove = True
             server._require_managed_codex_daemon_free(home)
         rollouts = list((home / "sessions").rglob("*.jsonl"))
