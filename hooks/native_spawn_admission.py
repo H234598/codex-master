@@ -39,8 +39,9 @@ def main() -> int:
             return _deny("invalid_pretooluse_input", ["invalid_input"])
         if not isinstance(payload.get("tool_input"), dict) or not isinstance(payload.get("cwd"), str):
             return _deny("invalid_pretooluse_input", ["invalid_input"])
-        from the_hive.server import reserve_native_agent_spawn
-        result = reserve_native_agent_spawn(payload)
+        from the_hive.server import native_hook_source_context, reserve_native_agent_spawn
+        with native_hook_source_context():
+            result = reserve_native_agent_spawn(payload)
         if not isinstance(result, dict) or result.get("allowed") is not True:
             code = result.get("error_code", "spawn_capacity_unavailable") if isinstance(result, dict) else "reservation_unavailable"
             reasons = result.get("reason_codes", ["session_metrics_unavailable"]) if isinstance(result, dict) else ["reservation_error"]

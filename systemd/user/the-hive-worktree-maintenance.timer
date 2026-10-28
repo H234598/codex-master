@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily approved Hive worktree maintenance
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=20m
+Unit=the-hive-worktree-maintenance.service
+
+[Install]
+WantedBy=timers.target

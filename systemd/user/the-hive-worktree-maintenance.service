@@ -1,0 +1,16 @@
+[Unit]
+Description=Preview and run approved Hive worktree maintenance
+
+[Service]
+Type=oneshot
+KeyringMode=private
+NoNewPrivileges=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+UMask=0077
+ExecStart=%h/.local/lib/the-hive-runtime/the-hive-mcp worktree-maintenance run

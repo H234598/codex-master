@@ -268,6 +268,34 @@ class HeadlessWriteScopeStore:
     def has_available(self, agent_id: str) -> bool:
         return bool(self._available(agent_id))
 
+    def available_worktree(self, agent_id: str) -> ScopeAttestation | None:
+        """Read an available worktree without expiring or consuming its record."""
+        agent_id = self._require_text(agent_id, "agent_id", 200)
+        with self._locked():
+            records = self._load_records_unlocked()
+        available = [
+            attestation
+            for _path, attestation in records
+            if attestation.agent_id == agent_id
+            and attestation.lifecycle == "available"
+        ]
+        if len(available) > 1:
+            raise self._failure(
+                "headless_attestation_ambiguous",
+                "more than one unused worktree attestation matches the agent",
+                "leave exactly one unused Masterjet worktree for the assignment",
+            )
+        if not available:
+            return None
+        attestation = available[0]
+        if self._is_expired(attestation):
+            raise self._failure(
+                "headless_attestation_expired",
+                "worktree attestation has expired",
+                "create a fresh worktree attestation before assigning writes",
+            )
+        return attestation
+
     def bind(
         self,
         agent_id: str,

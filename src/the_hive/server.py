@@ -35,7 +35,7 @@ import time
 import tomllib
 import uuid
 from collections.abc import Collection
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -65,7 +65,11 @@ from the_hive.admin_contracts import (
     ADMIN_OPERATION_METADATA,
 )
 from the_hive.native_registry import (
-    RegistryByteBudgetError, encode_registry_for_write, normalize_registry, reservation_is_live,
+    RegistryByteBudgetError,
+    encode_registry_for_write,
+    normalize_registry,
+    reservation_is_live,
+    retained_pin_session_ids,
 )
 from the_hive.fleet_registry import (
     AgentDescriptor,
@@ -125,6 +129,13 @@ from the_hive.usage_snapshot import (
     read_usage_evidence_v2,
 )
 from the_hive.hive.state import HiveStateStore
+from the_hive.worktree_lifecycle import (
+    G5ScopeBindingEvidence,
+    RuntimeEndEvidence,
+    WorktreeBinding,
+    WorktreeLifecycleError,
+    WorktreeLifecycleStore,
+)
 from the_hive.resource_cgroup import (
     APPROVED_CPUSET,
     ApprovedCgroupRuntimeV1,
@@ -300,8 +311,8 @@ from the_hive.hive.dispatch import (
 from the_hive.hive.events import HiveEventError, HiveEventStore
 from the_hive.hive.hourly_probe import probe_capacity_lock, read_probe_gate
 from the_hive.hive.messages import HiveMessage
-from the_hive.hive.repositories import RepositoryRegistry
-from the_hive.hive.config import load_agent_class_catalog, load_hive_config
+from the_hive.hive.repositories import RepositoryBinding, RepositoryError, RepositoryRegistry
+from the_hive.hive.config import HiveConfigError, load_agent_class_catalog, load_hive_config
 from the_hive.hive.runtime import (
     HiveRuntime,
     build_hive_runtime,
@@ -5946,16 +5957,25 @@ def _write_native_agent_registry(
     now: float | None = None,
     stopped_managed_sessions: frozenset[str] = frozenset(),
 ) -> None:
-    try:
-        encoded = encode_registry_for_write(
-            payload,
-            now=time.time() if now is None else now,
-            stopped_managed_sessions=stopped_managed_sessions,
-            max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES,
-        )
-    except (RegistryByteBudgetError, ValueError) as exc:
-        raise AgentError(str(exc)) from exc
-    replace_private_text(NATIVE_AGENT_REGISTRY_FILE, encoded.decode("utf-8"))
+    timestamp = time.time() if now is None else now
+    with native_agent_registry_lock():
+        if any(payload.get(key) for key in ("agents", "sessions", "reservations")):
+            try:
+                _worktree_lifecycle_store().reserve_native_reference(
+                    reference_id="native-registry-cleanup", now=int(timestamp)
+                )
+            except Exception as exc:
+                raise AgentError("native lifecycle protection unavailable") from exc
+        try:
+            encoded = encode_registry_for_write(
+                payload,
+                now=timestamp,
+                stopped_managed_sessions=stopped_managed_sessions,
+                max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES,
+            )
+        except (RegistryByteBudgetError, ValueError) as exc:
+            raise AgentError(str(exc)) from exc
+        replace_private_text(NATIVE_AGENT_REGISTRY_FILE, encoded.decode("utf-8"))
 
 
 def _native_registry_after_confirmed_managed_stop(managed_session: str) -> None:
@@ -6172,10 +6192,96 @@ def activate_native_agent_resume(
                     ),
                     "errors": admission.get("errors", []),
                 }
+        lifecycle_denial = _native_worktree_lifecycle_denial(
+            reference_id=f"native-resume:{uuid.uuid4().hex}"
+        )
+        if lifecycle_denial is not None:
+            return lifecycle_denial
         record["activity_state"] = "active"
         record["updated_at"] = timestamp
         _write_native_agent_registry(registry, now=timestamp)
     return {"allowed": True, "reason_codes": []}
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeHookSource:
+    path: Path
+    device: int
+    inode: int
+    directory_fd: int
+
+
+_NATIVE_HOOK_SOURCE: contextvars.ContextVar[_NativeHookSource | None] = (
+    contextvars.ContextVar("the_hive_native_hook_source", default=None)
+)
+
+
+@contextlib.contextmanager
+def native_hook_source_context():
+    """Pin the actual cwd of a direct native hook process for its admission call."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory_fd = os.open(".", flags)
+        opened = os.fstat(directory_fd)
+        path = Path.cwd().resolve(strict=True)
+        current = path.stat(follow_symlinks=False)
+        if (
+            not stat_module.S_ISDIR(opened.st_mode)
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+        ):
+            raise OSError("hook working directory changed")
+    except (OSError, RuntimeError, ValueError) as exc:
+        if "directory_fd" in locals():
+            os.close(directory_fd)
+        raise AgentError("native_hook_source_unavailable") from exc
+    token = _NATIVE_HOOK_SOURCE.set(
+        _NativeHookSource(path, opened.st_dev, opened.st_ino, directory_fd)
+    )
+    try:
+        yield
+    finally:
+        _NATIVE_HOOK_SOURCE.reset(token)
+        os.close(directory_fd)
+
+
+def _native_hook_source_path() -> Path:
+    source = _NATIVE_HOOK_SOURCE.get()
+    if source is None:
+        raise AgentError("native_hook_source_unavailable")
+    try:
+        opened = os.fstat(source.directory_fd)
+        current = source.path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise AgentError("native_hook_source_unavailable") from exc
+    if (
+        opened.st_dev != source.device
+        or opened.st_ino != source.inode
+        or current.st_dev != source.device
+        or current.st_ino != source.inode
+    ):
+        raise AgentError("native_hook_source_unavailable")
+    return source.path
+
+
+def _native_worktree_lifecycle_denial(
+    *,
+    reference_id: str,
+) -> dict[str, Any] | None:
+    try:
+        _worktree_lifecycle_store().reserve_native_reference(
+            reference_id=reference_id, now=int(time.time())
+        )
+    except Exception as exc:
+        reason = str(exc)
+        if re.fullmatch(r"[a-z0-9_]{1,128}", reason) is None:
+            reason = "worktree_lifecycle_unavailable"
+        return {
+            "allowed": False,
+            "error_code": "spawn_capacity_unavailable",
+            "reason_codes": [reason],
+        }
+    return None
 
 
 def _native_completed_agent_ids_from_tool_event(
@@ -6858,11 +6964,17 @@ def reserve_native_agent_spawn(payload: Any) -> dict[str, Any]:
                     "error_code": "spawn_capacity_unavailable",
                     "reason_codes": ["session_metrics_unavailable"],
                 }
+            reservation_id = uuid.uuid4().hex
+            lifecycle_denial = _native_worktree_lifecycle_denial(
+                reference_id=f"native-spawn:{reservation_id}",
+            )
+            if lifecycle_denial is not None:
+                return lifecycle_denial
             with hive_capacity_probe_guard("native_spawn"):
                 reservations = registry.setdefault("reservations", [])
                 reservations.append(
                     {
-                        "reservation_id": uuid.uuid4().hex,
+                        "reservation_id": reservation_id,
                         "kind": "native_spawn",
                         "created_at": time.time(),
                         "parent_session_id": parent_session_id,
@@ -12808,6 +12920,10 @@ def release_start_lease_if_safe(
     release_agent(agent, force=True)
 
 
+class _G5StartNotStarted(AgentCapacityError):
+    """Internal preflight denial raised before any G5 scope side effect."""
+
+
 def _g5_start_scope(
     session: str, runner_target: RunnerExecutionTargetV1
 ) -> tuple[ResourceGateRuntime, PreparedAgentScope]:
@@ -12815,7 +12931,7 @@ def _g5_start_scope(
 
     runtime = _RESOURCE_GATE_RUNTIME.get()
     if runtime is None:
-        raise AgentCapacityError(
+        raise _G5StartNotStarted(
             "capacity unavailable",
             {
                 "error_code": "spawn_capacity_unavailable",
@@ -12827,7 +12943,7 @@ def _g5_start_scope(
         )
     cgroup_runtime = _typed_g5_cgroup_runtime()
     if cgroup_runtime is None:
-        raise AgentCapacityError(
+        raise _G5StartNotStarted(
             "capacity unavailable",
             {
                 "error_code": "spawn_capacity_unavailable",
@@ -13225,6 +13341,8 @@ def _start_agent_unlocked(
         start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
         if not start_cwd.exists() or not start_cwd.is_dir():
             raise AgentError("cwd is not a directory")
+        run_id = f"{now_id()}-{agent}"
+        tracked_worktree_use = None
         effective_model = (
             ollama_descriptor.model if ollama_descriptor is not None else model
         )
@@ -13261,7 +13379,6 @@ def _start_agent_unlocked(
             )
         else:
             runner_target = open_runner_execution_path(agent, runner, runner_stat)
-        run_id = f"{now_id()}-{agent}"
         raw_log = RAW_DIR / f"{run_id}.log"
         raw_log_created = False
         try:
@@ -13279,20 +13396,46 @@ def _start_agent_unlocked(
         if prompt:
             argv.append(prompt)
 
-        if managed_codex:
-            command = (
-                "env -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY "
-                f"CODEX_HOME={shlex.quote(str(managed_home))} "
-                'THE_HIVE_MCP=1 CODEX_AGENT_MCP=1 "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
+        tracked_worktree_use = _begin_tracked_worktree_use(
+            start_cwd,
+            principal_id=agent,
+            session_id=session,
+            assignment_id=run_id,
+        )
+        producer_tmpdir = None
+        if tracked_worktree_use is not None:
+            lifecycle_store, lifecycle_lease = tracked_worktree_use
+            try:
+                producer_tmpdir = lifecycle_store.create_temporary_producer(
+                    lifecycle_lease, now=int(time.time())
+                )
+            except (WorktreeLifecycleError, OSError):
+                with contextlib.suppress(Exception):
+                    cleanup_failed_start(session, raw_log, kill_session=False)
+                close_runner_execution_fd(agent)
+                release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+                raise
+        command = (
+            _g5_runner_env_prefix(
+                managed_codex=managed_codex,
+                managed_home=managed_home if managed_codex else None,
+                producer_tmpdir=producer_tmpdir,
             )
-        else:
-            command = (
-                'env THE_HIVE_MCP=1 CODEX_AGENT_MCP=1 "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
-            )
+            + ' "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
+        )
         if argv:
             command += " " + shlex.join(argv)
         try:
             g5_runtime, g5_scope = _g5_start_scope(session, runner_target)
+        except _G5StartNotStarted:
+            with contextlib.suppress(Exception):
+                cleanup_failed_start(session, raw_log, kill_session=False)
+            _abort_tracked_worktree_use_before_spawn(
+                tracked_worktree_use, producer_tmpdir
+            )
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise
         except Exception:
             with contextlib.suppress(Exception):
                 cleanup_failed_start(session, raw_log, kill_session=False)
@@ -13307,6 +13450,15 @@ def _start_agent_unlocked(
                 effective_model,
                 descriptor=descriptor,
             )
+        except Exception:
+            _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
+            _abort_tracked_worktree_use_before_spawn(
+                tracked_worktree_use, producer_tmpdir
+            )
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise
+        try:
             cp = run_tmux(
                 [
                     *tmux_prefix,
@@ -13336,6 +13488,19 @@ def _start_agent_unlocked(
             close_runner_execution_fd(agent)
             release_start_lease_if_safe(agent, lease, release_lease_on_failure)
             raise
+        if tracked_worktree_use is not None:
+            lifecycle_store, lifecycle_lease = tracked_worktree_use
+            try:
+                runtime_evidence = G5ScopeBindingEvidence.capture(
+                    lifecycle_lease, g5_scope, now=int(time.time())
+                )
+                lifecycle_store.bind_g5_runtime(
+                    lifecycle_lease, runtime_evidence, now=int(time.time())
+                )
+            except Exception:
+                # Keep pending use protected; inability to attest cgroup binding
+                # must not turn a live process into a claimable worktree.
+                pass
 
         try:
             pipe_command = raw_log_writer_command(raw_log)
@@ -13372,6 +13537,7 @@ def _start_agent_unlocked(
             "raw_log_policy": "local_only_bounded_not_returned_by_default",
             "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
             G5_TMUX_SOCKET_META_KEY: g5_scope.socket_name,
+            "g5_scope_unit": g5_scope.unit_name,
         }
         if managed_codex:
             data[G5_NATIVE_RUNNER_META_KEY] = {
@@ -13422,6 +13588,1098 @@ def _headless_write_scope_store() -> HeadlessWriteScopeStore:
         STATE_ROOT / "headless-write-scope",
         git_runner=run_command,
     )
+
+
+def _worktree_lifecycle_store(*, read_only: bool = False) -> WorktreeLifecycleStore:
+    """Reuse the active HiveStateStore; never construct a parallel authority."""
+
+    runtime = _RESOURCE_GATE_RUNTIME.get()
+    state = runtime.state if isinstance(runtime, ResourceGateRuntime) else None
+    if not isinstance(state, HiveStateStore):
+        state = HiveStateStore(STATE_ROOT / "hive", read_only=read_only)
+    if not isinstance(state, HiveStateStore):
+        raise AgentError("worktree_lifecycle_unavailable")
+    return WorktreeLifecycleStore(state)
+
+
+_WORKTREE_MAINTENANCE_PROTOCOL = 1
+_WORKTREE_MAINTENANCE_APPROVAL_PATH = PurePosixPath(
+    "worktree-maintenance/approval.json"
+)
+
+
+def _maintenance_json_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _maintenance_code_digest() -> str:
+    digest = hashlib.sha256()
+    for path in (
+        Path(__file__).resolve(),
+        Path(__file__).with_name("maintenance.py").resolve(),
+        Path(__file__).with_name("worktree_lifecycle.py").resolve(),
+    ):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return "sha256:" + digest.hexdigest()
+
+
+def _maintenance_caller_coverage() -> dict[str, object]:
+    """Report current integration gate; no caller claim is inferred from code presence."""
+    return {
+        "complete": False,
+        "protocol": "native-headless-worktree-lifecycle-v1",
+        "reason": "native_resume_target_coverage_unattested",
+    }
+
+
+def _worktree_maintenance_contract_digest(
+    projects: list[dict[str, object]], coverage: Mapping[str, object]
+) -> str:
+    stable_project_keys = (
+        "repository_id",
+        "repository_config_digest",
+        "repository_root",
+        "worktree_root",
+        "archive_root",
+        "restore_root",
+        "git_common_directory",
+        "git_admin_directory",
+        "thresholds",
+    )
+    contract = {
+        "protocol_version": _WORKTREE_MAINTENANCE_PROTOCOL,
+        "package_version": __version__,
+        "code_digest": _maintenance_code_digest(),
+        "caller_coverage": dict(coverage),
+        "projects": [
+            {key: project.get(key) for key in stable_project_keys}
+            for project in projects
+        ],
+    }
+    return _maintenance_json_digest(contract)
+
+
+def _worktree_maintenance_plan() -> dict[str, object]:
+    """Build a read-only preview and bind its contract to canonical project state."""
+    from the_hive.maintenance import MaintenanceError, ProjectPolicy, _open_tree, scan_candidates
+
+    try:
+        root = repo_root().resolve(strict=True)
+    except OSError as exc:
+        raise AgentError("maintenance_repository_root_unavailable") from exc
+    try:
+        classes = load_agent_class_catalog(root / "codex-agent-classes.json")
+        config = load_hive_config(root / "codex-hive.json", classes)
+    except (OSError, AgentError, HiveConfigError) as exc:
+        raise AgentError("maintenance_repository_configuration_unavailable") from exc
+    repositories: list[RepositoryBinding] = []
+    for item in config.repositories:
+        if item["repo_id"] != "codex-master":
+            raise AgentError("maintenance_repository_root_unavailable")
+        repositories.append(
+            RepositoryBinding(
+                repo_id=item["repo_id"],
+                remote_identity=item["remote_identity"],
+                local_root=root,
+                default_branch=item["default_branch"],
+                config_digest=item["config_digest"],
+            )
+        )
+    registry = RepositoryRegistry(repositories)
+    configured = []
+    policies = []
+    candidates = []
+    lifecycle = _worktree_lifecycle_store(read_only=True)
+    root_fd, root_info, root_mount_id = _open_tree(root)
+    try:
+        mount_namespace_inode = os.stat("/proc/self/ns/mnt").st_ino
+    except OSError as exc:
+        os.close(root_fd)
+        raise AgentError("maintenance_mount_namespace_unavailable") from exc
+    try:
+        for binding in repositories:
+            validation = registry.validate(binding.repo_id)
+            if not validation.allowed:
+                raise AgentError("repository_not_eligible")
+            worktree_root = root / ".codex-master-worktrees"
+            archive_root = root / ".hive-archive"
+            restore_root = root / ".hive-restores"
+            common_text = RepositoryRegistry._git(
+                root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+            )
+            if common_text is None:
+                raise AgentError("repository_git_unavailable")
+            git_common_directory = Path(common_text).resolve(strict=True)
+            archive_identity = None
+            archive_mount_id = None
+            try:
+                archive_fd, archive_info, archive_mount_id = _open_tree(archive_root)
+            except MaintenanceError as exc:
+                if str(exc) not in {"source_unavailable", "foreign_source_owner"}:
+                    raise
+            else:
+                try:
+                    archive_identity = {
+                        "device": archive_info.st_dev,
+                        "inode": archive_info.st_ino,
+                    }
+                finally:
+                    os.close(archive_fd)
+            worktree_mount_id = None
+            try:
+                worktree_fd, worktree_info, _worktree_mount = _open_tree(worktree_root)
+            except MaintenanceError:
+                worktree_identity = None
+            else:
+                try:
+                    worktree_mount_id = _worktree_mount
+                    worktree_identity = {
+                        "device": worktree_info.st_dev,
+                        "inode": worktree_info.st_ino,
+                    }
+                finally:
+                    os.close(worktree_fd)
+            restore_mount_id = None
+            try:
+                restore_fd, restore_info, _restore_mount = _open_tree(restore_root)
+            except MaintenanceError:
+                restore_identity = None
+            else:
+                try:
+                    restore_mount_id = _restore_mount
+                    restore_identity = {
+                        "device": restore_info.st_dev,
+                        "inode": restore_info.st_ino,
+                    }
+                finally:
+                    os.close(restore_fd)
+            try:
+                common_fd, common_info, common_mount_id = _open_tree(git_common_directory)
+            except MaintenanceError as exc:
+                raise AgentError("repository_git_unavailable") from exc
+            else:
+                try:
+                    git_common_identity = {
+                        "device": common_info.st_dev,
+                        "inode": common_info.st_ino,
+                    }
+                finally:
+                    os.close(common_fd)
+            try:
+                admin_fd, admin_info, admin_mount_id = _open_tree(
+                    git_common_directory / "worktrees"
+                )
+            except MaintenanceError:
+                git_admin_identity = None
+                admin_mount_id = None
+            else:
+                try:
+                    git_admin_identity = {
+                        "device": admin_info.st_dev,
+                        "inode": admin_info.st_ino,
+                    }
+                finally:
+                    os.close(admin_fd)
+            project_row = {
+                "repository_id": binding.repo_id,
+                "repository_config_digest": binding.config_digest,
+                "repository_root": str(root),
+                "repository_device": root_info.st_dev,
+                "repository_inode": root_info.st_ino,
+                "mount_namespace_inode": mount_namespace_inode,
+                "repository_mount_id": root_mount_id,
+                "worktree_root": str(worktree_root),
+                "worktree_root_identity": worktree_identity,
+                "worktree_root_mount_id": worktree_mount_id,
+                "archive_root": str(archive_root),
+                "archive_identity": archive_identity,
+                "archive_mount_id": archive_mount_id,
+                "restore_root": str(restore_root),
+                "restore_identity": restore_identity,
+                "restore_mount_id": restore_mount_id,
+                "git_common_directory": str(git_common_directory),
+                "git_common_identity": git_common_identity,
+                "git_common_mount_id": common_mount_id,
+                "git_admin_directory": str(git_common_directory / "worktrees"),
+                "git_admin_identity": git_admin_identity,
+                "git_admin_mount_id": admin_mount_id,
+                "thresholds": {
+                    "inactive_seconds": 30 * 86400,
+                    "large_inactive_seconds": 7 * 86400,
+                    "large_bytes": 10 * 1024**3,
+                    "temporary_age_seconds": 7 * 86400,
+                },
+            }
+            configured.append(project_row)
+            try:
+                children = sorted(worktree_root.iterdir(), key=lambda path: path.name)
+            except FileNotFoundError:
+                children = []
+            except OSError as exc:
+                raise AgentError("maintenance_project_scan_unavailable") from exc
+            for source in children:
+                if source.name.startswith("."):
+                    continue
+                try:
+                    info = source.lstat()
+                except OSError:
+                    candidates.append(
+                        {"source": str(source), "eligible": False, "reasons": ["source_unavailable"]}
+                    )
+                    continue
+                if not stat_module.S_ISDIR(info.st_mode) or stat_module.S_ISLNK(info.st_mode):
+                    candidates.append(
+                        {"source": str(source), "eligible": False, "reasons": ["source_not_real_directory"]}
+                    )
+                    continue
+                policy = ProjectPolicy(
+                    source_root=source,
+                    allowed_source_roots=(worktree_root,),
+                    archive_root=archive_root,
+                )
+                policies.append(policy)
+                for candidate in scan_candidates((policy,), lifecycle, now=int(time.time())):
+                    reasons = list(candidate.reasons)
+                    eligible = candidate.eligible
+                    host_gate = "not_checked"
+                    if eligible:
+                        try:
+                            if candidate.temporary:
+                                from the_hive.maintenance import _assert_no_open_tree_references
+
+                                _assert_no_open_tree_references((candidate.source,))
+                            else:
+                                from the_hive.maintenance import _assert_no_open_tree_references
+
+                                _assert_no_open_tree_references((candidate.source,))
+                            host_gate = "clear_at_preview"
+                        except MaintenanceError as exc:
+                            host_gate = str(exc)
+                            eligible = False
+                            reasons.append(host_gate)
+                    candidates.append(
+                        {
+                            "repository_id": binding.repo_id,
+                            "source": str(candidate.source),
+                            "temporary": candidate.temporary,
+                            "eligible": eligible,
+                            "reasons": reasons,
+                            "last_use_ended_at": candidate.last_use_ended_at,
+                            "allocated_bytes": candidate.allocated_bytes,
+                            "source_identity": candidate.source_identity,
+                            "source_manifest_sha256": candidate.source_manifest_sha256,
+                            "host_gate": host_gate,
+                        }
+                    )
+    finally:
+        os.close(root_fd)
+    caller_coverage = _maintenance_caller_coverage()
+    contract_digest = _worktree_maintenance_contract_digest(configured, caller_coverage)
+    preview_digest = _maintenance_json_digest(
+        {"contract_digest": contract_digest, "candidates": candidates}
+    )
+    return {
+        "operation": "plan",
+        "protocol_version": _WORKTREE_MAINTENANCE_PROTOCOL,
+        "contract_digest": contract_digest,
+        "preview_digest": preview_digest,
+        "caller_coverage": caller_coverage,
+        "projects": configured,
+        "candidates": candidates,
+        "read_only": True,
+    }
+
+
+def _read_worktree_maintenance_approval() -> dict[str, object] | None:
+    try:
+        state = HiveStateStore(STATE_ROOT / "hive", read_only=True)
+        value = state.read_json(_WORKTREE_MAINTENANCE_APPROVAL_PATH, max_bytes=64 * 1024)
+    except Exception:
+        return None
+    if (
+        value.get("schema_version") != 1
+        or not isinstance(value.get("contract_digest"), str)
+        or not isinstance(value.get("preview_digest"), str)
+        or type(value.get("approved_at")) is not int
+    ):
+        return None
+    return dict(value)
+
+
+def _worktree_maintenance_approval_allows(
+    preview: Mapping[str, object], approval: Mapping[str, object] | None
+) -> bool:
+    coverage = preview.get("caller_coverage")
+    return (
+        isinstance(approval, Mapping)
+        and approval.get("contract_digest") == preview.get("contract_digest")
+        and isinstance(coverage, Mapping)
+        and coverage.get("complete") is True
+    )
+
+
+def _require_worktree_maintenance_approval(repository_id: str, source: Path) -> None:
+    preview = _worktree_maintenance_plan()
+    approval = _read_worktree_maintenance_approval()
+    if approval is None:
+        raise AgentError("maintenance_approval_required")
+    if approval.get("contract_digest") != preview.get("contract_digest"):
+        raise AgentError("maintenance_contract_changed")
+    if not _worktree_maintenance_approval_allows(preview, approval):
+        raise AgentError("caller_coverage_unavailable")
+    candidates = preview.get("candidates")
+    if not isinstance(candidates, list) or not any(
+        isinstance(candidate, Mapping)
+        and candidate.get("repository_id") == repository_id
+        and candidate.get("source") == str(source)
+        and candidate.get("eligible") is True
+        for candidate in candidates
+    ):
+        raise AgentError("maintenance_candidate_not_approved")
+
+
+def _approve_worktree_maintenance(preview_digest: str) -> dict[str, object]:
+    if not isinstance(preview_digest, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", preview_digest
+    ):
+        raise AgentError("maintenance_preview_digest_invalid")
+    preview = _worktree_maintenance_plan()
+    if preview.get("preview_digest") != preview_digest:
+        raise AgentError("maintenance_preview_stale")
+    state = HiveStateStore(STATE_ROOT / "hive")
+    approval = {
+        "schema_version": 1,
+        "contract_digest": preview["contract_digest"],
+        "preview_digest": preview_digest,
+        "approved_at": int(time.time()),
+    }
+    state.replace_json(_WORKTREE_MAINTENANCE_APPROVAL_PATH, approval)
+    return {"operation": "approve", "approval": approval}
+
+
+@contextlib.contextmanager
+def _worktree_maintenance_run_guard() -> Iterator[None]:
+    HiveStateStore(STATE_ROOT / "hive")
+    lock_path = STATE_ROOT / "hive" / ".worktree-maintenance-run.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat_module.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise AgentError("maintenance_run_lock_untrusted")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AgentError("maintenance_run_overlapping") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _restore_worktree_archive_by_id(
+    repository_id: str, archive_id: str, destination_name: str
+) -> Path:
+    """Restore one verified archive from the configured project's private store."""
+    from the_hive.maintenance import ArchiveReceipt, MaintenanceError, _open_tree, restore_archive
+
+    if (
+        type(repository_id) is not str
+        or type(archive_id) is not str
+        or type(destination_name) is not str
+        or re.fullmatch(r"(?:archive|temporary)-[0-9a-f]+-[0-9a-f]+-[0-9a-f]{16}", archive_id) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", destination_name) is None
+        or destination_name in {".", ".."}
+    ):
+        raise AgentError("maintenance_restore_selection_invalid")
+    root = repo_root().resolve(strict=True)
+    classes = load_agent_class_catalog(root / "codex-agent-classes.json")
+    config = load_hive_config(root / "codex-hive.json", classes)
+    bindings = []
+    for item in config.repositories:
+        if item["repo_id"] != "codex-master":
+            raise AgentError("repository_local_root_unavailable")
+        bindings.append(
+            RepositoryBinding(
+                repo_id=item["repo_id"],
+                remote_identity=item["remote_identity"],
+                local_root=root,
+                default_branch=item["default_branch"],
+                config_digest=item["config_digest"],
+            )
+        )
+    registry = RepositoryRegistry(bindings)
+    try:
+        registry.get(repository_id)
+    except RepositoryError as exc:
+        raise AgentError("repository_unknown") from exc
+    validation = registry.validate(repository_id)
+    if not validation.allowed:
+        raise AgentError("repository_not_eligible")
+
+    archive_root = root / ".hive-archive"
+    archive_root_fd, archive_root_info, archive_mount = _open_tree(archive_root)
+    archive_fd = -1
+    try:
+        archive_fd, archive_info, _ = _open_tree(archive_root / archive_id)
+        if archive_info.st_uid != os.geteuid() or stat_module.S_IMODE(archive_info.st_mode) != 0o700:
+            raise MaintenanceError("archive_identity_invalid")
+        archive_stat = os.stat(archive_id, dir_fd=archive_root_fd, follow_symlinks=False)
+        if (archive_stat.st_dev, archive_stat.st_ino) != (archive_info.st_dev, archive_info.st_ino):
+            raise MaintenanceError("archive_identity_invalid")
+
+        def read_private_file(name: str, limit: int) -> bytes:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(name, flags, dir_fd=archive_fd)
+            try:
+                info = os.fstat(descriptor)
+                if (
+                    not stat_module.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1
+                    or info.st_size > limit
+                ):
+                    raise MaintenanceError("archive_receipt_invalid")
+                chunks = []
+                remaining = limit + 1
+                while remaining:
+                    chunk = os.read(descriptor, min(remaining, 65536))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
+                if len(data) > limit:
+                    raise MaintenanceError("archive_receipt_invalid")
+                return data
+            finally:
+                os.close(descriptor)
+
+        receipt_data = json.loads(read_private_file("receipt.json", 64 * 1024))
+        manifest_data = read_private_file("manifest.json", 16 * 1024 * 1024)
+        digest = receipt_data.get("manifest_sha256") if isinstance(receipt_data, Mapping) else None
+        count = receipt_data.get("entry_count") if isinstance(receipt_data, Mapping) else None
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or hashlib.sha256(manifest_data).hexdigest() != digest
+            or type(count) is not int
+            or count < 0
+        ):
+            raise MaintenanceError("archive_receipt_invalid")
+        receipt = ArchiveReceipt(
+            archive=archive_root / archive_id,
+            manifest_sha256=digest,
+            entry_count=count,
+            archive_device=archive_info.st_dev,
+            archive_inode=archive_info.st_ino,
+        )
+    finally:
+        if archive_fd >= 0:
+            os.close(archive_fd)
+        os.close(archive_root_fd)
+
+    restore_root = root / ".hive-restores"
+    ensure_private_dir(restore_root)
+    restore_fd, restore_info, restore_mount = _open_tree(restore_root)
+    try:
+        if (
+            restore_info.st_dev != archive_root_info.st_dev
+            or restore_mount != archive_mount
+        ):
+            raise MaintenanceError("restore_filesystem_mismatch")
+    finally:
+        os.close(restore_fd)
+    return restore_archive(receipt, restore_root / destination_name)
+
+
+def _recover_worktree_maintenance_by_id(repository_id: str, source: Path) -> dict[str, object]:
+    """Fence an abandoned claim into recovery_hold; never replay its mutations."""
+    from the_hive.maintenance import (
+        _recover_maintenance_claim_under_archive_lock,
+        recover_temporary_source_after_hold,
+    )
+
+    if type(repository_id) is not str or not isinstance(source, Path):
+        raise AgentError("maintenance_selection_invalid")
+    root = repo_root().resolve(strict=True)
+    classes = load_agent_class_catalog(root / "codex-agent-classes.json")
+    config = load_hive_config(root / "codex-hive.json", classes)
+    bindings = []
+    for item in config.repositories:
+        if item["repo_id"] != "codex-master":
+            raise AgentError("repository_local_root_unavailable")
+        bindings.append(
+            RepositoryBinding(
+                repo_id=item["repo_id"],
+                remote_identity=item["remote_identity"],
+                local_root=root,
+                default_branch=item["default_branch"],
+                config_digest=item["config_digest"],
+            )
+        )
+    registry = RepositoryRegistry(bindings)
+    try:
+        registry.get(repository_id)
+    except RepositoryError as exc:
+        raise AgentError("repository_unknown") from exc
+    if not registry.validate(repository_id).allowed:
+        raise AgentError("repository_not_eligible")
+    try:
+        canonical_source = source.resolve(strict=True)
+    except FileNotFoundError:
+        canonical_source = source.resolve(strict=False)
+    lifecycle = _worktree_lifecycle_store()
+    temporary_binding = lifecycle.binding_for_temporary_source(canonical_source)
+    binding = temporary_binding or lifecycle.binding_for_source(canonical_source)
+    if binding is None:
+        raise AgentError("maintenance_source_unattested")
+    root_identity = root.stat(follow_symlinks=False)
+    common_text = RepositoryRegistry._git(root, "rev-parse", "--git-common-dir")
+    if common_text is None:
+        raise AgentError("repository_git_unavailable")
+    common = Path(common_text)
+    common = (common if common.is_absolute() else root / common).resolve(strict=True)
+    if (
+        binding.repository_id != f"repo:{root_identity.st_dev:x}:{root_identity.st_ino:x}"
+        or binding.git_common_directory != common
+        or (temporary_binding is None and binding.canonical_source_path != canonical_source)
+    ):
+        raise AgentError("maintenance_source_unattested")
+    claim = _recover_maintenance_claim_under_archive_lock(
+        lifecycle, binding, now=int(time.time())
+    )
+    if temporary_binding is not None:
+        restored = recover_temporary_source_after_hold(lifecycle, claim)
+        return {
+            "operation": "recover",
+            "recovered": True,
+            "phase": "source_restored",
+            "claim_id": claim.claim_id,
+            "source": str(restored),
+        }
+    return {
+        "operation": "recover",
+        "recovered": True,
+        "phase": "recovery_hold",
+        "claim_id": claim.claim_id,
+        "source": str(canonical_source),
+    }
+
+
+def _run_worktree_maintenance() -> dict[str, object]:
+    try:
+        with _worktree_maintenance_run_guard():
+            preview = _worktree_maintenance_plan()
+            approval = _read_worktree_maintenance_approval()
+            if approval is None:
+                return {
+                    "operation": "run",
+                    "started": False,
+                    "reason": "maintenance_approval_required",
+                }
+            if approval.get("contract_digest") != preview.get("contract_digest"):
+                return {
+                    "operation": "run",
+                    "started": False,
+                    "reason": "maintenance_contract_changed",
+                }
+            coverage = preview.get("caller_coverage")
+            if not isinstance(coverage, Mapping) or coverage.get("complete") is not True:
+                return {
+                    "operation": "run",
+                    "started": False,
+                    "reason": "caller_coverage_unavailable",
+                }
+            candidates = preview.get("candidates")
+            if not isinstance(candidates, list):
+                raise AgentError("maintenance_preview_invalid")
+            eligible = [candidate for candidate in candidates if candidate.get("eligible") is True]
+            if not eligible:
+                return {
+                    "operation": "run",
+                    "started": True,
+                    "processed": [],
+                    "reason": "no_eligible_candidates",
+                }
+            processed = []
+            for candidate in eligible:
+                receipt = _apply_worktree_by_id(
+                    str(candidate["repository_id"]), Path(str(candidate["source"]))
+                )
+                processed.append(
+                    {
+                        "source": candidate["source"],
+                        "archive": str(receipt.archive),
+                        "manifest_sha256": receipt.manifest_sha256,
+                    }
+                )
+            return {"operation": "run", "started": True, "processed": processed}
+    except AgentError as exc:
+        return {"operation": "run", "started": False, "reason": str(exc)}
+
+
+def _archive_worktree_by_id(repository_id: str, source: Path) -> Any:
+    """Compose archive authority from checked-in Hive config and fresh state.
+
+    Callers select a configured repository and source path only. Candidate,
+    policy, and lifecycle objects are always derived here.
+    """
+    from the_hive.maintenance import (
+        MaintenanceError,
+        ProjectPolicy,
+        _archive_candidate,
+        _open_tree,
+        scan_candidates,
+    )
+
+    if type(repository_id) is not str or not isinstance(source, Path):
+        raise AgentError("maintenance_selection_invalid")
+    root = repo_root().resolve(strict=True)
+    try:
+        classes = load_agent_class_catalog(root / "codex-agent-classes.json")
+        config = load_hive_config(root / "codex-hive.json", classes)
+        bindings = []
+        for item in config.repositories:
+            configured_id = item["repo_id"]
+            if configured_id != "codex-master":
+                raise AgentError("repository_local_root_unavailable")
+            bindings.append(
+                RepositoryBinding(
+                    repo_id=configured_id,
+                    remote_identity=item["remote_identity"],
+                    local_root=root,
+                    default_branch=item["default_branch"],
+                    config_digest=item["config_digest"],
+                )
+            )
+        registry = RepositoryRegistry(bindings)
+        try:
+            registry.get(repository_id)
+        except RepositoryError as exc:
+            raise AgentError("repository_unknown") from exc
+        validation = registry.validate(repository_id)
+        if not validation.allowed:
+            raise AgentError("repository_not_eligible")
+        canonical_source = source.resolve(strict=True)
+        source_root = (root / ".codex-master-worktrees").resolve(strict=True)
+        if source_root not in canonical_source.parents:
+            raise AgentError("maintenance_source_outside_project")
+        lifecycle = _worktree_lifecycle_store()
+        binding = lifecycle.binding_for_source(canonical_source)
+        root_info = root.stat(follow_symlinks=False)
+        expected_repository_id = f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
+        common_text = RepositoryRegistry._git(root, "rev-parse", "--git-common-dir")
+        if common_text is None:
+            raise AgentError("repository_git_unavailable")
+        common = Path(common_text)
+        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        if (
+            binding is None
+            or binding.repository_id != expected_repository_id
+            or binding.git_common_directory != common
+        ):
+            raise AgentError("maintenance_source_unattested")
+        archive_root = root / ".hive-archive"
+        ensure_private_dir(archive_root)
+        archive_fd, archive_info, archive_mount = _open_tree(archive_root)
+        try:
+            common_fd, common_info, common_mount = _open_tree(common)
+            try:
+                if (
+                    archive_info.st_dev != common_info.st_dev
+                    or archive_mount != common_mount
+                ):
+                    raise AgentError("maintenance_archive_filesystem_mismatch")
+            finally:
+                os.close(common_fd)
+        finally:
+            os.close(archive_fd)
+        policy = ProjectPolicy(
+            source_root=canonical_source,
+            allowed_source_roots=(source_root,),
+            archive_root=archive_root,
+        )
+        candidate = scan_candidates((policy,), lifecycle, now=int(time.time()))[0]
+        if not candidate.eligible:
+            raise MaintenanceError("candidate_not_eligible")
+        return _archive_candidate(candidate, policy=policy, lifecycle=lifecycle)
+    except (KeyError, OSError, ValueError) as exc:
+        if isinstance(exc, AgentError | MaintenanceError):
+            raise
+        raise AgentError("maintenance_owner_unavailable") from exc
+
+
+def _archive_temporary_by_id(repository_id: str, source: Path) -> Any:
+    """Archive one exact, lifecycle-recorded G5 temp producer for a configured repo."""
+    from the_hive.maintenance import (
+        MaintenanceError,
+        ProjectPolicy,
+        archive_temporary_candidate,
+        scan_candidates,
+    )
+
+    if type(repository_id) is not str or not isinstance(source, Path):
+        raise AgentError("maintenance_selection_invalid")
+    try:
+        root = repo_root().resolve(strict=True)
+        classes = load_agent_class_catalog(root / "codex-agent-classes.json")
+        config = load_hive_config(root / "codex-hive.json", classes)
+        bindings = []
+        for item in config.repositories:
+            configured_id = item["repo_id"]
+            if configured_id != "codex-master":
+                raise AgentError("repository_local_root_unavailable")
+            bindings.append(
+                RepositoryBinding(
+                    repo_id=configured_id,
+                    remote_identity=item["remote_identity"],
+                    local_root=root,
+                    default_branch=item["default_branch"],
+                    config_digest=item["config_digest"],
+                )
+            )
+        registry = RepositoryRegistry(bindings)
+        try:
+            registry.get(repository_id)
+        except RepositoryError as exc:
+            raise AgentError("repository_unknown") from exc
+        validation = registry.validate(repository_id)
+        if not validation.allowed:
+            raise AgentError("repository_not_eligible")
+        canonical_source = source.resolve(strict=True)
+        lifecycle = _worktree_lifecycle_store()
+        binding = lifecycle.binding_for_temporary_source(canonical_source)
+        root_info = root.stat(follow_symlinks=False)
+        worktree_root = (root / ".codex-master-worktrees").resolve(strict=True)
+        common_text = RepositoryRegistry._git(root, "rev-parse", "--git-common-dir")
+        if common_text is None:
+            raise AgentError("repository_git_unavailable")
+        common = Path(common_text)
+        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        if (
+            binding is None
+            or binding.repository_id != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
+            or binding.canonical_source_path != worktree_root
+            and worktree_root not in binding.canonical_source_path.parents
+            or binding.git_common_directory != common
+        ):
+            raise AgentError("maintenance_source_unattested")
+        archive_root = root / ".hive-archive"
+        ensure_private_dir(archive_root)
+        from the_hive.maintenance import _open_tree
+
+        archive_fd, archive_info, archive_mount = _open_tree(archive_root)
+        root_fd, root_share_info, root_mount = _open_tree(root)
+        try:
+            if (
+                archive_info.st_dev != root_share_info.st_dev
+                or archive_mount != root_mount
+            ):
+                raise AgentError("maintenance_archive_filesystem_mismatch")
+        finally:
+            os.close(root_fd)
+            os.close(archive_fd)
+        policy = ProjectPolicy(
+            source_root=binding.canonical_source_path,
+            allowed_source_roots=(worktree_root,),
+            archive_root=archive_root,
+        )
+        candidate = next(
+            (
+                item
+                for item in scan_candidates((policy,), lifecycle, now=int(time.time()))
+                if item.temporary and item.source == canonical_source
+            ),
+            None,
+        )
+        if candidate is None or not candidate.eligible:
+            raise MaintenanceError("candidate_not_eligible")
+        return archive_temporary_candidate(candidate, policy=policy, lifecycle=lifecycle)
+    except (KeyError, OSError, ValueError) as exc:
+        if isinstance(exc, AgentError | MaintenanceError):
+            raise
+        raise AgentError("maintenance_owner_unavailable") from exc
+
+
+def _apply_worktree_by_id(repository_id: str, source: Path) -> Any:
+    """Apply one fresh candidate using canonical project and lifecycle owners."""
+    from the_hive.maintenance import (
+        MaintenanceError,
+        ProjectPolicy,
+        _open_tree,
+        apply_candidate,
+        scan_candidates,
+    )
+
+    if type(repository_id) is not str or not isinstance(source, Path):
+        raise AgentError("maintenance_selection_invalid")
+    try:
+        if _worktree_lifecycle_store().binding_for_temporary_source(
+            source.resolve(strict=True)
+        ) is not None:
+            return _apply_temporary_by_id(repository_id, source)
+    except WorktreeLifecycleError as exc:
+        raise AgentError("maintenance_source_unattested") from exc
+    _require_worktree_maintenance_approval(repository_id, source)
+    try:
+        root = repo_root().resolve(strict=True)
+        classes = load_agent_class_catalog(root / "codex-agent-classes.json")
+        config = load_hive_config(root / "codex-hive.json", classes)
+        bindings = []
+        for item in config.repositories:
+            configured_id = item["repo_id"]
+            if configured_id != "codex-master":
+                raise AgentError("repository_local_root_unavailable")
+            bindings.append(
+                RepositoryBinding(
+                    repo_id=configured_id,
+                    remote_identity=item["remote_identity"],
+                    local_root=root,
+                    default_branch=item["default_branch"],
+                    config_digest=item["config_digest"],
+                )
+            )
+        registry = RepositoryRegistry(bindings)
+        try:
+            registry.get(repository_id)
+        except RepositoryError as exc:
+            raise AgentError("repository_unknown") from exc
+        validation = registry.validate(repository_id)
+        if not validation.allowed:
+            raise AgentError("repository_not_eligible")
+        canonical_source = source.resolve(strict=True)
+        source_root = (root / ".codex-master-worktrees").resolve(strict=True)
+        if source_root not in canonical_source.parents:
+            raise AgentError("maintenance_source_outside_project")
+        lifecycle = _worktree_lifecycle_store()
+        binding = lifecycle.binding_for_source(canonical_source)
+        root_info = root.stat(follow_symlinks=False)
+        if binding is None or binding.repository_id != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}":
+            raise AgentError("maintenance_source_unattested")
+        common_text = RepositoryRegistry._git(root, "rev-parse", "--git-common-dir")
+        if common_text is None:
+            raise AgentError("repository_git_unavailable")
+        common = Path(common_text)
+        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        if binding.git_common_directory != common:
+            raise AgentError("maintenance_source_unattested")
+        archive_root = root / ".hive-archive"
+        policy = ProjectPolicy(
+            source_root=canonical_source,
+            allowed_source_roots=(source_root,),
+            archive_root=archive_root,
+        )
+        candidate = scan_candidates((policy,), lifecycle, now=int(time.time()))[0]
+        if not candidate.eligible:
+            raise MaintenanceError("candidate_not_eligible")
+        from the_hive.maintenance import _assert_no_open_tree_references
+
+        _assert_no_open_tree_references((canonical_source,))
+        ensure_private_dir(archive_root)
+        archive_fd, archive_info, archive_mount = _open_tree(archive_root)
+        try:
+            common_fd, common_info, common_mount = _open_tree(common)
+            try:
+                if archive_info.st_dev != common_info.st_dev or archive_mount != common_mount:
+                    raise AgentError("maintenance_archive_filesystem_mismatch")
+            finally:
+                os.close(common_fd)
+        finally:
+            os.close(archive_fd)
+        claim = _claim_worktree_maintenance(binding, now=int(time.time()))
+        return apply_candidate(
+            candidate,
+            lifecycle,
+            policy=policy,
+            claim=claim,
+            now=int(time.time()),
+        )
+    except (KeyError, OSError, ValueError) as exc:
+        if isinstance(exc, AgentError | MaintenanceError):
+            raise
+        raise AgentError("maintenance_owner_unavailable") from exc
+
+
+def _apply_temporary_by_id(repository_id: str, source: Path) -> Any:
+    """Apply one ended, canonically bound G5 producer through the shared claim owner."""
+    from the_hive.maintenance import (
+        MaintenanceError,
+        ProjectPolicy,
+        _assert_no_open_tree_references,
+        _open_tree,
+        apply_candidate,
+        scan_candidates,
+    )
+
+    if type(repository_id) is not str or not isinstance(source, Path):
+        raise AgentError("maintenance_selection_invalid")
+    _require_worktree_maintenance_approval(repository_id, source)
+    try:
+        root = repo_root().resolve(strict=True)
+        classes = load_agent_class_catalog(root / "codex-agent-classes.json")
+        config = load_hive_config(root / "codex-hive.json", classes)
+        configured = []
+        for item in config.repositories:
+            configured_id = item["repo_id"]
+            if configured_id != "codex-master":
+                raise AgentError("repository_local_root_unavailable")
+            configured.append(
+                RepositoryBinding(
+                    repo_id=configured_id,
+                    remote_identity=item["remote_identity"],
+                    local_root=root,
+                    default_branch=item["default_branch"],
+                    config_digest=item["config_digest"],
+                )
+            )
+        registry = RepositoryRegistry(configured)
+        registry.get(repository_id)
+        if not registry.validate(repository_id).allowed:
+            raise AgentError("repository_not_eligible")
+        canonical_source = source.resolve(strict=True)
+        lifecycle = _worktree_lifecycle_store()
+        binding = lifecycle.binding_for_temporary_source(canonical_source)
+        root_info = root.stat(follow_symlinks=False)
+        worktree_root = (root / ".codex-master-worktrees").resolve(strict=True)
+        common_text = RepositoryRegistry._git(root, "rev-parse", "--git-common-dir")
+        if common_text is None:
+            raise AgentError("repository_git_unavailable")
+        common = Path(common_text)
+        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        if (
+            binding is None
+            or binding.repository_id != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
+            or (binding.canonical_source_path != worktree_root and worktree_root not in binding.canonical_source_path.parents)
+            or binding.git_common_directory != common
+        ):
+            raise AgentError("maintenance_source_unattested")
+        archive_root = root / ".hive-archive"
+        policy = ProjectPolicy(
+            source_root=binding.canonical_source_path,
+            allowed_source_roots=(worktree_root,),
+            archive_root=archive_root,
+        )
+        candidate = next(
+            (
+                item
+                for item in scan_candidates((policy,), lifecycle, now=int(time.time()))
+                if item.temporary and item.source == canonical_source
+            ),
+            None,
+        )
+        if candidate is None or not candidate.eligible:
+            raise MaintenanceError("candidate_not_eligible")
+        # This read-only preflight must finish before creating a claim.
+        _assert_no_open_tree_references((canonical_source,))
+        ensure_private_dir(archive_root)
+        archive_fd, archive_info, archive_mount = _open_tree(archive_root)
+        root_fd, root_info, root_mount = _open_tree(root)
+        try:
+            if archive_info.st_dev != root_info.st_dev or archive_mount != root_mount:
+                raise AgentError("maintenance_archive_filesystem_mismatch")
+        finally:
+            os.close(root_fd)
+            os.close(archive_fd)
+        claim = _claim_worktree_maintenance(binding, now=int(time.time()))
+        return apply_candidate(
+            candidate,
+            lifecycle,
+            policy=policy,
+            claim=claim,
+            now=int(time.time()),
+        )
+    except (KeyError, OSError, ValueError) as exc:
+        if isinstance(exc, AgentError | MaintenanceError):
+            raise
+        raise AgentError("maintenance_owner_unavailable") from exc
+
+
+def _claim_worktree_maintenance(binding: WorktreeBinding, *, now: int) -> Any:
+    """Claim only after a strict Native and pin snapshot under admission locks.
+
+    Native identifiers are opaque references. Their status and timestamps never
+    establish process termination, so any retained row keeps the broad lifecycle
+    reference pending. Missing, malformed, or unreadable inventory blocks claims.
+    """
+    with spawn_admission_lock():
+        with native_agent_registry_lock():
+            try:
+                registry, state = _read_native_agent_registry_read_only()
+                pins = retained_pin_session_ids(now)
+            except Exception as exc:
+                raise WorktreeLifecycleError("native_inventory_unavailable") from exc
+            if state != "ready" or pins is None:
+                raise WorktreeLifecycleError("native_inventory_unavailable")
+            if any(registry.get(key) for key in ("agents", "sessions", "reservations")) or pins:
+                lifecycle = _worktree_lifecycle_store()
+                lifecycle.reserve_native_reference(
+                    reference_id="native-inventory-legacy", now=now
+                )
+                raise WorktreeLifecycleError("native_reference_active")
+            return _worktree_lifecycle_store().claim_maintenance(binding, now=now)
+
+
+def _begin_tracked_worktree_use(
+    source: Path,
+    *,
+    principal_id: str,
+    session_id: str,
+    assignment_id: str,
+) -> tuple[WorktreeLifecycleStore, object] | None:
+    lifecycle = _worktree_lifecycle_store()
+    binding = lifecycle.binding_for_source(source)
+    if binding is None:
+        return None
+    return lifecycle, lifecycle.begin_use(
+        binding,
+        principal_id=principal_id,
+        session_id=session_id,
+        assignment_id=assignment_id,
+        now=int(time.time()),
+    )
+
+
+def _g5_runner_env_prefix(
+    *,
+    managed_codex: bool,
+    managed_home: Path | None,
+    producer_tmpdir: Path | None,
+) -> str:
+    arguments: list[str] = []
+    if managed_codex:
+        if not isinstance(managed_home, Path):
+            raise AgentError("managed_codex_home_invalid")
+        arguments.extend(
+            ["-u", "CODEX_ACCESS_TOKEN", "-u", "OPENAI_API_KEY", f"CODEX_HOME={managed_home}"]
+        )
+    if producer_tmpdir is not None:
+        arguments.append(f"TMPDIR={producer_tmpdir}")
+    arguments.extend(["THE_HIVE_MCP=1", "CODEX_AGENT_MCP=1"])
+    return "env " + shlex.join(arguments)
+
+
+def _abort_tracked_worktree_use_before_spawn(
+    tracked_worktree_use: tuple[WorktreeLifecycleStore, object] | None,
+    producer_tmpdir: Path | None,
+) -> None:
+    if tracked_worktree_use is None or producer_tmpdir is None:
+        return
+    lifecycle, lease = tracked_worktree_use
+    try:
+        lifecycle.abort_temporary_producer_before_spawn(
+            lease, producer_tmpdir, now=int(time.time())
+        )
+    except (WorktreeLifecycleError, OSError, TypeError, ValueError):
+        # An unverifiable abort remains protected in the lifecycle store.
+        return
 
 
 def _raise_headless_scope_failure(failure: HeadlessWriteScopeFailure) -> None:
@@ -13926,6 +15184,7 @@ def _run_headless_process(
     structured_gate: Mapping[str, Any] | None = None,
     write_scope_binding: ScopeBinding | None = None,
     write_scope_store: HeadlessWriteScopeStore | None = None,
+    lifecycle_use: tuple[WorktreeLifecycleStore, object] | None = None,
 ) -> dict[str, Any]:
     require_resource_capacity_preflight(operation="headless_assignment")
     headless_inflight_reservation_id = (
@@ -14246,6 +15505,14 @@ def _run_headless_process(
                 ):
                     raise AgentError("headless_worktree_identity_changed")
                 run_cwd = Path(f"/proc/self/fd/{worktree_fd}")
+                lifecycle_assignment = assignment_id or write_scope_binding.assignment_id
+                if lifecycle_use is None:
+                    _begin_tracked_worktree_use(
+                        verified_worktree,
+                        principal_id=agent,
+                        session_id=lifecycle_assignment,
+                        assignment_id=lifecycle_assignment,
+                    )
             popen_env = dict(child_env)
             popen_kwargs: dict[str, Any] = {
                 "stdin": subprocess.PIPE,
@@ -14861,6 +16128,7 @@ def _assign_headless_agent(
             )
     assignment_id = f"{now_id()}-{agent}"
     headless_inflight_reservation: dict[str, Any] | None = None
+    lifecycle_use: tuple[WorktreeLifecycleStore, object] | None = None
     try:
         with spawn_admission_lock():
             require_spawn_capacity(1, agent=agent, task=task, role=role)
@@ -14875,6 +16143,14 @@ def _assign_headless_agent(
                             "headless writes lack isolated worktree and diff attribution",
                             "use an isolated worktree or submit a read-only headless assignment",
                         )
+                    available_attestation = write_scope_store.available_worktree(agent)
+                    if available_attestation is not None:
+                        lifecycle_use = _begin_tracked_worktree_use(
+                            Path(available_attestation.worktree_path),
+                            principal_id=agent,
+                            session_id=assignment_id,
+                            assignment_id=assignment_id,
+                        )
                     snapshot = current_fleet_service().load()
                     current_generation = getattr(snapshot, "generation", None)
                     if current_generation is None:
@@ -14886,6 +16162,36 @@ def _assign_headless_agent(
                         assignment_id=assignment_id,
                         provider_generation=current_generation,
                     )
+                    if (
+                        lifecycle_use is not None
+                        and available_attestation is not None
+                        and (
+                            write_scope_binding.attestation_id
+                            != available_attestation.attestation_id
+                            or write_scope_binding.agent_id != available_attestation.agent_id
+                            or write_scope_binding.repository_root
+                            != available_attestation.repository_root
+                            or write_scope_binding.repository_device
+                            != available_attestation.repository_device
+                            or write_scope_binding.repository_inode
+                            != available_attestation.repository_inode
+                            or write_scope_binding.worktree_path
+                            != available_attestation.worktree_path
+                            or write_scope_binding.worktree_device
+                            != available_attestation.worktree_device
+                            or write_scope_binding.worktree_inode
+                            != available_attestation.worktree_inode
+                            or write_scope_binding.common_git_dir
+                            != available_attestation.common_git_dir
+                            or write_scope_binding.common_git_device
+                            != available_attestation.common_git_device
+                            or write_scope_binding.common_git_inode
+                            != available_attestation.common_git_inode
+                            or write_scope_binding.creation_generation
+                            != available_attestation.creation_generation
+                        )
+                    ):
+                        raise AgentError("headless_lifecycle_binding_changed")
                 except HeadlessWriteScopeFailure as exc:
                     _raise_headless_scope_failure(exc)
             headless_inflight_reservation = reserve_headless_inflight(
@@ -14997,6 +16303,7 @@ def _assign_headless_agent(
             structured_gate=gate,
             write_scope_binding=write_scope_binding,
             write_scope_store=write_scope_store,
+            lifecycle_use=lifecycle_use,
         )
     except FleetRateLimitError as exc:
         result = {
@@ -15284,7 +16591,26 @@ def stop_agent(
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     with agent_lifecycle_lock(agent, timeout_seconds=timeout_seconds):
-        return _stop_agent_unlocked(agent, force=force)
+        result = _stop_agent_unlocked(agent, force=force)
+        if result.get("status") in {"stopped", "not_running"}:
+            _end_tracked_worktree_use_for_agent(agent)
+        return result
+
+
+def _end_tracked_worktree_use_for_agent(agent: str) -> None:
+    try:
+        metadata = read_meta(agent)
+        assignment_id = metadata.get("run_id")
+        if not isinstance(assignment_id, str):
+            return
+        lifecycle = _worktree_lifecycle_store()
+        lease = lifecycle.active_use_for_assignment(assignment_id)
+        if lease is None:
+            return
+        evidence = RuntimeEndEvidence.observe(lease, now=int(time.time()))
+        lifecycle.end_use(lease, evidence, now=int(time.time()))
+    except (AgentError, WorktreeLifecycleError, OSError, TypeError, ValueError):
+        return
 
 
 def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
@@ -20220,6 +21546,15 @@ def worktree_create_for_agent(
             )
         except HeadlessWriteScopeFailure as exc:
             _raise_headless_scope_failure(exc)
+        try:
+            lifecycle_binding = WorktreeBinding.from_creation_attestation(attestation)
+            _worktree_lifecycle_store()._record_created_worktree(
+                lifecycle_binding, attestation
+            )
+        except WorktreeLifecycleError:
+            # Creation remains valid; missing lifecycle provenance leaves the
+            # worktree unattested and therefore ineligible for maintenance claims.
+            pass
         write_scope = {
             "state": "available",
             "attestation_id": attestation.attestation_id,
@@ -38610,6 +39945,8 @@ def _goddess_report_cli(argv: list[str]) -> int:
 def main_cli(argv: list[str]) -> int:
     """Run one CLI request with a request-scoped fleet inventory projection."""
 
+    if argv[:1] == ["worktree-maintenance"]:
+        return _main_cli_impl(argv)
     if argv[:2] == ["fleet", "overview"]:
         return _fleet_overview_cli(argv[2:])
     if argv[:2] == ["goddess", "report"]:
@@ -39253,12 +40590,74 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_raw_log_writer.add_argument("path")
     p_raw_log_writer.add_argument("--max-bytes", type=int, default=MAX_RAW_LOG_BYTES)
 
+    p_worktree_maintenance = sub.add_parser(
+        "worktree-maintenance", help="Preview and maintain attested project worktrees"
+    )
+    worktree_maintenance_sub = p_worktree_maintenance.add_subparsers(
+        dest="worktree_maintenance_command", required=False
+    )
+    worktree_maintenance_sub.add_parser("plan")
+    p_approve_worktree = worktree_maintenance_sub.add_parser("approve")
+    p_approve_worktree.add_argument("--preview-digest", required=True)
+    worktree_maintenance_sub.add_parser("run")
+    p_archive_worktree = worktree_maintenance_sub.add_parser("archive")
+    p_archive_worktree.add_argument("--repository-id", required=True)
+    p_archive_worktree.add_argument("--source", required=True)
+    p_archive_temp = worktree_maintenance_sub.add_parser("archive-temp")
+    p_archive_temp.add_argument("--repository-id", required=True)
+    p_archive_temp.add_argument("--source", required=True)
+    p_apply_worktree = worktree_maintenance_sub.add_parser("apply")
+    p_apply_worktree.add_argument("--repository-id", required=True)
+    p_apply_worktree.add_argument("--source", required=True)
+    p_restore_worktree = worktree_maintenance_sub.add_parser("restore")
+    p_restore_worktree.add_argument("--repository-id", required=True)
+    p_restore_worktree.add_argument("--archive-id", required=True)
+    p_restore_worktree.add_argument("--destination-name", required=True)
+    p_recover_worktree = worktree_maintenance_sub.add_parser("recover")
+    p_recover_worktree.add_argument("--repository-id", required=True)
+    p_recover_worktree.add_argument("--source", required=True)
+    p_worktree_maintenance.set_defaults(worktree_maintenance_command="plan")
+
     add_hive_cli_parsers(sub, fleet_subparsers=fleet_sub)
 
     args = parser.parse_args(argv)
     try:
         if args.command == "raw-log-writer":
             return write_bounded_raw_log(Path(args.path), args.max_bytes)
+        if args.command == "worktree-maintenance":
+            if args.worktree_maintenance_command == "plan":
+                return print_json(_worktree_maintenance_plan())
+            if args.worktree_maintenance_command == "approve":
+                return print_json(_approve_worktree_maintenance(args.preview_digest))
+            if args.worktree_maintenance_command == "run":
+                result = _run_worktree_maintenance()
+                return print_json(result)
+            if args.worktree_maintenance_command == "restore":
+                restored = _restore_worktree_archive_by_id(
+                    args.repository_id, args.archive_id, args.destination_name
+                )
+                return print_json({"operation": "restore", "restored": str(restored)})
+            if args.worktree_maintenance_command == "recover":
+                return print_json(
+                    _recover_worktree_maintenance_by_id(
+                        args.repository_id, Path(args.source)
+                    )
+                )
+            if args.worktree_maintenance_command == "archive":
+                receipt = _archive_worktree_by_id(args.repository_id, Path(args.source))
+            elif args.worktree_maintenance_command == "archive-temp":
+                receipt = _archive_temporary_by_id(args.repository_id, Path(args.source))
+            elif args.worktree_maintenance_command == "apply":
+                receipt = _apply_worktree_by_id(args.repository_id, Path(args.source))
+            else:
+                raise AgentError("maintenance_command_unavailable")
+            return print_json(
+                {
+                    "archive": str(receipt.archive),
+                    "manifest_sha256": receipt.manifest_sha256,
+                    "entry_count": receipt.entry_count,
+                }
+            )
         if args.command in {"hive", "selection-status", "reset-anchor-run"}:
             return print_json(run_hive_cli(args))
         if args.command == "fleet" and args.fleet_namespace == "test":

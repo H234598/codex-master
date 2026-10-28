@@ -4,6 +4,7 @@ import io
 import hashlib
 import json
 import os
+import secrets
 import signal
 import subprocess
 from contextlib import nullcontext
@@ -11,11 +12,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from the_hive import server
+from the_hive.hive.state import HiveStateStore
+from the_hive.resource_cgroup import PreparedAgentScope
+from the_hive import runtime_process
+from the_hive.worktree_lifecycle import (
+    G5ScopeBindingEvidence,
+    RuntimeEndEvidence,
+    WorktreeLifecycleError,
+    WorktreeLifecycleStore,
+)
 from the_hive.fleet_registry import (
     AgentDescriptor,
     AuthKind,
@@ -2657,6 +2667,7 @@ def test_headless_write_assignment_rejects_write_paths_outside_scope_before_bind
     )()
     scope_store = Mock()
     scope_store.has_available.return_value = True
+    scope_store.available_worktree.return_value = None
     scope_store.bind = Mock()
     claim = Mock()
 
@@ -2707,6 +2718,7 @@ def test_headless_write_assignment_binds_attestation_before_claim_and_passes_wor
     attested_worktree = tmp_path / "attested-worktree"
     scope_store = Mock()
     scope_store.has_available.return_value = True
+    scope_store.available_worktree.return_value = None
     scope_store.bind.return_value = SimpleNamespace(
         worktree_path=attested_worktree,
         attestation_id="a" * 32,
@@ -2809,10 +2821,16 @@ def test_worktree_create_registers_public_attestation_without_path_leak(
         text=True,
     )
     scope_store = server.HeadlessWriteScopeStore(tmp_path / "state")
+    lifecycle_store = WorktreeLifecycleStore(
+        HiveStateStore(tmp_path / "lifecycle-state")
+    )
     monkeypatch.setattr(server, "require_fleet_recovery_ready", lambda *_args: None)
     monkeypatch.setattr(server, "canonical_agent_id", lambda value: value)
     monkeypatch.setattr(server, "repo_root", lambda: repository)
     monkeypatch.setattr(server, "_headless_write_scope_store", lambda: scope_store)
+    monkeypatch.setattr(
+        server, "_worktree_lifecycle_store", lambda: lifecycle_store, raising=False
+    )
 
     result = server.worktree_create_for_agent(
         "d1", path=".codex-master-worktrees/agent-d1"
@@ -2825,6 +2843,8 @@ def test_worktree_create_registers_public_attestation_without_path_leak(
     attestation = scope_store.read(attestation_id)
     assert attestation.agent_id == "d1"
     assert attestation.worktree_path.name == "agent-d1"
+    binding = lifecycle_store.binding_for_source(attestation.worktree_path)
+    assert binding is not None
 
 
 def test_worktree_create_rejects_success_without_git_metadata(
@@ -3480,9 +3500,12 @@ def test_headless_write_runner_rejects_parent_path_swap_after_revalidation(
     scope_store.finalize.assert_called_once_with(binding)
 
 
+@pytest.mark.parametrize("scenario", ["normal", "claim", "swapped_attestation"])
 def test_headless_write_worktree_create_assign_runner_integration(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, scenario: str
 ) -> None:
+    maintenance_claim = scenario == "claim"
+    swap_attestation = scenario == "swapped_attestation"
     repository = tmp_path / "repository"
     repository.mkdir()
     for args in (
@@ -3507,6 +3530,9 @@ def test_headless_write_worktree_create_assign_runner_integration(
         text=True,
     )
     scope_store = server.HeadlessWriteScopeStore(tmp_path / "state")
+    lifecycle_store = WorktreeLifecycleStore(
+        HiveStateStore(tmp_path / "lifecycle-state")
+    )
     descriptor = SimpleNamespace(
         model="gemini-3-flash-preview",
         account_id="gemini-project",
@@ -3540,6 +3566,9 @@ def test_headless_write_worktree_create_assign_runner_integration(
     monkeypatch.setattr(server, "repo_root", lambda: repository)
     monkeypatch.setattr(server, "canonical_agent_id", lambda value: value)
     monkeypatch.setattr(server, "_headless_write_scope_store", lambda: scope_store)
+    monkeypatch.setattr(
+        server, "_worktree_lifecycle_store", lambda: lifecycle_store, raising=False
+    )
     monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
     monkeypatch.setattr(server, "_gemini_headless_gate", lambda _agent: dict(gate))
     monkeypatch.setattr(server, "status_agent", lambda *_args, **_kwargs: {"identity_guard": {"ok": True}})
@@ -3570,6 +3599,75 @@ def test_headless_write_worktree_create_assign_runner_integration(
     created = server.worktree_create_for_agent(
         "d1", path=".codex-master-worktrees/agent-d1"
     )
+    if maintenance_claim:
+        binding = lifecycle_store.binding_for_source(
+            scope_store.read(created["write_scope"]["attestation_id"]).worktree_path
+        )
+        assert binding is not None
+        lease = lifecycle_store.begin_use(
+            binding,
+            principal_id="d1",
+            session_id="prior-assignment",
+            assignment_id="prior-assignment",
+            now=1,
+        )
+        unit = f"the-hive-resource-{secrets.token_hex(16)}.scope"
+        group = f"/the-hive.slice/{unit}"
+        cgroup_root = tmp_path / "cgroup"
+        cgroup = cgroup_root / "the-hive.slice" / unit
+        cgroup.mkdir(parents=True)
+        (cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
+        (cgroup / "cgroup.procs").write_text("777\n", encoding="ascii")
+        invocation = secrets.token_hex(16)
+
+        def fake_systemctl(_args, *, environment, deadline):
+            del environment, deadline
+            return f"ControlGroup={group}\nInvocationID={invocation}\nLoadState=loaded\n".encode("ascii")
+
+        scope = PreparedAgentScope(
+            unit_name=unit,
+            socket_name=f"g5-{secrets.token_hex(10)}",
+            session_name=f"worktree-{secrets.token_hex(6)}",
+            control_group=group,
+            gate_pid=os.getpid(),
+            challenge=secrets.token_hex(32),
+        )
+        with patch.object(runtime_process, "_CGROUP_ROOT", cgroup_root), patch.object(
+            runtime_process, "_systemctl", fake_systemctl
+        ):
+            lease = lifecycle_store.bind_g5_runtime(
+                lease, G5ScopeBindingEvidence.capture(lease, scope, now=2), now=2
+            )
+            (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+            (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+            lifecycle_store.end_use(
+                lease, RuntimeEndEvidence.observe(lease, now=3), now=4
+            )
+        native_state = tmp_path / "native-state"
+        native_registry = native_state / "native-agents.json"
+        native_lock = native_state / "locks" / "native-agents.lock"
+        monkeypatch.chdir(binding.canonical_source_path)
+        with patch(
+            "the_hive.server.STATE_ROOT", native_state
+        ), patch("the_hive.server.LOCK_DIR", native_state / "locks"), patch(
+            "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", native_registry
+        ), patch(
+            "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", native_lock
+        ), patch(
+            "the_hive.server._worktree_lifecycle_store", return_value=lifecycle_store
+        ), patch(
+            "the_hive.server.require_resource_capacity_preflight"
+        ), patch(
+            "the_hive.server.spawn_admission_decision", return_value={"allowed": True}
+        ), patch("the_hive.server.time.time", return_value=1001.0):
+            lifecycle_store.claim_maintenance(binding, now=1)
+            with pytest.raises(server.AgentError, match="native lifecycle protection unavailable"):
+                server.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "parent-native"},
+                    now=1000.0,
+                )
+        assert not native_registry.exists()
+        assert len(lifecycle_store.snapshot().maintenance_claims) == 1
     monkeypatch.setattr(
         server,
         "subprocess",
@@ -3582,6 +3680,80 @@ def test_headless_write_worktree_create_assign_runner_integration(
     monkeypatch.setattr(server, "release_headless_inflight", lambda *_args: {"status": "released"})
     monkeypatch.setattr(server, "release_agent", lambda *_args, **_kwargs: {"lease": {"state": "unclaimed"}})
 
+    if swap_attestation:
+        original_available_worktree = scope_store.available_worktree
+        swapped: list[object] = []
+
+        def switch_available_worktree(agent_id: str):
+            selected = original_available_worktree(agent_id)
+            if not swapped:
+                prior_binding = scope_store.bind(
+                    agent_id,
+                    repository,
+                    ["src/file.py"],
+                    assignment_id="intervening-assignment",
+                    provider_generation=4,
+                )
+                scope_store.finalize(prior_binding)
+                second_worktree = repository / ".codex-master-worktrees" / "agent-d1-second"
+                subprocess.run(
+                    ("git", "worktree", "add", "--quiet", "--detach", str(second_worktree), "HEAD"),
+                    cwd=repository,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                second_attestation = scope_store.create(
+                    agent_id,
+                    repository,
+                    second_worktree,
+                    base_ref=None,
+                )
+                second_binding = server.WorktreeBinding.from_creation_attestation(
+                    second_attestation
+                )
+                lifecycle_store._record_created_worktree(
+                    second_binding, second_attestation
+                )
+                swapped.append(second_attestation)
+            return selected
+
+        monkeypatch.setattr(scope_store, "available_worktree", switch_available_worktree)
+        with pytest.raises(server.AgentError, match="headless_lifecycle_binding_changed"):
+            server._assign_headless_agent(
+                "d1",
+                role="arbeitsbiene",
+                task="fix",
+                scope=["src"],
+                write_paths=["src/file.py"],
+                timeout_seconds=5,
+            )
+        assert swapped
+        assert not server.subprocess.Popen.called
+        leases = lifecycle_store.snapshot().active_uses
+        assert len(leases) == 1
+        assert leases[0].binding.canonical_source_path == Path(
+            scope_store.read(created["write_scope"]["attestation_id"]).worktree_path
+        )
+        assert scope_store.read(created["write_scope"]["attestation_id"]).lifecycle == "consumed"
+        assert scope_store.read(swapped[0].attestation_id).lifecycle == "consumed"
+        return
+
+    if maintenance_claim:
+        with pytest.raises(WorktreeLifecycleError, match="maintenance_claim_active"):
+            server._assign_headless_agent(
+                "d1",
+                role="arbeitsbiene",
+                task="fix",
+                scope=["src"],
+                write_paths=["src/file.py"],
+                timeout_seconds=5,
+            )
+        attestation = scope_store.read(created["write_scope"]["attestation_id"])
+        assert attestation.lifecycle == "available"
+        assert len(lifecycle_store.snapshot().active_uses) == 0
+        assert not server.subprocess.Popen.called
+        return
     result = server._assign_headless_agent(
         "d1",
         role="arbeitsbiene",
@@ -3596,6 +3768,61 @@ def test_headless_write_worktree_create_assign_runner_integration(
     assert result["write_scope"]["code"] == "ok"
     attestation = scope_store.read(created["write_scope"]["attestation_id"])
     assert attestation.lifecycle == "consumed"
+    assert len(lifecycle_store.snapshot().active_uses) == 1
+    assert lifecycle_store.snapshot().active_uses[0].runtime_process is None
+
+    native_state = tmp_path / "native-state"
+    native_registry = native_state / "native-agents.json"
+    native_lock = native_state / "locks" / "native-agents.lock"
+    monkeypatch.chdir(attestation.worktree_path)
+    with patch("the_hive.server.STATE_ROOT", native_state), patch(
+        "the_hive.server.LOCK_DIR", native_state / "locks"
+    ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", native_registry), patch(
+        "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", native_lock
+    ), patch(
+        "the_hive.server._worktree_lifecycle_store", return_value=lifecycle_store
+    ), patch("the_hive.server.require_resource_capacity_preflight"), patch(
+        "the_hive.server.spawn_admission_decision", return_value={"allowed": True}
+    ), patch("the_hive.server.time.time", return_value=1001.0):
+        server.record_native_agent_event(
+            {"hook_event_name": "SessionStart", "session_id": "parent-native"},
+            now=1000.0,
+        )
+        with server.native_hook_source_context():
+            spawn_result = server.reserve_native_agent_spawn(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "spawn_agent",
+                    "session_id": "parent-native",
+                    "cwd": str(repository),
+                    "tool_input": {"task": "must not trust payload cwd"},
+                }
+            )
+        server.record_native_agent_event(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "parent-native",
+                "agent_id": "child-native",
+                "agent_type": "worker",
+            },
+            now=1002.0,
+        )
+        with server.native_hook_source_context():
+            resume_result = server.activate_native_agent_resume(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "send_input",
+                    "session_id": "parent-native",
+                    "cwd": str(repository),
+                    "tool_input": {"target": "child-native"},
+                },
+                now=1003.0,
+            )
+    assert spawn_result["allowed"] is True
+    assert resume_result["allowed"] is True
+    active_uses = lifecycle_store.snapshot().active_uses
+    assert len(active_uses) == 1
+    assert active_uses[0].principal_id == "d1"
 
 
 @pytest.mark.parametrize("runner_error", [False, True])

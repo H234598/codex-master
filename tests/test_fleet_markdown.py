@@ -599,6 +599,42 @@ def test_review_reporting_policy_projects_to_core_profiles_for_both_providers() 
             assert policy in primary
 
 
+def test_new_tl_and_worker_session_account_policy_projects_to_core_profiles() -> None:
+    policy = """## Hive-weite Accountwahl für neue TL- und Workerinnen-Sessions
+
+- Komplett neue Teamleiterinnen- und Workerinnen-Sessions, die keine vorhandene Session resumen, werden auf dem nächsten freien und benutzbaren Account mit der größten verbleibenden Wochenquote gestartet. Bei vergleichbaren Wochenrestquoten hat beispielsweise ein Account mit 70 % Vorrang vor einem Account mit 12 %.
+- Maßgeblich ist der aktuell verbleibende prozentuale Wochenanteil, nicht das feste Wochenkontingent oder die bereits verbrauchte Quote. Die Auswahl beruht auf gültiger, frischer und vergleichbarer Evidenz. Bestehende Authentifizierungs-, Quota-, Capability-, Ressourcen- und Reservierungsgates bleiben verbindlich; fehlende, veraltete oder unbekannte Wochenwerte dürfen nicht als verfügbare Quote erfunden werden.
+- Diese Erstwahlregel gilt nicht für Resumes. Bestehende Account- und Sessionbindungen sowie die Regeln für Accountwechsel und Context-Resets bleiben unverändert. Die neue Rangfolge erteilt keine Erlaubnis, aktive Sessions opportunistisch zu rotieren oder neu zu starten.""".encode(
+        "utf-8"
+    )
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        for profile in ("koenigin", "teamleiterin", "worker"):
+            projection = fleet_markdown.fleet_markdown_projection(
+                _agent(runner, profile)
+            )
+            primary = projection.artifacts[projection.metadata.provider_artifact_name]
+            assert policy in primary
+
+
+def test_shellcheck_policy_projects_to_core_profiles_for_both_providers() -> None:
+    policy = """## Hive-weite ShellCheck-Pflicht
+
+- ShellCheck muss in allen Hive-Entwicklungs-, Ausführungs- und Prüfumgebungen installiert und über `shellcheck` ausführbar sein.
+- Setze ShellCheck sinnvoll ein, insbesondere wenn unterstützter Shellcode neu erstellt, geändert oder geprüft wird. Wähle den tatsächlichen Shell-Dialekt; ein Lintlauf ersetzt weder Syntaxprüfung noch funktionale Tests.
+- Behebe relevante Befunde. Begründe nötige Ausnahmen eng am betroffenen Code; pauschale Unterdrückungen sind kein Ersatz für eine Prüfung. Fehlt ShellCheck oder wurde die Prüfung nicht ausgeführt, darf kein erfolgreicher ShellCheck-Nachweis behauptet werden.""".encode(
+        "utf-8"
+    )
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        for profile in ("koenigin", "teamleiterin", "worker"):
+            projection = fleet_markdown.fleet_markdown_projection(
+                _agent(runner, profile)
+            )
+            primary = projection.artifacts[projection.metadata.provider_artifact_name]
+            assert policy in primary
+
+
 def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> None:
     contract = load_common_policy()
     required_fragments = [

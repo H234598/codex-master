@@ -34,6 +34,8 @@ import the_hive.resource_cgroup as resource_cgroup
 from the_hive import __version__
 from the_hive.hive.types import TaskComplexity
 from the_hive.hive.state import HiveStateStore
+from the_hive.headless_write_scope import HeadlessWriteScopeStore
+from the_hive.worktree_lifecycle import WorktreeLifecycleError, WorktreeLifecycleStore
 from the_hive.masterjet_runtime import MasterjetRuntime
 from the_hive.runtime_layout import RuntimeLayout
 from the_hive.fleet_home_recovery import make_fleet_identity_journal_plan
@@ -1467,6 +1469,19 @@ def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_tracked_worktree_use_propagates_lifecycle_store_errors(self) -> None:
+        failure = AgentError("worktree_lifecycle_unavailable")
+        with patch(
+            "the_hive.server._worktree_lifecycle_store", side_effect=failure
+        ):
+            with self.assertRaisesRegex(AgentError, "worktree_lifecycle_unavailable"):
+                server_module._begin_tracked_worktree_use(
+                    Path.cwd(),
+                    principal_id="principal",
+                    session_id="session",
+                    assignment_id="assignment",
+                )
+
     def test_existing_portable_skill_profile_filters_remain_in_effect(self) -> None:
         for profile in ("generic", "worker", "teamlead", "teamleiterin", "koenigin"):
             with self.subTest(profile=profile):
@@ -18358,9 +18373,47 @@ google_accounts:
             ],
         )
 
+    def test_g5_runner_environment_prefix_executes_managed_and_unmanaged(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="g5 env ") as tmpdir:
+            root = Path(tmpdir)
+            temp_dir = root / "private temp"
+            managed_home = root / "codex home"
+            temp_dir.mkdir(mode=0o700)
+            managed_home.mkdir(mode=0o700)
+            for managed in (False, True):
+                prefix = server_module._g5_runner_env_prefix(
+                    managed_codex=managed,
+                    managed_home=managed_home if managed else None,
+                    producer_tmpdir=temp_dir,
+                )
+                environment = {
+                    "PATH": "/usr/bin:/bin",
+                    "CODEX_ACCESS_TOKEN": "sentinel-token",
+                    "OPENAI_API_KEY": "sentinel-key",
+                }
+                completed = subprocess.run(
+                    ["/bin/sh", "-c", f"{prefix} /usr/bin/env"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                output = set(completed.stdout.splitlines())
+                self.assertIn(f"TMPDIR={temp_dir}", output)
+                self.assertIn("THE_HIVE_MCP=1", output)
+                self.assertIn("CODEX_AGENT_MCP=1", output)
+                if managed:
+                    self.assertIn(f"CODEX_HOME={managed_home}", output)
+                    self.assertNotIn("CODEX_ACCESS_TOKEN=sentinel-token", output)
+                    self.assertNotIn("OPENAI_API_KEY=sentinel-key", output)
+                else:
+                    self.assertNotIn(f"CODEX_HOME={managed_home}", output)
+
     def test_start_agent_threads_pinned_runner_target_into_g5_scope(self) -> None:
         captured_scope_args: tuple[Any, ...] = ()
         events: list[str] = []
+        real_g5_start_scope = server_module._g5_start_scope
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             runner = root / "codex"
@@ -18375,6 +18428,39 @@ google_accounts:
             runner.write_text(server_module.pool_wrapper_text("a", root, str(native)), encoding="utf-8")
             runner.chmod(0o700)
             raw_dir.mkdir()
+
+            repository = root / "repository"
+            repository.mkdir()
+            for args in (
+                ("git", "init", "--quiet"),
+                ("git", "config", "user.email", "test@example.invalid"),
+                ("git", "config", "user.name", "G5 Lifecycle Test"),
+            ):
+                subprocess.run(args, cwd=repository, check=True, capture_output=True, text=True)
+            (repository / "README.md").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(("git", "add", "README.md"), cwd=repository, check=True)
+            subprocess.run(
+                ("git", "commit", "--quiet", "-m", "baseline"),
+                cwd=repository,
+                check=True,
+            )
+            lifecycle_store = WorktreeLifecycleStore(HiveStateStore(root / "lifecycle"))
+            write_scope_store = HeadlessWriteScopeStore(root / "write-scope")
+            with patch("the_hive.server.require_fleet_recovery_ready"), patch(
+                "the_hive.server.canonical_agent_id", side_effect=lambda value: value
+            ), patch("the_hive.server.repo_root", return_value=repository), patch(
+                "the_hive.server._headless_write_scope_store", return_value=write_scope_store
+            ), patch(
+                "the_hive.server._worktree_lifecycle_store", return_value=lifecycle_store
+            ):
+                created = server_module.worktree_create_for_agent(
+                    "a", path=".codex-master-worktrees/agent-a"
+                )
+            created_worktree = write_scope_store.read(
+                created["write_scope"]["attestation_id"]
+            ).worktree_path
+            nested_cwd = Path(created_worktree) / "nested"
+            nested_cwd.mkdir()
 
             def fake_scope(*args: Any) -> tuple[Any, PreparedAgentScope]:
                 nonlocal captured_scope_args
@@ -18419,15 +18505,24 @@ google_accounts:
             ), patch(
                 "the_hive.server.run_tmux",
                 side_effect=fake_run_tmux,
-            ) as run_tmux, patch("the_hive.server.write_meta") as write_meta:
+            ) as run_tmux, patch("the_hive.server.write_meta") as write_meta, patch(
+                "the_hive.server._worktree_lifecycle_store", return_value=lifecycle_store
+            ):
                 try:
-                    result = start_agent("a", cwd=tmpdir)
+                    result = start_agent("a", cwd=str(nested_cwd))
                     self.assertEqual(result["status"], "started")
                     self.assertEqual(len(captured_scope_args), 2)
                     runner_target = captured_scope_args[1]
                     self.assertEqual(runner_target.owner_pid, os.getpid())
                     self.assertEqual((runner_target.device, runner_target.inode), (native.stat().st_dev, native.stat().st_ino))
                     send_keys = next(call.args[0] for call in run_tmux.call_args_list if "send-keys" in call.args[0])
+                    self.assertIn("TMPDIR=", send_keys[-2])
+                    tmpdir_value = send_keys[-2].split("TMPDIR=", 1)[1].split(" ", 1)[0]
+                    producer_tmpdir = Path(tmpdir_value)
+                    self.addCleanup(shutil.rmtree, producer_tmpdir, ignore_errors=True)
+                    self.assertTrue(producer_tmpdir.is_dir())
+                    self.assertEqual(producer_tmpdir.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(producer_tmpdir.parent, Path(tempfile.gettempdir()).resolve())
                     self.assertIn("THE_HIVE_MCP=1 CODEX_AGENT_MCP=1", send_keys[-2])
                     self.assertNotIn("CODEX_MASTER_MCP=1", send_keys[-2])
                     self.assertIn('"${THE_HIVE_RUNNER_EXEC_PATH:?}"', send_keys[-2])
@@ -18446,6 +18541,56 @@ google_accounts:
                         },
                     )
                     self.assertNotIn("g5_native_runner", server_module.public_agent_meta(persisted_meta))
+                    active_uses = lifecycle_store.snapshot().active_uses
+                    self.assertEqual(len(active_uses), 1)
+                    self.assertIsNone(active_uses[0].runtime_scope)
+                    with self.assertRaisesRegex(
+                        WorktreeLifecycleError, "worktree_in_use"
+                    ):
+                        lifecycle_store.claim_maintenance(
+                            active_uses[0].binding, now=10
+                        )
+
+                    active_before = lifecycle_store.snapshot().active_uses
+                    producer_dirs_before = set(
+                        Path(tempfile.gettempdir()).glob("the-hive-g5-*")
+                    )
+                    for _attempt in range(2):
+                        with patch.object(
+                            server_module,
+                            "_RESOURCE_GATE_RUNTIME",
+                            SimpleNamespace(get=lambda: None),
+                        ), patch.object(
+                            server_module,
+                            "_g5_start_scope",
+                            new=real_g5_start_scope,
+                        ), self.assertRaises(server_module._G5StartNotStarted):
+                            start_agent("a", cwd=str(nested_cwd))
+                    self.assertEqual(
+                        lifecycle_store.snapshot().active_uses, active_before
+                    )
+                    self.assertEqual(
+                        set(Path(tempfile.gettempdir()).glob("the-hive-g5-*")),
+                        producer_dirs_before,
+                    )
+
+                    def ambiguous_send(*_args: Any, **_kwargs: Any) -> Any:
+                        raise RuntimeError("send_result_ambiguous")
+
+                    before_ambiguous_send = set(
+                        Path(tempfile.gettempdir()).glob("the-hive-g5-*")
+                    )
+                    with patch("the_hive.server.run_tmux", side_effect=ambiguous_send):
+                        with self.assertRaisesRegex(RuntimeError, "send_result_ambiguous"):
+                            start_agent("a", cwd=str(nested_cwd))
+                    for temp_path in set(
+                        Path(tempfile.gettempdir()).glob("the-hive-g5-*")
+                    ) - before_ambiguous_send:
+                        self.addCleanup(shutil.rmtree, temp_path, ignore_errors=True)
+                    self.assertEqual(
+                        len(lifecycle_store.snapshot().active_uses),
+                        len(active_before) + 1,
+                    )
                 finally:
                     server_module.close_runner_execution_fd("a")
 
@@ -30536,17 +30681,18 @@ google_accounts:
 
         def run_native_reservation() -> None:
             try:
-                b_result.append(
-                    server_module.reserve_native_agent_spawn(
-                        {
-                            "hook_event_name": "PreToolUse",
-                            "tool_name": "spawn_agent",
-                            "tool_input": {"task": "parallel"},
-                            "session_id": parent_session,
-                            "cwd": "/tmp",
-                        }
+                with server_module.native_hook_source_context():
+                    b_result.append(
+                        server_module.reserve_native_agent_spawn(
+                            {
+                                "hook_event_name": "PreToolUse",
+                                "tool_name": "spawn_agent",
+                                "tool_input": {"task": "parallel"},
+                                "session_id": parent_session,
+                                "cwd": "/tmp",
+                            }
+                        )
                     )
-                )
             except BaseException as exc:  # pragma: no cover - surfaced below
                 errors.append(exc)
             finally:
@@ -30567,6 +30713,9 @@ google_accounts:
             with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
                 "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
             ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server._worktree_lifecycle_store",
+                return_value=WorktreeLifecycleStore(HiveStateStore(root / "lifecycle")),
+            ), patch(
                 "the_hive.server.time.time", return_value=1_000.0
             ), patch.dict(
                 "the_hive.server.AGENTS",
@@ -36898,7 +37047,142 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("agents-secret", payload_text)
 
 
+@contextlib.contextmanager
+def _recording_lock(events: list[str], name: str) -> Iterator[None]:
+    events.append(f"{name}-enter")
+    try:
+        yield
+    finally:
+        events.append(f"{name}-exit")
+
+
 class NativeAgentRegistryTest(unittest.TestCase):
+    def test_lifecycle_claim_requires_a_valid_empty_native_snapshot(self) -> None:
+        events: list[str] = []
+        lifecycle = SimpleNamespace(
+            claim_maintenance=lambda binding, *, now: events.append("claim") or "claim"
+        )
+        registry = {"agents": [], "sessions": [], "reservations": []}
+        with (
+            patch.object(server_module, "spawn_admission_lock", side_effect=lambda: _recording_lock(events, "spawn")),
+            patch.object(server_module, "native_agent_registry_lock", side_effect=lambda: _recording_lock(events, "native")),
+            patch.object(server_module, "_read_native_agent_registry_read_only", return_value=(registry, "ready")),
+            patch.object(server_module, "retained_pin_session_ids", return_value=frozenset()),
+            patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
+        ):
+            result = server_module._claim_worktree_maintenance(object(), now=5)
+        self.assertEqual(result, "claim")
+        self.assertEqual(events, ["spawn-enter", "native-enter", "claim", "native-exit", "spawn-exit"])
+
+    def test_lifecycle_claim_fails_closed_for_unknown_native_snapshot(self) -> None:
+        for registry_state in ("missing", "degraded"):
+            lifecycle = SimpleNamespace(claim_maintenance=Mock())
+            with (
+                patch.object(server_module, "spawn_admission_lock", return_value=contextlib.nullcontext()),
+                patch.object(server_module, "native_agent_registry_lock", return_value=contextlib.nullcontext()),
+                patch.object(server_module, "_read_native_agent_registry_read_only", return_value=({}, registry_state)),
+                patch.object(server_module, "retained_pin_session_ids", return_value=frozenset()),
+                patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
+            ):
+                with self.assertRaises(WorktreeLifecycleError):
+                    server_module._claim_worktree_maintenance(object(), now=5)
+            lifecycle.claim_maintenance.assert_not_called()
+
+    def test_lifecycle_claim_protects_opaque_legacy_rows_regardless_of_status_or_age(self) -> None:
+        lifecycle = SimpleNamespace(
+            reserve_native_reference=Mock(), claim_maintenance=Mock()
+        )
+        registry = {
+            "agents": [{"session_id": "legacy-thread", "activity_state": "completed", "updated_at": 0}],
+            "sessions": [],
+            "reservations": [],
+        }
+        with (
+            patch.object(server_module, "spawn_admission_lock", return_value=contextlib.nullcontext()),
+            patch.object(server_module, "native_agent_registry_lock", return_value=contextlib.nullcontext()),
+            patch.object(server_module, "_read_native_agent_registry_read_only", return_value=(registry, "ready")),
+            patch.object(server_module, "retained_pin_session_ids", return_value=frozenset()),
+            patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
+        ):
+            with self.assertRaises(WorktreeLifecycleError):
+                server_module._claim_worktree_maintenance(object(), now=10**12)
+        lifecycle.reserve_native_reference.assert_called_once()
+        lifecycle.claim_maintenance.assert_not_called()
+
+    def test_lifecycle_claim_protects_opaque_hook_pins(self) -> None:
+        lifecycle = SimpleNamespace(
+            reserve_native_reference=Mock(), claim_maintenance=Mock()
+        )
+        with (
+            patch.object(server_module, "spawn_admission_lock", return_value=contextlib.nullcontext()),
+            patch.object(server_module, "native_agent_registry_lock", return_value=contextlib.nullcontext()),
+            patch.object(
+                server_module,
+                "_read_native_agent_registry_read_only",
+                return_value=({"agents": [], "sessions": [], "reservations": []}, "ready"),
+            ),
+            patch.object(server_module, "retained_pin_session_ids", return_value=frozenset({"legacy-pin"})),
+            patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
+        ):
+            with self.assertRaises(WorktreeLifecycleError):
+                server_module._claim_worktree_maintenance(object(), now=5)
+        lifecycle.reserve_native_reference.assert_called_once()
+        lifecycle.claim_maintenance.assert_not_called()
+
+    def test_claim_and_native_reference_are_excluded_in_both_lock_orders(self) -> None:
+        for first in ("native", "claim"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir) / "state"
+                registry = {"agents": [], "sessions": [], "reservations": []}
+                state = {"claim": False, "reference": False}
+
+                class Lifecycle:
+                    def claim_maintenance(self, binding: Any, *, now: int) -> str:
+                        del binding, now
+                        if state["reference"]:
+                            raise WorktreeLifecycleError("native_reference_active")
+                        state["claim"] = True
+                        return "claimed"
+
+                    def reserve_native_reference(self, *, reference_id: str, now: int) -> None:
+                        del reference_id, now
+                        if state["claim"]:
+                            raise WorktreeLifecycleError("maintenance_claim_active")
+                        state["reference"] = True
+
+                lifecycle = Lifecycle()
+
+                def admit_native() -> None:
+                    with server_module.spawn_admission_lock():
+                        with server_module.native_agent_registry_lock():
+                            lifecycle.reserve_native_reference(
+                                reference_id="race-native", now=5
+                            )
+
+                with (
+                    patch.object(server_module, "STATE_ROOT", root),
+                    patch.object(server_module, "LOCK_DIR", root / "locks"),
+                    patch.object(
+                        server_module,
+                        "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                        root / "locks" / "native-agents.lock",
+                    ),
+                    patch.object(server_module, "_read_native_agent_registry_read_only", return_value=(registry, "ready")),
+                    patch.object(server_module, "retained_pin_session_ids", return_value=frozenset()),
+                    patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
+                ):
+                    if first == "native":
+                        admit_native()
+                        with self.assertRaises(WorktreeLifecycleError):
+                            server_module._claim_worktree_maintenance(object(), now=5)
+                    else:
+                        self.assertEqual(
+                            server_module._claim_worktree_maintenance(object(), now=5),
+                            "claimed",
+                        )
+                        with self.assertRaises(WorktreeLifecycleError):
+                            admit_native()
+
     def test_native_agent_registry_threshold_constants(self) -> None:
         self.assertEqual(server_module.NATIVE_AGENT_ACTIVE_SECONDS, 2 * 60 * 60)
         self.assertEqual(server_module.NATIVE_AGENT_RETENTION_SECONDS, 24 * 60 * 60)
@@ -36993,6 +37277,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             ), patch(
                 "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ), patch(
+                "the_hive.server._worktree_lifecycle_store",
+                return_value=WorktreeLifecycleStore(HiveStateStore(state / "lifecycle")),
+            ), patch(
                 "the_hive.server._total_running_agent_count", return_value=10
             ), patch(
                 "the_hive.server.system_resource_snapshot",
@@ -37024,19 +37311,31 @@ class NativeAgentRegistryTest(unittest.TestCase):
                     },
                     now=1_001.0,
                 )
-                result = server_module.activate_native_agent_resume(
+                with server_module.native_hook_source_context():
+                    result = server_module.activate_native_agent_resume(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "session_id": "thr_parent",
+                            "tool_name": "multi_agent_v1__send_input",
+                            "tool_input": {"target": "agent_1"},
+                        },
+                        now=1_002.0,
+                    )
+                direct_result = server_module.activate_native_agent_resume(
                     {
                         "hook_event_name": "PreToolUse",
                         "session_id": "thr_parent",
                         "tool_name": "multi_agent_v1__send_input",
                         "tool_input": {"target": "agent_1"},
                     },
-                    now=1_002.0,
+                    now=1_003.0,
                 )
                 stored = json.loads(record_path.read_text(encoding="utf-8"))
 
         self.assertTrue(result["allowed"])
         self.assertEqual(result["reason_codes"], [])
+        self.assertTrue(direct_result["allowed"])
+        self.assertEqual(direct_result["reason_codes"], [])
         self.assertEqual(stored["agents"][0]["activity_state"], "active")
 
     def test_nonterminal_wait_status_keeps_resumed_native_agent_active(self) -> None:
