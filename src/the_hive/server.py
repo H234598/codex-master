@@ -24144,24 +24144,25 @@ class _ResourceMonitorPrimaryFailure(Exception):
         self.error = error
 
 
-def install_resource_scope_gate(
-    *,
-    root: Path | None = None,
-    target: Path | None = None,
-) -> dict[str, Any]:
+def _resource_scope_gate_source_bytes() -> bytes:
+    try:
+        layout, _release_root, _generation = _resource_monitor_current_release_layout()
+        return layout.read_attested_file("bin/the-hive-resource-scope-gate")
+    except Exception as exc:
+        raise AgentError("resource_scope_gate_source_invalid") from exc
+
+
+def install_resource_scope_gate(*, target: Path | None = None) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise AgentError("resource_scope_gate_install_requires_root")
-    root = root or repo_root()
     target = target or Path(RESOURCE_SCOPE_GATE_PATH)
     if (
-        not isinstance(root, Path)
-        or not isinstance(target, Path)
+        not isinstance(target, Path)
         or not target.is_absolute()
         or target.name != RESOURCE_SCOPE_GATE_NAME
     ):
         raise AgentError("resource_scope_gate_target_untrusted")
-    source = root / "bin" / RESOURCE_SCOPE_GATE_NAME
-    raw, _source_stat = _resource_monitor_read_source(source)
+    raw = _resource_scope_gate_source_bytes()
     try:
         parent_stat = target.parent.lstat()
     except OSError as exc:
@@ -24195,11 +24196,18 @@ def install_resource_scope_gate(
                 "status": "already_installed",
                 "raw_output": "not_returned",
             }
+        if installed_stat is not None:
+            raise AgentError("resource_scope_gate_target_untrusted")
         staged_name, _staged_stat = _resource_monitor_temp_bytes(
             directory_fd, target.name, raw, 0o755
         )
-        os.replace(
-            staged_name, target.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+        _fleet_rename_noreplace_at(
+            directory_fd,
+            staged_name,
+            target.name,
+            _staged_stat,
+            "resource_scope_gate_install_failed",
+            collision_text="resource_scope_gate_target_untrusted",
         )
         staged_name = None
         os.fsync(directory_fd)

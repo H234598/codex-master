@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import runpy
 import subprocess
+from unittest.mock import patch
 
 import pytest
 
@@ -44,6 +45,15 @@ NOW = datetime(2026, 8, 31, 12, tzinfo=UTC)
 # Private structural builder fixture only, never Git provenance. Production
 # publication separately verifies the real commit through _verified_release_commit.
 TEST_STRUCTURAL_COMMIT = "a" * 40
+
+
+class _RootInstallerOS:
+    def __getattr__(self, name: str) -> object:
+        return getattr(os, name)
+
+    @staticmethod
+    def geteuid() -> int:
+        return 0
 
 
 def _p2_checkout(tmp_path: Path) -> Path:
@@ -175,6 +185,71 @@ def _p2_runtime_image(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     )
     assert RuntimeLayout.from_runtime_root(stage).root == stage
     return stage, state_root, installer
+
+
+def test_attested_runtime_scope_gate_installer_uses_generation_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    stage, _state_root, _installer = _p2_runtime_image(tmp_path)
+    layout = RuntimeLayout.from_runtime_root(stage)
+    expected = (stage / "bin" / "the-hive-resource-scope-gate").read_bytes()
+
+    staged_server = runpy.run_path(str(stage / "src" / "the_hive" / "server.py"))
+    assert staged_server["repo_root"]() == stage
+
+    target = tmp_path / "libexec" / "the-hive-resource-scope-gate"
+    target.parent.mkdir()
+    install_globals = staged_server["install_resource_scope_gate"].__globals__
+    install_globals["RESOURCE_SCOPE_GATE_PATH"] = target
+    install_globals["_resource_monitor_current_release_layout"] = (
+        lambda: (layout, stage.parent, stage.name)
+    )
+    install_globals["os"] = _RootInstallerOS()
+    with patch.dict(install_globals):
+        result = staged_server["main_cli"](["install-resource-scope-gate"])
+
+    assert result == 0
+    assert '"status": "installed"' in capsys.readouterr().out
+    assert target.read_bytes() == expected
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+def test_runtime_stage_validator_rejects_unattested_scope_gate_bytes(
+    tmp_path: Path,
+) -> None:
+    stage, _state_root, installer = _p2_runtime_image(tmp_path)
+    gate = stage / "bin" / "the-hive-resource-scope-gate"
+    gate.write_bytes(gate.read_bytes() + b"# changed after manifest\n")
+
+    with pytest.raises(installer["InstallError"], match="^install_stage_validation_failed$"):
+        installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
+
+
+def test_attested_scope_gate_installer_rejects_changed_generation_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    stage, _state_root, _installer = _p2_runtime_image(tmp_path)
+    layout = RuntimeLayout.from_runtime_root(stage)
+    attested_gate = layout.read_attested_file("bin/the-hive-resource-scope-gate")
+    staged_server = runpy.run_path(str(stage / "src" / "the_hive" / "server.py"))
+    target = tmp_path / "libexec" / "the-hive-resource-scope-gate"
+    target.parent.mkdir()
+    install_globals = staged_server["install_resource_scope_gate"].__globals__
+    install_globals["RESOURCE_SCOPE_GATE_PATH"] = target
+    install_globals["_resource_monitor_current_release_layout"] = (
+        lambda: (layout, stage.parent, stage.name)
+    )
+    install_globals["os"] = _RootInstallerOS()
+
+    (stage / "bin" / "the-hive-resource-scope-gate").write_bytes(
+        attested_gate + b"# changed after launcher attestation\n"
+    )
+    with patch.dict(install_globals):
+        result = staged_server["main_cli"](["install-resource-scope-gate"])
+
+    assert result == 1
+    assert "resource_scope_gate_source_invalid" in capsys.readouterr().out
+    assert not target.exists()
 
 
 def _published_launcher_release(
