@@ -1,0 +1,754 @@
+#!/usr/bin/python3
+"""Install only the operator-pinned gate from a current user release."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Callable
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+
+
+_GATE_NAME = "the-hive-resource-scope-gate"
+_GATE_MEMBER = "bin/the-hive-resource-scope-gate"
+_POINTER_NAME = ".the-hive-release-pointers.json"
+_PUBLISH_LOCK_NAME = ".the-hive-release-publish.lock"
+_MANIFEST_NAME = ".the-hive-runtime-manifest.json"
+_MAX_POINTER_BYTES = 64 * 1024
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_GATE_BYTES = 1024 * 1024
+_RELEASE_ROOT_RELATIVE = (".local", "lib", "the-hive-runtime")
+_TARGET_DIRECTORY = Path("/usr/libexec")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_GENERATION = re.compile(r"^[0-9a-f]{40}$")
+_UID = re.compile(r"^[1-9][0-9]*$")
+_RENAME_NOREPLACE = 1
+
+
+class GateInstallError(RuntimeError):
+    """A redacted fail-closed result for the fixed root consumer."""
+
+
+def _fail(code: str) -> GateInstallError:
+    return GateInstallError(code)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate_json_key")
+        value[key] = item
+    return value
+
+
+def _canonical_json(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def _open_directory_at(parent_fd: int, name: str, *, uid: int, mode: int) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != uid
+            or stat.S_IMODE(info.st_mode) != mode
+        ):
+            os.close(descriptor)
+            raise _fail("release_directory_untrusted")
+        path_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _identity(path_info) != _identity(info):
+            os.close(descriptor)
+            raise _fail("release_directory_changed")
+        return descriptor, info
+    except GateInstallError:
+        raise
+    except OSError as exc:
+        raise _fail("release_directory_untrusted") from exc
+
+
+def _open_directory_chain(
+    path: Path, *, root_protected: bool = False
+) -> tuple[int, os.stat_result]:
+    if not isinstance(path, Path) or not path.is_absolute() or path != Path(os.path.normpath(path)):
+        raise _fail("release_directory_untrusted")
+    try:
+        descriptor = os.open("/", _directory_flags())
+        info = os.fstat(descriptor)
+        for part in path.parts[1:]:
+            child = os.open(part, _directory_flags(), dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                raise _fail("release_directory_untrusted")
+            if root_protected and (
+                info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022
+            ):
+                raise _fail("gate_target_directory_untrusted")
+        return descriptor, info
+    except GateInstallError:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise _fail("release_directory_untrusted") from exc
+
+
+def _open_user_release_root(release_root: Path, *, uid: int) -> tuple[int, os.stat_result]:
+    if (
+        release_root.name != "the-hive-runtime"
+        or release_root.parent.name != "lib"
+        or release_root.parent.parent.name != ".local"
+    ):
+        raise _fail("release_root_untrusted")
+    home = release_root.parents[2]
+    descriptor, home_info = _open_directory_chain(home)
+    if (
+        home_info.st_uid != uid
+        or stat.S_IMODE(home_info.st_mode) & 0o022
+    ):
+        os.close(descriptor)
+        raise _fail("release_root_untrusted")
+    try:
+        for name in _RELEASE_ROOT_RELATIVE:
+            child, _info = _open_directory_at(
+                descriptor, name, uid=uid, mode=0o700
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, os.fstat(descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _assert_release_lease(
+    release_root: Path,
+    *,
+    release_fd: int,
+    release_info: os.stat_result,
+    lock_fd: int,
+    uid: int,
+) -> None:
+    try:
+        held_root = os.fstat(release_fd)
+        if (
+            _identity(held_root) != _identity(release_info)
+            or held_root.st_uid != uid
+            or stat.S_IMODE(held_root.st_mode) != 0o700
+        ):
+            raise _fail("release_source_changed")
+        path_fd, path_info = _open_user_release_root(release_root, uid=uid)
+        try:
+            if _identity(path_info) != _identity(held_root):
+                raise _fail("release_source_changed")
+        finally:
+            os.close(path_fd)
+
+        lock_path_info = os.stat(
+            _PUBLISH_LOCK_NAME, dir_fd=release_fd, follow_symlinks=False
+        )
+        held_lock = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_path_info.st_mode)
+            or lock_path_info.st_uid != uid
+            or lock_path_info.st_nlink != 1
+            or stat.S_IMODE(lock_path_info.st_mode) != 0o600
+            or _identity(lock_path_info) != _identity(held_lock)
+            or held_lock.st_uid != uid
+            or held_lock.st_nlink != 1
+            or stat.S_IMODE(held_lock.st_mode) != 0o600
+        ):
+            raise _fail("release_publish_lock_changed")
+    except GateInstallError:
+        raise
+    except OSError as exc:
+        raise _fail("release_source_changed") from exc
+
+
+def _open_release_read_lease(
+    release_root: Path, *, uid: int
+) -> tuple[int, os.stat_result, int]:
+    root_fd = -1
+    lock_fd = -1
+    try:
+        root_fd, root_info = _open_user_release_root(release_root, uid=uid)
+        before = os.stat(
+            _PUBLISH_LOCK_NAME, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise _fail("release_publish_lock_untrusted")
+        lock_fd = os.open(
+            _PUBLISH_LOCK_NAME,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(lock_fd)
+        if _identity(opened) != _identity(before):
+            raise _fail("release_publish_lock_changed")
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        _assert_release_lease(
+            release_root,
+            release_fd=root_fd,
+            release_info=root_info,
+            lock_fd=lock_fd,
+            uid=uid,
+        )
+        return root_fd, root_info, lock_fd
+    except GateInstallError:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise
+    except OSError as exc:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise _fail("release_publish_lock_untrusted") from exc
+
+
+def _read_regular_at(
+    parent_fd: int,
+    name: str,
+    *,
+    uid: int,
+    mode: int,
+    maximum: int,
+    error: str,
+) -> tuple[bytes, os.stat_result]:
+    descriptor = -1
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != mode
+            or not 0 < before.st_size <= maximum
+        ):
+            raise _fail(error)
+        descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if _identity(opened) != _identity(before):
+            raise _fail(error)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise _fail(error)
+        after = os.fstat(descriptor)
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _identity(after) != _identity(opened)
+            or _identity(rebound) != _identity(opened)
+            or after.st_uid != uid
+            or after.st_nlink != 1
+            or stat.S_IMODE(after.st_mode) != mode
+            or after.st_size != total
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise _fail(error)
+        return b"".join(chunks), after
+    except GateInstallError:
+        raise
+    except OSError as exc:
+        raise _fail(error) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _parse_json(raw: bytes, *, error: str) -> dict[str, object]:
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise _fail(error) from exc
+    if not isinstance(value, dict):
+        raise _fail(error)
+    return value
+
+
+def _valid_pointer_entry(value: object) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"generation", "manifest_digest"}:
+        raise _fail("release_pointer_invalid")
+    generation = value.get("generation")
+    digest = value.get("manifest_digest")
+    if not isinstance(generation, str) or _GENERATION.fullmatch(generation) is None:
+        raise _fail("release_pointer_invalid")
+    if not isinstance(digest, str) or not digest.startswith("sha256:") or _DIGEST.fullmatch(digest[7:]) is None:
+        raise _fail("release_pointer_invalid")
+    return {"generation": generation, "manifest_digest": digest}
+
+
+def _read_pinned_gate(
+    release_root: Path,
+    *,
+    uid: int,
+    generation: str,
+    manifest_sha256: str,
+    release_fd: int,
+    release_info: os.stat_result,
+    lock_fd: int,
+) -> bytes:
+    if (
+        type(uid) is not int
+        or uid <= 0
+        or not isinstance(generation, str)
+        or _GENERATION.fullmatch(generation) is None
+        or not isinstance(manifest_sha256, str)
+        or _DIGEST.fullmatch(manifest_sha256) is None
+    ):
+        raise _fail("operator_pin_invalid")
+    generations_fd = -1
+    generation_fd = -1
+    bin_fd = -1
+    try:
+        _assert_release_lease(
+            release_root,
+            release_fd=release_fd,
+            release_info=release_info,
+            lock_fd=lock_fd,
+            uid=uid,
+        )
+        pointer_raw, pointer_info = _read_regular_at(
+            release_fd,
+            _POINTER_NAME,
+            uid=uid,
+            mode=0o644,
+            maximum=_MAX_POINTER_BYTES,
+            error="release_pointer_invalid",
+        )
+        pointer = _parse_json(pointer_raw, error="release_pointer_invalid")
+        if (
+            set(pointer) != {"schema_version", "current", "previous"}
+            or type(pointer.get("schema_version")) is not int
+            or pointer.get("schema_version") != 1
+            or _canonical_json(pointer) != pointer_raw
+        ):
+            raise _fail("release_pointer_invalid")
+        current = _valid_pointer_entry(pointer.get("current"))
+        _valid_pointer_entry(pointer.get("previous"))
+        if current != {
+            "generation": generation,
+            "manifest_digest": f"sha256:{manifest_sha256}",
+        }:
+            raise _fail("operator_pin_not_current")
+
+        generations_fd, generations_info = _open_directory_at(
+            release_fd, "generations", uid=uid, mode=0o700
+        )
+        generation_fd, generation_info = _open_directory_at(
+            generations_fd, generation, uid=uid, mode=0o700
+        )
+        manifest_raw, manifest_info = _read_regular_at(
+            generation_fd,
+            _MANIFEST_NAME,
+            uid=uid,
+            mode=0o644,
+            maximum=_MAX_MANIFEST_BYTES,
+            error="runtime_manifest_invalid",
+        )
+        if hashlib.sha256(manifest_raw).hexdigest() != manifest_sha256:
+            raise _fail("runtime_manifest_pin_mismatch")
+        manifest = _parse_json(manifest_raw, error="runtime_manifest_invalid")
+        if (
+            type(manifest.get("schema_version")) is not int
+            or manifest.get("schema_version") != 2
+            or manifest.get("generation") != generation
+            or manifest.get("commit") != generation
+        ):
+            raise _fail("runtime_manifest_invalid")
+        directories = manifest.get("directories")
+        root_entry = directories.get(".") if isinstance(directories, dict) else None
+        bin_entry = directories.get("bin") if isinstance(directories, dict) else None
+        if (
+            not isinstance(root_entry, dict)
+            or root_entry.get("mode") != 0o700
+            or not isinstance(bin_entry, dict)
+            or bin_entry.get("mode") != 0o700
+        ):
+            raise _fail("runtime_manifest_invalid")
+
+        bin_fd, bin_info = _open_directory_at(generation_fd, "bin", uid=uid, mode=0o700)
+        files = manifest.get("files")
+        member = files.get(_GATE_MEMBER) if isinstance(files, dict) else None
+        if (
+            not isinstance(member, dict)
+            or set(member) != {"mode", "nlink", "size", "sha256"}
+            or member.get("mode") != 0o755
+            or member.get("nlink") != 1
+            or type(member.get("size")) is not int
+            or not 0 < member["size"] <= _MAX_GATE_BYTES
+            or not isinstance(member.get("sha256"), str)
+            or _DIGEST.fullmatch(member["sha256"]) is None
+        ):
+            raise _fail("runtime_gate_manifest_member_invalid")
+        gate_raw, gate_info = _read_regular_at(
+            bin_fd,
+            _GATE_NAME,
+            uid=uid,
+            mode=0o755,
+            maximum=_MAX_GATE_BYTES,
+            error="runtime_gate_member_invalid",
+        )
+        if len(gate_raw) != member["size"] or hashlib.sha256(gate_raw).hexdigest() != member["sha256"]:
+            raise _fail("runtime_gate_digest_mismatch")
+
+        pointer_check, pointer_check_info = _read_regular_at(
+            release_fd,
+            _POINTER_NAME,
+            uid=uid,
+            mode=0o644,
+            maximum=_MAX_POINTER_BYTES,
+            error="release_pointer_changed",
+        )
+        manifest_check, manifest_check_info = _read_regular_at(
+            generation_fd,
+            _MANIFEST_NAME,
+            uid=uid,
+            mode=0o644,
+            maximum=_MAX_MANIFEST_BYTES,
+            error="runtime_manifest_changed",
+        )
+        gate_check, gate_check_info = _read_regular_at(
+            bin_fd,
+            _GATE_NAME,
+            uid=uid,
+            mode=0o755,
+            maximum=_MAX_GATE_BYTES,
+            error="runtime_gate_member_changed",
+        )
+        if (
+            pointer_check != pointer_raw
+            or _identity(pointer_check_info) != _identity(pointer_info)
+            or manifest_check != manifest_raw
+            or _identity(manifest_check_info) != _identity(manifest_info)
+            or gate_check != gate_raw
+            or _identity(gate_check_info) != _identity(gate_info)
+        ):
+            raise _fail("release_source_changed")
+
+        generations_recheck_fd, generations_recheck = _open_directory_at(
+            release_fd, "generations", uid=uid, mode=0o700
+        )
+        try:
+            if _identity(generations_recheck) != _identity(generations_info):
+                raise _fail("release_source_changed")
+            generation_recheck_fd, generation_recheck = _open_directory_at(
+                generations_recheck_fd, generation, uid=uid, mode=0o700
+            )
+            try:
+                if _identity(generation_recheck) != _identity(generation_info):
+                    raise _fail("release_source_changed")
+            finally:
+                os.close(generation_recheck_fd)
+        finally:
+            os.close(generations_recheck_fd)
+        bin_recheck_fd, bin_recheck = _open_directory_at(
+            generation_fd, "bin", uid=uid, mode=0o700
+        )
+        try:
+            if _identity(bin_recheck) != _identity(bin_info):
+                raise _fail("release_source_changed")
+        finally:
+            os.close(bin_recheck_fd)
+        _assert_release_lease(
+            release_root,
+            release_fd=release_fd,
+            release_info=release_info,
+            lock_fd=lock_fd,
+            uid=uid,
+        )
+        return gate_raw
+    finally:
+        for descriptor in (bin_fd, generation_fd, generations_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _write_all(fd: int, raw: bytes) -> None:
+    view = memoryview(raw)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise _fail("gate_stage_write_failed")
+        view = view[written:]
+
+
+def _rename_noreplace(directory_fd: int, source: str, target: str) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as exc:
+        raise _fail("atomic_noreplace_unavailable") from exc
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(target),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise _fail("gate_target_race")
+        raise _fail("atomic_noreplace_unavailable") from OSError(error, os.strerror(error))
+
+
+def _publish_gate(
+    directory_fd: int,
+    raw: bytes,
+    digest: str,
+    *,
+    verify_source: Callable[[], None] | None = None,
+) -> str:
+    if not isinstance(raw, bytes) or not raw or _DIGEST.fullmatch(digest) is None:
+        raise _fail("gate_publish_unavailable")
+    directory = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or directory.st_uid != os.geteuid()
+        or stat.S_IMODE(directory.st_mode) != 0o755
+    ):
+        raise _fail("gate_target_directory_untrusted")
+    stage_name = f".{_GATE_NAME}.{digest}.stage"
+    locked = False
+    try:
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            locked = True
+        except OSError as exc:
+            raise _fail("gate_publish_lock_unavailable") from exc
+        if verify_source is not None:
+            verify_source()
+        try:
+            installed, info = _read_regular_at(
+                directory_fd,
+                _GATE_NAME,
+                uid=os.geteuid(),
+                mode=0o755,
+                maximum=_MAX_GATE_BYTES,
+                error="gate_target_untrusted",
+            )
+        except GateInstallError as exc:
+            if str(exc) != "gate_target_untrusted":
+                raise
+            try:
+                os.stat(_GATE_NAME, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                installed = None
+                info = None
+            else:
+                raise
+        if installed is not None:
+            if installed != raw or info is None or info.st_nlink != 1:
+                raise _fail("gate_target_untrusted")
+            os.fsync(directory_fd)
+            return "already_installed"
+
+        try:
+            stage_raw, stage_info = _read_regular_at(
+                directory_fd,
+                stage_name,
+                uid=os.geteuid(),
+                mode=0o755,
+                maximum=_MAX_GATE_BYTES,
+                error="gate_stage_untrusted",
+            )
+        except GateInstallError as exc:
+            if str(exc) != "gate_stage_untrusted":
+                raise
+            try:
+                os.stat(stage_name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                stage_raw = None
+                stage_info = None
+            else:
+                raise
+        if stage_raw is None:
+            if verify_source is not None:
+                verify_source()
+            stage_fd = -1
+            try:
+                stage_fd = os.open(
+                    stage_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                os.fchmod(stage_fd, 0o755)
+                _write_all(stage_fd, raw)
+                os.fsync(stage_fd)
+                stage_info = os.fstat(stage_fd)
+                if (
+                    not stat.S_ISREG(stage_info.st_mode)
+                    or stage_info.st_uid != os.geteuid()
+                    or stage_info.st_nlink != 1
+                    or stat.S_IMODE(stage_info.st_mode) != 0o755
+                ):
+                    raise _fail("gate_stage_untrusted")
+                stage_raw = raw
+            except OSError as exc:
+                raise _fail("gate_stage_write_failed") from exc
+            finally:
+                if stage_fd >= 0:
+                    os.close(stage_fd)
+            os.fsync(directory_fd)
+        elif stage_raw != raw or stage_info is None:
+            raise _fail("gate_stage_untrusted")
+
+        if verify_source is not None:
+            verify_source()
+        try:
+            _rename_noreplace(directory_fd, stage_name, _GATE_NAME)
+        except GateInstallError as exc:
+            if str(exc) != "gate_target_race":
+                raise
+            installed, info = _read_regular_at(
+                directory_fd,
+                _GATE_NAME,
+                uid=os.geteuid(),
+                mode=0o755,
+                maximum=_MAX_GATE_BYTES,
+                error="gate_target_untrusted",
+            )
+            if installed != raw or info.st_nlink != 1:
+                raise _fail("gate_target_untrusted") from exc
+            os.fsync(directory_fd)
+            return "already_installed"
+        os.fsync(directory_fd)
+        installed, info = _read_regular_at(
+            directory_fd,
+            _GATE_NAME,
+            uid=os.geteuid(),
+            mode=0o755,
+            maximum=_MAX_GATE_BYTES,
+            error="gate_target_untrusted",
+        )
+        if installed != raw or info.st_nlink != 1:
+            raise _fail("gate_target_untrusted")
+        return "installed"
+    except GateInstallError:
+        raise
+    except OSError as exc:
+        raise _fail("gate_publish_failed") from exc
+    finally:
+        if locked:
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
+
+
+def _install_for_uid(uid: int, generation: str, manifest_sha256: str) -> str:
+    if os.geteuid() != 0:
+        raise _fail("root_required")
+    if type(uid) is not int or uid <= 0:
+        raise _fail("operator_pin_invalid")
+    try:
+        home = Path(pwd.getpwuid(uid).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise _fail("operator_uid_unknown") from exc
+    release_root = home.joinpath(*_RELEASE_ROOT_RELATIVE)
+    release_fd, release_info, lock_fd = _open_release_read_lease(
+        release_root, uid=uid
+    )
+    try:
+        raw = _read_pinned_gate(
+            release_root,
+            uid=uid,
+            generation=generation,
+            manifest_sha256=manifest_sha256,
+            release_fd=release_fd,
+            release_info=release_info,
+            lock_fd=lock_fd,
+        )
+        target_fd = -1
+        try:
+            target_fd, target_info = _open_directory_chain(
+                _TARGET_DIRECTORY, root_protected=True
+            )
+            if target_info.st_uid != 0 or stat.S_IMODE(target_info.st_mode) != 0o755:
+                raise _fail("gate_target_directory_untrusted")
+            return _publish_gate(
+                target_fd,
+                raw,
+                hashlib.sha256(raw).hexdigest(),
+                verify_source=lambda: _assert_release_lease(
+                    release_root,
+                    release_fd=release_fd,
+                    release_info=release_info,
+                    lock_fd=lock_fd,
+                    uid=uid,
+                ),
+            )
+        finally:
+            if target_fd >= 0:
+                os.close(target_fd)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+            os.close(release_fd)
+
+
+def _parse_uid(value: str) -> int:
+    if not isinstance(value, str) or _UID.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("uid_must_be_canonical_positive_decimal")
+    uid = int(value)
+    if uid > 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("uid_out_of_range")
+    return uid
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="install-the-hive-resource-scope-gate")
+    parser.add_argument("--uid", required=True, type=_parse_uid)
+    parser.add_argument("--generation", required=True)
+    parser.add_argument("--manifest-sha256", required=True)
+    args = parser.parse_args(argv)
+    try:
+        status = _install_for_uid(args.uid, args.generation, args.manifest_sha256)
+    except GateInstallError as exc:
+        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        return 1
+    print(json.dumps({"status": status}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

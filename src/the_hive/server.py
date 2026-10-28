@@ -146,7 +146,6 @@ from the_hive.resource_cgroup import (
     CgroupProfileV1,
     CgroupIoPressureEvidenceV1,
     PreparedAgentScope,
-    RESOURCE_SCOPE_GATE_PATH,
     REQUIRED_CONTROLLERS,
     read_hive_io_pressure,
     SystemdUserCgroupAdapter,
@@ -941,7 +940,6 @@ RESOURCE_MONITOR_UNIT_NAMES = (
     RESOURCE_MONITOR_SERVICE_NAME,
     RESOURCE_MONITOR_SLICE_NAME,
 )
-RESOURCE_SCOPE_GATE_NAME = "the-hive-resource-scope-gate"
 MAX_SYSTEMD_UNIT_BYTES = 64 * 1024
 MAX_SYSTEMD_SECURITY_OUTPUT_BYTES = 64 * 1024
 RESOURCE_MONITOR_SYSTEMCTL_TIMEOUT_SECONDS = 15.0
@@ -24144,100 +24142,6 @@ class _ResourceMonitorPrimaryFailure(Exception):
         self.error = error
 
 
-def _resource_scope_gate_source_bytes() -> bytes:
-    try:
-        layout, _release_root, _generation = _resource_monitor_current_release_layout()
-        return layout.read_attested_file("bin/the-hive-resource-scope-gate")
-    except Exception as exc:
-        raise AgentError("resource_scope_gate_source_invalid") from exc
-
-
-def install_resource_scope_gate(*, target: Path | None = None) -> dict[str, Any]:
-    if os.geteuid() != 0:
-        raise AgentError("resource_scope_gate_install_requires_root")
-    target = target or Path(RESOURCE_SCOPE_GATE_PATH)
-    if (
-        not isinstance(target, Path)
-        or not target.is_absolute()
-        or target.name != RESOURCE_SCOPE_GATE_NAME
-    ):
-        raise AgentError("resource_scope_gate_target_untrusted")
-    raw = _resource_scope_gate_source_bytes()
-    try:
-        parent_stat = target.parent.lstat()
-    except OSError as exc:
-        raise AgentError("resource_scope_gate_target_untrusted") from exc
-    if not stat_module.S_ISDIR(
-        parent_stat.st_mode
-    ) or not directory_chain_is_real_no_symlink(target.parent):
-        raise AgentError("resource_scope_gate_target_untrusted")
-    directory_fd = -1
-    staged_name: str | None = None
-    try:
-        try:
-            directory_fd = _resource_monitor_open_directory(target.parent)
-        except AgentError as exc:
-            raise AgentError("resource_scope_gate_target_untrusted") from exc
-        try:
-            installed, installed_stat = _resource_monitor_read_regular_at_fd(
-                directory_fd,
-                target.name,
-                missing_ok=True,
-            )
-        except AgentError as exc:
-            raise AgentError("resource_scope_gate_target_untrusted") from exc
-        if (
-            installed == raw
-            and installed_stat is not None
-            and stat_module.S_IMODE(installed_stat.st_mode) == 0o755
-        ):
-            return {
-                "ok": True,
-                "status": "already_installed",
-                "raw_output": "not_returned",
-            }
-        if installed_stat is not None:
-            raise AgentError("resource_scope_gate_target_untrusted")
-        staged_name, _staged_stat = _resource_monitor_temp_bytes(
-            directory_fd, target.name, raw, 0o755
-        )
-        _fleet_rename_noreplace_at(
-            directory_fd,
-            staged_name,
-            target.name,
-            _staged_stat,
-            "resource_scope_gate_install_failed",
-            collision_text="resource_scope_gate_target_untrusted",
-        )
-        staged_name = None
-        os.fsync(directory_fd)
-        try:
-            verified, verified_stat = _resource_monitor_read_regular_at_fd(
-                directory_fd,
-                target.name,
-                missing_ok=False,
-            )
-        except AgentError as exc:
-            raise AgentError("resource_scope_gate_target_untrusted") from exc
-        if (
-            verified != raw
-            or verified_stat is None
-            or stat_module.S_IMODE(verified_stat.st_mode) != 0o755
-        ):
-            raise AgentError("resource_scope_gate_target_untrusted")
-        return {"ok": True, "status": "installed", "raw_output": "not_returned"}
-    except AgentError:
-        raise
-    except OSError as exc:
-        raise AgentError("resource_scope_gate_install_failed") from exc
-    finally:
-        if staged_name is not None and directory_fd >= 0:
-            with contextlib.suppress(OSError):
-                os.unlink(staged_name, dir_fd=directory_fd)
-        if directory_fd >= 0:
-            os.close(directory_fd)
-
-
 def native_hook_coverage_status(
     *, root: Path | None = None, now: float | None = None
 ) -> dict[str, Any]:
@@ -39512,13 +39416,8 @@ def _resource_monitor_install_cli(argv: list[str]) -> int:
 def _resource_scope_gate_install_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="the-hive-mcp install-resource-scope-gate")
     parser.parse_args(argv)
-    try:
-        result = install_resource_scope_gate()
-        print_json(result)
-        return 0 if result.get("ok") else 1
-    except Exception as exc:
-        print_json(public_error_payload(exc))
-        return 1
+    print_json({"error": "resource_scope_gate_root_consumer_required"})
+    return 1
 
 
 def _resource_monitor_status_cli(argv: list[str]) -> int:
