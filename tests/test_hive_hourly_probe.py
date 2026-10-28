@@ -271,6 +271,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     )
     write("bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
+    write("bin/the-hive-resource-scope-gate", "#!/bin/sh\nexit 0\n", 0o755)
     write("systemd/user/the-hive-resource-monitor.service", "[Service]\n")
     write("systemd/user/the-hive.slice", "[Slice]\n")
     write("systemd/user/the-hive-openai-pricing.service", "[Service]\n")
