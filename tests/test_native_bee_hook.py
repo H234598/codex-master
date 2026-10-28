@@ -993,6 +993,50 @@ class NativeRegistryCleanupTest(unittest.TestCase):
             ),
         )
 
+    def test_hook_writer_persists_lifecycle_reference_before_ttl_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            observed = []
+
+            def record_reference(_store, *, reference_id, now):
+                observed.append((reference_id, now))
+
+            try:
+                with (
+                    patch.object(self.hook, "_hook_state_root", return_value=root),
+                    patch(
+                        "the_hive.native_registry.retained_pin_session_ids",
+                        return_value=frozenset(),
+                    ),
+                    patch(
+                        "the_hive.worktree_lifecycle.WorktreeLifecycleStore.reserve_native_reference",
+                        autospec=True,
+                        side_effect=record_reference,
+                    ) as reserve,
+                ):
+                    self.assertTrue(
+                        self.hook._write_registry(
+                            root_fd,
+                            self.registry(
+                                reservations=[
+                                    {
+                                        "reservation_id": "expired",
+                                        "kind": "native_spawn",
+                                        "created_at": 1,
+                                        "parent_session_id": "parent",
+                                    }
+                                ]
+                            ),
+                            now=2_000,
+                        )
+                    )
+                reserve.assert_called_once()
+                self.assertEqual(observed[0][0], "native-registry-cleanup")
+                self.assertEqual(self.hook._read_registry(root_fd)["reservations"], [])
+            finally:
+                os.close(root_fd)
+
     def test_atomic_byte_rejection_preserves_file_and_protected_reservations(self):
         rows = [
             self.agent(i, "active", parent="p" * 128)

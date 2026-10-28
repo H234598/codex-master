@@ -26,6 +26,8 @@ if str(SRC_ROOT) not in sys.path:
 from the_hive.native_registry import (  # noqa: E402
     RegistryByteBudgetError, encode_registry_for_write, normalize_registry, reservation_is_live,
 )
+from the_hive.hive.state import HiveStateStore  # noqa: E402
+from the_hive.worktree_lifecycle import WorktreeLifecycleStore  # noqa: E402
 
 
 def _read_payload() -> dict[str, object] | None:
@@ -102,8 +104,19 @@ def _read_registry(root_fd: int) -> dict[str, object] | None:
 
 
 def _write_registry(root_fd: int, registry: dict[str, object], *, now: float | None = None) -> bool:
+    timestamp = time.time() if now is None else now
+    if any(registry.get(key) for key in ("agents", "sessions", "reservations")):
+        try:
+            WorktreeLifecycleStore(
+                HiveStateStore(_hook_state_root() / "hive")
+            ).reserve_native_reference(
+                reference_id="native-registry-cleanup", now=int(timestamp)
+            )
+        except Exception:
+            sys.stderr.write("error_code=native_lifecycle_protection_unavailable\n")
+            return False
     try:
-        encoded = encode_registry_for_write(registry, now=time.time() if now is None else now, max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES)
+        encoded = encode_registry_for_write(registry, now=timestamp, max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES)
     except RegistryByteBudgetError:
         sys.stderr.write("error_code=native_registry_byte_budget_exceeded\n")
         return False
@@ -402,9 +415,13 @@ def main() -> int:
             )
             return 0
         try:
-            from the_hive.server import activate_native_agent_resume
+            from the_hive.server import (
+                activate_native_agent_resume,
+                native_hook_source_context,
+            )
 
-            result = activate_native_agent_resume(payload)
+            with native_hook_source_context():
+                result = activate_native_agent_resume(payload)
         except Exception:
             result = {
                 "allowed": False,

@@ -213,6 +213,21 @@ _RUNTIME_IMAGE_FILES = (
         "systemd/user/the-hive-openai-pricing.timer",
         0o644,
     ),
+    (
+        "systemd/user/the-hive-worktree-maintenance.service",
+        "systemd/user/the-hive-worktree-maintenance.service",
+        0o644,
+    ),
+    (
+        "systemd/user/the-hive-worktree-maintenance.timer",
+        "systemd/user/the-hive-worktree-maintenance.timer",
+        0o644,
+    ),
+    (
+        "docs/operations/worktree-maintenance.md",
+        "share/doc/the-hive/worktree-maintenance.md",
+        0o644,
+    ),
 )
 _RUNTIME_IMAGE_TREES = (
     ("src/the_hive", "src/the_hive"),

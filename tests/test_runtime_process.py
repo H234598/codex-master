@@ -120,6 +120,53 @@ def _wait_for_fifo_eof(
     pytest.fail("manager lifetime did not close the live child event")
 
 
+def test_g5_scope_reference_requires_same_invocation_and_empty_bound_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import the_hive.runtime_process as runtime_process
+
+    unit = "the-hive-resource-0123456789abcdef0123456789abcdef.scope"
+    cgroup = tmp_path / "the-hive.slice" / unit
+    cgroup.mkdir(parents=True)
+    (cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
+    (cgroup / "cgroup.procs").write_text("123\n", encoding="ascii")
+    invocation = "a" * 32
+    snapshot = {
+        "ControlGroup": f"/the-hive.slice/{unit}",
+        "InvocationID": invocation,
+        "LoadState": "loaded",
+    }
+
+    def fake_systemctl(args, *, environment, deadline):
+        del environment, deadline
+        assert args[-1] == unit
+        return "".join(f"{key}={value}\n" for key, value in snapshot.items()).encode()
+
+    monkeypatch.setattr(runtime_process, "_CGROUP_ROOT", tmp_path)
+    monkeypatch.setattr(runtime_process, "_systemctl", fake_systemctl)
+
+    identity = runtime_process.bind_g5_scope(unit, f"/the-hive.slice/{unit}")
+
+    (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+    (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+    assert runtime_process.g5_scope_is_empty(identity)
+
+    (cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
+    (cgroup / "cgroup.procs").write_text("321\n", encoding="ascii")
+    assert not runtime_process.g5_scope_is_empty(identity)
+
+    snapshot["InvocationID"] = "b" * 32
+    assert not runtime_process.g5_scope_is_empty(identity)
+
+    (cgroup / "cgroup.events").unlink()
+    (cgroup / "cgroup.procs").unlink()
+    cgroup.rmdir()
+    snapshot.update(
+        {"ControlGroup": "", "InvocationID": "", "LoadState": "not-found"}
+    )
+    assert runtime_process.g5_scope_is_empty(identity)
+
+
 def _test_unit_properties(
     runtime_process: object,
     unit: str,

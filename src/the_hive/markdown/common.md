@@ -38,6 +38,12 @@ und noch gültigem Evidence-Reuse-Fenster wiederverwendet werden. Andernfalls de
 Test neu ausführen. Vorgeschriebene Voll- und Release-Gates bleiben verbindlich
 und werden einmal am passenden Gate ausgeführt.
 
+## Hive-weite ShellCheck-Pflicht
+
+- ShellCheck muss in allen Hive-Entwicklungs-, Ausführungs- und Prüfumgebungen installiert und über `shellcheck` ausführbar sein.
+- Setze ShellCheck sinnvoll ein, insbesondere wenn unterstützter Shellcode neu erstellt, geändert oder geprüft wird. Wähle den tatsächlichen Shell-Dialekt; ein Lintlauf ersetzt weder Syntaxprüfung noch funktionale Tests.
+- Behebe relevante Befunde. Begründe nötige Ausnahmen eng am betroffenen Code; pauschale Unterdrückungen sind kein Ersatz für eine Prüfung. Fehlt ShellCheck oder wurde die Prüfung nicht ausgeführt, darf kein erfolgreicher ShellCheck-Nachweis behauptet werden.
+
 ## Sprache in Dokumenten für Menschen
 
 Für die Userin oder andere Menschen bestimmte Dokumente dürfen keine
@@ -227,6 +233,12 @@ Jeder normale `rg`-Lauf enthält alle vier exakten Globs:
 verwenden. Explizite Suche im jeweils benannten pCloud-Namensraum ist die
 einzige Ausnahme. Diese gemeinsame Regel wird für jede Klasse und jedes Home
 beim Spawn und Resume mit diesem Common Hive context materialisiert.
+
+## Hive-weite Accountwahl für neue TL- und Workerinnen-Sessions
+
+- Komplett neue Teamleiterinnen- und Workerinnen-Sessions, die keine vorhandene Session resumen, werden auf dem nächsten freien und benutzbaren Account mit der größten verbleibenden Wochenquote gestartet. Bei vergleichbaren Wochenrestquoten hat beispielsweise ein Account mit 70 % Vorrang vor einem Account mit 12 %.
+- Maßgeblich ist der aktuell verbleibende prozentuale Wochenanteil, nicht das feste Wochenkontingent oder die bereits verbrauchte Quote. Die Auswahl beruht auf gültiger, frischer und vergleichbarer Evidenz. Bestehende Authentifizierungs-, Quota-, Capability-, Ressourcen- und Reservierungsgates bleiben verbindlich; fehlende, veraltete oder unbekannte Wochenwerte dürfen nicht als verfügbare Quote erfunden werden.
+- Diese Erstwahlregel gilt nicht für Resumes. Bestehende Account- und Sessionbindungen sowie die Regeln für Accountwechsel und Context-Resets bleiben unverändert. Die neue Rangfolge erteilt keine Erlaubnis, aktive Sessions opportunistisch zu rotieren oder neu zu starten.
 
 ## OpenAI-Account- und Context-Reset-Policy
 

@@ -270,6 +270,11 @@ def test_wheel_contract_contains_installer_units_and_static_account_layout() -> 
             "systemd/tmpfiles.d/the-hive-agent-api.conf",
             "systemd/tmpfiles.d/the-hive-host-agent.conf"
         ],
+        "lib/the-hive/systemd/user": [
+            "systemd/user/the-hive-worktree-maintenance.service",
+            "systemd/user/the-hive-worktree-maintenance.timer",
+        ],
+        "share/doc/the-hive": ["docs/operations/worktree-maintenance.md"],
         "libexec/the-hive": ["scripts/install-host-agent"],
     }
 

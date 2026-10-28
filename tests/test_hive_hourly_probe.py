@@ -2609,6 +2609,33 @@ def test_manifest_failure_never_unlinks_a_swapped_foreign_manifest_tempfile(
     assert displaced_private_temp.exists()
 
 
+def test_worktree_maintenance_artifacts_are_in_private_runtime_stage(
+    tmp_path: Path,
+) -> None:
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    stage = tmp_path / "private-runtime-stage"
+    stage.mkdir(mode=0o700)
+    installer["_build_runtime_image"](
+        repository=ROOT,
+        stage=stage,
+        generation="fixture-generation",
+        commit=TEST_NON_F25_COMMIT,
+    )
+
+    service = stage / "systemd/user/the-hive-worktree-maintenance.service"
+    timer = stage / "systemd/user/the-hive-worktree-maintenance.timer"
+    manual = stage / "share/doc/the-hive/worktree-maintenance.md"
+    assert service.is_file()
+    assert timer.is_file()
+    assert manual.is_file()
+    assert (
+        "ExecStart=%h/.local/lib/the-hive-runtime/the-hive-mcp "
+        "worktree-maintenance run"
+    ) in service.read_text(encoding="utf-8")
+
+
 def test_runtime_spawn_helper_build_fails_closed_before_image_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

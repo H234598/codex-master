@@ -10,6 +10,7 @@ import errno
 import hashlib
 import os
 from pathlib import Path
+import re
 import secrets
 import selectors
 import signal
@@ -76,6 +77,32 @@ class BoundedProcessResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True, slots=True)
+class G5ScopeIdentity:
+    unit_name: str
+    control_group: str
+    invocation_id: str
+    device: int
+    inode: int
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"the-hive-resource-[0-9a-f]{32}\.scope", self.unit_name):
+            raise BoundedProcessError("command_group_unavailable")
+        if (
+            not isinstance(self.control_group, str)
+            or not self.control_group.startswith("/the-hive.slice/")
+            or self.control_group.rsplit("/", 1)[-1] != self.unit_name
+            or any(part in {".", ".."} for part in self.control_group.split("/"))
+        ):
+            raise BoundedProcessError("command_group_unavailable")
+        if not re.fullmatch(r"[0-9a-f]{32}", self.invocation_id):
+            raise BoundedProcessError("command_group_unavailable")
+        if type(self.device) is not int or self.device < 0:
+            raise BoundedProcessError("command_group_unavailable")
+        if type(self.inode) is not int or self.inode <= 0:
+            raise BoundedProcessError("command_group_unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +511,141 @@ def _open_cgroup_directory(cgroup: Path) -> tuple[int, tuple[int, int]]:
             descriptor = _close_descriptor(descriptor)
 
 
+def _g5_unit_snapshot(unit_name: str) -> tuple[str, str, str]:
+    if not re.fullmatch(r"the-hive-resource-[0-9a-f]{32}\.scope", unit_name):
+        raise BoundedProcessError("command_group_unavailable")
+    environment = minimal_environment(home=Path.home())
+    output = _systemctl(
+        (
+            "show",
+            "--property=ControlGroup",
+            "--property=InvocationID",
+            "--property=LoadState",
+            unit_name,
+        ),
+        environment=environment,
+        deadline=time.monotonic() + 5.0,
+    )
+    try:
+        lines = output.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or key in values:
+            raise BoundedProcessError("command_group_unavailable")
+        values[key] = value
+    if set(values) != {"ControlGroup", "InvocationID", "LoadState"}:
+        raise BoundedProcessError("command_group_unavailable")
+    if values["LoadState"] == "not-found":
+        if values["ControlGroup"] or values["InvocationID"]:
+            raise BoundedProcessError("command_group_unavailable")
+        return "", "", "not-found"
+    if values["LoadState"] != "loaded":
+        raise BoundedProcessError("command_group_unavailable")
+    if not re.fullmatch(r"[0-9a-f]{32}", values["InvocationID"]):
+        raise BoundedProcessError("command_group_unavailable")
+    cgroup = _cgroup_path(values["ControlGroup"].encode("ascii"))
+    control_group = "/" + str(cgroup.relative_to(_CGROUP_ROOT))
+    if control_group.rsplit("/", 1)[-1] != unit_name:
+        raise BoundedProcessError("command_group_unavailable")
+    return control_group, values["InvocationID"], values["LoadState"]
+
+
+def _read_g5_cgroup_file(descriptor: int, name: str) -> bytes:
+    file_descriptor = -1
+    try:
+        file_descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=descriptor,
+        )
+        chunks = bytearray()
+        while len(chunks) <= 4096:
+            chunk = os.read(file_descriptor, 4097 - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if len(chunks) > 4096:
+            raise BoundedProcessError("command_group_unavailable")
+        return bytes(chunks)
+    except BoundedProcessError:
+        raise
+    except OSError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    finally:
+        file_descriptor = _close_descriptor(file_descriptor)
+
+
+def bind_g5_scope(unit_name: str, expected_control_group: str) -> G5ScopeIdentity:
+    """Bind a confirmed G5 unit to its current InvocationID and cgroup inode."""
+
+    control_group, invocation_id, _load_state = _g5_unit_snapshot(unit_name)
+    if control_group.lstrip("/") != expected_control_group.lstrip("/"):
+        raise BoundedProcessError("command_group_unavailable")
+    cgroup = _CGROUP_ROOT / control_group.lstrip("/")
+    descriptor, identity = _open_cgroup_directory(cgroup)
+    try:
+        events = _read_g5_cgroup_file(descriptor, "cgroup.events").decode("ascii")
+        populated = [line for line in events.splitlines() if line.startswith("populated ")]
+        processes = _read_g5_cgroup_file(descriptor, "cgroup.procs").split()
+        if populated != ["populated 1"] or not processes:
+            raise BoundedProcessError("command_group_unavailable")
+        confirmed_group, confirmed_invocation, _ = _g5_unit_snapshot(unit_name)
+        if confirmed_group != control_group or confirmed_invocation != invocation_id:
+            raise BoundedProcessError("command_group_unavailable")
+        return G5ScopeIdentity(
+            unit_name=unit_name,
+            control_group=control_group,
+            invocation_id=invocation_id,
+            device=identity[0],
+            inode=identity[1],
+        )
+    finally:
+        descriptor = _close_descriptor(descriptor)
+
+
+def g5_scope_is_empty(identity: G5ScopeIdentity) -> bool:
+    """Recheck the bound systemd InvocationID and complete cgroup emptiness."""
+
+    if type(identity) is not G5ScopeIdentity:
+        return False
+    try:
+        control_group, invocation_id, load_state = _g5_unit_snapshot(
+            identity.unit_name
+        )
+        if load_state == "not-found":
+            try:
+                (_CGROUP_ROOT / identity.control_group.lstrip("/")).lstat()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            return False
+        if (
+            control_group != identity.control_group
+            or invocation_id != identity.invocation_id
+        ):
+            return False
+        descriptor, current_identity = _open_cgroup_directory(
+            _CGROUP_ROOT / identity.control_group.lstrip("/")
+        )
+        try:
+            if current_identity != (identity.device, identity.inode):
+                return False
+            events = _read_g5_cgroup_file(descriptor, "cgroup.events").decode("ascii")
+            populated = [
+                line for line in events.splitlines() if line.startswith("populated ")
+            ]
+            processes = _read_g5_cgroup_file(descriptor, "cgroup.procs").split()
+            return populated == ["populated 0"] and not processes
+        finally:
+            descriptor = _close_descriptor(descriptor)
+    except (BoundedProcessError, OSError, UnicodeError, ValueError):
+        return False
+
+
 def _bind_cgroup(
     process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
 ) -> None:
@@ -835,9 +997,12 @@ def run_bounded(
 __all__ = [
     "BoundedProcessError",
     "BoundedProcessResult",
+    "G5ScopeIdentity",
     "BOUNDED_PROCESS_CLEANUP_SECONDS",
     "DEFAULT_STDERR_LIMIT",
     "DEFAULT_STDOUT_LIMIT",
     "minimal_environment",
+    "bind_g5_scope",
+    "g5_scope_is_empty",
     "run_bounded",
 ]
