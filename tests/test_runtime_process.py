@@ -120,19 +120,21 @@ def _wait_for_fifo_eof(
     pytest.fail("manager lifetime did not close the live child event")
 
 
+@pytest.mark.parametrize("slice_path", ("/the-hive.slice", "/user.slice/the-hive.slice"))
 def test_g5_scope_reference_requires_same_invocation_and_empty_bound_cgroup(
+    slice_path: str,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import the_hive.runtime_process as runtime_process
 
     unit = "the-hive-resource-0123456789abcdef0123456789abcdef.scope"
-    cgroup = tmp_path / "the-hive.slice" / unit
+    cgroup = tmp_path.joinpath(*slice_path.strip("/").split("/"), unit)
     cgroup.mkdir(parents=True)
     (cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
     (cgroup / "cgroup.procs").write_text("123\n", encoding="ascii")
     invocation = "a" * 32
     snapshot = {
-        "ControlGroup": f"/the-hive.slice/{unit}",
+        "ControlGroup": f"{slice_path}/{unit}",
         "InvocationID": invocation,
         "LoadState": "loaded",
     }
@@ -145,7 +147,8 @@ def test_g5_scope_reference_requires_same_invocation_and_empty_bound_cgroup(
     monkeypatch.setattr(runtime_process, "_CGROUP_ROOT", tmp_path)
     monkeypatch.setattr(runtime_process, "_systemctl", fake_systemctl)
 
-    identity = runtime_process.bind_g5_scope(unit, f"/the-hive.slice/{unit}")
+    identity = runtime_process.bind_g5_scope(unit, f"{slice_path}/{unit}")
+    assert identity.control_group == f"{slice_path}/{unit}"
 
     (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
     (cgroup / "cgroup.procs").write_text("", encoding="ascii")
@@ -158,6 +161,18 @@ def test_g5_scope_reference_requires_same_invocation_and_empty_bound_cgroup(
     snapshot["InvocationID"] = "b" * 32
     assert not runtime_process.g5_scope_is_empty(identity)
 
+    wrong_inode = runtime_process.G5ScopeIdentity(
+        unit_name=identity.unit_name,
+        control_group=identity.control_group,
+        invocation_id=invocation,
+        device=identity.device,
+        inode=identity.inode + 1,
+    )
+    snapshot["InvocationID"] = invocation
+    (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+    (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+    assert not runtime_process.g5_scope_is_empty(wrong_inode)
+
     (cgroup / "cgroup.events").unlink()
     (cgroup / "cgroup.procs").unlink()
     cgroup.rmdir()
@@ -165,6 +180,25 @@ def test_g5_scope_reference_requires_same_invocation_and_empty_bound_cgroup(
         {"ControlGroup": "", "InvocationID": "", "LoadState": "not-found"}
     )
     assert runtime_process.g5_scope_is_empty(identity)
+
+
+def test_g5_scope_identity_rejects_unbound_parent_and_noncanonical_components() -> None:
+    import the_hive.runtime_process as runtime_process
+
+    unit = "the-hive-resource-0123456789abcdef0123456789abcdef.scope"
+    for control_group in (
+        f"/user.slice/other.slice/{unit}",
+        f"/user.slice/the-hive.slice/../{unit}",
+        f"/user.slice//the-hive.slice/{unit}",
+    ):
+        with pytest.raises(runtime_process.BoundedProcessError):
+            runtime_process.G5ScopeIdentity(
+                unit_name=unit,
+                control_group=control_group,
+                invocation_id="a" * 32,
+                device=1,
+                inode=1,
+            )
 
 
 def _test_unit_properties(

@@ -191,6 +191,7 @@ def _complete_use(
     *,
     session_id: str = "session.test",
     now: int = 1,
+    slice_path: str = "/the-hive.slice",
 ) -> UseLease:
     lease = store.begin_use(
         binding,
@@ -200,9 +201,9 @@ def _complete_use(
         now=now,
     )
     unit = f"the-hive-resource-{secrets.token_hex(16)}.scope"
-    group = f"/the-hive.slice/{unit}"
+    group = f"{slice_path}/{unit}"
     cgroup_root = binding.canonical_source_path.parent / "test-cgroup"
-    cgroup = cgroup_root / "the-hive.slice" / unit
+    cgroup = cgroup_root.joinpath(*slice_path.strip("/").split("/"), unit)
     cgroup.mkdir(parents=True)
     (cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
     (cgroup / "cgroup.procs").write_text("777\n", encoding="ascii")
@@ -243,6 +244,27 @@ def _complete_use(
         end_evidence = RuntimeEndEvidence.observe(lease, now=now + 2)
         store.end_use(lease, end_evidence, now=now + 3)
     return lease
+
+
+def test_full_user_manager_scope_persists_and_retires_after_cgroup_empty(
+    tmp_path: Path,
+) -> None:
+    binding = _binding(tmp_path)
+    store = WorktreeLifecycleStore(HiveStateStore(tmp_path / "state"))
+
+    lease = _complete_use(
+        store,
+        binding,
+        session_id="session.user-manager-scope",
+        now=10,
+        slice_path="/user.slice/user-1000.slice/user@1000.service/the-hive.slice",
+    )
+
+    assert lease.runtime_scope is not None
+    assert lease.runtime_scope.control_group == (
+        "/user.slice/user-1000.slice/user@1000.service/the-hive.slice/"
+        f"{lease.runtime_scope.unit_name}"
+    )
 
 
 def test_unknown_worktree_is_not_claimed_as_attested_unused(tmp_path: Path) -> None:
