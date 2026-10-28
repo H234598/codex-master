@@ -1724,6 +1724,12 @@ def installed_admin_entrypoint(tmp_path_factory: pytest.TempPathFactory) -> Path
     shutil.copy2(repository / "pyproject.toml", source / "pyproject.toml")
     shutil.copytree(repository / "src", source / "src")
     shutil.copytree(repository / "systemd", source / "systemd")
+    documentation = source / "docs" / "operations"
+    documentation.mkdir(parents=True)
+    shutil.copy2(
+        repository / "docs" / "operations" / "worktree-maintenance.md",
+        documentation / "worktree-maintenance.md",
+    )
     (source / "scripts").mkdir()
     shutil.copy2(repository / "scripts" / "install-host-agent", source / "scripts")
     installed = subprocess.run(
@@ -1745,7 +1751,7 @@ def installed_admin_entrypoint(tmp_path_factory: pytest.TempPathFactory) -> Path
         timeout=60,
         check=False,
     )
-    assert installed.returncode == 0
+    assert installed.returncode == 0, installed.stderr.decode("utf-8", errors="replace")
     entrypoint = install_root / "bin" / "the-hive-admin"
     assert entrypoint.is_file()
     assert os.access(entrypoint, os.X_OK)

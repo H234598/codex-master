@@ -155,9 +155,14 @@ jobs:
           "${THE_HIVE_TEST_CODEX_USAGE_PYTHON}" -m pytest -q tests/test_usage_snapshot.py
 
       - name: Run remaining unit tests with Python 3.12
-        run: >-
-          PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src:${THE_HIVE_TEST_NATIVE_PYTHON}"
-          python -m pytest -q --ignore=tests/test_usage_snapshot.py
+        run: |
+          set -eu
+          umask 077
+          pytest_parent="$(mktemp -d "${HOME}/.the-hive-pytest.XXXXXX")"
+          chmod 700 "${pytest_parent}"
+          pytest_tmp="${pytest_parent}/basetemp"
+          PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src:${THE_HIVE_TEST_NATIVE_PYTHON}" \
+            python -m pytest -q --basetemp="${pytest_tmp}" --ignore=tests/test_usage_snapshot.py
 
       - name: Check CLI wrapper syntax
         run: |
