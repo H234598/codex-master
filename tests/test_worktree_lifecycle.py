@@ -19,7 +19,6 @@ from the_hive import runtime_process
 from the_hive import server as server_module
 from the_hive.worktree_lifecycle import (
     G5ScopeBindingEvidence,
-    MaintenanceClaim,
     RuntimeBindingEvidence,
     RuntimeEndEvidence,
     UseLease,

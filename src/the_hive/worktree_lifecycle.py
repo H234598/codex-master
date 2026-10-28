@@ -2016,7 +2016,7 @@ class WorktreeLifecycleStore:
             if temporary:
                 gitdir_relative = None
                 gitdir_info = None
-                git_common_info = binding.git_common_directory.stat(follow_symlinks=False)
+                binding.git_common_directory.stat(follow_symlinks=False)
             else:
                 gitdir_relative = manifest["gitdir"]
                 gitdir = binding.git_common_directory / gitdir_relative
@@ -2027,7 +2027,7 @@ class WorktreeLifecycleStore:
                     or _mount_id(gitdir) != _mount_id(binding.git_common_directory)
                 ):
                     raise WorktreeLifecycleError("maintenance_gitdir_invalid")
-                git_common_info = binding.git_common_directory.stat(follow_symlinks=False)
+                binding.git_common_directory.stat(follow_symlinks=False)
         except WorktreeLifecycleError:
             raise
         except (KeyError, OSError, TypeError) as exc:
