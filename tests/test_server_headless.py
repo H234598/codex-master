@@ -3140,34 +3140,74 @@ def test_worktree_create_surfaces_rollback_identity_failure(
         "headless_attestation_invalid", "attestation failed", "retry"
     )
     real_run_command = server.run_command
+    original_fstat = server.os.fstat
+    unrelated_fd = server.os.open(os.devnull, os.O_RDONLY)
+    unrelated_stat = original_fstat(unrelated_fd)
     registered = False
+    target_path = repository / ".codex-master-worktrees" / "agent-d1"
+    opened_worktree_fds: dict[int, tuple[int, int]] = {}
+    faulted_fds: list[int] = []
 
     def mark_registered(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal registered
+        result = real_run_command(args, **kwargs)
         if args[:3] == ["git", "worktree", "add"]:
             registered = True
-        return real_run_command(args, **kwargs)
+            assert server.os.fstat(unrelated_fd) == unrelated_stat
+        return result
 
-    real_fstat = server.os.fstat
+    real_open = server.os.open
     (tmp_path / "foreign").mkdir()
     foreign = (tmp_path / "foreign").stat()
 
+    def track_open(path, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, flags, *args, **kwargs)
+        try:
+            opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve()
+        except OSError:
+            return descriptor
+        if opened_path == target_path.resolve():
+            info = original_fstat(descriptor)
+            opened_worktree_fds[descriptor] = (info.st_dev, info.st_ino)
+        return descriptor
+
     def fault_fstat(fd: int):
-        if registered:
+        info = original_fstat(fd)
+        if registered and opened_worktree_fds.get(fd) == (info.st_dev, info.st_ino):
+            faulted_fds.append(fd)
             if rollback_fault == "fstat":
                 raise OSError("fstat failed")
             return foreign
-        return real_fstat(fd)
+        return info
 
     monkeypatch.setattr(server, "require_fleet_recovery_ready", lambda *_args: None)
     monkeypatch.setattr(server, "canonical_agent_id", lambda value: value)
     monkeypatch.setattr(server, "repo_root", lambda: repository)
     monkeypatch.setattr(server, "run_command", mark_registered)
     monkeypatch.setattr(server, "_headless_write_scope_store", lambda: scope_store)
+    monkeypatch.setattr(server.os, "open", track_open)
     monkeypatch.setattr(server.os, "fstat", fault_fstat)
 
-    with pytest.raises(server.AgentError, match="headless_attestation_rollback_incomplete"):
-        server.worktree_create_for_agent("d1", path=".codex-master-worktrees/agent-d1")
+    try:
+        with pytest.raises(server.AgentError, match="headless_attestation_rollback_incomplete"):
+            server.worktree_create_for_agent("d1", path=".codex-master-worktrees/agent-d1")
+        assert opened_worktree_fds
+        assert faulted_fds
+        target_fd = next(iter(opened_worktree_fds))
+        with pytest.raises(OSError):
+            original_fstat(target_fd)
+        reused_fd = real_open(os.devnull, os.O_RDONLY)
+        try:
+            reused_stat = original_fstat(reused_fd)
+            if reused_fd != target_fd:
+                os.dup2(reused_fd, target_fd)
+            assert server.os.fstat(target_fd) == reused_stat
+        finally:
+            os.close(target_fd)
+            if reused_fd != target_fd:
+                os.close(reused_fd)
+    finally:
+        os.close(unrelated_fd)
 
 
 def test_rollback_recovery_never_targets_repository_root(

@@ -6,6 +6,9 @@ import multiprocessing
 import fcntl
 import io
 import sys
+import stat
+import base64
+import errno
 import hashlib
 import json
 import secrets
@@ -304,6 +307,38 @@ def _create_ended_temp_producer(
         end_evidence = RuntimeEndEvidence.observe(lease, now=now - 8 * 86400 + 2)
         lifecycle.end_use(lease, end_evidence, now=now - 8 * 86400 + 3)
     return producer
+
+
+def _other_filesystem_tempdir(project_root: Path, *, prefix: str):
+    project_device = project_root.stat(follow_symlinks=False).st_dev
+    for parent in dict.fromkeys((Path(tempfile.gettempdir()), Path("/dev/shm"))):
+        try:
+            parent_before = parent.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(parent_before.st_mode):
+                continue
+            temporary = tempfile.TemporaryDirectory(prefix=prefix, dir=parent)
+        except OSError:
+            continue
+        root = Path(temporary.name)
+        try:
+            root_info = root.stat(follow_symlinks=False)
+            parent_after = parent.stat(follow_symlinks=False)
+        except OSError:
+            temporary.cleanup()
+            continue
+        if (
+            stat.S_ISDIR(root_info.st_mode)
+            and root_info.st_dev != project_device
+            and root_info.st_dev == parent_before.st_dev
+            and (parent_before.st_dev, parent_before.st_ino)
+            == (parent_after.st_dev, parent_after.st_ino)
+            and root_info.st_uid == os.geteuid()
+            and root_info.st_gid == os.getegid()
+            and stat.S_IMODE(root_info.st_mode) == 0o700
+        ):
+            return temporary
+        temporary.cleanup()
+    pytest.skip("runner does not provide a writable, owned second filesystem")
 
 
 def _small_linked_worktree_fixture(
@@ -1172,7 +1207,10 @@ def test_g5_temporary_producer_requires_verified_end_and_expires_after_seven_day
     source, binding, lifecycle, policy = _small_linked_worktree_fixture(
         project, source_parent, tmp_path / "state"
     )
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+    temporary_root = _other_filesystem_tempdir(project, prefix="hive-g5-producer-")
+    request.addfinalizer(temporary_root.cleanup)
+    temp_root = Path(temporary_root.name)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_root))
     lease = lifecycle.begin_use(
         binding,
         principal_id="principal.temp-fixture",
@@ -1631,7 +1669,10 @@ def test_recovery_rejects_caller_selected_private_root_while_archive_child_lives
 
 
 def test_server_archive_owner_derives_policy_and_lifecycle_from_canonical_sources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    request: pytest.FixtureRequest,
 ) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -1698,7 +1739,9 @@ def test_server_archive_owner_derives_policy_and_lifecycle_from_canonical_source
     assert restored_worktree.is_dir()
     assert (restored_worktree / ".git").is_file()
 
-    temp_root = Path("/tmp")
+    temporary_root = _other_filesystem_tempdir(root, prefix="hive-temp-owner-")
+    request.addfinalizer(temporary_root.cleanup)
+    temp_root = Path(temporary_root.name)
     producer = _create_ended_temp_producer(lifecycle, binding, temp_root, now=int(time.time()))
     producer_identity = (producer.stat().st_dev, producer.stat().st_ino)
     assert producer.stat().st_dev != root.stat().st_dev
@@ -2315,9 +2358,20 @@ def test_manifest_records_symlink_security_xattrs(tmp_path: Path) -> None:
     link = source / "link"
     link.symlink_to("target")
 
+    try:
+        source_xattrs = os.listxattr(link, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            raise
+        pytest.skip("fixture filesystem cannot inspect symlink xattrs")
+    if "security.selinux" not in source_xattrs:
+        pytest.skip("fixture symlink does not carry a security xattr")
+    source_value = os.getxattr(link, "security.selinux", follow_symlinks=False)
     entry = next(item for item in _tree_manifest(source) if item["path"] == "link")
 
-    assert "security.selinux" in entry["xattrs"]
+    assert entry["xattrs"]["security.selinux"] == base64.b64encode(
+        source_value
+    ).decode("ascii")
 
 
 def test_manifest_records_root_acl_and_xattrs_for_both_trees(tmp_path: Path) -> None:
@@ -2808,7 +2862,9 @@ def test_linked_worktree_archive_restores_after_original_cross_fs_fixture_is_rem
     project = tmp_path / "project"
     project.mkdir()
     archive_root = project / ".hive-archive"
-    with tempfile.TemporaryDirectory(prefix="hive-maintenance-source-", dir="/tmp") as raw:
+    with _other_filesystem_tempdir(
+        project, prefix="hive-maintenance-source-"
+    ) as raw:
         source_parent = Path(raw)
         origin = project / "origin"
         origin.mkdir()

@@ -7,6 +7,7 @@ import subprocess
 import tomllib
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -21,12 +22,11 @@ def project_metadata() -> dict:
 
 
 def workflow_step_run(name: str) -> str:
-    marker = f"      - name: {name}\n"
-    following = workflow_text().split(marker, 1)[1]
-    step = following.split("\n      - name:", 1)[0]
-    indented_run = step.split("        run: |\n", 1)[1]
-    return "\n".join(
-        line.removeprefix("          ") for line in indented_run.splitlines()
+    workflow = yaml.safe_load(workflow_text())
+    return next(
+        step["run"]
+        for step in workflow["jobs"]["test"]["steps"]
+        if step.get("name") == name
     )
 
 
@@ -61,10 +61,26 @@ def test_plugin_manifest_gate_requires_the_hive_identity_without_a_legacy_alias(
 
 
 def test_cli_wrapper_syntax_gate_covers_the_stable_hook_launcher() -> None:
-    assert (
-        "run: bash -n ./bin/the-hive-mcp ./bin/the-hive-mcp-stable "
-        "./bin/the-hive-plugin-hook-stable"
-    ) in workflow_text()
+    step = workflow_step_run("Check CLI wrapper syntax")
+    commands = [line.strip() for line in step.splitlines() if line.strip()]
+
+    assert commands == [
+        "shellcheck ./bin/the-hive-mcp ./bin/the-hive-mcp-stable ./bin/the-hive-plugin-hook-stable",
+        "bash -n ./bin/the-hive-mcp ./bin/the-hive-mcp-stable ./bin/the-hive-plugin-hook-stable",
+    ]
+    assert "shellcheck" in workflow_step_run("Install Linux dependencies")
+
+
+def test_remaining_suite_uses_private_home_pytest_basetemp() -> None:
+    step = workflow_step_run("Run remaining unit tests with Python 3.12")
+
+    make_temp = 'mktemp -d "${HOME}/.the-hive-pytest.XXXXXX"'
+    chmod_temp = 'chmod 700 "${pytest_parent}"'
+    set_basetemp = '--basetemp="${pytest_tmp}"'
+    assert make_temp in step
+    assert chmod_temp in step
+    assert set_basetemp in step
+    assert step.index(make_temp) < step.index(chmod_temp) < step.index(set_basetemp)
 
 
 def test_manpage_gate_builds_and_renders_repository_source() -> None:

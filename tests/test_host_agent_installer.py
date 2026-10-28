@@ -803,18 +803,29 @@ def test_provisioning_rollback_restores_directory_metadata_and_group_membership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_installer()
+    original_open = module.os.open
+    original_fstat = module.os.fstat
+    original_close = module.os.close
+    unrelated_fd = original_open("/dev/null", os.O_RDONLY)
     path = Path("/var/lib/codex-master-agent")
     directory = module._DirectoryState(path, 11, 22, 33, 44, 0o2750)
     calls: list[object] = []
+    fstat_calls: list[int] = []
     monkeypatch.setitem(module.ROLE_USERS, "master", ())
     monkeypatch.setitem(module.ROLE_GROUPS, "master", ("state-group",))
     monkeypatch.setitem(module.ROLE_STATE_DIRECTORIES, "master", (path,))
     monkeypatch.setattr(module.os, "open", lambda *args, **kwargs: 91)
-    monkeypatch.setattr(
-        module.os,
-        "fstat",
-        lambda _descriptor: SimpleNamespace(st_dev=11, st_ino=22),
-    )
+    def fixture_fstat(descriptor: int):
+        if descriptor == 91:
+            fstat_calls.append(descriptor)
+            return SimpleNamespace(st_dev=11, st_ino=22)
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(module.os, "fstat", fixture_fstat)
+    try:
+        assert module.os.fstat(unrelated_fd) == original_fstat(unrelated_fd)
+    finally:
+        original_close(unrelated_fd)
     monkeypatch.setattr(
         module.os,
         "fchown",
@@ -848,6 +859,7 @@ def test_provisioning_rollback_restores_directory_metadata_and_group_membership(
 
     module._restore_provisioning_state("master", state)
 
+    assert fstat_calls == [91]
     assert calls == [
         ("chown", 91, 33, 44),
         ("chmod", 91, 0o2750),

@@ -1184,6 +1184,14 @@ def test_fd_backed_bundle_executes_both_hooks_with_its_bundled_server_source(
     tmp_path: Path,
 ) -> None:
     stub = """\
+from contextlib import contextmanager
+
+
+@contextmanager
+def native_hook_source_context():
+    yield
+
+
 def activate_native_agent_resume(payload):
     return {"allowed": False, "error_code": "fd_bundled_server",
             "reason_codes": ["bundled_source"]}

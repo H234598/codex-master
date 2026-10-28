@@ -2000,11 +2000,14 @@ def test_s4_materializer_closes_the_owned_fd_on_every_pretransfer_failure(
     original_fstat = record.os.fstat
     original_fcntl = record.fcntl.fcntl
     created: list[int] = []
+    created_identity: dict[int, tuple[int, int]] = {}
     closed: list[int] = []
 
     def capture_memfd_create(name: str, flags: int) -> int:
         descriptor = original_memfd_create(name, flags)
         created.append(descriptor)
+        info = original_fstat(descriptor)
+        created_identity[descriptor] = (info.st_dev, info.st_ino)
         return descriptor
 
     def tracking_close(descriptor: int) -> None:
@@ -2021,11 +2024,22 @@ def test_s4_materializer_closes_the_owned_fd_on_every_pretransfer_failure(
             lambda *_: (_ for _ in ()).throw(OSError("synthetic fchmod failure")),
         )
     elif failure == "fstat":
+        def fail_owned_fstat(descriptor: int):
+            info = original_fstat(descriptor)
+            if created_identity.get(descriptor) == (info.st_dev, info.st_ino):
+                raise OSError("synthetic fstat failure")
+            return info
+
         monkeypatch.setattr(
             record.os,
             "fstat",
-            lambda *_: (_ for _ in ()).throw(OSError("synthetic fstat failure")),
+            fail_owned_fstat,
         )
+        unrelated_fd = original_memfd_create("unrelated", os.MFD_CLOEXEC)
+        try:
+            assert record.os.fstat(unrelated_fd) == original_fstat(unrelated_fd)
+        finally:
+            original_close(unrelated_fd)
     elif failure == "encoder":
         monkeypatch.setattr(
             record,
@@ -2066,6 +2080,16 @@ def test_s4_materializer_closes_the_owned_fd_on_every_pretransfer_failure(
     assert closed == created
     with pytest.raises(OSError):
         original_fstat(created[0])
+    reused_fd = original_memfd_create("reused", os.MFD_CLOEXEC)
+    try:
+        reused_stat = original_fstat(reused_fd)
+        if reused_fd != created[0]:
+            os.dup2(reused_fd, created[0])
+        assert record.os.fstat(created[0]) == reused_stat
+    finally:
+        original_close(created[0])
+        if reused_fd != created[0]:
+            original_close(reused_fd)
 
 
 def test_s4_materializer_rejects_zero_write_and_close_failure(
