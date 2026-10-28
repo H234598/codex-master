@@ -179,6 +179,11 @@ _RUNTIME_IMAGE_FILES = (
     ),
     (_LEGACY_PROBE_LAUNCHER_SOURCE, _LEGACY_PROBE_LAUNCHER_SOURCE, 0o755),
     ("bin/the-hive-resource-monitor", "bin/the-hive-resource-monitor", 0o755),
+    (
+        "bin/the-hive-resource-scope-gate",
+        "bin/the-hive-resource-scope-gate",
+        0o755,
+    ),
     ("bin/the-hive-hive-hourly-probe", "bin/the-hive-hive-hourly-probe", 0o755),
     (".codex-plugin/plugin.json", ".codex-plugin/plugin.json", 0o644),
     (".mcp.json", ".mcp.json", 0o644),
@@ -612,6 +617,7 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
     try:
         layout = RuntimeLayout.from_runtime_root(stage)
         layout.read_attested_file("src/the_hive/server.py")
+        layout.read_attested_file("bin/the-hive-resource-scope-gate")
     except ValueError as exc:
         raise InstallError("install_stage_validation_failed") from exc
     stage_server = (
