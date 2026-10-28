@@ -90,11 +90,24 @@ class G5ScopeIdentity:
     def __post_init__(self) -> None:
         if not re.fullmatch(r"the-hive-resource-[0-9a-f]{32}\.scope", self.unit_name):
             raise BoundedProcessError("command_group_unavailable")
+        if not isinstance(self.control_group, str) or not 2 <= len(self.control_group) <= 512:
+            raise BoundedProcessError("command_group_unavailable")
+        if not self.control_group.startswith("/") or self.control_group.endswith("/"):
+            raise BoundedProcessError("command_group_unavailable")
+        parts = self.control_group[1:].split("/")
         if (
-            not isinstance(self.control_group, str)
-            or not self.control_group.startswith("/the-hive.slice/")
-            or self.control_group.rsplit("/", 1)[-1] != self.unit_name
-            or any(part in {".", ".."} for part in self.control_group.split("/"))
+            len(parts) < 2
+            or any(
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}", part)
+                for part in parts
+            )
+            or parts[-1] != self.unit_name
+            or parts[-2] != "the-hive.slice"
+            or parts.count("the-hive.slice") != 1
+            or not (
+                parts == ["the-hive.slice", self.unit_name]
+                or parts[0] == "user.slice"
+            )
         ):
             raise BoundedProcessError("command_group_unavailable")
         if not re.fullmatch(r"[0-9a-f]{32}", self.invocation_id):
