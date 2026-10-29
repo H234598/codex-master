@@ -876,6 +876,23 @@ def test_canary_returns_each_bounded_preexec_stage_and_quiesces(
         "generation": _CANARY_GENERATION,
         "manifest_digest": _CANARY_DIGEST,
         "raw_output": "not_returned",
+        "qualification_diagnostic": {
+            "evidence_case": "stage_red",
+            "runtime_status": "fail",
+            "runtime_reasons": [
+                "canary_evidence_red",
+                "health_checks_not_all_true",
+                "health_commands_not_all_true",
+                "unit_not_strict_success",
+            ],
+            "checks_all_true": False,
+            "commands_all_true": False,
+            "failed_checks": ["hive_doctor", "hive_runtime"],
+            "missing_checks": [],
+            "failed_commands": ["hive_doctor", "hive_status"],
+            "missing_commands": [],
+            "unit_state_class": "failed_exit_code_1",
+        },
     }
     assert len(manager.run_calls) == 1
     assert manager.stopped is True
@@ -901,9 +918,89 @@ def test_canary_unknown_diagnostic_fails_closed_without_returning_it(
 
     assert result["status"] == "runtime_canary_failed"
     assert result["error_code"] == "runtime_canary_evidence_invalid"
+    assert "qualification_diagnostic" not in result
     assert "secret" not in json.dumps(result)
     assert manager.stopped is True
     assert manager.reset is True
+
+
+@pytest.mark.parametrize(
+    ("invalid_json", "parse_reason"),
+    (
+        (
+            _canary_green_health().replace(
+                b'"schema_version":3}',
+                b'"schema_version":3,"schema_version":3}',
+                1,
+            ),
+            "d320_json_invalid",
+        ),
+        (
+            _canary_green_health().replace(
+                b'"checked_at":"2026-09-28T00:00:00+00:00"',
+                b'"checked_at":NaN',
+                1,
+            ),
+            "d320_json_invalid",
+        ),
+    ),
+    ids=("duplicate-key", "nonfinite-number"),
+)
+def test_canary_health_keeps_strict_d320_json_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_json: bytes,
+    parse_reason: str,
+) -> None:
+    with pytest.raises(runtime_lifecycle.D320CutoverJournalError, match=parse_reason):
+        runtime_lifecycle._d320_parse_json(invalid_json)
+
+    parser_image_root = tmp_path / "parser-image"
+    parser_image_root.mkdir(mode=0o700)
+    parsed_image = _fake_canary_image(parser_image_root, _CANARY_STAGE_CODES[0])
+    parsed_health = parsed_image.state_root / "hive-hourly-health.json"
+    parsed_health.write_bytes(invalid_json)
+    parsed_health.chmod(0o600)
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_canary_evidence_invalid",
+    ):
+        runtime_lifecycle._canary_health_payload(parsed_image)
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canary_runtime_root", lambda: tmp_path / "runtime"
+    )
+    prepare_image = runtime_lifecycle._prepare_canary_image
+
+    def prepare_with_invalid_json(**kwargs: object):
+        image = prepare_image(**kwargs)
+        health = image.state_root / "hive-hourly-health.json"
+        health.write_bytes(invalid_json)
+        health.chmod(0o600)
+        return image
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_prepare_canary_image", prepare_with_invalid_json
+    )
+    manager = _CanaryManager()
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result["status"] == "runtime_canary_failed"
+    assert result["error_code"] == "runtime_canary_evidence_invalid"
+    assert "qualification_diagnostic" not in result
+    assert manager.stopped is True
+    assert manager.reset is True
+    assert not tuple((tmp_path / "runtime").glob("run-*"))
+    assert (
+        runtime_lifecycle._read_canary_qualification_record(tmp_path / "runtime")
+        is None
+    )
 
 
 def test_canary_start_error_still_quiesces_its_attested_transient_unit(
@@ -985,6 +1082,18 @@ def test_canary_green_result_is_bounded_and_quiescent(
         "generation": _CANARY_GENERATION,
         "manifest_digest": _CANARY_DIGEST,
         "raw_output": "not_returned",
+        "qualification_diagnostic": {
+            "evidence_case": "strict_green",
+            "runtime_status": "pass",
+            "runtime_reasons": [],
+            "checks_all_true": True,
+            "commands_all_true": True,
+            "failed_checks": [],
+            "missing_checks": [],
+            "failed_commands": [],
+            "missing_commands": [],
+            "unit_state_class": "active_success_0",
+        },
     }
     record = runtime_lifecycle._read_canary_qualification_record(runtime_root)
     assert record is not None
@@ -1273,6 +1382,18 @@ def test_canary_records_client_metadata_without_claiming_client_behavior(
     )
 
     assert result["status"] == "runtime_canary_green", result
+    assert result["qualification_diagnostic"] == {
+        "evidence_case": "strict_green",
+        "runtime_status": "pass",
+        "runtime_reasons": [],
+        "checks_all_true": True,
+        "commands_all_true": True,
+        "failed_checks": [],
+        "missing_checks": [],
+        "failed_commands": [],
+        "missing_commands": [],
+        "unit_state_class": "active_success_0",
+    }
     record = runtime_lifecycle._read_canary_qualification_record(runtime_root)
     assert record is not None
     false_config_sha = hashlib.sha256(
@@ -1473,6 +1594,21 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
         "generation": _CANARY_GENERATION,
         "manifest_digest": _CANARY_DIGEST,
         "raw_output": "not_returned",
+        "qualification_diagnostic": {
+            "evidence_case": "pilot_blocked_green",
+            "runtime_status": "unknown",
+            "runtime_reasons": [
+                "health_checks_not_all_true",
+                "unit_not_strict_success",
+            ],
+            "checks_all_true": False,
+            "commands_all_true": True,
+            "failed_checks": ["hive_doctor", "hive_runtime"],
+            "missing_checks": [],
+            "failed_commands": [],
+            "missing_commands": [],
+            "unit_state_class": "failed_exit_code_1",
+        },
     }
     record = runtime_lifecycle._read_canary_qualification_record(runtime_root)
     assert record is not None
@@ -8783,6 +8919,18 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         systemd_run=private_systemd_run,
     )
     assert canary_result["status"] == "runtime_canary_green", canary_result
+    assert canary_result["qualification_diagnostic"] == {
+        "evidence_case": "strict_green",
+        "runtime_status": "pass",
+        "runtime_reasons": [],
+        "checks_all_true": True,
+        "commands_all_true": True,
+        "failed_checks": [],
+        "missing_checks": [],
+        "failed_commands": [],
+        "missing_commands": [],
+        "unit_state_class": "active_success_0",
+    }
     assert set(manager_observations) == set(runtime_lifecycle._V2_MANAGER_UNITS)
     assert manager_snapshots
     assert all(
