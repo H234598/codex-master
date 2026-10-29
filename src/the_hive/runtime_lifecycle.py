@@ -7371,10 +7371,8 @@ def _canary_diagnostic_value(value: object, *, command_ready: bool) -> str:
     return code
 
 
-def _canary_evidence_result(
-    *, image: _CanaryImage, manager_state: Mapping[str, str]
-) -> tuple[str, str | None]:
-    """Return only one fixed diagnosis from the private Canary state."""
+def _canary_health_payload(image: _CanaryImage) -> Mapping[str, object]:
+    """Read one bounded, closed health payload for Canary classification."""
 
     try:
         raw = _regular_bytes(
@@ -7387,8 +7385,8 @@ def _canary_evidence_result(
     if raw is None:
         raise _error("runtime_canary_evidence_invalid")
     try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        payload = _d320_parse_json(raw)
+    except D320CutoverJournalError as exc:
         raise _error("runtime_canary_evidence_invalid") from exc
     if not isinstance(payload, Mapping) or set(payload) != {
         "schema_version",
@@ -7400,11 +7398,6 @@ def _canary_evidence_result(
         "global_pilot_readiness",
     }:
         raise _error("runtime_canary_evidence_invalid")
-    try:
-        from the_hive.hive.hourly_probe import valid_probe_record
-    except Exception as exc:
-        raise _error("runtime_canary_evidence_invalid") from exc
-    record_valid = valid_probe_record(payload)
     checks = payload.get("checks")
     commands = payload.get("commands")
     diagnostics = payload.get("diagnostics")
@@ -7422,6 +7415,27 @@ def _canary_evidence_result(
         or set(diagnostics) != keys
     ):
         raise _error("runtime_canary_evidence_invalid")
+    return payload
+
+
+def _canary_evidence_result(
+    *,
+    image: _CanaryImage,
+    manager_state: Mapping[str, str],
+    payload: Mapping[str, object] | None = None,
+) -> tuple[str, str | None]:
+    """Return only one fixed diagnosis from the private Canary state."""
+
+    payload = payload if payload is not None else _canary_health_payload(image)
+    try:
+        from the_hive.hive.hourly_probe import valid_probe_record
+    except Exception as exc:
+        raise _error("runtime_canary_evidence_invalid") from exc
+    record_valid = valid_probe_record(payload)
+    checks = payload.get("checks")
+    commands = payload.get("commands")
+    diagnostics = payload.get("diagnostics")
+    keys = {"runtime_status", "hive_status", "hive_doctor"}
     codes = {
         _canary_diagnostic_value(
             diagnostics[name], command_ready=commands[name] is True
@@ -7463,20 +7477,18 @@ def _canary_evidence_result(
 
 
 def _canary_runtime_qualification_status(
-    *, image: _CanaryImage, manager_state: Mapping[str, str]
+    *,
+    image: _CanaryImage,
+    manager_state: Mapping[str, str],
+    payload: Mapping[str, object] | None = None,
 ) -> str:
     """Separate a successful pilot-blocked diagnosis from runtime qualification."""
 
     try:
+        payload = payload if payload is not None else _canary_health_payload(image)
         status, _error_code = _canary_evidence_result(
-            image=image, manager_state=manager_state
+            image=image, manager_state=manager_state, payload=payload
         )
-        raw = _regular_bytes(
-            image.state_root / "hive-hourly-health.json",
-            maximum=_CANARY_HEALTH_BYTES,
-            mode=0o600,
-        )
-        payload = _d320_parse_json(raw) if raw is not None else None
     except (RuntimeLifecycleError, D320CutoverJournalError):
         return "fail"
     if status != "runtime_canary_green" or not isinstance(payload, Mapping):
@@ -7494,6 +7506,84 @@ def _canary_runtime_qualification_status(
     ):
         return "unknown"
     return "pass"
+
+
+def _canary_qualification_diagnostic(
+    *,
+    payload: Mapping[str, object],
+    manager_state: Mapping[str, str],
+    evidence_status: str,
+    runtime_status: str,
+) -> dict[str, object]:
+    """Project private Canary evidence into closed, data-sparse diagnostics."""
+
+    check_names = ("runtime_layout", "hive_runtime", "hive_doctor")
+    command_names = ("runtime_status", "hive_status", "hive_doctor")
+    checks = payload.get("checks")
+    commands = payload.get("commands")
+    if not isinstance(checks, Mapping) or not isinstance(commands, Mapping):
+        raise _error("runtime_canary_evidence_invalid")
+    failed_checks = sorted(
+        name for name in check_names if name in checks and checks[name] is not True
+    )
+    missing_checks = sorted(name for name in check_names if name not in checks)
+    failed_commands = sorted(
+        name
+        for name in command_names
+        if name in commands and commands[name] is not True
+    )
+    missing_commands = sorted(name for name in command_names if name not in commands)
+    checks_all_true = not failed_checks and not missing_checks
+    commands_all_true = not failed_commands and not missing_commands
+    strict_unit_success = (
+        manager_state.get("ActiveState") == "active"
+        and manager_state.get("Result") == "success"
+        and manager_state.get("ExecMainStatus") == "0"
+    )
+    failed_exit_code = (
+        manager_state.get("ActiveState") == "failed"
+        and manager_state.get("Result") == "exit-code"
+        and manager_state.get("ExecMainStatus") == "1"
+    )
+    unit_state_class = (
+        "active_success_0"
+        if strict_unit_success
+        else "failed_exit_code_1"
+        if failed_exit_code
+        else "other"
+    )
+    evidence_case = (
+        "stage_red"
+        if evidence_status == "runtime_canary_red"
+        else "strict_green"
+        if checks_all_true and commands_all_true and strict_unit_success
+        else "pilot_blocked_green"
+    )
+    reasons: set[str] = set()
+    if evidence_case == "stage_red":
+        reasons.add("canary_evidence_red")
+    if not checks_all_true:
+        reasons.add("health_checks_not_all_true")
+    if not commands_all_true:
+        reasons.add("health_commands_not_all_true")
+    if not strict_unit_success:
+        reasons.add("unit_not_strict_success")
+    if runtime_status == "fail" and evidence_case != "stage_red":
+        reasons.add("runtime_qualification_failed")
+    if runtime_status == "unknown" and not reasons:
+        reasons.add("runtime_qualification_unknown")
+    return {
+        "evidence_case": evidence_case,
+        "runtime_status": runtime_status,
+        "runtime_reasons": sorted(reasons),
+        "checks_all_true": checks_all_true,
+        "commands_all_true": commands_all_true,
+        "failed_checks": failed_checks,
+        "missing_checks": missing_checks,
+        "failed_commands": failed_commands,
+        "missing_commands": missing_commands,
+        "unit_state_class": unit_state_class,
+    }
 
 
 def _probe_codex_client_metadata(
@@ -9728,6 +9818,7 @@ def canary(
     launch_attempted = False
     ownership_attested = False
     manager_states: dict[str, dict[str, str]] | None = None
+    qualification_diagnostic: dict[str, object] | None = None
     qualification_input: (
         tuple[_CanaryImage, str, Mapping[str, object] | None] | None
     ) = None
@@ -9777,16 +9868,26 @@ def canary(
                     source_tree_digest,
                 ):
                     raise _error("runtime_canary_source_changed")
+                payload = _canary_health_payload(image)
                 status_code, error_code = _canary_evidence_result(
-                    image=image, manager_state=manager_state
+                    image=image, manager_state=manager_state, payload=payload
                 )
+                runtime_status = "fail"
                 if status_code == "runtime_canary_green":
+                    runtime_status = _canary_runtime_qualification_status(
+                        image=image, manager_state=manager_state, payload=payload
+                    )
                     qualification_input = (
                         image,
-                        _canary_runtime_qualification_status(
-                            image=image, manager_state=manager_state
-                        ),
+                        runtime_status,
                         _canary_client_metadata(invocation),
+                    )
+                if status_code in {"runtime_canary_green", "runtime_canary_red"}:
+                    qualification_diagnostic = _canary_qualification_diagnostic(
+                        payload=payload,
+                        manager_state=manager_state,
+                        evidence_status=status_code,
+                        runtime_status=runtime_status,
                     )
                 result = _canary_result(
                     status_code=status_code,
@@ -9809,6 +9910,8 @@ def canary(
                     )
                 if not cleanup_ok:
                     raise _error("runtime_canary_cleanup_unverified")
+            if qualification_diagnostic is not None:
+                result["qualification_diagnostic"] = qualification_diagnostic
             if qualification_input is not None:
                 image, runtime_status, client_metadata = qualification_input
                 manager_states = _canary_manager_state_snapshot(systemctl)
