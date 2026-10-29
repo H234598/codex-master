@@ -13,6 +13,7 @@ import sys
 import fcntl
 import multiprocessing
 import stat
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -44,6 +45,124 @@ _CANARY_STAGE_CODES = (
     "command_cgroup_bind_unavailable",
 )
 _CUTOVER_TEST_PROFILE = b"synthetic stage profile for lifecycle mechanics only\n"
+_TEST_CODEX_CLIENT_ENV = "THE_HIVE_TEST_CODEX_CLIENT"
+_TEST_CODEX_CLIENT_SHA256 = (
+    "9a820c17865fa825d04db416818679a9d63bd72e50835c396f496e5684626c9c"
+)
+
+
+def _replace_file_with_live_inode(
+    path: Path, content: bytes, mode: int
+) -> os.stat_result:
+    """Atomically replace a file with a distinct inode while both exist."""
+
+    original = path.lstat()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.replacement-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("short write for replacement fixture")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        prepared = os.fstat(descriptor)
+        if (prepared.st_dev, prepared.st_ino) == (original.st_dev, original.st_ino):
+            raise AssertionError("replacement must be a distinct live inode")
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        replacement = path.lstat()
+        assert (replacement.st_dev, replacement.st_ino) != (
+            original.st_dev,
+            original.st_ino,
+        )
+        assert stat.S_IMODE(replacement.st_mode) == mode
+        assert replacement.st_uid == original.st_uid
+        assert replacement.st_gid == original.st_gid
+        assert replacement.st_nlink == 1
+        assert path.read_bytes() == content
+        return replacement
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _bind_test_codex_client(monkeypatch: pytest.MonkeyPatch) -> str | None:
+    """Bind CI's verified official client bytes to the real metadata producer."""
+
+    supplied = os.environ.get(_TEST_CODEX_CLIENT_ENV)
+    if supplied is None:
+        return None
+    client = Path(supplied)
+    before = client.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o755
+    ):
+        pytest.fail("pinned Codex client input has invalid physical metadata")
+
+    def current_digest() -> str | None:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                client,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(descriptor)
+            current = client.lstat()
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o755
+                or (opened.st_dev, opened.st_ino, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)
+                or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                or opened.st_size <= 0
+            ):
+                return None
+            digest = hashlib.sha256()
+            offset = 0
+            while offset < opened.st_size:
+                chunk = os.pread(
+                    descriptor, min(1024 * 1024, opened.st_size - offset), offset
+                )
+                if not chunk:
+                    return None
+                digest.update(chunk)
+                offset += len(chunk)
+            if os.fstat(descriptor).st_size != opened.st_size:
+                return None
+            value = digest.hexdigest()
+            return value if value == _TEST_CODEX_CLIENT_SHA256 else None
+        except OSError:
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    if current_digest() != _TEST_CODEX_CLIENT_SHA256:
+        pytest.fail("pinned Codex client input does not match the official ELF digest")
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canonical_codex_client_path", lambda: client
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canonical_codex_client_digest", current_digest
+    )
+    return _TEST_CODEX_CLIENT_SHA256
 
 
 def _canary_service() -> bytes:
@@ -2695,9 +2814,7 @@ def test_public_install_persists_intent_before_installer_effects(
                                     / target
                                     / ".hook-session-pins-v1.lock"
                                 )
-                                lock_path.unlink()
-                                lock_path.write_bytes(b"")
-                                lock_path.chmod(0o600)
+                                _replace_file_with_live_inode(lock_path, b"", 0o600)
                             raise SimulatedProcessCrash()
 
                     globals_map["_rename_noreplace"] = fail_after_lock_reservation
@@ -8418,6 +8535,7 @@ def test_public_resume_requires_current_qualification_record(
 def test_public_plan_accepts_current_owner_qualified_structural_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    pinned_client_digest = _bind_test_codex_client(monkeypatch)
     fixture_bound, _fixture_states = _bound_failure_fixture(tmp_path)
     source_root = tmp_path / "owner-source"
     source_root.mkdir(mode=0o700)
@@ -8601,6 +8719,10 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
     assert isinstance(record, Mapping) and record["status"] == "qualified"
     assert record["criteria"]["runtime_canary"] == "pass"
     assert record["criteria"]["runtime_features"] == "pass"
+    if pinned_client_digest is not None:
+        client_binding = record["bindings"]["client"]
+        assert client_binding["artifact_sha256"] == pinned_client_digest
+        assert client_binding["version"] == "codex-cli 0.161.0"
 
     def reject_client_exec(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("public plan attempted client execution")
@@ -8835,8 +8957,10 @@ def test_public_recovery_does_not_require_unexpired_forward_qualification(
     monkeypatch.setattr(
         runtime_lifecycle,
         "_v2_recover_phase",
-        lambda **_kwargs: recovery_calls.append("recover")
-        or {"status": "runtime_lifecycle_recovery_complete"},
+        lambda **_kwargs: (
+            recovery_calls.append("recover")
+            or {"status": "runtime_lifecycle_recovery_complete"}
+        ),
     )
 
     result = runtime_lifecycle.cutover(
@@ -9239,11 +9363,7 @@ def test_public_recover_holds_on_same_bytes_replaced_inode(
         runtime_lifecycle._v2_store_journal(
             home, journal, expected_digest=None, lease=lease
         )
-    inode_before = path.lstat().st_ino
-    path.unlink()
-    path.write_bytes(original)
-    path.chmod(0o644)
-    assert path.lstat().st_ino != inode_before
+    _replace_file_with_live_inode(path, original, 0o644)
     monkeypatch.setattr(
         runtime_lifecycle,
         "_source_tree_binding",
@@ -9289,10 +9409,8 @@ def test_v2_file_snapshot_identity_rejects_same_bytes_with_another_inode(
     }
     assert runtime_lifecycle._v2_file_snapshot_identity_matches(path, snapshot)
 
-    path.unlink()
-    path.write_bytes(content)
-    path.chmod(0o644)
-    assert path.lstat().st_ino != before.st_ino
+    replacement = _replace_file_with_live_inode(path, content, 0o644)
+    assert (replacement.st_dev, replacement.st_ino) != (before.st_dev, before.st_ino)
     assert not runtime_lifecycle._v2_file_snapshot_identity_matches(path, snapshot)
 
 
