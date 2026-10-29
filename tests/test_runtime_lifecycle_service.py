@@ -343,12 +343,24 @@ def _manager_api_contract_fixture() -> dict[str, object]:
     }
 
 
+def _private_manager_test_root(request: pytest.FixtureRequest) -> Path:
+    temporary_root = tempfile.TemporaryDirectory(prefix="h-", dir="/tmp")
+    root = Path(temporary_root.name)
+    metadata = root.lstat()
+    assert stat.S_ISDIR(metadata.st_mode)
+    assert metadata.st_uid == os.geteuid()
+    assert stat.S_IMODE(metadata.st_mode) == 0o700
+    request.addfinalizer(temporary_root.cleanup)
+    return root
+
+
 def _patch_manager_api_contract_transport(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> tuple[socket.socket, list[tuple[str, ...]], dict[str, str]]:
-    runtime = tmp_path / "manager-runtime"
+    private_root = _private_manager_test_root(request)
+    runtime = private_root / "manager-runtime"
     runtime.mkdir(mode=0o700)
-    unit_path = tmp_path / "manager-units"
+    unit_path = private_root / "manager-units"
     unit_path.mkdir(mode=0o700)
     bus = runtime / "bus"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -417,7 +429,7 @@ def _patch_manager_api_contract_transport(
                     b".StopUnit method ss o -\n", b".StopUnit method s o -\n"
                 )
             elif control["scenario"] == "unitpath_rebind":
-                os.rename(unit_path, tmp_path / "manager-units-old")
+                os.rename(unit_path, private_root / "manager-units-old")
                 unit_path.mkdir(mode=0o700)
         return subprocess.CompletedProcess(arguments, 0, response, b"")
 
@@ -1341,12 +1353,12 @@ def test_canary_does_not_publish_record_after_manager_api_drift(
 
 @pytest.mark.parametrize("scenario", ["valid", "signature_drift", "unitpath_rebind"])
 def test_manager_api_contract_pins_bus_and_requires_expected_methods(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,
+    request: pytest.FixtureRequest,
 ) -> None:
     listener, calls, control = _patch_manager_api_contract_transport(
-        tmp_path, monkeypatch
+        monkeypatch, request
     )
     control["scenario"] = scenario
     try:
@@ -1362,13 +1374,14 @@ def test_manager_api_contract_pins_bus_and_requires_expected_methods(
 
 
 def test_manager_api_contract_rejects_runtime_directory_rebind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
-    runtime = tmp_path / "runtime"
+    private_root = _private_manager_test_root(request)
+    runtime = private_root / "runtime"
     runtime.mkdir(mode=0o700)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(os.fspath(runtime / "bus"))
-    moved = tmp_path / "runtime-old"
+    moved = private_root / "runtime-old"
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     outputs = {
         "systemctl": b"Version=fixture\nFeatures=+PAM\nUnitPath=/run/user/1000/systemd/user\n",
@@ -8578,7 +8591,7 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
 ) -> None:
     pinned_client_digest = _bind_test_codex_client(monkeypatch)
     manager_socket, manager_transport_calls, manager_transport_control = (
-        _patch_manager_api_contract_transport(tmp_path, monkeypatch)
+        _patch_manager_api_contract_transport(monkeypatch, request)
     )
     request.addfinalizer(manager_socket.close)
     manager_snapshots: list[dict[str, object] | None] = []
