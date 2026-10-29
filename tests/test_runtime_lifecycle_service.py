@@ -1596,7 +1596,7 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
         "raw_output": "not_returned",
         "qualification_diagnostic": {
             "evidence_case": "pilot_blocked_green",
-            "runtime_status": "unknown",
+            "runtime_status": "pass",
             "runtime_reasons": [
                 "health_checks_not_all_true",
                 "unit_not_strict_success",
@@ -1619,8 +1619,8 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
         "client_compatibility": "unknown",
         "manager_api_contract": "pass",
         "manager_actions": "unknown",
-        "runtime_canary": "unknown",
-        "runtime_features": "unknown",
+        "runtime_canary": "pass",
+        "runtime_features": "pass",
     }
     tampered = dict(record)
     tampered["criteria"] = {**record["criteria"], "unreviewed": "pass"}
@@ -1635,6 +1635,54 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
         runtime_lifecycle._read_canary_qualification_record(runtime_root)
     assert manager.stopped is True
     assert manager.reset is True
+
+
+@pytest.mark.parametrize(
+    "invalid_field",
+    ("alarm", "global_pilot_readiness", "checked_at", "diagnostics"),
+)
+def test_canary_criteria_reject_health_v3_records_rejected_by_full_validator(
+    tmp_path: Path, invalid_field: str
+) -> None:
+    from the_hive.hive.hourly_probe import valid_probe_record
+
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+    payload = json.loads(_canary_green_health())
+    if invalid_field == "alarm":
+        payload["alarm"] = {"invalid": "private-marker"}
+    elif invalid_field == "global_pilot_readiness":
+        payload["global_pilot_readiness"]["unexpected"] = "private-marker"
+    elif invalid_field == "checked_at":
+        payload["checked_at"] = "2026-10-29T00:00:00"
+    else:
+        payload["diagnostics"]["runtime_status"]["code"] = "unknown"
+    health = image.state_root / "hive-hourly-health.json"
+    health.write_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    health.chmod(0o600)
+
+    assert valid_probe_record(payload) is False
+    assert (
+        runtime_lifecycle._canary_runtime_qualification_status(
+            image=image,
+            manager_state={
+                "ActiveState": "active",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+            payload=payload,
+        )
+        == "fail"
+    )
+    assert (
+        runtime_lifecycle._canary_runtime_features_qualification_status(
+            image=image, payload=payload
+        )
+        == "fail"
+    )
 
 
 def test_canary_accepts_a_valid_fail_closed_live_usage_state(tmp_path: Path) -> None:
@@ -1669,6 +1717,52 @@ def test_canary_accepts_a_valid_fail_closed_live_usage_state(tmp_path: Path) -> 
         runtime_lifecycle._canary_runtime_qualification_status(
             image=image, manager_state=manager_state
         )
+        == "pass"
+    )
+    assert (
+        runtime_lifecycle._canary_runtime_features_qualification_status(image=image)
+        == "pass"
+    )
+
+    payload["checks"]["hive_doctor"] = True
+    payload["alarm"]["reason_codes"] = ["hive_runtime"]
+    health.write_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    health.chmod(0o600)
+    assert runtime_lifecycle._canary_evidence_result(
+        image=image, manager_state=manager_state
+    ) == ("runtime_canary_green", None)
+    assert (
+        runtime_lifecycle._canary_runtime_qualification_status(
+            image=image, manager_state=manager_state
+        )
+        == "unknown"
+    )
+    assert (
+        runtime_lifecycle._canary_runtime_features_qualification_status(image=image)
+        == "pass"
+    )
+
+    payload["commands"]["runtime_status"] = False
+    payload["diagnostics"]["runtime_status"] = {
+        "code": _CANARY_STAGE_CODES[0],
+        "exit_code": None,
+        "stderr": {
+            "state": "not_returned",
+            "excerpt": "",
+            "redaction_applied": False,
+        },
+    }
+    health.write_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    health.chmod(0o600)
+    from the_hive.hive.hourly_probe import valid_probe_record
+
+    assert valid_probe_record(payload) is True
+    assert (
+        runtime_lifecycle._canary_runtime_features_qualification_status(image=image)
         == "unknown"
     )
 
@@ -3554,6 +3648,14 @@ def test_public_install_persists_intent_before_installer_effects(
 def test_public_plan_is_deterministic_and_reports_missing_profile_without_effects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
+    # Keep the missing-record assertion in this test's private runtime owner;
+    # /run/user/<uid> is shared with the real Canary owner and may hold an
+    # expired record from a separate, explicitly authorized run.
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_canary_runtime_root",
+        lambda: tmp_path / "runtime-owner" / "the-hive-runtime-canary",
+    )
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     HookSessionPinStoreV1.create_at(
@@ -8720,10 +8822,14 @@ def test_public_resume_requires_current_qualification_record(
     assert not qualification_root.exists()
 
 
+@pytest.mark.parametrize(
+    "scenario", ("strict_green", "pilot_blocked", "partial_blocked")
+)
 def test_public_plan_accepts_current_owner_qualified_structural_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
+    scenario: str,
 ) -> None:
     pinned_client_digest = _bind_test_codex_client(monkeypatch)
     manager_socket, manager_transport_calls, manager_transport_control = (
@@ -8863,7 +8969,20 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         runtime_lifecycle, "_canary_runtime_root", lambda: qualification_root
     )
     prepared_images: list[runtime_lifecycle._CanaryImage] = []
+    prepared_health_payloads: list[Mapping[str, object]] = []
     prepare_canary_image = runtime_lifecycle._prepare_canary_image
+    read_canary_health_payload = runtime_lifecycle._canary_health_payload
+
+    def capture_canary_health_payload(
+        image: runtime_lifecycle._CanaryImage,
+    ) -> Mapping[str, object]:
+        payload = read_canary_health_payload(image)
+        prepared_health_payloads.append(payload)
+        return payload
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canary_health_payload", capture_canary_health_payload
+    )
 
     def capture_canary_image(**kwargs: object) -> runtime_lifecycle._CanaryImage:
         image = prepare_canary_image(**kwargs)
@@ -8873,7 +8992,7 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
     monkeypatch.setattr(
         runtime_lifecycle, "_prepare_canary_image", capture_canary_image
     )
-    transient_manager = _CanaryManager(success=True)
+    transient_manager = _CanaryManager(success=scenario == "strict_green")
     manager_observations: list[str] = []
 
     def private_systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
@@ -8909,7 +9028,18 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         assert len(prepared_images) == 1
         health = prepared_images[0].state_root / "hive-hourly-health.json"
         assert not health.exists()
-        health.write_bytes(_canary_green_health())
+        if scenario == "strict_green":
+            health_bytes = _canary_green_health()
+        else:
+            payload = json.loads(_canary_isolated_health())
+            if scenario == "partial_blocked":
+                payload["checks"]["hive_doctor"] = True
+                payload["alarm"]["reason_codes"] = ["hive_runtime"]
+            health_bytes = (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                + b"\n"
+            )
+        health.write_bytes(health_bytes)
         health.chmod(0o600)
         return result
 
@@ -8919,18 +9049,54 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         systemd_run=private_systemd_run,
     )
     assert canary_result["status"] == "runtime_canary_green", canary_result
-    assert canary_result["qualification_diagnostic"] == {
-        "evidence_case": "strict_green",
-        "runtime_status": "pass",
-        "runtime_reasons": [],
-        "checks_all_true": True,
-        "commands_all_true": True,
-        "failed_checks": [],
-        "missing_checks": [],
-        "failed_commands": [],
-        "missing_commands": [],
-        "unit_state_class": "active_success_0",
-    }
+    if scenario == "partial_blocked":
+        assert canary_result["qualification_diagnostic"]["runtime_status"] == "unknown"
+        record = runtime_lifecycle._read_canary_qualification_record(qualification_root)
+        assert record is not None
+        assert record["status"] == "unqualified"
+        assert record["criteria"]["runtime_canary"] == "unknown"
+        assert record["criteria"]["runtime_features"] == "pass"
+        assert transient_manager.stopped is True
+        assert transient_manager.reset is True
+        blocked = runtime_lifecycle.plan(
+            home=bound.home,
+            systemctl=private_systemctl,
+        )
+        assert blocked["status"] == "runtime_lifecycle_plan_blocked", blocked
+        assert (
+            "runtime_lifecycle_qualification_record_unqualified"
+            in blocked["reason_codes"]
+        )
+        return
+    if scenario == "pilot_blocked":
+        assert canary_result["qualification_diagnostic"] == {
+            "evidence_case": "pilot_blocked_green",
+            "runtime_status": "pass",
+            "runtime_reasons": [
+                "health_checks_not_all_true",
+                "unit_not_strict_success",
+            ],
+            "checks_all_true": False,
+            "commands_all_true": True,
+            "failed_checks": ["hive_doctor", "hive_runtime"],
+            "missing_checks": [],
+            "failed_commands": [],
+            "missing_commands": [],
+            "unit_state_class": "failed_exit_code_1",
+        }
+    else:
+        assert canary_result["qualification_diagnostic"] == {
+            "evidence_case": "strict_green",
+            "runtime_status": "pass",
+            "runtime_reasons": [],
+            "checks_all_true": True,
+            "commands_all_true": True,
+            "failed_checks": [],
+            "missing_checks": [],
+            "failed_commands": [],
+            "missing_commands": [],
+            "unit_state_class": "active_success_0",
+        }
     assert set(manager_observations) == set(runtime_lifecycle._V2_MANAGER_UNITS)
     assert manager_snapshots
     assert all(
@@ -9086,7 +9252,12 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         source_commit=source_commit,
         source_tree_digest=source_tree,
         image=prepared_images[0],
-        runtime_status="pass",
+        runtime_status="unknown",
+        runtime_features_status=(
+            runtime_lifecycle._canary_runtime_features_qualification_status(
+                image=prepared_images[0], payload=prepared_health_payloads[0]
+            )
+        ),
         client_metadata=record["bindings"]["client"],
         manager_states=runtime_lifecycle._canary_manager_state_snapshot(
             private_systemctl
@@ -9097,7 +9268,7 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
     assert unqualified_record["criteria"]["client_probe"] == "pass"
     assert unqualified_record["criteria"]["client_compatibility"] == "pass"
     assert unqualified_record["criteria"]["manager_api_contract"] == "unknown"
-    assert unqualified_record["criteria"]["runtime_canary"] == "pass"
+    assert unqualified_record["criteria"]["runtime_canary"] == "unknown"
     assert unqualified_record["criteria"]["runtime_features"] == "pass"
     with runtime_lifecycle._canary_lock(qualification_root) as canary_lock_fd:
         runtime_lifecycle._publish_canary_qualification_record(
@@ -10599,6 +10770,62 @@ def _root_hook_effect_fixture(root: Path, *, issued_at_unix_ns: int) -> tuple[st
     (root / "root-hook-effect-receipt-v1.json").write_text(
         json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
     )
+    receipt_path = root / "root-hook-effect-receipt-v1.json"
+    receipt_raw = receipt_path.read_bytes()
+    parent_info = root.stat()
+    lock_info = lock.stat()
+    target_info = target.stat()
+    receipt_info = receipt_path.stat()
+    upgrade_state = {
+        "backup_name": None,
+        "expected_root_state_sha256": "2" * 64,
+        "generation": generation,
+        "manifest_digest": manifest_digest,
+        "old_receipt": {"present": False},
+        "old_target": {"present": False},
+        "owner_lock": {
+            "dev": lock_info.st_dev,
+            "gid": lock_info.st_gid,
+            "ino": lock_info.st_ino,
+            "mode": stat.S_IMODE(lock_info.st_mode),
+            "nlink": lock_info.st_nlink,
+            "sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+            "size": lock_info.st_size,
+            "uid": lock_info.st_uid,
+        },
+        "parent": {
+            "dev": parent_info.st_dev,
+            "gid": parent_info.st_gid,
+            "ino": parent_info.st_ino,
+            "mode": stat.S_IMODE(parent_info.st_mode),
+            "uid": parent_info.st_uid,
+        },
+        "receipt": {
+            "dev": receipt_info.st_dev,
+            "gid": receipt_info.st_gid,
+            "ino": receipt_info.st_ino,
+            "mode": stat.S_IMODE(receipt_info.st_mode),
+            "nlink": receipt_info.st_nlink,
+            "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+            "size": receipt_info.st_size,
+            "uid": receipt_info.st_uid,
+        },
+        "schema": "RootHookAbiUpgradeStateV1",
+        "stage_name": None,
+        "status": "committed",
+        "target": {
+            "dev": target_info.st_dev,
+            "gid": target_info.st_gid,
+            "ino": target_info.st_ino,
+            "mode": stat.S_IMODE(target_info.st_mode),
+            "uid": target_info.st_uid,
+        },
+        "transaction_id": "1" * 32,
+    }
+    (root / ".root-hook-abi-upgrade-v1.json").write_text(
+        json.dumps(upgrade_state, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    (root / ".root-hook-abi-upgrade-v1.json").chmod(0o644)
     return generation, manifest_digest
 
 
@@ -10662,6 +10889,219 @@ def test_root_hook_receipt_consumer_holds_expired_or_wrong_generation(
     with pytest.raises(
         runtime_lifecycle.RuntimeLifecycleError,
         match="runtime_lifecycle_owner_receipt_expired",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def test_root_hook_receipt_consumer_holds_pending_upgrade_after_lock_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(
+        parent, issued_at_unix_ns=time.time_ns()
+    )
+    state_path = parent / ".root-hook-abi-upgrade-v1.json"
+    state = json.loads(state_path.read_bytes())
+    state["status"] = "pending"
+    state_path.write_text(
+        json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    state_path.chmod(0o644)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_upgrade_uncommitted",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def test_root_hook_receipt_consumer_holds_when_owner_lock_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(
+        parent, issued_at_unix_ns=time.time_ns()
+    )
+    (parent / ".root-hook-abi-owner.lock").unlink()
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_effect_unverified",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def test_root_hook_receipt_consumer_holds_when_upgrade_marker_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(
+        parent, issued_at_unix_ns=time.time_ns()
+    )
+    (parent / ".root-hook-abi-upgrade-v1.json").unlink()
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_upgrade_uncommitted",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def test_root_hook_receipt_consumer_holds_upgrade_marker_rebound_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(
+        parent, issued_at_unix_ns=time.time_ns()
+    )
+    original_read = runtime_lifecycle._read_regular_at
+    marker_path = parent / ".root-hook-abi-upgrade-v1.json"
+    observed = False
+
+    def read_then_rebind_marker(*args, **kwargs):
+        nonlocal observed
+        result = original_read(*args, **kwargs)
+        if args[1] == "launcher" and not observed:
+            marker_state = json.loads(marker_path.read_bytes())
+            marker_state["status"] = "pending"
+            replacement = parent / "review-marker-replacement"
+            replacement.write_bytes(
+                runtime_lifecycle._d320_canonical_json(marker_state) + b"\n"
+            )
+            replacement.chmod(0o644)
+            os.replace(replacement, marker_path)
+            observed = True
+        return result
+
+    monkeypatch.setattr(runtime_lifecycle, "_read_regular_at", read_then_rebind_marker)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_upgrade_uncommitted",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+    assert observed
+    assert json.loads(marker_path.read_bytes())["status"] == "pending"
+
+
+def test_root_hook_receipt_consumer_holds_owner_lock_inode_rebind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(
+        parent, issued_at_unix_ns=time.time_ns()
+    )
+    verify_state = runtime_lifecycle._read_root_hook_upgrade_state
+
+    def rebind_lock_after_acquire(parent_fd, lock_info):
+        lock_path = parent / ".root-hook-abi-owner.lock"
+        lock_path.unlink()
+        descriptor = os.open(
+            lock_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+        )
+        try:
+            os.fchmod(descriptor, 0o644)
+            replacement_info = os.fstat(descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        assert (replacement_info.st_dev, replacement_info.st_ino) != (
+            lock_info.st_dev,
+            lock_info.st_ino,
+        )
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        return verify_state(parent_fd, lock_info)
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_read_root_hook_upgrade_state", rebind_lock_after_acquire
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_upgrade_uncommitted",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def test_root_hook_receipt_consumer_rebinds_upgrade_backup_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(
+        parent, issued_at_unix_ns=time.time_ns()
+    )
+    backup_name = ".v1.previous-" + "a" * 32
+    backup = parent / backup_name
+    backup.mkdir(mode=0o755)
+    backup.chmod(0o755)
+    backup_info = backup.stat()
+    state_path = parent / ".root-hook-abi-upgrade-v1.json"
+    state = json.loads(state_path.read_bytes())
+    state["backup_name"] = backup_name
+    state["old_target"] = {
+        "dev": backup_info.st_dev,
+        "gid": backup_info.st_gid,
+        "ino": backup_info.st_ino + 1,
+        "mode": stat.S_IMODE(backup_info.st_mode),
+        "present": True,
+        "uid": backup_info.st_uid,
+    }
+    state_path.write_text(
+        json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    state_path.chmod(0o644)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_upgrade_uncommitted",
     ):
         runtime_lifecycle._verify_root_hook_effect_receipt(
             generation=generation, manifest_digest=manifest_digest
