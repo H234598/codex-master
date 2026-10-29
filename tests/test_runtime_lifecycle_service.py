@@ -343,6 +343,91 @@ def _manager_api_contract_fixture() -> dict[str, object]:
     }
 
 
+def _patch_manager_api_contract_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[socket.socket, list[tuple[str, ...]], dict[str, str]]:
+    runtime = tmp_path / "manager-runtime"
+    runtime.mkdir(mode=0o700)
+    unit_path = tmp_path / "manager-units"
+    unit_path.mkdir(mode=0o700)
+    bus = runtime / "bus"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(bus))
+    uid = os.geteuid()
+    methods = {
+        "Reload": ("-", "-"),
+        "StartUnit": ("ss", "o"),
+        "StopUnit": ("ss", "o"),
+        "EnableUnitFiles": ("asbb", "ba(sss)"),
+        "DisableUnitFiles": ("asb", "a(sss)"),
+        "GetUnitFileState": ("s", "s"),
+    }
+    introspection = "NAME TYPE SIGNATURE RESULT/VALUE FLAGS\n" + "".join(
+        f".{name} method {signature} {result} -\n"
+        for name, (signature, result) in methods.items()
+    )
+    manager_text = (
+        f"Version=systemd fixture\nFeatures=+PAM -GCRYPT\nUnitPath={unit_path}\n"
+    ).encode()
+    owner_text = (
+        f"PID=123\nUID={uid}\nOwnerUID={uid}\nUniqueName=:1.23\n"
+        f"Unit=user@{uid}.service\n"
+        f"CGroup=/user.slice/user-{uid}.slice/user@{uid}.service\n"
+    ).encode()
+    commands = {
+        (
+            "/usr/bin/systemctl",
+            "--user",
+            "--no-pager",
+            "show",
+            "--property=Version,Features,UnitPath",
+        ): manager_text,
+        ("/usr/bin/busctl", "--user", "status", "org.freedesktop.systemd1"): owner_text,
+        (
+            "/usr/bin/busctl",
+            "--user",
+            "introspect",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        ): introspection.encode(),
+    }
+    control = {"scenario": "valid"}
+    calls: list[tuple[str, ...]] = []
+    real_run = subprocess.run
+
+    def controlled_readonly_transport(arguments, **kwargs):
+        command = tuple(os.fspath(argument) for argument in arguments)
+        response = commands.get(command)
+        if response is None:
+            return real_run(arguments, **kwargs)
+        calls.append(command)
+        bus_fds = kwargs.get("pass_fds", ())
+        assert len(bus_fds) == 1
+        assert kwargs["env"]["DBUS_SESSION_BUS_ADDRESS"] == (
+            f"unix:path=/proc/self/fd/{bus_fds[0]}"
+        )
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["stdout"] == subprocess.PIPE
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        assert kwargs["timeout"] == 8
+        if command[-1] == "org.freedesktop.systemd1.Manager":
+            if control["scenario"] == "signature_drift":
+                response = response.replace(
+                    b".StopUnit method ss o -\n", b".StopUnit method s o -\n"
+                )
+            elif control["scenario"] == "unitpath_rebind":
+                os.rename(unit_path, tmp_path / "manager-units-old")
+                unit_path.mkdir(mode=0o700)
+        return subprocess.CompletedProcess(arguments, 0, response, b"")
+
+    monkeypatch.setattr(runtime_lifecycle, "_user_runtime_directory", lambda: runtime)
+    monkeypatch.setattr(
+        runtime_lifecycle.subprocess, "run", controlled_readonly_transport
+    )
+    return listener, calls, control
+
+
 def _client_metadata_fixture(
     artifact_sha256: str = "a" * 64,
     features_sha256: str = "b" * 64,
@@ -1260,56 +1345,10 @@ def test_manager_api_contract_pins_bus_and_requires_expected_methods(
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,
 ) -> None:
-    runtime = tmp_path / "runtime"
-    runtime.mkdir(mode=0o700)
-    unit_path = tmp_path / "units"
-    unit_path.mkdir(mode=0o700)
-    bus = runtime / "bus"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(os.fspath(bus))
-    monkeypatch.setattr(runtime_lifecycle, "_user_runtime_directory", lambda: runtime)
-    methods = {
-        "Reload": ("-", "-"),
-        "StartUnit": ("ss", "o"),
-        "StopUnit": ("ss", "o"),
-        "EnableUnitFiles": ("asbb", "ba(sss)"),
-        "DisableUnitFiles": ("asb", "a(sss)"),
-        "GetUnitFileState": ("s", "s"),
-    }
-    introspection = "NAME TYPE SIGNATURE RESULT/VALUE FLAGS\n" + "".join(
-        f".{name} method {('s' if scenario == 'signature_drift' and name == 'StopUnit' else signature)} {result} -\n"
-        for name, (signature, result) in methods.items()
+    listener, calls, control = _patch_manager_api_contract_transport(
+        tmp_path, monkeypatch
     )
-    outputs = {
-        "systemctl": (
-            f"Version=systemd fixture\nFeatures=+PAM -GCRYPT\nUnitPath={unit_path}\n"
-        ).encode(),
-        "status": (
-            f"PID=123\nUID={os.geteuid()}\nOwnerUID={os.geteuid()}\n"
-            "UniqueName=:1.23\nUnit=user@1000.service\n"
-            "CGroup=/user.slice/user-1000.slice/user@1000.service\n"
-        ).encode(),
-        "introspect": introspection.encode(),
-    }
-    calls: list[tuple[str, ...]] = []
-
-    def fake_run(arguments, **kwargs):
-        calls.append(tuple(arguments))
-        assert kwargs["pass_fds"] and kwargs["env"][
-            "DBUS_SESSION_BUS_ADDRESS"
-        ].endswith(f"/proc/self/fd/{kwargs['pass_fds'][0]}")
-        if arguments[0].endswith("systemctl"):
-            key = "systemctl"
-        elif "status" in arguments:
-            key = "status"
-        else:
-            key = "introspect"
-            if scenario == "unitpath_rebind":
-                os.rename(unit_path, tmp_path / "units-old")
-                unit_path.mkdir(mode=0o700)
-        return subprocess.CompletedProcess(arguments, 0, outputs[key], b"")
-
-    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", fake_run)
+    control["scenario"] = scenario
     try:
         result = runtime_lifecycle._manager_api_contract_snapshot()
     finally:
@@ -8533,9 +8572,26 @@ def test_public_resume_requires_current_qualification_record(
 
 
 def test_public_plan_accepts_current_owner_qualified_structural_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     pinned_client_digest = _bind_test_codex_client(monkeypatch)
+    manager_socket, manager_transport_calls, manager_transport_control = (
+        _patch_manager_api_contract_transport(tmp_path, monkeypatch)
+    )
+    request.addfinalizer(manager_socket.close)
+    manager_snapshots: list[dict[str, object] | None] = []
+    actual_manager_snapshot = runtime_lifecycle._manager_api_contract_snapshot
+
+    def capture_manager_snapshot() -> dict[str, object] | None:
+        snapshot = actual_manager_snapshot()
+        manager_snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_manager_api_contract_snapshot", capture_manager_snapshot
+    )
     fixture_bound, _fixture_states = _bound_failure_fixture(tmp_path)
     source_root = tmp_path / "owner-source"
     source_root.mkdir(mode=0o700)
@@ -8715,7 +8771,38 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
     )
     assert canary_result["status"] == "runtime_canary_green", canary_result
     assert set(manager_observations) == set(runtime_lifecycle._V2_MANAGER_UNITS)
+    assert manager_snapshots
+    assert all(
+        runtime_lifecycle._valid_manager_api_contract(snapshot)
+        for snapshot in manager_snapshots
+    )
+    expected_manager_queries = (
+        (
+            "/usr/bin/systemctl",
+            "--user",
+            "--no-pager",
+            "show",
+            "--property=Version,Features,UnitPath",
+        ),
+        ("/usr/bin/busctl", "--user", "status", "org.freedesktop.systemd1"),
+        (
+            "/usr/bin/busctl",
+            "--user",
+            "introspect",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        ),
+    )
+    assert len(manager_transport_calls) >= len(expected_manager_queries)
+    assert len(manager_transport_calls) % len(expected_manager_queries) == 0
+    assert all(
+        tuple(manager_transport_calls[index : index + 3]) == expected_manager_queries
+        for index in range(0, len(manager_transport_calls), 3)
+    )
     record = runtime_lifecycle._read_canary_qualification_record(qualification_root)
+    assert record is not None
+    assert record["bindings"]["manager_api_contract"] == manager_snapshots[0]
     if isinstance(record, Mapping):
         bindings = record.get("bindings")
         criteria = record.get("criteria")
@@ -8823,6 +8910,48 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
     )
     assert changed["status"] == "runtime_lifecycle_plan_blocked", changed
     assert "runtime_lifecycle_qualification_record_changed" in changed["reason_codes"]
+
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_canonical_codex_client_digest",
+        lambda: pinned_client_digest,
+    )
+    manager_transport_control["scenario"] = "signature_drift"
+    missing_manager_contract = runtime_lifecycle._manager_api_contract_snapshot()
+    assert missing_manager_contract is None
+    unqualified_record = runtime_lifecycle._canary_qualification_record(
+        repository=source_root,
+        home=bound.home,
+        source_commit=source_commit,
+        source_tree_digest=source_tree,
+        image=prepared_images[0],
+        runtime_status="pass",
+        client_metadata=record["bindings"]["client"],
+        manager_states=runtime_lifecycle._canary_manager_state_snapshot(
+            private_systemctl
+        ),
+        manager_api_contract=missing_manager_contract,
+    )
+    assert unqualified_record["status"] == "unqualified"
+    assert unqualified_record["criteria"]["client_probe"] == "pass"
+    assert unqualified_record["criteria"]["client_compatibility"] == "pass"
+    assert unqualified_record["criteria"]["manager_api_contract"] == "unknown"
+    assert unqualified_record["criteria"]["runtime_canary"] == "pass"
+    assert unqualified_record["criteria"]["runtime_features"] == "pass"
+    with runtime_lifecycle._canary_lock(qualification_root) as canary_lock_fd:
+        runtime_lifecycle._publish_canary_qualification_record(
+            root=qualification_root,
+            lock_fd=canary_lock_fd,
+            value=unqualified_record,
+        )
+    blocked = runtime_lifecycle.plan(
+        home=bound.home,
+        systemctl=private_systemctl,
+    )
+    assert blocked["status"] == "runtime_lifecycle_plan_blocked", blocked
+    assert (
+        "runtime_lifecycle_qualification_record_unqualified" in blocked["reason_codes"]
+    )
 
 
 def test_public_recover_rejects_persisted_fixture_only_qualification(
