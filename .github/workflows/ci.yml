@@ -70,6 +70,101 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install --disable-pip-version-check "setuptools>=69" ".[test,test-index]"
 
+      - name: Fetch and verify the pinned Codex client fixture
+        run: |
+          client_root="${RUNNER_TEMP}/the-hive-codex-0161"
+          install -d -m 700 "${client_root}"
+          archive="${client_root}/codex-0.161.0-linux-x64.tgz"
+          client="${client_root}/codex"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            'https://registry.npmjs.org/@openai/codex/-/codex-0.161.0-linux-x64.tgz' \
+            --output "${archive}"
+          chmod 600 "${archive}"
+          python - "${archive}" "${client}" <<'PY'
+          import base64
+          import hashlib
+          import os
+          from pathlib import Path, PurePosixPath
+          import stat
+          import sys
+          import tarfile
+
+          archive = Path(sys.argv[1])
+          client = Path(sys.argv[2])
+          expected_sri = (
+              "sha512-AVkNzeJWyCHHPyg5vxD8UE6aFsYaOwq0/"
+              "x6mtmkOKy6LdjvsyxLr7Q7UULlk+Ma3+PnrN8uIxG2/"
+              "XGPQ936hgA=="
+          )
+          expected_elf_sha256 = (
+              "9a820c17865fa825d04db416818679a9d63bd72e"
+              "50835c396f496e5684626c9c"
+          )
+          expected_member = (
+              "package/vendor/x86_64-unknown-linux-musl/bin/codex"
+          )
+          with archive.open("rb") as stream:
+              actual_sri = "sha512-" + base64.b64encode(
+                  hashlib.file_digest(stream, "sha512").digest()
+              ).decode("ascii")
+          if actual_sri != expected_sri:
+              raise SystemExit("official Codex tarball SRI did not match the pin")
+
+          with tarfile.open(archive, "r:gz") as bundle:
+              members = bundle.getmembers()
+              if len(members) != 46:
+                  raise SystemExit("official Codex archive member count changed")
+              target = None
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or not path.parts
+                      or path.parts[0] != "package"
+                      or not member.isfile()
+                      or member.type != tarfile.REGTYPE
+                      or member.mode & 0o7000
+                  ):
+                      raise SystemExit("unsafe or unexpected Codex archive member")
+                  if member.name == expected_member:
+                      target = member
+              if target is None or target.mode != 0o755 or target.size <= 0:
+                  raise SystemExit("pinned Codex ELF member was missing or changed")
+              source = bundle.extractfile(target)
+              if source is None:
+                  raise SystemExit("pinned Codex ELF could not be read")
+              descriptor = os.open(
+                  client,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                  0o700,
+              )
+              digest = hashlib.sha256()
+              size = 0
+              with os.fdopen(descriptor, "wb") as output:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      output.write(chunk)
+                      digest.update(chunk)
+                      size += len(chunk)
+                  output.flush()
+                  os.fsync(output.fileno())
+                  os.fchmod(output.fileno(), 0o755)
+              if size != target.size or digest.hexdigest() != expected_elf_sha256:
+                  client.unlink(missing_ok=True)
+                  raise SystemExit("pinned Codex ELF digest or size changed")
+              info = client.lstat()
+              if (
+                  not stat.S_ISREG(info.st_mode)
+                  or info.st_nlink != 1
+                  or stat.S_IMODE(info.st_mode) != 0o755
+              ):
+                  client.unlink(missing_ok=True)
+                  raise SystemExit("extracted Codex ELF metadata changed")
+          print(f"verified_codex_client={client}")
+          print(f"verified_codex_elf_sha256={expected_elf_sha256}")
+          PY
+          echo "THE_HIVE_TEST_CODEX_CLIENT=${client}" >> "${GITHUB_ENV}"
+
       - name: Validate plugin manifests
         run: |
           python - <<'PY'
