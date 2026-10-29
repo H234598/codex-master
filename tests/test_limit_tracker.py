@@ -589,7 +589,9 @@ def test_d300_active_release_rejects_a_fully_rebound_other_source_manifest(
     binding_path = evidence.generations / GENERATION / "account-usage-v2.binding.json"
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
     usage = binding["usage_binding"]
-    usage["active_manifest_sha256"] = hashlib.sha256(active_path.read_bytes()).hexdigest()
+    usage["active_manifest_sha256"] = hashlib.sha256(
+        active_path.read_bytes()
+    ).hexdigest()
     usage["source_manifest_sha256"] = unexpected_manifest
 
     authority_path = evidence.generations / GENERATION / "pool-authority-v2.json"
@@ -612,7 +614,9 @@ def test_d300_active_release_rejects_a_fully_rebound_other_source_manifest(
     assert read(evidence).status == "invalid"
 
 
-def _rebind_current_authority(evidence: EvidenceTree, authority: dict[str, object]) -> None:
+def _rebind_current_authority(
+    evidence: EvidenceTree, authority: dict[str, object]
+) -> None:
     authority_path = evidence.generations / GENERATION / "pool-authority-v2.json"
     private_file(authority_path, canonical(authority))
     binding_path = evidence.generations / GENERATION / "account-usage-v2.binding.json"
@@ -1425,7 +1429,10 @@ def test_file_and_parent_security_fail_closed(
 
 @pytest.mark.parametrize(
     "validator",
-    [limit_tracker._validate_private_directory, limit_tracker._validate_release_directory],
+    [
+        limit_tracker._validate_private_directory,
+        limit_tracker._validate_release_directory,
+    ],
 )
 def test_private_directory_accepts_single_link_filesystems(validator) -> None:
     item = SimpleNamespace(
@@ -1436,7 +1443,10 @@ def test_private_directory_accepts_single_link_filesystems(validator) -> None:
 
 @pytest.mark.parametrize(
     "validator",
-    [limit_tracker._validate_private_directory, limit_tracker._validate_release_directory],
+    [
+        limit_tracker._validate_private_directory,
+        limit_tracker._validate_release_directory,
+    ],
 )
 @pytest.mark.parametrize("defect", ["unlinked", "type", "mode", "owner"])
 def test_private_directory_still_rejects_unsafe_metadata(validator, defect) -> None:

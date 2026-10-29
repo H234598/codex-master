@@ -750,7 +750,11 @@ class MasterjetControlService:
             elif domain == "host":
                 host_ref = cast(str, request.arguments["host_ref"])
                 host = next(
-                    (item for item in self._host_registry.list() if item.ref == host_ref),
+                    (
+                        item
+                        for item in self._host_registry.list()
+                        if item.ref == host_ref
+                    ),
                     None,
                 )
                 if host is None:
@@ -785,9 +789,7 @@ class MasterjetControlService:
             ),
             frozenset({"account"}),
         )
-        account = _exact_mapping(
-            receipt["account"], frozenset({"ref", "generation"})
-        )
+        account = _exact_mapping(receipt["account"], frozenset({"ref", "generation"}))
         generation = account["generation"]
         if (
             account["ref"] != account_ref
@@ -847,7 +849,7 @@ class MasterjetControlService:
             "accounts": [
                 _serialize_google_account(self._google_account_summary(item, status))
                 for item in self._google_manager.list_accounts()
-            ]
+            ],
         }
 
     def _google_account_summary(
@@ -1099,7 +1101,10 @@ class MasterjetControlService:
         try:
             view = self._agent_operations.get(operation_id)
             if view.kind != "ollama.instance" or view.action not in {
-                "plan", "apply", "probe", "stop"
+                "plan",
+                "apply",
+                "probe",
+                "stop",
             }:
                 raise _service_error("resource.host_response_invalid")
             state = "running" if view.state == "leased" else view.state

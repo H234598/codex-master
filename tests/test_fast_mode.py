@@ -19,7 +19,9 @@ NOW = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture
-def configured_fast_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, object]:
+def configured_fast_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> dict[str, object]:
     clock = {"now": NOW}
     notifications: list[dict[str, object]] = []
     snapshots: dict[str, object] = {}
@@ -29,7 +31,9 @@ def configured_fast_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dic
     monkeypatch.setattr(fast_mode, "_STATE_ROOT", state_root, raising=False)
     monkeypatch.setattr(fast_mode, "_STATE_PATH", state_path)
     monkeypatch.setattr(fast_mode, "_now_utc", lambda: clock["now"])
-    monkeypatch.setattr(fast_mode, "_snapshot_reader", lambda account: snapshots.get(account))
+    monkeypatch.setattr(
+        fast_mode, "_snapshot_reader", lambda account: snapshots.get(account)
+    )
     monkeypatch.setattr(fast_mode, "_notifier", notifications.append)
     return {
         "clock": clock,
@@ -113,10 +117,14 @@ def _run_race(
     for process in processes:
         process.join(timeout=10)
         assert process.exitcode == 0
-    assert sorted(results.get(timeout=2) for _ in processes) == sorted(("ok", action) for action, _account, _now in actions)
+    assert sorted(results.get(timeout=2) for _ in processes) == sorted(
+        ("ok", action) for action, _account, _now in actions
+    )
 
 
-def test_initial_state_is_flex_and_snapshot_is_empty(configured_fast_mode: dict[str, object]) -> None:
+def test_initial_state_is_flex_and_snapshot_is_empty(
+    configured_fast_mode: dict[str, object],
+) -> None:
     assert fast_mode.active_mode("BW_Work") is None
     assert fast_mode.snapshot() == {"schema_version": 1, "modes": {}}
 
@@ -147,10 +155,14 @@ def test_enable_persists_private_redacted_account_mode_and_notifies(
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
     notifications = configured_fast_mode["notifications"]
-    assert notifications == [{"account": "BW_Work", "state": "fast", "reason": "operator_request"}]
+    assert notifications == [
+        {"account": "BW_Work", "state": "fast", "reason": "operator_request"}
+    ]
 
 
-def test_disable_returns_only_target_account_to_flex(configured_fast_mode: dict[str, object]) -> None:
+def test_disable_returns_only_target_account_to_flex(
+    configured_fast_mode: dict[str, object],
+) -> None:
     fast_mode.set_mode("BW_Work", enabled=True)
     fast_mode.set_mode("BP_Privat", enabled=True)
 
@@ -166,7 +178,9 @@ def test_disable_returns_only_target_account_to_flex(configured_fast_mode: dict[
     }
 
 
-@pytest.mark.parametrize("account", ("", "../escape", "a/b", "with space", "x" * 65, None))
+@pytest.mark.parametrize(
+    "account", ("", "../escape", "a/b", "with space", "x" * 65, None)
+)
 def test_invalid_accounts_are_rejected_before_state_access(
     configured_fast_mode: dict[str, object], account: object
 ) -> None:
@@ -176,13 +190,19 @@ def test_invalid_accounts_are_rejected_before_state_access(
     assert fast_mode.snapshot() == {"schema_version": 1, "modes": {}}
 
 
-@pytest.mark.parametrize("until_utc", ("not-a-time", "2026-08-23 13:00:00Z", "2026-08-23T13:00:00", 17))
-def test_invalid_expiry_is_rejected(configured_fast_mode: dict[str, object], until_utc: object) -> None:
+@pytest.mark.parametrize(
+    "until_utc", ("not-a-time", "2026-08-23 13:00:00Z", "2026-08-23T13:00:00", 17)
+)
+def test_invalid_expiry_is_rejected(
+    configured_fast_mode: dict[str, object], until_utc: object
+) -> None:
     with pytest.raises(fast_mode.FastModeError, match="invalid_fast_mode_expiry"):
         fast_mode.set_mode("BW_Work", enabled=True, until_utc=until_utc)  # type: ignore[arg-type]
 
 
-def test_expiry_boundary_disables_only_expired_account(configured_fast_mode: dict[str, object]) -> None:
+def test_expiry_boundary_disables_only_expired_account(
+    configured_fast_mode: dict[str, object],
+) -> None:
     fast_mode.set_mode("BW_Work", enabled=True, until_utc="2026-08-23T12:15:00Z")
     fast_mode.set_mode("BP_Privat", enabled=True)
     clock = configured_fast_mode["clock"]
@@ -194,7 +214,9 @@ def test_expiry_boundary_disables_only_expired_account(configured_fast_mode: dic
     assert set(fast_mode.snapshot()["modes"]) == {"BP_Privat"}
 
 
-def test_valid_exhaustion_disables_only_affected_account(configured_fast_mode: dict[str, object]) -> None:
+def test_valid_exhaustion_disables_only_affected_account(
+    configured_fast_mode: dict[str, object],
+) -> None:
     fast_mode.set_mode("BW_Work", enabled=True)
     fast_mode.set_mode("BP_Privat", enabled=True)
     snapshots = configured_fast_mode["snapshots"]
@@ -212,7 +234,12 @@ def test_valid_exhaustion_disables_only_affected_account(configured_fast_mode: d
         {"schema_version": 2, "account": "BW_Work", "exhausted": True},
         {"schema_version": 1, "account": "other", "exhausted": True},
         {"schema_version": 1, "account": "BW_Work", "exhausted": "yes"},
-        {"schema_version": 1, "account": "BW_Work", "exhausted": True, "padding": "x" * 16_385},
+        {
+            "schema_version": 1,
+            "account": "BW_Work",
+            "exhausted": True,
+            "padding": "x" * 16_385,
+        },
     ),
 )
 def test_missing_invalid_or_oversize_snapshot_never_forges_exhaustion(
@@ -234,15 +261,24 @@ def test_reminder_waits_fifteen_minutes_and_notification_failure_keeps_mode(
     assert isinstance(notifications, list)
     notifications.clear()
 
-    assert fast_mode.maybe_notify_fast("BW_Work", now=NOW + timedelta(minutes=14, seconds=59)) is False
-    assert fast_mode.maybe_notify_fast("BW_Work", now=NOW + timedelta(minutes=15)) is True
+    assert (
+        fast_mode.maybe_notify_fast(
+            "BW_Work", now=NOW + timedelta(minutes=14, seconds=59)
+        )
+        is False
+    )
+    assert (
+        fast_mode.maybe_notify_fast("BW_Work", now=NOW + timedelta(minutes=15)) is True
+    )
     assert len(notifications) == 1
 
     def fail(_payload: object) -> None:
         raise OSError("desktop unavailable")
 
     monkeypatch.setattr(fast_mode, "_notifier", fail)
-    assert fast_mode.maybe_notify_fast("BW_Work", now=NOW + timedelta(minutes=30)) is False
+    assert (
+        fast_mode.maybe_notify_fast("BW_Work", now=NOW + timedelta(minutes=30)) is False
+    )
     assert fast_mode.active_mode("BW_Work") is not None
 
 
@@ -261,7 +297,12 @@ def test_corrupt_or_oversize_state_fails_safe_without_overwrite(
         fast_mode.set_mode("BW_Work", enabled=True)
     assert state_path.read_text(encoding="utf-8") == "{not-json"
 
-    state_path.write_text(json.dumps({"schema_version": 1, "modes": {"BW_Work": {"padding": "x" * 16_385}}}), encoding="utf-8")
+    state_path.write_text(
+        json.dumps(
+            {"schema_version": 1, "modes": {"BW_Work": {"padding": "x" * 16_385}}}
+        ),
+        encoding="utf-8",
+    )
     state_path.chmod(0o600)
     assert fast_mode.active_mode("BW_Work") is None
 
@@ -269,7 +310,9 @@ def test_corrupt_or_oversize_state_fails_safe_without_overwrite(
     monkeypatch.setattr(
         fast_mode,
         "_write_state_to_parent",
-        lambda _parent_fd, _state: (_ for _ in ()).throw(fast_mode.FastModeError("fast_mode_state_write_failed")),
+        lambda _parent_fd, _state: (_ for _ in ()).throw(
+            fast_mode.FastModeError("fast_mode_state_write_failed")
+        ),
     )
     with pytest.raises(fast_mode.FastModeError, match="fast_mode_state_write_failed"):
         fast_mode.set_mode("BW_Work", enabled=True)
@@ -284,7 +327,9 @@ def test_state_path_rejects_intermediate_symlink_and_parent_swap(
     redirected = state_root / "redirected"
     redirected.mkdir(mode=0o700)
     (state_root / "linked").symlink_to(redirected, target_is_directory=True)
-    monkeypatch.setattr(fast_mode, "_STATE_PATH", state_root / "linked" / "state" / "fast-mode.json")
+    monkeypatch.setattr(
+        fast_mode, "_STATE_PATH", state_root / "linked" / "state" / "fast-mode.json"
+    )
 
     with pytest.raises(fast_mode.FastModeError):
         fast_mode.set_mode("BW_Work", enabled=True)
@@ -298,9 +343,13 @@ def test_state_path_rejects_intermediate_symlink_and_parent_swap(
     real_open = fast_mode.os.open
     swapped = False
 
-    def swap_before_parent_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+    def swap_before_parent_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
         nonlocal swapped
-        is_parent = path == state_parent or (path == state_parent.name and kwargs.get("dir_fd") is not None)
+        is_parent = path == state_parent or (
+            path == state_parent.name and kwargs.get("dir_fd") is not None
+        )
         if not swapped and is_parent:
             state_parent.rename(state_root / "original-parent")
             replacement.rename(state_parent)
@@ -355,7 +404,9 @@ def test_state_rejects_final_symlink_hardlink_bad_mode_and_non_regular_file(
         fast_mode.set_mode("BW_Work", enabled=True)
 
 
-def test_concurrent_enables_keep_both_accounts(configured_fast_mode: dict[str, object], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_concurrent_enables_keep_both_accounts(
+    configured_fast_mode: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
     state_root = configured_fast_mode["state_root"]
     assert isinstance(state_root, Path)
     for attempt in range(12):
@@ -440,7 +491,11 @@ def test_default_usage_adapter_exhausts_only_valid_private_local_snapshot(
     snapshot_path.chmod(0o600)
     monkeypatch.setattr(fast_mode, "_USAGE_ROOT", usage_root, raising=False)
     monkeypatch.setattr(fast_mode, "_USAGE_ROOT_ANCHOR", state_root, raising=False)
-    monkeypatch.setattr(fast_mode, "_snapshot_reader", getattr(fast_mode, "_default_usage_snapshot", None))
+    monkeypatch.setattr(
+        fast_mode,
+        "_snapshot_reader",
+        getattr(fast_mode, "_default_usage_snapshot", None),
+    )
 
     fast_mode.set_mode("BW_Work", enabled=True)
 
@@ -451,8 +506,15 @@ def test_default_notifier_has_bounded_redacted_desktop_payload(
     configured_fast_mode: dict[str, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     messages: list[tuple[str, str]] = []
-    monkeypatch.setattr(fast_mode, "_desktop_notify", lambda title, body: messages.append((title, body)), raising=False)
-    monkeypatch.setattr(fast_mode, "_notifier", getattr(fast_mode, "_default_notifier", None))
+    monkeypatch.setattr(
+        fast_mode,
+        "_desktop_notify",
+        lambda title, body: messages.append((title, body)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fast_mode, "_notifier", getattr(fast_mode, "_default_notifier", None)
+    )
 
     fast_mode.set_mode("BW_Work", enabled=True, reason="Bearer private-token-value")
 
@@ -514,10 +576,14 @@ class _FakeDesktop:
                 assert callable(callback)
                 if desktop.outcome == "call_error":
                     desktop.context.callbacks.append(
-                        lambda: callback(self, RuntimeError("notify unavailable"), user_data)
+                        lambda: callback(
+                            self, RuntimeError("notify unavailable"), user_data
+                        )
                     )
                 else:
-                    desktop.context.callbacks.append(lambda: callback(self, "notify-ok", user_data))
+                    desktop.context.callbacks.append(
+                        lambda: callback(self, "notify-ok", user_data)
+                    )
 
             def call_sync(self, *args: object) -> None:
                 desktop.notify_calls.append(args)
@@ -544,10 +610,14 @@ class _FakeDesktop:
                 user_data = args[-1]
                 assert callable(callback)
                 if desktop.outcome == "success" or desktop.outcome == "call_error":
-                    desktop.context.callbacks.append(lambda: callback(None, "proxy-ok", user_data))
+                    desktop.context.callbacks.append(
+                        lambda: callback(None, "proxy-ok", user_data)
+                    )
                 elif desktop.outcome == "setup_error":
                     desktop.context.callbacks.append(
-                        lambda: callback(None, RuntimeError("session bus unavailable"), user_data)
+                        lambda: callback(
+                            None, RuntimeError("session bus unavailable"), user_data
+                        )
                     )
 
             @staticmethod
@@ -558,7 +628,9 @@ class _FakeDesktop:
 
         return types.SimpleNamespace(
             BusType=types.SimpleNamespace(SESSION="session"),
-            DBusProxyFlags=types.SimpleNamespace(DO_NOT_LOAD_PROPERTIES="no-properties"),
+            DBusProxyFlags=types.SimpleNamespace(
+                DO_NOT_LOAD_PROPERTIES="no-properties"
+            ),
             DBusCallFlags=types.SimpleNamespace(NONE="none"),
             Cancellable=Cancellable,
             DBusProxy=DBusProxy,
@@ -572,7 +644,9 @@ class _FakeDesktop:
             def new() -> _FakeDesktopContext:
                 return desktop.context
 
-        return types.SimpleNamespace(MainContext=MainContext, Variant=lambda signature, value: (signature, value))
+        return types.SimpleNamespace(
+            MainContext=MainContext, Variant=lambda signature, value: (signature, value)
+        )
 
     def finish_setup_late(self) -> None:
         assert callable(self.setup_callback)
@@ -591,7 +665,9 @@ def _install_fake_desktop(
     monkeypatch.setitem(sys.modules, "gi", gi)
     monkeypatch.setitem(sys.modules, "gi.repository", repository)
     clock = {"value": 0.0}
-    monkeypatch.setattr(fast_mode.time, "monotonic", lambda: clock["value"], raising=False)
+    monkeypatch.setattr(
+        fast_mode.time, "monotonic", lambda: clock["value"], raising=False
+    )
     monkeypatch.setattr(
         fast_mode.time,
         "sleep",
@@ -650,7 +726,9 @@ def test_default_notifier_async_success_uses_single_deadline_bound_call(
 
 @pytest.mark.parametrize("outcome", ("setup_error", "call_error"))
 def test_default_notifier_async_errors_cancel_and_preserve_mode(
-    configured_fast_mode: dict[str, object], monkeypatch: pytest.MonkeyPatch, outcome: str
+    configured_fast_mode: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
 ) -> None:
     desktop, _clock = _install_fake_desktop(monkeypatch, outcome)
     monkeypatch.setattr(fast_mode, "_notifier", fast_mode._default_notifier)
@@ -695,7 +773,9 @@ def test_default_usage_adapter_rejects_invalid_current_without_legacy_fallback(
     if kind == "corrupt":
         current_path.write_text("{not-json", encoding="utf-8")
     elif kind == "oversize":
-        current_path.write_text("x" * (fast_mode._MAX_SNAPSHOT_BYTES + 1), encoding="utf-8")
+        current_path.write_text(
+            "x" * (fast_mode._MAX_SNAPSHOT_BYTES + 1), encoding="utf-8"
+        )
     else:
         outside = state_root / "outside-usage.json"
         outside.write_text("{}", encoding="utf-8")
@@ -705,7 +785,9 @@ def test_default_usage_adapter_rejects_invalid_current_without_legacy_fallback(
         current_path.chmod(0o600)
     monkeypatch.setattr(fast_mode, "_USAGE_ROOT", usage_root)
     monkeypatch.setattr(fast_mode, "_USAGE_ROOT_ANCHOR", state_root)
-    monkeypatch.setattr(fast_mode, "_snapshot_reader", fast_mode._default_usage_snapshot)
+    monkeypatch.setattr(
+        fast_mode, "_snapshot_reader", fast_mode._default_usage_snapshot
+    )
 
     fast_mode.set_mode("BW_Work", enabled=True)
 
@@ -729,7 +811,9 @@ def test_failed_enable_notification_is_attempted_once_and_keeps_mode(
     assert fast_mode.active_mode("BW_Work") is not None
 
 
-def test_now_utc_requests_an_aware_utc_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_now_utc_requests_an_aware_utc_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     expected = datetime(2026, 8, 29, 10, 30, tzinfo=timezone.utc)
     requested: list[object] = []
 

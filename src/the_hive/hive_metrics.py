@@ -83,7 +83,10 @@ class FleetMetricSnapshot:
     health_state: str = "OK"
 
     def __post_init__(self) -> None:
-        if type(self.observations) is not tuple or type(self.block_devices) is not tuple:
+        if (
+            type(self.observations) is not tuple
+            or type(self.block_devices) is not tuple
+        ):
             raise HiveMetricsError("invalid_metric_input")
 
 
@@ -174,7 +177,17 @@ def _role_bucket(value: str) -> str:
 
 def _projection_invalid(registered_homes: int) -> FleetMetricProjection:
     return FleetMetricProjection(
-        "invalid", None, registered_homes, None, None, None, (), False, (), None, "CONTAMINATED"
+        "invalid",
+        None,
+        registered_homes,
+        None,
+        None,
+        None,
+        (),
+        False,
+        (),
+        None,
+        "CONTAMINATED",
     )
 
 
@@ -239,7 +252,11 @@ def project_hive_metrics(
     snapshot: FleetMetricSnapshot | None = None,
 ) -> FleetMetricProjection:
     if snapshot is not None:
-        if observations is not None or registered_homes is not None or captured_at is not None:
+        if (
+            observations is not None
+            or registered_homes is not None
+            or captured_at is not None
+        ):
             raise HiveMetricsError("invalid_metric_input")
         if type(snapshot) is not FleetMetricSnapshot:
             raise HiveMetricsError("invalid_metric_input")
@@ -274,7 +291,11 @@ def project_hive_metrics(
         )
         if len(block_devices) != len(snapshot.block_devices):
             return _projection_invalid(registered_homes)
-        hive_io_psi = _project_io_psi(snapshot.hive_io_psi) if snapshot.hive_io_psi is not None else None
+        hive_io_psi = (
+            _project_io_psi(snapshot.hive_io_psi)
+            if snapshot.hive_io_psi is not None
+            else None
+        )
         if snapshot.hive_io_psi is not None and hive_io_psi is None:
             return _projection_invalid(registered_homes)
     try:
@@ -282,7 +303,11 @@ def project_hive_metrics(
         age_seconds = (observed_at - captured_at).total_seconds()
     except Exception:
         raise HiveMetricsError("invalid_metric_input") from None
-    if len(items) > _MAX_OBSERVATIONS or not math.isfinite(age_seconds) or age_seconds < 0:
+    if (
+        len(items) > _MAX_OBSERVATIONS
+        or not math.isfinite(age_seconds)
+        or age_seconds < 0
+    ):
         raise HiveMetricsError("invalid_metric_input")
 
     providers = {bucket: 0 for bucket in _PROVIDER_BUCKETS}
@@ -344,16 +369,23 @@ def project_hive_metrics(
                     lifecycle,
                 )
             )
-    ordered_details = tuple(sorted(details, key=lambda item: (
-        item.provider,
-        item.role,
-        item.special_class,
-        item.model_tier,
-        item.reasoning_tier,
-        item.lifecycle,
-    )))
+    ordered_details = tuple(
+        sorted(
+            details,
+            key=lambda item: (
+                item.provider,
+                item.role,
+                item.special_class,
+                item.model_tier,
+                item.reasoning_tier,
+                item.lifecycle,
+            ),
+        )
+    )
     return FleetMetricProjection(
-        "stale" if health_state == "STALE" or age_seconds > stale_after_seconds else "fresh",
+        "stale"
+        if health_state == "STALE" or age_seconds > stale_after_seconds
+        else "fresh",
         float(age_seconds),
         registered_homes,
         sum(providers.values()),
@@ -363,7 +395,9 @@ def project_hive_metrics(
         len(ordered_details) > _MAX_DETAILS,
         block_devices,
         hive_io_psi,
-        "STALE" if health_state == "STALE" or age_seconds > stale_after_seconds else health_state,
+        "STALE"
+        if health_state == "STALE" or age_seconds > stale_after_seconds
+        else health_state,
     )
 
 

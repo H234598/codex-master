@@ -6,7 +6,12 @@ from collections.abc import Mapping
 import time
 
 from the_hive.hive.runtime import HiveRuntimeEvidence
-from the_hive.hive.status import godbee_status, hive_status, queen_list, selection_status
+from the_hive.hive.status import (
+    godbee_status,
+    hive_status,
+    queen_list,
+    selection_status,
+)
 from the_hive.hive.evidence_service import (
     HiveTestEvidenceService,
     build_local_test_service,
@@ -15,8 +20,18 @@ from the_hive.hive.evidence_service import (
 
 
 _NAMES = (
-    "hive_status", "godbee_status", "queen_list", "queen_status", "hive_dispatch_status", "hive_queue_status",
-    "hive_decisions", "hive_authority_check", "hive_plan_dispatch", "hive_admission_status", "agent_selection_preview", "agent_selection_status",
+    "hive_status",
+    "godbee_status",
+    "queen_list",
+    "queen_status",
+    "hive_dispatch_status",
+    "hive_queue_status",
+    "hive_decisions",
+    "hive_authority_check",
+    "hive_plan_dispatch",
+    "hive_admission_status",
+    "agent_selection_preview",
+    "agent_selection_status",
 )
 _TEST_NAMES = (
     "hive_test_index_status",
@@ -32,7 +47,11 @@ def _test_tool_definitions() -> list[dict[str, object]]:
     text = {"type": "string", "maxLength": 2048}
     empty = {"type": "object", "additionalProperties": False, "properties": {}}
     return [
-        {"name": "hive_test_index_status", "description": "Validate canonical Hive test index", "inputSchema": empty},
+        {
+            "name": "hive_test_index_status",
+            "description": "Validate canonical Hive test index",
+            "inputSchema": empty,
+        },
         {
             "name": "hive_test_plan",
             "description": "Plan smallest required indexed test set",
@@ -42,13 +61,20 @@ def _test_tool_definitions() -> list[dict[str, object]]:
                 "properties": {
                     "changed_paths": {"type": "array", "maxItems": 1000, "items": text},
                     "function_ids": {"type": "array", "maxItems": 1000, "items": text},
-                    "phase": {"type": "string", "enum": ["change", "branch", "merge", "release"]},
+                    "phase": {
+                        "type": "string",
+                        "enum": ["change", "branch", "merge", "release"],
+                    },
                     "base_revision": {"type": "string", "maxLength": 256},
                     "target_revision": {"type": "string", "maxLength": 256},
                 },
             },
         },
-        {"name": "hive_test_status", "description": "Return bounded Hive test evidence status", "inputSchema": empty},
+        {
+            "name": "hive_test_status",
+            "description": "Return bounded Hive test evidence status",
+            "inputSchema": empty,
+        },
         {
             "name": "hive_test_run",
             "description": "Run one exact indexed local test node",
@@ -74,10 +100,20 @@ def _test_tool_definitions() -> list[dict[str, object]]:
 
 def hive_tool_definitions() -> list[dict[str, object]]:
     diagnostic = [
-        {"name": name, "description": "Read-only Hive diagnostic", "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}}
+        {
+            "name": name,
+            "description": "Read-only Hive diagnostic",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            },
+        }
         for name in _NAMES
     ]
     return [*diagnostic, *_test_tool_definitions()]
+
+
 def call_hive_tool(
     name: str,
     args: Mapping[str, object] | None = None,
@@ -85,7 +121,9 @@ def call_hive_tool(
     runtime_evidence: HiveRuntimeEvidence | None = None,
     test_service: HiveTestEvidenceService | None = None,
 ) -> Mapping[str, object]:
-    if name not in {*_NAMES, *_TEST_NAMES} or (args is not None and not isinstance(args, Mapping)):
+    if name not in {*_NAMES, *_TEST_NAMES} or (
+        args is not None and not isinstance(args, Mapping)
+    ):
         raise ValueError("unknown_hive_tool")
     args = args or {}
     if name in _NAMES and args:
@@ -105,7 +143,11 @@ def call_hive_tool(
     if name == "hive_test_index_status":
         if args:
             raise ValueError("hive_tool_arguments_not_allowed")
-        return test_service.index_status() if test_service is not None else probe_test_index()
+        return (
+            test_service.index_status()
+            if test_service is not None
+            else probe_test_index()
+        )
     service = test_service or build_local_test_service()
     if name == "hive_test_plan":
         request = service.request(
@@ -145,9 +187,13 @@ def _string_list(value: object, field: str) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)) or len(value) > 1000:
         raise ValueError("test.index_invalid")
     values = tuple(value)
-    if any(not isinstance(item, str) or not item or len(item) > 2048 for item in values):
+    if any(
+        not isinstance(item, str) or not item or len(item) > 2048 for item in values
+    ):
         raise ValueError("test.index_invalid")
-    if field == "changed_paths" and any(item.startswith("/") or ".." in item.split("/") for item in values):
+    if field == "changed_paths" and any(
+        item.startswith("/") or ".." in item.split("/") for item in values
+    ):
         raise ValueError("test.index_invalid")
     return values
 

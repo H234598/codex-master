@@ -61,7 +61,9 @@ def _git(path: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _restore_worker(receipt: ArchiveReceipt, destination: Path, results: object) -> None:
+def _restore_worker(
+    receipt: ArchiveReceipt, destination: Path, results: object
+) -> None:
     try:
         results.put(restore_archive(receipt, destination).as_posix())
     except Exception as exc:
@@ -80,9 +82,7 @@ def _archive_writer_crashes_with_locked_child(
     lifecycle.advance_maintenance_phase(claim, phase="archiving")
     lock_fd = os.open(archive_root, os.O_RDONLY | os.O_DIRECTORY)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    lifecycle._bind_maintenance_archive_lock(
-        claim, Path(archive_root), lock_fd
-    )
+    lifecycle._bind_maintenance_archive_lock(claim, Path(archive_root), lock_fd)
     child_code = (
         "import os,sys,time; marker=sys.argv[1]; "
         "exec('while not os.path.exists(marker):\\n time.sleep(0.01)')"
@@ -253,7 +253,9 @@ def _finish_fixture_use(
     ):
         evidence = G5ScopeBindingEvidence.capture(lease, scope, now=now + 1)
         lease = lifecycle.bind_g5_runtime(lease, evidence, now=now + 1)
-        (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+        (cgroup / "cgroup.events").write_text(
+            "populated 0\nfrozen 0\n", encoding="ascii"
+        )
         (cgroup / "cgroup.procs").write_text("", encoding="ascii")
         end_evidence = RuntimeEndEvidence.observe(lease, now=now + 2)
         lifecycle.end_use(lease, end_evidence, now=now + 3)
@@ -277,7 +279,9 @@ def _create_ended_temp_producer(
         producer = lifecycle.create_temporary_producer(lease, now=now - 8 * 86400)
     unit = f"the-hive-resource-{secrets.token_hex(16)}.scope"
     group = f"/the-hive.slice/{unit}"
-    cgroup_root = binding.canonical_source_path.parent / f"cgroups-{secrets.token_hex(5)}"
+    cgroup_root = (
+        binding.canonical_source_path.parent / f"cgroups-{secrets.token_hex(5)}"
+    )
     cgroup = cgroup_root / "the-hive.slice" / unit
     cgroup.mkdir(parents=True)
     (cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
@@ -302,7 +306,9 @@ def _create_ended_temp_producer(
     ):
         evidence = G5ScopeBindingEvidence.capture(lease, scope, now=now - 8 * 86400 + 1)
         lease = lifecycle.bind_g5_runtime(lease, evidence, now=now - 8 * 86400 + 1)
-        (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+        (cgroup / "cgroup.events").write_text(
+            "populated 0\nfrozen 0\n", encoding="ascii"
+        )
         (cgroup / "cgroup.procs").write_text("", encoding="ascii")
         end_evidence = RuntimeEndEvidence.observe(lease, now=now - 8 * 86400 + 2)
         lifecycle.end_use(lease, end_evidence, now=now - 8 * 86400 + 3)
@@ -378,7 +384,9 @@ def _temporary_archive_fixture(tmp_path: Path):
     producer = _create_ended_temp_producer(
         lifecycle, binding, temp_root, now=int(time.time())
     )
-    (producer / "payload.txt").write_text("attested producer output\n", encoding="utf-8")
+    (producer / "payload.txt").write_text(
+        "attested producer output\n", encoding="utf-8"
+    )
     candidate = next(
         item
         for item in scan_candidates((policy,), lifecycle, now=int(time.time()))
@@ -392,7 +400,9 @@ def _canonical_temp_owner_fixture(tmp_path: Path):
     root.mkdir()
     checkout = Path(server_module.__file__).resolve().parents[2]
     shutil.copy2(checkout / "codex-hive.json", root / "codex-hive.json")
-    shutil.copy2(checkout / "codex-agent-classes.json", root / "codex-agent-classes.json")
+    shutil.copy2(
+        checkout / "codex-agent-classes.json", root / "codex-agent-classes.json"
+    )
     _git(root, "init", "-qb", "main")
     _git(root, "config", "user.email", "test@example.invalid")
     _git(root, "config", "user.name", "Fixture")
@@ -464,7 +474,9 @@ def test_temp_restore_uses_the_tar_file_that_was_validated(
         archive.addfile(member, io.BytesIO(data))
     original_extract = maintenance_module._run_tar_extract
 
-    def swap_tar_then_extract(archive_path, destination_fd, *, lock_fd=None, archive_fd=None):
+    def swap_tar_then_extract(
+        archive_path, destination_fd, *, lock_fd=None, archive_fd=None
+    ):
         if swap_kind == "rename":
             tar_path.rename(saved_tar)
             shutil.copyfile(evil_tar, tar_path)
@@ -474,9 +486,7 @@ def test_temp_restore_uses_the_tar_file_that_was_validated(
                 stream.write(evil_tar.read_bytes())
                 stream.truncate()
         kwargs = {} if archive_fd is None else {"archive_fd": archive_fd}
-        return original_extract(
-            archive_path, destination_fd, lock_fd=lock_fd, **kwargs
-        )
+        return original_extract(archive_path, destination_fd, lock_fd=lock_fd, **kwargs)
 
     monkeypatch.setattr(maintenance_module, "_run_tar_extract", swap_tar_then_extract)
     restored = restore_archive(receipt, tmp_path / "restored")
@@ -493,14 +503,18 @@ def test_temp_archive_rechecks_source_after_independent_restore(
 
     def restore_then_change_source(*args, **kwargs):
         result = original_restore(*args, **kwargs)
-        (producer / "payload.txt").write_text("changed after verification\n", encoding="utf-8")
+        (producer / "payload.txt").write_text(
+            "changed after verification\n", encoding="utf-8"
+        )
         return result
 
     monkeypatch.setattr(
         maintenance_module, "_restore_archive_unlocked", restore_then_change_source
     )
 
-    with pytest.raises(MaintenanceError, match="temporary_source_changed_before_publish"):
+    with pytest.raises(
+        MaintenanceError, match="temporary_source_changed_before_publish"
+    ):
         maintenance_module.archive_temporary_candidate(
             candidate, policy=policy, lifecycle=lifecycle
         )
@@ -527,7 +541,9 @@ def test_worktree_maintenance_without_subcommand_defaults_to_read_only_plan(
 
 
 def test_maintenance_service_uses_no_filesystem_namespace_bind_mounts() -> None:
-    unit = Path(__file__).parents[1] / "systemd/user/the-hive-worktree-maintenance.service"
+    unit = (
+        Path(__file__).parents[1] / "systemd/user/the-hive-worktree-maintenance.service"
+    )
     text = unit.read_text(encoding="utf-8")
 
     assert "ProtectSystem=strict" not in text
@@ -565,7 +581,9 @@ def test_worktree_maintenance_contract_ignores_candidate_age_and_membership(
             "temporary_age_seconds": 7 * 86400,
         },
     }
-    monkeypatch.setattr(server_module, "_maintenance_code_digest", lambda: "sha256:code")
+    monkeypatch.setattr(
+        server_module, "_maintenance_code_digest", lambda: "sha256:code"
+    )
     coverage = {"complete": False, "protocol": "fixture"}
 
     first = server_module._worktree_maintenance_contract_digest([project], coverage)
@@ -589,11 +607,15 @@ def test_worktree_maintenance_contract_changes_with_code_or_target_identity(
         "archive_identity": {"device": 1, "inode": 4},
         "thresholds": {"inactive_seconds": 30 * 86400},
     }
-    monkeypatch.setattr(server_module, "_maintenance_code_digest", lambda: "sha256:code-a")
+    monkeypatch.setattr(
+        server_module, "_maintenance_code_digest", lambda: "sha256:code-a"
+    )
     first = server_module._worktree_maintenance_contract_digest(
         [project], {"complete": False}
     )
-    monkeypatch.setattr(server_module, "_maintenance_code_digest", lambda: "sha256:code-b")
+    monkeypatch.setattr(
+        server_module, "_maintenance_code_digest", lambda: "sha256:code-b"
+    )
     changed_code = server_module._worktree_maintenance_contract_digest(
         [project], {"complete": False}
     )
@@ -610,7 +632,9 @@ def test_worktree_maintenance_contract_changes_with_code_or_target_identity(
         archive_identity={"device": 21, "inode": 22},
         archive_mount_id=23,
     )
-    monkeypatch.setattr(server_module, "_maintenance_code_digest", lambda: "sha256:code-a")
+    monkeypatch.setattr(
+        server_module, "_maintenance_code_digest", lambda: "sha256:code-a"
+    )
     stable_physical_contract = server_module._worktree_maintenance_contract_digest(
         [changed_physical_observation], {"complete": False}
     )
@@ -639,13 +663,23 @@ def test_worktree_maintenance_run_without_approval_never_applies(
         "contract_digest": "sha256:" + "a" * 64,
         "preview_digest": "sha256:" + "b" * 64,
         "caller_coverage": {"complete": True},
-        "candidates": [{"eligible": True, "repository_id": "codex-master", "source": "/fixture/worktree"}],
+        "candidates": [
+            {
+                "eligible": True,
+                "repository_id": "codex-master",
+                "source": "/fixture/worktree",
+            }
+        ],
     }
     applied = []
     monkeypatch.setattr(server_module, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(server_module, "_worktree_maintenance_plan", lambda: preview)
-    monkeypatch.setattr(server_module, "_read_worktree_maintenance_approval", lambda: None)
-    monkeypatch.setattr(server_module, "_apply_worktree_by_id", lambda *args: applied.append(args))
+    monkeypatch.setattr(
+        server_module, "_read_worktree_maintenance_approval", lambda: None
+    )
+    monkeypatch.setattr(
+        server_module, "_apply_worktree_by_id", lambda *args: applied.append(args)
+    )
 
     result = server_module._run_worktree_maintenance()
 
@@ -661,7 +695,13 @@ def test_worktree_maintenance_run_with_incomplete_caller_coverage_never_applies(
         "contract_digest": contract,
         "preview_digest": "sha256:" + "b" * 64,
         "caller_coverage": {"complete": False, "reason": "unattested"},
-        "candidates": [{"eligible": True, "repository_id": "codex-master", "source": "/fixture/worktree"}],
+        "candidates": [
+            {
+                "eligible": True,
+                "repository_id": "codex-master",
+                "source": "/fixture/worktree",
+            }
+        ],
     }
     applied = []
     monkeypatch.setattr(server_module, "STATE_ROOT", tmp_path / "state")
@@ -669,9 +709,14 @@ def test_worktree_maintenance_run_with_incomplete_caller_coverage_never_applies(
     monkeypatch.setattr(
         server_module,
         "_read_worktree_maintenance_approval",
-        lambda: {"contract_digest": contract, "preview_digest": preview["preview_digest"]},
+        lambda: {
+            "contract_digest": contract,
+            "preview_digest": preview["preview_digest"],
+        },
     )
-    monkeypatch.setattr(server_module, "_apply_worktree_by_id", lambda *args: applied.append(args))
+    monkeypatch.setattr(
+        server_module, "_apply_worktree_by_id", lambda *args: applied.append(args)
+    )
 
     result = server_module._run_worktree_maintenance()
 
@@ -686,8 +731,14 @@ def test_overlapping_maintenance_cli_run_never_claims_or_changes_lifecycle(
     lifecycle = WorktreeLifecycleStore(HiveStateStore(tmp_path / "lifecycle"))
     before = lifecycle.snapshot()
     claims = []
-    monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle)
-    monkeypatch.setattr(server_module, "_claim_worktree_maintenance", lambda *args, **kwargs: claims.append(args))
+    monkeypatch.setattr(
+        server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_claim_worktree_maintenance",
+        lambda *args, **kwargs: claims.append(args),
+    )
 
     with server_module._worktree_maintenance_run_guard():
         exit_code = server_module.main_cli(["worktree-maintenance", "run"])
@@ -706,13 +757,21 @@ def test_project_share_failure_during_cli_run_leaves_lifecycle_unchanged(
     lifecycle = WorktreeLifecycleStore(HiveStateStore(tmp_path / "lifecycle"))
     before = lifecycle.snapshot()
     claims = []
-    monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle)
+    monkeypatch.setattr(
+        server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle
+    )
     monkeypatch.setattr(
         server_module,
         "_worktree_maintenance_plan",
-        lambda: (_ for _ in ()).throw(server_module.AgentError("maintenance_project_scan_unavailable")),
+        lambda: (_ for _ in ()).throw(
+            server_module.AgentError("maintenance_project_scan_unavailable")
+        ),
     )
-    monkeypatch.setattr(server_module, "_claim_worktree_maintenance", lambda *args, **kwargs: claims.append(args))
+    monkeypatch.setattr(
+        server_module,
+        "_claim_worktree_maintenance",
+        lambda *args, **kwargs: claims.append(args),
+    )
 
     exit_code = server_module.main_cli(["worktree-maintenance", "run"])
 
@@ -738,8 +797,14 @@ def test_missing_project_share_during_cli_run_is_bounded_before_claim(
     lifecycle = WorktreeLifecycleStore(HiveStateStore(tmp_path / "lifecycle"))
     before = lifecycle.snapshot()
     claims = []
-    monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle)
-    monkeypatch.setattr(server_module, "_claim_worktree_maintenance", lambda *args, **kwargs: claims.append(args))
+    monkeypatch.setattr(
+        server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_claim_worktree_maintenance",
+        lambda *args, **kwargs: claims.append(args),
+    )
 
     exit_code = server_module.main_cli(["worktree-maintenance", "run"])
 
@@ -757,7 +822,9 @@ def test_missing_project_share_during_cli_run_is_bounded_before_claim(
 def test_worktree_maintenance_rejects_archive_root_inode_swap_before_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, _worktree, _worktree_root, lifecycle, _binding = _canonical_temp_owner_fixture(tmp_path)
+    root, _worktree, _worktree_root, lifecycle, _binding = (
+        _canonical_temp_owner_fixture(tmp_path)
+    )
     state_root = tmp_path / "state"
     archive_root = root / ".hive-archive"
     archive_root.mkdir(mode=0o700)
@@ -770,7 +837,9 @@ def test_worktree_maintenance_rejects_archive_root_inode_swap_before_claim(
     )
 
     preview = server_module._worktree_maintenance_plan()
-    project = next(item for item in preview["projects"] if item["repository_id"] == "codex-master")
+    project = next(
+        item for item in preview["projects"] if item["repository_id"] == "codex-master"
+    )
     original_identity = project["archive_identity"]
     assert original_identity == {
         "device": archive_root.stat(follow_symlinks=False).st_dev,
@@ -785,7 +854,8 @@ def test_worktree_maintenance_rejects_archive_root_inode_swap_before_claim(
     archive_root.mkdir(mode=0o700)
     replacement_info = archive_root.stat(follow_symlinks=False)
     assert (replacement_info.st_dev, replacement_info.st_ino) != (
-        original_identity["device"], original_identity["inode"]
+        original_identity["device"],
+        original_identity["inode"],
     )
 
     changed_preview = server_module._worktree_maintenance_plan()
@@ -794,7 +864,9 @@ def test_worktree_maintenance_rejects_archive_root_inode_swap_before_claim(
     assert changed_preview["contract_digest"] == preview["contract_digest"]
     assert result["reason"] == "caller_coverage_unavailable"
     assert lifecycle.snapshot() == before
-    assert displaced_root.stat(follow_symlinks=False).st_ino == original_identity["inode"]
+    assert (
+        displaced_root.stat(follow_symlinks=False).st_ino == original_identity["inode"]
+    )
     assert list(displaced_root.iterdir()) == []
     assert list(archive_root.iterdir()) == []
 
@@ -807,19 +879,25 @@ def test_maintenance_approval_is_stable_but_share_swap_fails_before_claim(
 ) -> None:
     if shutil.which("unshare") is None or shutil.which("mount") is None:
         pytest.skip("user/mount namespace tools are unavailable")
-    root, _worktree, _worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(tmp_path)
+    root, _worktree, _worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(
+        tmp_path
+    )
     state_root = tmp_path / "state"
     archive_root = root / ".hive-archive"
     archive_root.mkdir(mode=0o700)
     monkeypatch.setattr(server_module, "repo_root", lambda: root)
     monkeypatch.setattr(server_module, "STATE_ROOT", state_root)
-    monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle)
+    monkeypatch.setattr(
+        server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle
+    )
     monkeypatch.setattr(
         server_module,
         "_maintenance_caller_coverage",
         lambda: {"complete": True, "protocol": "fixture-only"},
     )
-    monkeypatch.setattr(maintenance_module, "_assert_no_open_tree_references", lambda _roots: None)
+    monkeypatch.setattr(
+        maintenance_module, "_assert_no_open_tree_references", lambda _roots: None
+    )
     preview = server_module._worktree_maintenance_plan()
     assert preview["caller_coverage"]["complete"] is True
     approval = server_module._approve_worktree_maintenance(preview["preview_digest"])
@@ -873,9 +951,17 @@ print(json.dumps({
 """
     completed = subprocess.run(
         [
-            "unshare", "--user", "--map-root-user", "--mount",
-            sys.executable, "-c", probe,
-            str(root), str(state_root), scenario, str(binding.canonical_source_path),
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            sys.executable,
+            "-c",
+            probe,
+            str(root),
+            str(state_root),
+            scenario,
+            str(binding.canonical_source_path),
         ],
         check=False,
         stdout=subprocess.PIPE,
@@ -899,10 +985,14 @@ print(json.dumps({
     assert outcome["mount_ids"] == {}
 
 
-def test_archive_share_swap_in_same_namespace_fails_before_claim(tmp_path: Path) -> None:
+def test_archive_share_swap_in_same_namespace_fails_before_claim(
+    tmp_path: Path,
+) -> None:
     if shutil.which("unshare") is None or shutil.which("mount") is None:
         pytest.skip("user/mount namespace tools are unavailable")
-    root, source, _worktree_root, _lifecycle, _binding = _canonical_temp_owner_fixture(tmp_path)
+    root, source, _worktree_root, _lifecycle, _binding = _canonical_temp_owner_fixture(
+        tmp_path
+    )
     archive_root = root / ".hive-archive"
     archive_root.mkdir(mode=0o700)
     state_root = tmp_path / "same-namespace-state"
@@ -1005,9 +1095,16 @@ print(json.dumps({
 """
     completed = subprocess.run(
         [
-            "unshare", "--user", "--map-root-user", "--mount",
-            sys.executable, "-c", probe,
-            str(root), str(source), str(state_root),
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            sys.executable,
+            "-c",
+            probe,
+            str(root),
+            str(source),
+            str(state_root),
         ],
         check=False,
         stdout=subprocess.PIPE,
@@ -1028,7 +1125,9 @@ print(json.dumps({
     assert outcome["mount_ids"]["before"] != outcome["mount_ids"]["after"]
 
 
-def test_worktree_maintenance_approval_gate_requires_same_contract_and_coverage() -> None:
+def test_worktree_maintenance_approval_gate_requires_same_contract_and_coverage() -> (
+    None
+):
     contract = "sha256:" + "a" * 64
     preview = {"contract_digest": contract, "caller_coverage": {"complete": True}}
     approval = {"contract_digest": contract}
@@ -1050,7 +1149,9 @@ def test_approved_cli_apply_reaches_existing_owner_on_controlled_worktree(
     root.mkdir()
     checkout = Path(server_module.__file__).resolve().parents[2]
     shutil.copy2(checkout / "codex-hive.json", root / "codex-hive.json")
-    shutil.copy2(checkout / "codex-agent-classes.json", root / "codex-agent-classes.json")
+    shutil.copy2(
+        checkout / "codex-agent-classes.json", root / "codex-agent-classes.json"
+    )
     _git(root, "init", "-qb", "main")
     _git(root, "config", "user.email", "test@example.invalid")
     _git(root, "config", "user.name", "Fixture")
@@ -1094,7 +1195,10 @@ def test_approved_cli_apply_reaches_existing_owner_on_controlled_worktree(
     assert any(
         candidate.get("source") == str(source) and candidate.get("eligible") is True
         for candidate in preview["candidates"]
-    ), [(item["source"], item["reasons"], item["host_gate"]) for item in preview["candidates"]]
+    ), [
+        (item["source"], item["reasons"], item["host_gate"])
+        for item in preview["candidates"]
+    ]
     monkeypatch.setattr(
         server_module,
         "_read_worktree_maintenance_approval",
@@ -1224,7 +1328,8 @@ def test_g5_temporary_producer_requires_verified_end_and_expires_after_seven_day
     request.addfinalizer(
         lambda: shutil.rmtree(producer_path)
         if producer_path.exists()
-        and (producer_path.stat().st_dev, producer_path.stat().st_ino) == producer_identity
+        and (producer_path.stat().st_dev, producer_path.stat().st_ino)
+        == producer_identity
         else None
     )
     assert producer_path.parent == Path(tempfile.gettempdir()).resolve()
@@ -1259,20 +1364,26 @@ def test_g5_temporary_producer_requires_verified_end_and_expires_after_seven_day
     ):
         evidence = G5ScopeBindingEvidence.capture(lease, scope, now=now - 8 * 86400 + 1)
         lease = lifecycle.bind_g5_runtime(lease, evidence, now=now - 8 * 86400 + 1)
-        (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+        (cgroup / "cgroup.events").write_text(
+            "populated 0\nfrozen 0\n", encoding="ascii"
+        )
         (cgroup / "cgroup.procs").write_text("", encoding="ascii")
         end_evidence = RuntimeEndEvidence.observe(lease, now=now - 8 * 86400 + 2)
         lifecycle.end_use(lease, end_evidence, now=now - 8 * 86400 + 3)
 
     candidates = scan_candidates((policy,), lifecycle, now=now)
-    temp_candidates = [candidate for candidate in candidates if candidate.source == producer_path]
+    temp_candidates = [
+        candidate for candidate in candidates if candidate.source == producer_path
+    ]
     assert len(temp_candidates) == 1
     assert temp_candidates[0].eligible is True
     assert "temporary_producer_7_days" in temp_candidates[0].reasons
     assert temp_candidates[0].temporary is True
     (producer_path / "nested").mkdir()
     (producer_path / "payload.bin").write_bytes(b"g5 temporary data\x00\xff")
-    (producer_path / "nested" / "state.txt").write_text("verified end\n", encoding="utf-8")
+    (producer_path / "nested" / "state.txt").write_text(
+        "verified end\n", encoding="utf-8"
+    )
     os.setxattr(producer_path, "user.temp-root-fixture", b"root-metadata")
     temp_candidate = next(
         candidate
@@ -1300,8 +1411,12 @@ def test_g5_temporary_producer_requires_verified_end_and_expires_after_seven_day
 
     try:
         with monkeypatch.context() as swap_patch:
-            swap_patch.setattr(maintenance_module, "_run_tar_create", tar_then_swap_source)
-            with pytest.raises(MaintenanceError, match="temporary_source_identity_changed"):
+            swap_patch.setattr(
+                maintenance_module, "_run_tar_create", tar_then_swap_source
+            )
+            with pytest.raises(
+                MaintenanceError, match="temporary_source_identity_changed"
+            ):
                 maintenance_module.archive_temporary_candidate(
                     temp_candidate, policy=policy, lifecycle=lifecycle
                 )
@@ -1342,7 +1457,10 @@ def test_g5_temporary_producer_requires_verified_end_and_expires_after_seven_day
         maintenance_module.archive_temporary_candidate(
             temp_candidate, policy=policy, lifecycle=lifecycle
         )
-    assert not any(candidate.source == producer_path for candidate in scan_candidates((policy,), lifecycle, now=now))
+    assert not any(
+        candidate.source == producer_path
+        for candidate in scan_candidates((policy,), lifecycle, now=now)
+    )
 
 
 def test_temp_apply_claims_archives_restores_and_removes_only_bound_producer(
@@ -1358,7 +1476,9 @@ def test_temp_apply_claims_archives_restores_and_removes_only_bound_producer(
     )
     monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
     _control_reference_inventory(monkeypatch)
-    claim = server_module._claim_worktree_maintenance(candidate.binding, now=int(time.time()))
+    claim = server_module._claim_worktree_maintenance(
+        candidate.binding, now=int(time.time())
+    )
 
     receipt = apply_candidate(
         candidate,
@@ -1377,7 +1497,9 @@ def test_temp_apply_claims_archives_restores_and_removes_only_bound_producer(
         lifecycle.assert_claim(claim)
 
 
-def test_archive_lock_fd_is_included_in_writer_child_inheritance(tmp_path: Path) -> None:
+def test_archive_lock_fd_is_included_in_writer_child_inheritance(
+    tmp_path: Path,
+) -> None:
     archive_root = tmp_path / "archive"
     archive_root.mkdir(mode=0o700)
     lock_fd = os.open(archive_root, os.O_RDONLY | os.O_DIRECTORY)
@@ -1427,7 +1549,10 @@ def test_restore_lock_remains_held_by_child_after_parent_finally(
             with pytest.raises(MaintenanceError, match="restore_fixture_failure"):
                 restore_archive(receipt, tmp_path / "restore-bundle")
         else:
-            assert restore_archive(receipt, tmp_path / "restore-bundle") == tmp_path / "restore-bundle"
+            assert (
+                restore_archive(receipt, tmp_path / "restore-bundle")
+                == tmp_path / "restore-bundle"
+            )
         child = child_processes[0]
         assert child.poll() is None
         challenger_fd = os.open(archive_root, os.O_RDONLY | os.O_DIRECTORY)
@@ -1525,9 +1650,7 @@ def test_archive_error_finally_keeps_lock_until_started_child_exits(
         child_processes.append(
             subprocess.Popen(
                 [sys.executable, "-c", child_code, str(release_marker)],
-                pass_fds=maintenance_module._maintenance_pass_fds(
-                    lock_fd, (root_fd,)
-                ),
+                pass_fds=maintenance_module._maintenance_pass_fds(lock_fd, (root_fd,)),
             )
         )
         raise MaintenanceError("archive_fixture_failure")
@@ -1572,7 +1695,13 @@ def test_archive_child_keeps_lock_after_writer_crash_until_handoff_to_hold(
     writer_recv, writer_send = context.Pipe(duplex=False)
     writer = context.Process(
         target=_archive_writer_crashes_with_locked_child,
-        args=(str(state_root), binding, str(archive_root), str(release_marker), writer_send),
+        args=(
+            str(state_root),
+            binding,
+            str(archive_root),
+            str(release_marker),
+            writer_send,
+        ),
     )
     writer.start()
     writer_send.close()
@@ -1635,7 +1764,13 @@ def test_recovery_rejects_caller_selected_private_root_while_archive_child_lives
     writer_recv, writer_send = context.Pipe(duplex=False)
     writer = context.Process(
         target=_archive_writer_crashes_with_locked_child,
-        args=(str(state_root), binding, str(archive_root), str(release_marker), writer_send),
+        args=(
+            str(state_root),
+            binding,
+            str(archive_root),
+            str(release_marker),
+            writer_send,
+        ),
     )
     writer.start()
     writer_send.close()
@@ -1678,7 +1813,10 @@ def test_server_archive_owner_derives_policy_and_lifecycle_from_canonical_source
     root.mkdir()
     canonical_checkout = Path(server_module.__file__).resolve().parents[2]
     shutil.copy2(canonical_checkout / "codex-hive.json", root / "codex-hive.json")
-    shutil.copy2(canonical_checkout / "codex-agent-classes.json", root / "codex-agent-classes.json")
+    shutil.copy2(
+        canonical_checkout / "codex-agent-classes.json",
+        root / "codex-agent-classes.json",
+    )
     _git(root, "init", "-qb", "main")
     _git(root, "config", "user.email", "test@example.invalid")
     _git(root, "config", "user.name", "Fixture")
@@ -1742,7 +1880,9 @@ def test_server_archive_owner_derives_policy_and_lifecycle_from_canonical_source
     temporary_root = _other_filesystem_tempdir(root, prefix="hive-temp-owner-")
     request.addfinalizer(temporary_root.cleanup)
     temp_root = Path(temporary_root.name)
-    producer = _create_ended_temp_producer(lifecycle, binding, temp_root, now=int(time.time()))
+    producer = _create_ended_temp_producer(
+        lifecycle, binding, temp_root, now=int(time.time())
+    )
     producer_identity = (producer.stat().st_dev, producer.stat().st_ino)
     assert producer.stat().st_dev != root.stat().st_dev
     (producer / "runner-state.json").write_text('{"result":"done"}\n', encoding="utf-8")
@@ -1774,16 +1914,23 @@ def test_server_archive_owner_derives_policy_and_lifecycle_from_canonical_source
     unknown_temp.mkdir()
     with pytest.raises(Exception, match="maintenance_source_unattested"):
         server_module._archive_temporary_by_id("codex-master", unknown_temp)
-    if producer.exists() and (producer.stat().st_dev, producer.stat().st_ino) == producer_identity:
+    if (
+        producer.exists()
+        and (producer.stat().st_dev, producer.stat().st_ino) == producer_identity
+    ):
         shutil.rmtree(producer)
     with pytest.raises(Exception, match="maintenance_selection_invalid"):
-        server_module._archive_worktree_by_id("codex-master", ArchiveReceipt(Path("/archive"), "sha256:x", 0))
+        server_module._archive_worktree_by_id(
+            "codex-master", ArchiveReceipt(Path("/archive"), "sha256:x", 0)
+        )
 
 
 def test_server_cli_applies_only_attested_temp_producer_after_read_only_preflight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    root, worktree, _worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(tmp_path)
+    root, worktree, _worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(
+        tmp_path
+    )
     monkeypatch.setattr(server_module, "repo_root", lambda: root)
     monkeypatch.setattr(server_module, "STATE_ROOT", tmp_path / "state")
     _control_reference_inventory(monkeypatch)
@@ -1794,7 +1941,9 @@ def test_server_cli_applies_only_attested_temp_producer_after_read_only_prefligh
             lifecycle, binding, temp_root, now=int(time.time())
         )
     (producer / "state.json").write_text("verified producer output\n")
-    monkeypatch.setattr(server_module, "_require_worktree_maintenance_approval", lambda *_args: None)
+    monkeypatch.setattr(
+        server_module, "_require_worktree_maintenance_approval", lambda *_args: None
+    )
     monkeypatch.setattr(
         server_module,
         "_read_native_agent_registry_read_only",
@@ -1842,7 +1991,9 @@ def test_temp_apply_holds_when_open_reference_remains(
         lambda: ({"agents": {}, "sessions": {}, "reservations": {}}, "ready"),
     )
     monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
-    claim = server_module._claim_worktree_maintenance(candidate.binding, now=int(time.time()))
+    claim = server_module._claim_worktree_maintenance(
+        candidate.binding, now=int(time.time())
+    )
     payload = producer / "payload.txt"
     fd = mapping = None
     old_cwd = Path.cwd()
@@ -1859,10 +2010,17 @@ def test_temp_apply_holds_when_open_reference_remains(
             mapped_path=payload if reference_kind == "mapping" else None,
         )
         with pytest.raises(MaintenanceError, match="maintenance_open_reference_active"):
-            apply_candidate(candidate, lifecycle, policy=policy, claim=claim, now=int(time.time()))
+            apply_candidate(
+                candidate, lifecycle, policy=policy, claim=claim, now=int(time.time())
+            )
         assert producer.exists()
-        assert (producer / "payload.txt").read_text(encoding="utf-8") == "attested producer output\n"
-        assert any(item.claim_id == claim.claim_id for item in lifecycle.snapshot().maintenance_claims)
+        assert (producer / "payload.txt").read_text(
+            encoding="utf-8"
+        ) == "attested producer output\n"
+        assert any(
+            item.claim_id == claim.claim_id
+            for item in lifecycle.snapshot().maintenance_claims
+        )
     finally:
         os.chdir(old_cwd)
         if mapping is not None:
@@ -1874,11 +2032,17 @@ def test_temp_apply_holds_when_open_reference_remains(
 def test_temp_cli_unreadable_reference_inventory_is_no_mutation_before_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, _worktree, _worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(tmp_path)
+    root, _worktree, _worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(
+        tmp_path
+    )
     monkeypatch.setattr(server_module, "repo_root", lambda: root)
     monkeypatch.setattr(server_module, "STATE_ROOT", tmp_path / "state")
-    monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle)
-    monkeypatch.setattr(server_module, "_require_worktree_maintenance_approval", lambda *_args: None)
+    monkeypatch.setattr(
+        server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle
+    )
+    monkeypatch.setattr(
+        server_module, "_require_worktree_maintenance_approval", lambda *_args: None
+    )
     monkeypatch.setattr(
         server_module,
         "_read_native_agent_registry_read_only",
@@ -1908,10 +2072,14 @@ def test_temp_cli_unreadable_reference_inventory_is_no_mutation_before_claim(
     monkeypatch.setattr(os, "listdir", fixture_process_inventory)
     monkeypatch.setattr(os, "scandir", unreadable_own_fd_dir)
     before = lifecycle.snapshot()
-    with pytest.raises(MaintenanceError, match="maintenance_reference_inventory_unavailable"):
+    with pytest.raises(
+        MaintenanceError, match="maintenance_reference_inventory_unavailable"
+    ):
         server_module._apply_worktree_by_id("codex-master", producer)
     assert lifecycle.snapshot() == before
-    assert (producer / "payload.txt").read_text(encoding="utf-8") == "keep on unavailable inventory\n"
+    assert (producer / "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "keep on unavailable inventory\n"
 
 
 def test_temp_apply_rejects_identity_swap_after_archive_without_deleting_either_tree(
@@ -1926,7 +2094,9 @@ def test_temp_apply_rejects_identity_swap_after_archive_without_deleting_either_
     )
     monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
     _control_reference_inventory(monkeypatch)
-    claim = server_module._claim_worktree_maintenance(candidate.binding, now=int(time.time()))
+    claim = server_module._claim_worktree_maintenance(
+        candidate.binding, now=int(time.time())
+    )
     original_archive = maintenance_module.archive_temporary_candidate
     saved = producer.with_name(producer.name + ".saved")
 
@@ -1937,12 +2107,25 @@ def test_temp_apply_rejects_identity_swap_after_archive_without_deleting_either_
         (producer / "replacement.txt").write_text("replacement must survive\n")
         return receipt
 
-    monkeypatch.setattr(maintenance_module, "archive_temporary_candidate", archive_then_swap)
-    with pytest.raises(WorktreeLifecycleError, match="maintenance_receipt_binding_mismatch"):
-        apply_candidate(candidate, lifecycle, policy=policy, claim=claim, now=int(time.time()))
-    assert (saved / "payload.txt").read_text(encoding="utf-8") == "attested producer output\n"
-    assert (producer / "replacement.txt").read_text(encoding="utf-8") == "replacement must survive\n"
-    assert any(item.claim_id == claim.claim_id for item in lifecycle.snapshot().maintenance_claims)
+    monkeypatch.setattr(
+        maintenance_module, "archive_temporary_candidate", archive_then_swap
+    )
+    with pytest.raises(
+        WorktreeLifecycleError, match="maintenance_receipt_binding_mismatch"
+    ):
+        apply_candidate(
+            candidate, lifecycle, policy=policy, claim=claim, now=int(time.time())
+        )
+    assert (saved / "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "attested producer output\n"
+    assert (producer / "replacement.txt").read_text(
+        encoding="utf-8"
+    ) == "replacement must survive\n"
+    assert any(
+        item.claim_id == claim.claim_id
+        for item in lifecycle.snapshot().maintenance_claims
+    )
 
 
 def test_temp_apply_restores_name_swapped_tree_before_holding_claim(
@@ -1957,30 +2140,47 @@ def test_temp_apply_restores_name_swapped_tree_before_holding_claim(
     )
     monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
     _control_reference_inventory(monkeypatch)
-    claim = server_module._claim_worktree_maintenance(candidate.binding, now=int(time.time()))
+    claim = server_module._claim_worktree_maintenance(
+        candidate.binding, now=int(time.time())
+    )
     filesystem = maintenance_module.LocalFleetHomeV2Filesystem
     rename = filesystem.rename_noreplace_between_at
     displaced_original = producer.with_name(producer.name + ".original")
     raced = False
 
-    def swap_after_identity_check(self, source_parent_fd, source_name, target_parent_fd, target_name):
+    def swap_after_identity_check(
+        self, source_parent_fd, source_name, target_parent_fd, target_name
+    ):
         nonlocal raced
         if source_name == producer.name and target_name == "temporary" and not raced:
             producer.rename(displaced_original)
             producer.mkdir(mode=0o700)
             (producer / "replacement.txt").write_text("replacement tree\n")
             raced = True
-        return rename(self, source_parent_fd, source_name, target_parent_fd, target_name)
+        return rename(
+            self, source_parent_fd, source_name, target_parent_fd, target_name
+        )
 
-    monkeypatch.setattr(filesystem, "rename_noreplace_between_at", swap_after_identity_check)
+    monkeypatch.setattr(
+        filesystem, "rename_noreplace_between_at", swap_after_identity_check
+    )
     with pytest.raises(MaintenanceError, match="quarantine_identity_changed"):
-        apply_candidate(candidate, lifecycle, policy=policy, claim=claim, now=int(time.time()))
+        apply_candidate(
+            candidate, lifecycle, policy=policy, claim=claim, now=int(time.time())
+        )
 
     assert raced
-    assert (displaced_original / "payload.txt").read_text(encoding="utf-8") == "attested producer output\n"
-    assert (producer / "replacement.txt").read_text(encoding="utf-8") == "replacement tree\n"
+    assert (displaced_original / "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "attested producer output\n"
+    assert (producer / "replacement.txt").read_text(
+        encoding="utf-8"
+    ) == "replacement tree\n"
     assert not (producer.parent / ".hive-quarantine" / claim.claim_id).exists()
-    assert any(item.claim_id == claim.claim_id for item in lifecycle.snapshot().maintenance_claims)
+    assert any(
+        item.claim_id == claim.claim_id
+        for item in lifecycle.snapshot().maintenance_claims
+    )
 
 
 @pytest.mark.parametrize("source_conflict", [False, True])
@@ -1998,7 +2198,9 @@ def test_temp_handoff_identity_read_failure_restores_or_records_collision_hold(
     )
     monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
     _control_reference_inventory(monkeypatch)
-    claim = server_module._claim_worktree_maintenance(candidate.binding, now=int(time.time()))
+    claim = server_module._claim_worktree_maintenance(
+        candidate.binding, now=int(time.time())
+    )
     filesystem = maintenance_module.LocalFleetHomeV2Filesystem
     rename = filesystem.rename_noreplace_between_at
     identity_at = filesystem.identity_at
@@ -2012,13 +2214,17 @@ def test_temp_handoff_identity_read_failure_restores_or_records_collision_hold(
             producer.rename(displaced_original)
             producer.mkdir(mode=0o700)
             (producer / "replacement.txt").write_text("replacement tree\n")
-            result = rename(self, source_parent_fd, source_name, target_parent_fd, target_name)
+            result = rename(
+                self, source_parent_fd, source_name, target_parent_fd, target_name
+            )
             if source_conflict:
                 producer.mkdir(mode=0o700)
                 (producer / "later.txt").write_text("later occupant\n")
             moved = True
             return result
-        return rename(self, source_parent_fd, source_name, target_parent_fd, target_name)
+        return rename(
+            self, source_parent_fd, source_name, target_parent_fd, target_name
+        )
 
     def fail_first_quarantine_identity(directory_fd, name):
         nonlocal injected
@@ -2028,24 +2234,40 @@ def test_temp_handoff_identity_read_failure_restores_or_records_collision_hold(
         return identity_at(directory_fd, name)
 
     monkeypatch.setattr(filesystem, "rename_noreplace_between_at", race_rename)
-    monkeypatch.setattr(filesystem, "identity_at", staticmethod(fail_first_quarantine_identity))
-    with pytest.raises(MaintenanceError, match="temporary_quarantine_or_removal_failed"):
-        apply_candidate(candidate, lifecycle, policy=policy, claim=claim, now=int(time.time()))
+    monkeypatch.setattr(
+        filesystem, "identity_at", staticmethod(fail_first_quarantine_identity)
+    )
+    with pytest.raises(
+        MaintenanceError, match="temporary_quarantine_or_removal_failed"
+    ):
+        apply_candidate(
+            candidate, lifecycle, policy=policy, claim=claim, now=int(time.time())
+        )
 
     assert moved and injected
-    assert (displaced_original / "payload.txt").read_text(encoding="utf-8") == "attested producer output\n"
+    assert (displaced_original / "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "attested producer output\n"
     operation = lifecycle.maintenance_operation_for_recovery(claim)
     if source_conflict:
-        quarantined = producer.parent / ".hive-quarantine" / claim.claim_id / "temporary"
-        assert (producer / "later.txt").read_text(encoding="utf-8") == "later occupant\n"
-        assert (quarantined / "replacement.txt").read_text(encoding="utf-8") == "replacement tree\n"
+        quarantined = (
+            producer.parent / ".hive-quarantine" / claim.claim_id / "temporary"
+        )
+        assert (producer / "later.txt").read_text(
+            encoding="utf-8"
+        ) == "later occupant\n"
+        assert (quarantined / "replacement.txt").read_text(
+            encoding="utf-8"
+        ) == "replacement tree\n"
         evidence = operation["collision_evidence"]
         assert evidence["source_name"] == producer.name
         assert evidence["quarantine_name"] == "temporary"
         assert evidence["moved_inode"] == quarantined.stat().st_ino
         assert evidence["moved_device"] == quarantined.stat().st_dev
     else:
-        assert (producer / "replacement.txt").read_text(encoding="utf-8") == "replacement tree\n"
+        assert (producer / "replacement.txt").read_text(
+            encoding="utf-8"
+        ) == "replacement tree\n"
         assert not (producer.parent / ".hive-quarantine" / claim.claim_id).exists()
         assert operation["collision_evidence"] is None
 
@@ -2062,7 +2284,9 @@ def test_temp_apply_failure_after_quarantine_restores_source_and_releases_claim(
     )
     monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
     _control_reference_inventory(monkeypatch)
-    claim = server_module._claim_worktree_maintenance(candidate.binding, now=int(time.time()))
+    claim = server_module._claim_worktree_maintenance(
+        candidate.binding, now=int(time.time())
+    )
     advance = lifecycle.advance_maintenance_phase
 
     def fail_after_quarantine(claim_arg, *, phase):
@@ -2071,10 +2295,16 @@ def test_temp_apply_failure_after_quarantine_restores_source_and_releases_claim(
             raise OSError("fixture crash after durable quarantine phase")
 
     monkeypatch.setattr(lifecycle, "advance_maintenance_phase", fail_after_quarantine)
-    with pytest.raises(MaintenanceError, match="temporary_quarantine_or_removal_failed"):
-        apply_candidate(candidate, lifecycle, policy=policy, claim=claim, now=int(time.time()))
+    with pytest.raises(
+        MaintenanceError, match="temporary_quarantine_or_removal_failed"
+    ):
+        apply_candidate(
+            candidate, lifecycle, policy=policy, claim=claim, now=int(time.time())
+        )
     assert producer.exists()
-    assert (producer / "payload.txt").read_text(encoding="utf-8") == "attested producer output\n"
+    assert (producer / "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "attested producer output\n"
     assert not (producer.parent / ".hive-quarantine" / claim.claim_id).exists()
     assert not lifecycle.snapshot().maintenance_claims
 
@@ -2100,9 +2330,13 @@ def test_temp_recovery_restores_quarantined_source_after_writer_exit(
     lifecycle.hold_maintenance_claim(claim)
 
     with monkeypatch.context() as recovery_patch:
-        recovery_patch.setattr(lifecycle_module, "_process_is_active", lambda _identity: False)
-        recovered_claim = maintenance_module._recover_maintenance_claim_under_archive_lock(
-            lifecycle, candidate.binding, now=int(time.time())
+        recovery_patch.setattr(
+            lifecycle_module, "_process_is_active", lambda _identity: False
+        )
+        recovered_claim = (
+            maintenance_module._recover_maintenance_claim_under_archive_lock(
+                lifecycle, candidate.binding, now=int(time.time())
+            )
         )
     restored = maintenance_module.recover_temporary_source_after_hold(
         lifecycle, recovered_claim
@@ -2119,14 +2353,18 @@ def test_temp_recovery_waits_for_crashed_writer_child_lock_and_preserves_inode(
     tmp_path: Path, source_conflict: bool
 ) -> None:
     context = multiprocessing.get_context("fork")
-    root, _worktree, worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(tmp_path)
+    root, _worktree, worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(
+        tmp_path
+    )
     temp_root = tmp_path / "tmp-source"
     temp_root.mkdir()
     producer = _create_ended_temp_producer(
         lifecycle, binding, temp_root, now=int(time.time())
     )
     payload = producer / "state.json"
-    payload.write_text("restore only after the archive writer child exits\n", encoding="utf-8")
+    payload.write_text(
+        "restore only after the archive writer child exits\n", encoding="utf-8"
+    )
     policy = ProjectPolicy(
         source_root=binding.canonical_source_path,
         allowed_source_roots=(worktree_root,),
@@ -2174,11 +2412,18 @@ def test_temp_recovery_waits_for_crashed_writer_child_lock_and_preserves_inode(
     recovery_recv, recovery_send = context.Pipe(duplex=False)
     recovery = context.Process(
         target=_run_temporary_recovery_cli_process,
-        args=(str(root), str(tmp_path / "state" / "hive"), str(producer), recovery_send),
+        args=(
+            str(root),
+            str(tmp_path / "state" / "hive"),
+            str(producer),
+            recovery_send,
+        ),
     )
     recovery.start()
     recovery_send.close()
-    assert recovery_recv.poll(30), "canonical recovery owner did not announce its attempt"
+    assert recovery_recv.poll(30), (
+        "canonical recovery owner did not announce its attempt"
+    )
     assert recovery_recv.recv() == "flock_attempting"
     locked_fd = os.open(policy.archive_root, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -2191,7 +2436,9 @@ def test_temp_recovery_waits_for_crashed_writer_child_lock_and_preserves_inode(
 
         if source_conflict:
             producer.mkdir(mode=0o700)
-            (producer / "occupant.txt").write_text("keep this occupant\n", encoding="utf-8")
+            (producer / "occupant.txt").write_text(
+                "keep this occupant\n", encoding="utf-8"
+            )
         release_marker.write_text("release", encoding="ascii")
         assert recovery_recv.poll(30), "recovery did not finish after lock child exit"
         result = recovery_recv.recv()
@@ -2209,8 +2456,12 @@ def test_temp_recovery_waits_for_crashed_writer_child_lock_and_preserves_inode(
     if source_conflict:
         assert result[0] == "cli"
         assert result[1] == 1
-        assert json.loads(result[2]) == {"error": "maintenance_source_restore_ambiguous"}
-        assert (producer / "occupant.txt").read_text(encoding="utf-8") == "keep this occupant\n"
+        assert json.loads(result[2]) == {
+            "error": "maintenance_source_restore_ambiguous"
+        }
+        assert (producer / "occupant.txt").read_text(
+            encoding="utf-8"
+        ) == "keep this occupant\n"
         assert quarantined.stat(follow_symlinks=False).st_ino == original_inode
         held = store.snapshot().maintenance_claims[0]
         assert held.claim_id == claim_id
@@ -2246,10 +2497,14 @@ def test_temp_recover_cli_restores_quarantined_source_by_canonical_owner(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    root, _worktree, worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(tmp_path)
+    root, _worktree, worktree_root, lifecycle, binding = _canonical_temp_owner_fixture(
+        tmp_path
+    )
     monkeypatch.setattr(server_module, "repo_root", lambda: root)
     monkeypatch.setattr(server_module, "STATE_ROOT", tmp_path / "state")
-    monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle)
+    monkeypatch.setattr(
+        server_module, "_worktree_lifecycle_store", lambda **_kwargs: lifecycle
+    )
     temp_root = tmp_path / "tmp-source"
     temp_root.mkdir()
     producer = _create_ended_temp_producer(
@@ -2284,7 +2539,9 @@ def test_temp_recover_cli_restores_quarantined_source_by_canonical_owner(
     recover_claim = maintenance_module._recover_maintenance_claim_under_archive_lock
 
     def recover_dead_writer(*args, **kwargs):
-        with patch.object(lifecycle_module, "_process_is_active", lambda _identity: False):
+        with patch.object(
+            lifecycle_module, "_process_is_active", lambda _identity: False
+        ):
             return recover_claim(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -2306,7 +2563,9 @@ def test_temp_recover_cli_restores_quarantined_source_by_canonical_owner(
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
     assert result["phase"] == "source_restored"
-    assert (producer / "state.json").read_text(encoding="utf-8") == "restore after writer crash\n"
+    assert (producer / "state.json").read_text(
+        encoding="utf-8"
+    ) == "restore after writer crash\n"
     assert not quarantine_claim.exists()
     assert not lifecycle.snapshot().maintenance_claims
 
@@ -2369,9 +2628,9 @@ def test_manifest_records_symlink_security_xattrs(tmp_path: Path) -> None:
     source_value = os.getxattr(link, "security.selinux", follow_symlinks=False)
     entry = next(item for item in _tree_manifest(source) if item["path"] == "link")
 
-    assert entry["xattrs"]["security.selinux"] == base64.b64encode(
-        source_value
-    ).decode("ascii")
+    assert entry["xattrs"]["security.selinux"] == base64.b64encode(source_value).decode(
+        "ascii"
+    )
 
 
 def test_manifest_records_root_acl_and_xattrs_for_both_trees(tmp_path: Path) -> None:
@@ -2388,7 +2647,9 @@ def test_manifest_records_root_acl_and_xattrs_for_both_trees(tmp_path: Path) -> 
         )
         os.setxattr(root, "user.root-fixture", root.name.encode())
 
-    worktree_root = next(item for item in _tree_manifest(worktree) if item["path"] == ".")
+    worktree_root = next(
+        item for item in _tree_manifest(worktree) if item["path"] == "."
+    )
     common_root = next(item for item in _tree_manifest(common) if item["path"] == ".")
 
     for entry in (worktree_root, common_root):
@@ -2397,7 +2658,9 @@ def test_manifest_records_root_acl_and_xattrs_for_both_trees(tmp_path: Path) -> 
         assert entry["xattrs"]["user.root-fixture"]
 
 
-def test_preview_is_read_only_and_protects_missing_lifecycle_age(tmp_path: Path) -> None:
+def test_preview_is_read_only_and_protects_missing_lifecycle_age(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source"
     source.mkdir()
     marker = source / "keep.txt"
@@ -2442,7 +2705,9 @@ def test_preview_uses_exact_age_and_allocated_size_thresholds(
         last_use_ended_at=lambda bound: 100,
         snapshot=lambda: SimpleNamespace(active_uses=(), maintenance_claims=()),
     )
-    monkeypatch.setattr(maintenance, "_git_layout", lambda path, bound: (common, "worktrees/x"))
+    monkeypatch.setattr(
+        maintenance, "_git_layout", lambda path, bound: (common, "worktrees/x")
+    )
     monkeypatch.setattr(maintenance, "_tree_manifest", lambda path, **kwargs: [])
     monkeypatch.setattr(maintenance, "_allocated_bytes", lambda path: allocated)
     preview = scan_candidates(
@@ -2495,7 +2760,10 @@ def test_old_end_history_does_not_override_current_lifecycle_exclusions(
         now=4 + 30 * 86400,
     )[0]
 
-    assert "worktree_in_use" in preview.reasons or "maintenance_claim_active" in preview.reasons
+    assert (
+        "worktree_in_use" in preview.reasons
+        or "maintenance_claim_active" in preview.reasons
+    )
     assert not preview.eligible
 
 
@@ -2517,7 +2785,11 @@ def test_unattested_archive_candidate_cannot_touch_source_or_existing_archive(
     before = _file_snapshot(tmp_path)
 
     with pytest.raises(MaintenanceError, match="candidate_not_eligible"):
-        _archive_candidate(candidate, policy=ProjectPolicy(candidate.source, (tmp_path,), archive_root), lifecycle=object())
+        _archive_candidate(
+            candidate,
+            policy=ProjectPolicy(candidate.source, (tmp_path,), archive_root),
+            lifecycle=object(),
+        )
 
     assert _file_snapshot(tmp_path) == before
     assert old_archive.read_bytes() == b"old receipt"
@@ -2531,7 +2803,11 @@ def test_forged_eligible_boolean_does_not_open_archive_writer(tmp_path: Path) ->
     candidate = MaintenanceCandidate(source, (), True)
 
     with pytest.raises(MaintenanceError, match="candidate_not_eligible"):
-        _archive_candidate(candidate, policy=ProjectPolicy(candidate.source, (tmp_path,), archive_root), lifecycle=object())
+        _archive_candidate(
+            candidate,
+            policy=ProjectPolicy(candidate.source, (tmp_path,), archive_root),
+            lifecycle=object(),
+        )
 
     assert not archive_root.exists()
     assert (source / "keep.txt").read_text() == "source"
@@ -2596,7 +2872,9 @@ def test_invalid_restore_receipt_preserves_existing_and_missing_targets(
     assert not missing_destination.exists()
 
 
-def test_restore_rejects_manifest_gitdir_escape_before_any_write(tmp_path: Path) -> None:
+def test_restore_rejects_manifest_gitdir_escape_before_any_write(
+    tmp_path: Path,
+) -> None:
     archive_dir = tmp_path / "untrusted-archive"
     archive_dir.mkdir(mode=0o700)
     os.chmod(archive_dir, 0o700)
@@ -2614,7 +2892,9 @@ def test_restore_rejects_manifest_gitdir_escape_before_any_write(tmp_path: Path)
         "common_entries": [],
         "archives": archives,
     }
-    raw_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    raw_manifest = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
     (archive_dir / "manifest.json").write_bytes(raw_manifest)
     info = archive_dir.stat()
     receipt = ArchiveReceipt(
@@ -2654,7 +2934,9 @@ def test_git_config_validator_blocks_fsmonitor_commands(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
-def test_restore_validates_real_linked_worktree_config_before_git_status(tmp_path: Path) -> None:
+def test_restore_validates_real_linked_worktree_config_before_git_status(
+    tmp_path: Path,
+) -> None:
     import the_hive.maintenance as maintenance
 
     origin = tmp_path / "origin"
@@ -2679,8 +2961,12 @@ def test_restore_validates_real_linked_worktree_config_before_git_status(tmp_pat
     worktree_fd = os.open(worktree, os.O_RDONLY | os.O_DIRECTORY)
     common_fd = os.open(common, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        maintenance._tar_create(worktree_fd, archive_dir / "worktree.tar", exclude_git=True)
-        maintenance._tar_create(common_fd, archive_dir / "git-common.tar", exclude_git=False)
+        maintenance._tar_create(
+            worktree_fd, archive_dir / "worktree.tar", exclude_git=True
+        )
+        maintenance._tar_create(
+            common_fd, archive_dir / "git-common.tar", exclude_git=False
+        )
     finally:
         os.close(worktree_fd)
         os.close(common_fd)
@@ -2708,7 +2994,9 @@ def test_restore_validates_real_linked_worktree_config_before_git_status(tmp_pat
             for name in ("worktree.tar", "git-common.tar")
         },
     }
-    raw_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    raw_manifest = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
     (archive_dir / "manifest.json").write_bytes(raw_manifest)
     archive_info = archive_dir.stat()
     receipt = ArchiveReceipt(
@@ -2755,7 +3043,9 @@ def test_restore_rejects_tar_symlink_escape_before_extraction(tmp_path: Path) ->
             for name in ("worktree.tar", "git-common.tar")
         },
     }
-    raw_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    raw_manifest = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
     (archive_dir / "manifest.json").write_bytes(raw_manifest)
     info = archive_dir.stat()
     receipt = ArchiveReceipt(
@@ -2794,16 +3084,22 @@ def test_apply_refuses_open_fd_write_after_archive_verification(
         assert candidate.eligible
         tracked = source / "tracked.txt"
         writer_fd = os.open(tracked, os.O_WRONLY | os.O_APPEND)
-        monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda: lifecycle)
+        monkeypatch.setattr(
+            server_module, "_worktree_lifecycle_store", lambda: lifecycle
+        )
         monkeypatch.setattr(
             server_module,
             "_read_native_agent_registry_read_only",
             lambda: ({"agents": {}, "sessions": {}, "reservations": {}}, "ready"),
         )
-        monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
+        monkeypatch.setattr(
+            server_module, "retained_pin_session_ids", lambda _now: set()
+        )
         claim = server_module._claim_worktree_maintenance(binding, now=int(time.time()))
         try:
-            with pytest.raises(MaintenanceError, match="maintenance_open_reference_active"):
+            with pytest.raises(
+                MaintenanceError, match="maintenance_open_reference_active"
+            ):
                 apply_candidate(
                     candidate,
                     lifecycle,
@@ -2813,13 +3109,17 @@ def test_apply_refuses_open_fd_write_after_archive_verification(
                 )
             assert source.exists()
             assert tracked.read_bytes() == b"original\n"
-            with pytest.raises(WorktreeLifecycleError, match="maintenance_operation_incomplete"):
+            with pytest.raises(
+                WorktreeLifecycleError, match="maintenance_operation_incomplete"
+            ):
                 lifecycle.finish_maintenance(claim, outcome="incorrectly-finished")
             with lifecycle._state.locked():
                 document = lifecycle._state.read_json_locked(
                     PurePosixPath("worktree-lifecycle-v1.json"), max_bytes=1024 * 1024
                 )
-            operation = next(iter(document["worktrees"].values()))["maintenance_operation"]
+            operation = next(iter(document["worktrees"].values()))[
+                "maintenance_operation"
+            ]
             assert operation["phase"] == "recovery_hold"
         finally:
             os.close(writer_fd)
@@ -2835,13 +3135,17 @@ def test_apply_holds_when_proc_reference_inventory_is_incomplete(
             project, Path(raw), tmp_path / "state"
         )
         candidate = scan_candidates((policy,), lifecycle, now=int(time.time()))[0]
-        monkeypatch.setattr(server_module, "_worktree_lifecycle_store", lambda: lifecycle)
+        monkeypatch.setattr(
+            server_module, "_worktree_lifecycle_store", lambda: lifecycle
+        )
         monkeypatch.setattr(
             server_module,
             "_read_native_agent_registry_read_only",
             lambda: ({"agents": {}, "sessions": {}, "reservations": {}}, "ready"),
         )
-        monkeypatch.setattr(server_module, "retained_pin_session_ids", lambda _now: set())
+        monkeypatch.setattr(
+            server_module, "retained_pin_session_ids", lambda _now: set()
+        )
         claim = server_module._claim_worktree_maintenance(binding, now=int(time.time()))
         with pytest.raises(
             MaintenanceError, match="maintenance_reference_inventory_unavailable"
@@ -2862,9 +3166,7 @@ def test_linked_worktree_archive_restores_after_original_cross_fs_fixture_is_rem
     project = tmp_path / "project"
     project.mkdir()
     archive_root = project / ".hive-archive"
-    with _other_filesystem_tempdir(
-        project, prefix="hive-maintenance-source-"
-    ) as raw:
+    with _other_filesystem_tempdir(project, prefix="hive-maintenance-source-") as raw:
         source_parent = Path(raw)
         origin = project / "origin"
         origin.mkdir()
@@ -2885,7 +3187,10 @@ def test_linked_worktree_archive_restores_after_original_cross_fs_fixture_is_rem
         other_head = _git(other_worktree, "rev-parse", "HEAD")
         other_gitdir = (
             other_worktree
-            / (other_worktree / ".git").read_text(encoding="utf-8").strip().removeprefix("gitdir: ")
+            / (other_worktree / ".git")
+            .read_text(encoding="utf-8")
+            .strip()
+            .removeprefix("gitdir: ")
         ).resolve(strict=True)
         attestation = HeadlessWriteScopeStore(tmp_path / "origin-evidence").create(
             "fixture", source.resolve(), source.resolve(), base_ref=None
@@ -2921,9 +3226,17 @@ def test_linked_worktree_archive_restores_after_original_cross_fs_fixture_is_rem
             stream.seek(7 * 1024 * 1024)
             stream.write(b"tail")
         _git(source, "config", "maintenance.fixture", "preserved")
-        original_status = _git(source, "status", "--porcelain", "--untracked-files=all", "--ignored=matching")
+        original_status = _git(
+            source,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=matching",
+        )
         original_head = _git(source, "rev-parse", "HEAD")
-        index_path = Path(_git(source, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+        index_path = Path(
+            _git(source, "rev-parse", "--path-format=absolute", "--git-path", "index")
+        )
         if not index_path.is_absolute():
             index_path = source / index_path
         original_index = index_path.read_bytes()
@@ -2962,7 +3275,9 @@ def test_linked_worktree_archive_restores_after_original_cross_fs_fixture_is_rem
         gitdir = (source / gitdir_text.removeprefix("gitdir: ")).resolve(strict=True)
         swapped_gitdir = gitdir.with_name("fixture-swapped")
         gitdir.rename(swapped_gitdir)
-        assert not scan_candidates((policy,), lifecycle, now=int(time.time()))[0].eligible
+        assert not scan_candidates((policy,), lifecycle, now=int(time.time()))[
+            0
+        ].eligible
         swapped_gitdir.rename(gitdir)
         swapped_source = source.with_name("worktree-swapped")
         source.rename(swapped_source)
@@ -3015,17 +3330,37 @@ def test_linked_worktree_archive_restores_after_original_cross_fs_fixture_is_rem
         shutil.rmtree(origin)
         restored_bundle = project / "restored-bundle"
         destination = restore_archive(receipt, restored_bundle)
-        assert {path.name for path in restored_bundle.iterdir()} == {"worktree", "git-common"}
+        assert {path.name for path in restored_bundle.iterdir()} == {
+            "worktree",
+            "git-common",
+        }
         assert not list(project.glob(".restored-bundle.git-common-*"))
 
-        restored_index_path = Path(_git(destination, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+        restored_index_path = Path(
+            _git(
+                destination,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index",
+            )
+        )
         if not restored_index_path.is_absolute():
             restored_index_path = destination / restored_index_path
         assert restored_index_path.read_bytes() == original_index
         restored_root = destination.stat()
         assert restored_root.st_mode & 0o7777 == original_root.st_mode & 0o7777
         assert restored_root.st_mtime_ns == original_root.st_mtime_ns
-        assert _git(destination, "status", "--porcelain", "--untracked-files=all", "--ignored=matching") == original_status
+        assert (
+            _git(
+                destination,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=matching",
+            )
+            == original_status
+        )
         assert _git(destination, "rev-parse", "HEAD") == original_head
         assert _git(destination, "config", "maintenance.fixture") == "preserved"
         assert _tree_manifest(destination, skip_git=True) == original_manifest

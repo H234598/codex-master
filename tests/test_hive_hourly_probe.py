@@ -27,7 +27,10 @@ from the_hive.hive.hourly_probe import (
     run_probe,
     valid_probe_record,
 )
-from the_hive.runtime_layout import RuntimeLayout
+from the_hive.runtime_layout import (
+    RuntimeLayout,
+    validate_runtime_release_compatibility_profile,
+)
 from the_hive.runtime_process import BoundedProcessError, BoundedProcessResult
 
 
@@ -67,10 +70,11 @@ def _offline_stage_diagnostic(
     """Replace only external diagnostic processes for installer unit tests."""
 
     prefix = ["/usr/bin/python3", "-I", "-B", "-c", STAGE_SERVER_BOOTSTRAP, str(cwd)]
-    suffix = arguments[len(prefix):]
+    suffix = arguments[len(prefix) :]
     if (
-        arguments[:len(prefix)] != prefix
-        or suffix not in (["--runtime-status-mcp"], ["hive", "status"], ["hive", "doctor"])
+        arguments[: len(prefix)] != prefix
+        or suffix
+        not in (["--runtime-status-mcp"], ["hive", "status"], ["hive", "doctor"])
         or not isinstance(runtime_layout, RuntimeLayout)
         or runtime_layout.root != cwd
         or not home.is_absolute()
@@ -85,9 +89,12 @@ def _offline_stage_diagnostic(
         requests = [json.loads(line) for line in input_data.splitlines()]
         if requests != [
             {
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
                     "clientInfo": {"name": "the-hive-runtime-status", "version": "1"},
                 },
             },
@@ -103,11 +110,48 @@ def _offline_stage_diagnostic(
     return BoundedProcessResult(returncode=0, stdout=output, stderr="")
 
 
-
 def _offline_installer() -> dict[str, object]:
-    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
     installer["_validate_runtime_image_stage"].__globals__["run_bounded"] = (
         _offline_stage_diagnostic
+    )
+
+    class InstallTestCall:
+        def __init__(self, function: object) -> None:
+            self.function = function
+
+        @property
+        def __globals__(self) -> dict[str, object]:
+            return self.function.__globals__  # type: ignore[attr-defined,no-any-return]
+
+        def __call__(
+            self,
+            *,
+            home: Path,
+            stage_name: str | None = None,
+            record_setup: object | None = None,
+            reserve_setup: object | None = None,
+            before_publish: object | None = None,
+        ) -> dict[str, object]:
+            selected_stage = stage_name or (
+                ".the-hive-runtime.stage.test-"
+                + hashlib.sha256(os.fspath(home).encode()).hexdigest()[:12]
+            )
+            callback = before_publish or (lambda _stage, _layout, _outputs: None)
+            setup = record_setup or (lambda _stage: None)
+            reserve = reserve_setup or (lambda _path, _temporary, _digest: None)
+            return self.function(
+                home=home,
+                stage_name=selected_stage,
+                record_setup=setup,
+                reserve_setup=reserve,
+                before_publish=callback,
+            )  # type: ignore[operator,return-value]
+
+    installer["_install_attested_runtime"] = InstallTestCall(
+        installer["_install_attested_runtime"]
     )
     return installer
 
@@ -272,6 +316,11 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     write("bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-resource-scope-gate", "#!/bin/sh\nexit 0\n", 0o755)
+    write(
+        "bin/the-hive-hook-abi-v1-install",
+        (ROOT / "scripts" / "the-hive-hook-abi-v1-install").read_text(encoding="utf-8"),
+        0o755,
+    )
     write("systemd/user/the-hive-resource-monitor.service", "[Service]\n")
     write("systemd/user/the-hive.slice", "[Slice]\n")
     write("systemd/user/the-hive-openai-pricing.service", "[Service]\n")
@@ -793,9 +842,7 @@ def test_bounded_hive_diagnostic_names_the_timed_out_phase(
             },
         },
     )
-    assert hourly_probe_module._valid_diagnostic(
-        result[2], command_ready=False
-    ) is True
+    assert hourly_probe_module._valid_diagnostic(result[2], command_ready=False) is True
     assert capsys.readouterr().err == (
         "runtime_image_probe_phase_timeout phase=hive_doctor limit_seconds=45\n"
     )
@@ -1000,9 +1047,7 @@ def test_hourly_probe_unit_never_self_binds_the_user_runtime_directory() -> None
 
     service = ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
 
-    assert "BindReadOnlyPaths=%t:%t:norbind" not in service.read_text(
-        encoding="utf-8"
-    )
+    assert "BindReadOnlyPaths=%t:%t:norbind" not in service.read_text(encoding="utf-8")
 
 
 def test_attested_runtime_materializes_hourly_without_runtime_directory_self_bind(
@@ -1024,10 +1069,7 @@ def test_attested_runtime_materializes_hourly_without_runtime_directory_self_bin
         home / ".config" / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
     ).read_text(encoding="utf-8")
     assert "BindReadOnlyPaths=%t:%t:norbind" not in installed_service
-    assert (
-        "BindReadOnlyPaths=%t/bus:%t/bus:norbind"
-        in installed_service
-    )
+    assert "BindReadOnlyPaths=%t/bus:%t/bus:norbind" in installed_service
     assert (
         "BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind"
         in installed_service
@@ -1117,10 +1159,8 @@ def test_hourly_probe_renderer_rejects_an_extra_home_bind() -> None:
     )
     install_error = installer["InstallError"]
     template = (
-        (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service")
-        .read_bytes()
-        + b"BindReadOnlyPaths=%h:%h:norbind\n"
-    )
+        ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
+    ).read_bytes() + b"BindReadOnlyPaths=%h:%h:norbind\n"
 
     with pytest.raises(install_error, match="install_release_template_invalid"):
         installer["_render_hourly_probe_service"](
@@ -1462,6 +1502,80 @@ def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
     )
 
 
+def test_runtime_installer_seals_reserved_stage_before_publishing(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = _offline_installer()
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
+        lambda _repository: "a" * 40
+    )
+    calls: list[str] = []
+    publisher = installer["_publish_runtime_generation"]
+
+    def record_publish(**kwargs: object) -> object:
+        calls.append("publish")
+        return publisher(**kwargs)
+
+    installer["_install_attested_runtime"].__globals__[
+        "_publish_runtime_generation"
+    ] = record_publish
+
+    def seal(stage: Path, layout: object, outputs: dict[str, str]) -> None:
+        calls.append("seal")
+        assert stage.name == ".the-hive-runtime.stage.fixture"
+        assert getattr(layout, "root") == stage
+        assert len(getattr(layout, "manifest_digest")) == 71
+        assert set(outputs) == {
+            "mcp_launcher",
+            "hourly_service",
+            "hourly_timer",
+            "pricing_launcher",
+            "pricing_service",
+            "pricing_timer",
+            "legacy_launcher",
+        }
+
+    installed = installer["_install_attested_runtime"](
+        home=home,
+        stage_name=".the-hive-runtime.stage.fixture",
+        record_setup=lambda _stage: calls.append("setup"),
+        before_publish=seal,
+    )
+
+    assert installed["status"] == "installed"
+    assert calls == ["setup", "seal", "publish"]
+
+
+def test_runtime_installer_seal_failure_never_calls_publisher(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = _offline_installer()
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
+        lambda _repository: "a" * 40
+    )
+    publisher_calls: list[str] = []
+    installer["_install_attested_runtime"].__globals__[
+        "_publish_runtime_generation"
+    ] = lambda **_kwargs: publisher_calls.append("publish")
+
+    def reject_seal(_stage: Path, _layout: object, _outputs: dict[str, str]) -> None:
+        raise ValueError("journal_fsync_failed")
+
+    with pytest.raises(ValueError, match="journal_fsync_failed"):
+        installer["_install_attested_runtime"](
+            home=home,
+            stage_name=".the-hive-runtime.stage.fixture",
+            record_setup=lambda _stage: None,
+            before_publish=reject_seal,
+        )
+
+    assert publisher_calls == []
+
+
 def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime_image(
     tmp_path: Path,
 ) -> None:
@@ -1700,15 +1814,20 @@ def test_pricing_inventory_runtime_materialization_is_attested_and_upgrade_safe(
         assert stat.S_ISREG(item.st_mode)
         assert item.st_nlink == 1
         assert stat.S_IMODE(item.st_mode) == mode
-    assert launcher.read_bytes() == (
-        first_runtime / "bin" / "the-hive-openai-pricing-inventory-stable"
-    ).read_bytes()
-    assert service.read_bytes() == (
-        first_runtime / "systemd" / "user" / service.name
-    ).read_bytes()
-    assert timer.read_bytes() == (
-        first_runtime / "systemd" / "user" / timer.name
-    ).read_bytes()
+    assert (
+        launcher.read_bytes()
+        == (
+            first_runtime / "bin" / "the-hive-openai-pricing-inventory-stable"
+        ).read_bytes()
+    )
+    assert (
+        service.read_bytes()
+        == (first_runtime / "systemd" / "user" / service.name).read_bytes()
+    )
+    assert (
+        timer.read_bytes()
+        == (first_runtime / "systemd" / "user" / timer.name).read_bytes()
+    )
     assert stat.S_IMODE(launcher.lstat().st_mode) == 0o755
     assert stat.S_IMODE(service.lstat().st_mode) == 0o644
     assert stat.S_IMODE(timer.lstat().st_mode) == 0o644
@@ -1781,15 +1900,20 @@ def test_pricing_inventory_runtime_materialization_is_attested_and_upgrade_safe(
     assert pointers["current"]["generation"] == "b" * 40
     assert pointers["previous"]["generation"] == first_generation
     upgraded_runtime = release_root / "generations" / ("b" * 40)
-    assert launcher.read_bytes() == (
-        upgraded_runtime / "bin" / "the-hive-openai-pricing-inventory-stable"
-    ).read_bytes()
-    assert service.read_bytes() == (
-        upgraded_runtime / "systemd" / "user" / service.name
-    ).read_bytes()
-    assert timer.read_bytes() == (
-        upgraded_runtime / "systemd" / "user" / timer.name
-    ).read_bytes()
+    assert (
+        launcher.read_bytes()
+        == (
+            upgraded_runtime / "bin" / "the-hive-openai-pricing-inventory-stable"
+        ).read_bytes()
+    )
+    assert (
+        service.read_bytes()
+        == (upgraded_runtime / "systemd" / "user" / service.name).read_bytes()
+    )
+    assert (
+        timer.read_bytes()
+        == (upgraded_runtime / "systemd" / "user" / timer.name).read_bytes()
+    )
 
     pointer_original = pointer.read_bytes()
     pointer_payload = json.loads(pointer_original)
@@ -2632,9 +2756,77 @@ def test_worktree_maintenance_artifacts_are_in_private_runtime_stage(
     assert timer.is_file()
     assert manual.is_file()
     assert (
-        "ExecStart=%h/.local/lib/the-hive-runtime/the-hive-mcp "
-        "worktree-maintenance run"
+        "ExecStart=%h/.local/lib/the-hive-runtime/the-hive-mcp worktree-maintenance run"
     ) in service.read_text(encoding="utf-8")
+
+
+def test_root_hook_installer_is_a_manifest_attested_runtime_member(
+    tmp_path: Path,
+) -> None:
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    stage = tmp_path / "private-runtime-stage"
+    stage.mkdir(mode=0o700)
+    installer["_build_runtime_image"](
+        repository=ROOT,
+        stage=stage,
+        generation="fixture-generation",
+        commit=TEST_NON_F25_COMMIT,
+    )
+
+    layout = RuntimeLayout.from_runtime_root(stage)
+    expected = (ROOT / "scripts" / "the-hive-hook-abi-v1-install").read_bytes()
+    actual = layout.read_attested_file("bin/the-hive-hook-abi-v1-install")
+
+    assert actual == expected
+
+
+def test_runtime_compatibility_profile_is_manifest_attested_in_the_image(
+    tmp_path: Path,
+) -> None:
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    stage = tmp_path / "private-runtime-stage"
+    stage.mkdir(mode=0o700)
+    installer["_build_runtime_image"](
+        repository=ROOT,
+        stage=stage,
+        generation="fixture-generation",
+        commit=TEST_NON_F25_COMMIT,
+    )
+
+    layout = RuntimeLayout.from_runtime_root(stage)
+    actual = layout.read_attested_file(
+        "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+    )
+
+    expected = (
+        json.dumps(
+            {
+                "profile_id": "runtime-release-compatibility-v2",
+                "requirements": {
+                    "client_argv": ["--no-daemon", "features", "list"],
+                    "client_config_key": "features.daemon_auto_start",
+                    "client_probe_schema_revision": 1,
+                    "manager_api_schema_revision": 1,
+                    "predecessor_required": True,
+                    "runtime_criteria": ["runtime_canary", "runtime_features"],
+                },
+                "schema_version": 2,
+                "status": "structural_requirements",
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+    assert actual == expected
+    assert validate_runtime_release_compatibility_profile(actual)["status"] == (
+        "structural_requirements"
+    )
 
 
 def test_runtime_spawn_helper_build_fails_closed_before_image_publication(

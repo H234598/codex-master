@@ -34,16 +34,19 @@ RUN_LOCK_FILE_NAME = ".inventory.lock"
 TRANSACTION_FILE_NAME = ".transaction.json"
 TRANSACTION_BACKUP_FILE_NAME = ".transaction-catalog-backup.json"
 TRANSACTION_SCHEMA_VERSION = 1
-STABLE_ERROR_CODES = frozenset({
-    "invalid_response",
-    "io_error",
-    "inventory_failed",
-    "inventory_in_progress",
-})
-MODEL_RE = re.compile(r"\b(?:gpt|o[1-9]|codex|chat|computer-use|sora|text-|text-embedding|dall-e|whisper|tts)[A-Za-z0-9._-]*\b", re.I)
-MANAGED_CONFIG_LINE_RE = re.compile(
-    r"^\s*(?P<key>model_catalog_json|service_tier)\s*="
+STABLE_ERROR_CODES = frozenset(
+    {
+        "invalid_response",
+        "io_error",
+        "inventory_failed",
+        "inventory_in_progress",
+    }
 )
+MODEL_RE = re.compile(
+    r"\b(?:gpt|o[1-9]|codex|chat|computer-use|sora|text-|text-embedding|dall-e|whisper|tts)[A-Za-z0-9._-]*\b",
+    re.I,
+)
+MANAGED_CONFIG_LINE_RE = re.compile(r"^\s*(?P<key>model_catalog_json|service_tier)\s*=")
 MODEL_CATALOG_JSON_LINE_RE = re.compile(
     r'^\s*model_catalog_json\s*=\s*"(?P<value>[^"\r\n]*)"\s*$'
 )
@@ -86,7 +89,11 @@ def _is_valid_timestamp(value: str) -> bool:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return False
-    return parsed.tzinfo is not None and parsed.utcoffset() is not None and parsed.isoformat() == value
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() is not None
+        and parsed.isoformat() == value
+    )
 
 
 def _is_valid_generation_name(value: str) -> bool:
@@ -213,9 +220,9 @@ def _parse_managed_config_field(line: str) -> tuple[str, str] | None:
     if value_match is None:
         raise ValueError("invalid managed configuration field")
     value = value_match["value"]
-    if (
-        key == "model_catalog_json" and not _is_valid_local_catalog_path(value)
-    ) or (key == "service_tier" and value not in SERVICE_TIER_VALUES):
+    if (key == "model_catalog_json" and not _is_valid_local_catalog_path(value)) or (
+        key == "service_tier" and value not in SERVICE_TIER_VALUES
+    ):
         raise ValueError("invalid managed configuration field")
     return key, value
 
@@ -237,7 +244,9 @@ def _config_rollback_state(text: str) -> dict[str, object]:
 
 
 def _valid_config_rollback_state(value: object) -> bool:
-    if not isinstance(value, dict) or not isinstance(value.get("trailing_newline"), bool):
+    if not isinstance(value, dict) or not isinstance(
+        value.get("trailing_newline"), bool
+    ):
         return False
     fields = value.get("fields")
     if not isinstance(fields, list):
@@ -258,10 +267,7 @@ def _valid_config_rollback_state(value: object) -> bool:
             or not isinstance(key, str)
             or key in keys
             or not isinstance(value, str)
-            or (
-                key == "model_catalog_json"
-                and not _is_valid_local_catalog_path(value)
-            )
+            or (key == "model_catalog_json" and not _is_valid_local_catalog_path(value))
             or (key == "service_tier" and value not in SERVICE_TIER_VALUES)
             or key not in {"model_catalog_json", "service_tier"}
         ):
@@ -334,7 +340,10 @@ def _read_transaction_journal(root: Path) -> dict[str, object] | None:
     if payload.get("schema_version") != TRANSACTION_SCHEMA_VERSION:
         raise ValueError("invalid transaction journal")
     if payload.get("phase") not in {
-        "prepared", "backup_ready", "rolled_back", "committed"
+        "prepared",
+        "backup_ready",
+        "rolled_back",
+        "committed",
     }:
         raise ValueError("invalid transaction journal")
     generation = payload.get("generation")
@@ -342,10 +351,13 @@ def _read_transaction_journal(root: Path) -> dict[str, object] | None:
     if (
         not isinstance(generation, str)
         or not _is_valid_generation_name(generation)
-        or (previous_current is not None and (
-            not isinstance(previous_current, str)
-            or not _is_valid_generation_name(previous_current)
-        ))
+        or (
+            previous_current is not None
+            and (
+                not isinstance(previous_current, str)
+                or not _is_valid_generation_name(previous_current)
+            )
+        )
         or not isinstance(payload.get("catalog_existed"), bool)
     ):
         raise ValueError("invalid transaction journal")
@@ -369,7 +381,9 @@ def _restore_config_rollback_state(path: Path, state: dict[str, object]) -> None
     if not _valid_config_rollback_state(state):
         raise ValueError("invalid config rollback state")
     text = path.read_text(encoding="utf-8")
-    lines = [line for line in text.splitlines() if not MANAGED_CONFIG_LINE_RE.match(line)]
+    lines = [
+        line for line in text.splitlines() if not MANAGED_CONFIG_LINE_RE.match(line)
+    ]
     fields = state["fields"]
     assert isinstance(fields, list)
     for field in fields:
@@ -587,7 +601,9 @@ def _documented_flex_models(pricing: str) -> set[str]:
     matches = list(MODEL_RE.finditer(text))
     flex_models: set[str] = set()
     for index, match in enumerate(matches):
-        next_model = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        next_model = (
+            matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        )
         context = text[match.end() : next_model]
         if re.search(r"\bflex\b", context, re.IGNORECASE):
             flex_models.add(match.group().lower())
@@ -625,7 +641,9 @@ def _agent_home_files(name: str) -> list[Path]:
 
 def _catalog_paths() -> list[Path]:
     configured = os.environ.get("CODEX_MODEL_CATALOG")
-    paths = [Path(configured)] if configured else [Path.home() / ".codex/models_cache.json"]
+    paths = (
+        [Path(configured)] if configured else [Path.home() / ".codex/models_cache.json"]
+    )
     paths.extend(_agent_home_files("models_cache.json"))
     # codex-usage owns the canonical homes for provisioned accounts.  They are
     # real Codex homes too and must participate in the three-way reconciliation.
@@ -644,39 +662,56 @@ def _read_catalogs() -> list[dict[str, object]]:
             models = payload.get("models", []) if isinstance(payload, dict) else []
             entries = []
             for model in models:
-                if not isinstance(model, dict) or not isinstance(model.get("slug"), str):
+                if not isinstance(model, dict) or not isinstance(
+                    model.get("slug"), str
+                ):
                     continue
                 tiers = model.get("service_tiers", [])
-                entries.append({
-                    "id": model["slug"],
-                    "service_tiers": sorted(
-                        tier.get("id") for tier in tiers
-                        if isinstance(tier, dict) and isinstance(tier.get("id"), str)
-                    ),
-                    "additional_speed_tiers": sorted(
-                        value for value in model.get("additional_speed_tiers", [])
-                        if isinstance(value, str)
-                    ),
-                    "supported_in_api": model.get("supported_in_api"),
-                })
-            fetched_at = payload.get("fetched_at") if isinstance(payload, dict) else None
+                entries.append(
+                    {
+                        "id": model["slug"],
+                        "service_tiers": sorted(
+                            tier.get("id")
+                            for tier in tiers
+                            if isinstance(tier, dict)
+                            and isinstance(tier.get("id"), str)
+                        ),
+                        "additional_speed_tiers": sorted(
+                            value
+                            for value in model.get("additional_speed_tiers", [])
+                            if isinstance(value, str)
+                        ),
+                        "supported_in_api": model.get("supported_in_api"),
+                    }
+                )
+            fetched_at = (
+                payload.get("fetched_at") if isinstance(payload, dict) else None
+            )
             age_seconds: float | None = None
             if isinstance(fetched_at, str):
                 try:
                     age_seconds = max(
                         0.0,
-                        time.time() - datetime.fromisoformat(fetched_at.replace("Z", "+00:00")).timestamp(),
+                        time.time()
+                        - datetime.fromisoformat(
+                            fetched_at.replace("Z", "+00:00")
+                        ).timestamp(),
                     )
                 except ValueError:
                     age_seconds = None
-            result.append({
-                "path": str(path),
-                "models": entries,
-                "fetched_at": fetched_at,
-                "client_version": payload.get("client_version") if isinstance(payload, dict) else None,
-                "age_seconds": age_seconds,
-                "fresh": age_seconds is not None and age_seconds <= MODEL_CACHE_MAX_AGE_SECONDS,
-            })
+            result.append(
+                {
+                    "path": str(path),
+                    "models": entries,
+                    "fetched_at": fetched_at,
+                    "client_version": payload.get("client_version")
+                    if isinstance(payload, dict)
+                    else None,
+                    "age_seconds": age_seconds,
+                    "fresh": age_seconds is not None
+                    and age_seconds <= MODEL_CACHE_MAX_AGE_SECONDS,
+                }
+            )
         except (OSError, ValueError, TypeError):
             result.append({"path": str(path), "error": "invalid_or_unreadable"})
     return result
@@ -701,7 +736,9 @@ def _write_effective_catalog(root: Path, eligible_flex: set[str]) -> Path | None
                 if not isinstance(tier, dict) or tier.get("id") != "flex"
             ]
             if model.get("slug") in eligible_flex:
-                tiers.append({"id": "flex", "name": "Flex", "description": "Flex Processing"})
+                tiers.append(
+                    {"id": "flex", "name": "Flex", "description": "Flex Processing"}
+                )
         target = root / "effective-codex-model-catalog.json"
         _atomic_write_bytes(
             target,
@@ -722,7 +759,9 @@ def _codex_config_paths() -> list[Path]:
     return [path for path in dict.fromkeys(paths) if path.is_file()]
 
 
-def _cache_for_config(config: Path, catalogs: list[dict[str, object]]) -> dict[str, object] | None:
+def _cache_for_config(
+    config: Path, catalogs: list[dict[str, object]]
+) -> dict[str, object] | None:
     home = config.parent
     cache = home / "models_cache.json"
     for item in catalogs:
@@ -765,21 +804,31 @@ def _home_auth_mode(home: Path) -> str:
     path = home / "auth.json"
     try:
         metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 1024 * 1024:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > 1024 * 1024
+        ):
             return "unknown"
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
         try:
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino, opened.st_size) != (
-                metadata.st_dev, metadata.st_ino, metadata.st_size
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
             ):
                 return "unknown"
             data = os.read(fd, 1024 * 1024 + 1)
         finally:
             os.close(fd)
         document = json.loads(data)
-        return "api" if isinstance(document, dict) and document.get("auth_mode") == "api" else "unknown"
+        return (
+            "api"
+            if isinstance(document, dict) and document.get("auth_mode") == "api"
+            else "unknown"
+        )
     except (OSError, ValueError, UnicodeDecodeError):
         return "unknown"
 
@@ -800,20 +849,25 @@ def _plan_codex_config_updates(
             for line in lines:
                 catalog_match = MODEL_CATALOG_JSON_LINE_RE.fullmatch(line)
                 if SERVICE_TIER_LINE_RE.fullmatch(line) or (
-                    catalog_match is not None
-                    and catalog_match["value"] == str(catalog)
+                    catalog_match is not None and catalog_match["value"] == str(catalog)
                 ):
                     continue
                 updated.append(line)
             updated.insert(0, f'service_tier = "{tier}"')
             new_text = "\n".join(updated) + "\n"
-            plans.append({
-                "path": path,
-                "new_text": new_text,
-                "changed": new_text != text,
-                "rollback": _config_rollback_state(text),
-                "decision": {"config": str(path), "service_tier": tier, "reason": reason},
-            })
+            plans.append(
+                {
+                    "path": path,
+                    "new_text": new_text,
+                    "changed": new_text != text,
+                    "rollback": _config_rollback_state(text),
+                    "decision": {
+                        "config": str(path),
+                        "service_tier": tier,
+                        "reason": reason,
+                    },
+                }
+            )
         except (OSError, ValueError):
             continue
     return plans
@@ -836,13 +890,18 @@ def _update_codex_configs(
         path = plan["path"]
         if not isinstance(decision, dict) or not isinstance(path, Path):
             raise ValueError("invalid config update plan")
-        if not all(isinstance(decision.get(key), str) for key in ("config", "service_tier", "reason")):
+        if not all(
+            isinstance(decision.get(key), str)
+            for key in ("config", "service_tier", "reason")
+        ):
             raise ValueError("invalid config update plan")
-        decisions.append({
-            "config": decision["config"],
-            "service_tier": decision["service_tier"],
-            "reason": decision["reason"],
-        })
+        decisions.append(
+            {
+                "config": decision["config"],
+                "service_tier": decision["service_tier"],
+                "reason": decision["reason"],
+            }
+        )
         if not plan["changed"]:
             continue
         new_text = plan["new_text"]
@@ -888,20 +947,28 @@ def update(root: Path = DEFAULT_ROOT) -> Path:
             )
             api_status = "ok"
         documented_models = _models_from_text(pricing, models)
-        documented_flex_models = _documented_flex_models(pricing) & set(documented_models)
+        documented_flex_models = _documented_flex_models(pricing) & set(
+            documented_models
+        )
         catalogs = _read_catalogs()
-        catalog_models = sorted({
-            entry["id"] for catalog in catalogs
-            for entry in catalog.get("models", [])
-            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
-        })
-        catalog_flex_models = sorted({
-            entry["id"] for catalog in catalogs
-            for entry in catalog.get("models", [])
-            if isinstance(entry, dict)
-            and isinstance(entry.get("id"), str)
-            and "flex" in entry.get("service_tiers", [])
-        })
+        catalog_models = sorted(
+            {
+                entry["id"]
+                for catalog in catalogs
+                for entry in catalog.get("models", [])
+                if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+            }
+        )
+        catalog_flex_models = sorted(
+            {
+                entry["id"]
+                for catalog in catalogs
+                for entry in catalog.get("models", [])
+                if isinstance(entry, dict)
+                and isinstance(entry.get("id"), str)
+                and "flex" in entry.get("service_tiers", [])
+            }
+        )
         api_set = set(api_models)
         eligible_flex = set(documented_flex_models)
         if api_status == "ok":
@@ -950,10 +1017,14 @@ def update(root: Path = DEFAULT_ROOT) -> Path:
             "api": {
                 "status": api_status,
                 "models": api_models,
-                "only_in_documentation": sorted(set(documented_models) - set(api_models))
-                if api_status == "ok" else [],
+                "only_in_documentation": sorted(
+                    set(documented_models) - set(api_models)
+                )
+                if api_status == "ok"
+                else [],
                 "only_in_api": sorted(set(api_models) - set(documented_models))
-                if api_status == "ok" else [],
+                if api_status == "ok"
+                else [],
             },
             "codex_catalog": {
                 "files": catalogs,
@@ -965,8 +1036,11 @@ def update(root: Path = DEFAULT_ROOT) -> Path:
                 "api_model_count": len(api_models),
                 "catalog_model_count": len(catalog_models),
                 "catalog_flex_model_count": len(catalog_flex_models),
-                "flex_gap": sorted(set(documented_models) & set(api_models) - set(catalog_flex_models))
-                if api_status == "ok" else [],
+                "flex_gap": sorted(
+                    set(documented_models) & set(api_models) - set(catalog_flex_models)
+                )
+                if api_status == "ok"
+                else [],
                 "eligible_flex_models": sorted(eligible_flex),
                 "effective_catalog": str(effective_catalog or ""),
                 "config_files_updated": config_changes,
@@ -975,7 +1049,11 @@ def update(root: Path = DEFAULT_ROOT) -> Path:
             },
             "policy": {
                 "served_service_tier_is_verified_on_response": True,
-                "sources_are_independent": ["codex_catalog", "openai_api", "web_pricing"],
+                "sources_are_independent": [
+                    "codex_catalog",
+                    "openai_api",
+                    "web_pricing",
+                ],
             },
             "sha256": {
                 "pricing": hashlib.sha256(pricing.encode()).hexdigest(),
@@ -986,7 +1064,9 @@ def update(root: Path = DEFAULT_ROOT) -> Path:
         _atomic_write_bytes(staging / "models.html", models.encode("utf-8"))
         _atomic_write_bytes(
             staging / "inventory.json",
-            (json.dumps(inventory, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+            (json.dumps(inventory, ensure_ascii=False, indent=2) + "\n").encode(
+                "utf-8"
+            ),
         )
         generation_target = root / generation
         if generation_target.exists():
@@ -1008,7 +1088,11 @@ def update(root: Path = DEFAULT_ROOT) -> Path:
             _mark_transaction_phase(root, transaction, "committed")
             _finalize_transaction(root)
         generations = sorted(
-            (path for path in root.iterdir() if path.is_dir() and re.fullmatch(r"\d{8}T\d{6}Z", path.name)),
+            (
+                path
+                for path in root.iterdir()
+                if path.is_dir() and re.fullmatch(r"\d{8}T\d{6}Z", path.name)
+            ),
             reverse=True,
         )
         retained_nonactive = 0

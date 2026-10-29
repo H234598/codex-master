@@ -51,7 +51,11 @@ class TimedMetricsReader:
     ) -> None:
         if not callable(source):
             raise TypeError("source must be callable")
-        if type(ttl_seconds) not in {int, float} or not math.isfinite(ttl_seconds) or not 0 < ttl_seconds <= 60:
+        if (
+            type(ttl_seconds) not in {int, float}
+            or not math.isfinite(ttl_seconds)
+            or not 0 < ttl_seconds <= 60
+        ):
             raise ValueError("invalid ttl_seconds")
         if not callable(clock):
             raise TypeError("clock must be callable")
@@ -374,7 +378,9 @@ class MetricsHttpServer(ThreadingHTTPServer):
         if (
             type(request_timeout_seconds) not in {int, float}
             or not math.isfinite(request_timeout_seconds)
-            or not MIN_REQUEST_TIMEOUT_SECONDS <= request_timeout_seconds <= MAX_REQUEST_TIMEOUT_SECONDS
+            or not MIN_REQUEST_TIMEOUT_SECONDS
+            <= request_timeout_seconds
+            <= MAX_REQUEST_TIMEOUT_SECONDS
         ):
             raise ValueError("invalid request timeout")
         if (
@@ -392,7 +398,9 @@ class MetricsHttpServer(ThreadingHTTPServer):
             raise ValueError("loopback address required") from None
         if not address.is_loopback:
             raise ValueError("loopback address required")
-        self.address_family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+        self.address_family = (
+            socket.AF_INET6 if address.version == 6 else socket.AF_INET
+        )
         self.metrics_reader = metrics_reader
         self.request_timeout_seconds = float(request_timeout_seconds)
         self._request_slots = threading.BoundedSemaphore(max_handler_threads)
@@ -407,7 +415,9 @@ class MetricsHttpServer(ThreadingHTTPServer):
         self._stopping = threading.Event()
         self._metrics_source = _BoundedMetricsSource(metrics_reader, self._stopping)
         self._preface_lock = threading.Lock()
-        self._preface_pending: OrderedDict[socket.socket, _PrefaceRequest] = OrderedDict()
+        self._preface_pending: OrderedDict[socket.socket, _PrefaceRequest] = (
+            OrderedDict()
+        )
         self._preface_registered: set[socket.socket] = set()
         self._preface_selector = selectors.DefaultSelector()
         self._preface_wakeup_reader, self._preface_wakeup_writer = socket.socketpair()
@@ -560,7 +570,10 @@ class MetricsHttpServer(ThreadingHTTPServer):
                 self.shutdown_request(request)
             return
         state.preface.extend(received)
-        if b"\r\n\r\n" not in state.preface and len(state.preface) >= MAX_REQUEST_HEADER_BYTES:
+        if (
+            b"\r\n\r\n" not in state.preface
+            and len(state.preface) >= MAX_REQUEST_HEADER_BYTES
+        ):
             removed = self._remove_preface_request(request)
             if removed is not None:
                 self.shutdown_request(request)
@@ -688,5 +701,7 @@ class MetricsHttpServer(ThreadingHTTPServer):
             if slot is not None:
                 slot.release()
 
-    def handle_error(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+    def handle_error(
+        self, request: socket.socket, client_address: tuple[str, int]
+    ) -> None:
         return

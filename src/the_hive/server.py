@@ -310,8 +310,16 @@ from the_hive.hive.dispatch import (
 from the_hive.hive.events import HiveEventError, HiveEventStore
 from the_hive.hive.hourly_probe import probe_capacity_lock, read_probe_gate
 from the_hive.hive.messages import HiveMessage
-from the_hive.hive.repositories import RepositoryBinding, RepositoryError, RepositoryRegistry
-from the_hive.hive.config import HiveConfigError, load_agent_class_catalog, load_hive_config
+from the_hive.hive.repositories import (
+    RepositoryBinding,
+    RepositoryError,
+    RepositoryRegistry,
+)
+from the_hive.hive.config import (
+    HiveConfigError,
+    load_agent_class_catalog,
+    load_hive_config,
+)
 from the_hive.hive.runtime import (
     HiveRuntime,
     build_hive_runtime,
@@ -6376,7 +6384,9 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
             lock_stack.enter_context(spawn_admission_lock())
         lock_stack.enter_context(native_agent_registry_lock())
         registry, registry_state = _read_native_agent_registry()
-        if registry_state != "ready" and path_present_no_follow(NATIVE_AGENT_REGISTRY_FILE):
+        if registry_state != "ready" and path_present_no_follow(
+            NATIVE_AGENT_REGISTRY_FILE
+        ):
             raise AgentError("native agent registry unavailable; event update rejected")
         current = registry["agents"]
         if event_name == "PostToolUse":
@@ -6421,7 +6431,11 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
         managed_session = _trusted_managed_tmux_session_for_home()
         if managed_session is None:
             managed_session = next(
-                (row.get("managed_session") for row in sessions if row["session_id"] == session_id),
+                (
+                    row.get("managed_session")
+                    for row in sessions
+                    if row["session_id"] == session_id
+                ),
                 None,
             )
         sessions[:] = [
@@ -8726,10 +8740,9 @@ def _require_managed_codex_daemon_free(home: Path) -> None:
             )
             if not source_identity_with_snapshot_matches(observed_home, home_stat):
                 raise AgentError("managed_codex_daemon_home_unknown")
-        if (
-            not directory_chain_is_real_no_symlink(home.parent)
-            or not executable_directory_chain_is_trusted(home.parent)
-        ):
+        if not directory_chain_is_real_no_symlink(
+            home.parent
+        ) or not executable_directory_chain_is_trusted(home.parent):
             raise AgentError("managed_codex_daemon_home_unknown")
     except AgentError:
         raise
@@ -9712,7 +9725,10 @@ def _home_refresh_config(
     tier = document.get("service_tier")
     if tier is None or tier == "auto":
         tier = "default"
-    elif not isinstance(tier, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", tier) is None:
+    elif (
+        not isinstance(tier, str)
+        or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", tier) is None
+    ):
         raise AgentError("agent_class_materialization_invalid")
     elif tier == "priority":
         if not _fast_or_emergency_mode_active():
@@ -13663,7 +13679,12 @@ def _worktree_maintenance_contract_digest(
 
 def _worktree_maintenance_plan() -> dict[str, object]:
     """Build a read-only preview and bind its contract to canonical project state."""
-    from the_hive.maintenance import MaintenanceError, ProjectPolicy, _open_tree, scan_candidates
+    from the_hive.maintenance import (
+        MaintenanceError,
+        ProjectPolicy,
+        _open_tree,
+        scan_candidates,
+    )
 
     try:
         root = repo_root().resolve(strict=True)
@@ -13756,7 +13777,9 @@ def _worktree_maintenance_plan() -> dict[str, object]:
                 finally:
                     os.close(restore_fd)
             try:
-                common_fd, common_info, common_mount_id = _open_tree(git_common_directory)
+                common_fd, common_info, common_mount_id = _open_tree(
+                    git_common_directory
+                )
             except MaintenanceError as exc:
                 raise AgentError("repository_git_unavailable") from exc
             else:
@@ -13826,12 +13849,22 @@ def _worktree_maintenance_plan() -> dict[str, object]:
                     info = source.lstat()
                 except OSError:
                     candidates.append(
-                        {"source": str(source), "eligible": False, "reasons": ["source_unavailable"]}
+                        {
+                            "source": str(source),
+                            "eligible": False,
+                            "reasons": ["source_unavailable"],
+                        }
                     )
                     continue
-                if not stat_module.S_ISDIR(info.st_mode) or stat_module.S_ISLNK(info.st_mode):
+                if not stat_module.S_ISDIR(info.st_mode) or stat_module.S_ISLNK(
+                    info.st_mode
+                ):
                     candidates.append(
-                        {"source": str(source), "eligible": False, "reasons": ["source_not_real_directory"]}
+                        {
+                            "source": str(source),
+                            "eligible": False,
+                            "reasons": ["source_not_real_directory"],
+                        }
                     )
                     continue
                 policy = ProjectPolicy(
@@ -13840,18 +13873,24 @@ def _worktree_maintenance_plan() -> dict[str, object]:
                     archive_root=archive_root,
                 )
                 policies.append(policy)
-                for candidate in scan_candidates((policy,), lifecycle, now=int(time.time())):
+                for candidate in scan_candidates(
+                    (policy,), lifecycle, now=int(time.time())
+                ):
                     reasons = list(candidate.reasons)
                     eligible = candidate.eligible
                     host_gate = "not_checked"
                     if eligible:
                         try:
                             if candidate.temporary:
-                                from the_hive.maintenance import _assert_no_open_tree_references
+                                from the_hive.maintenance import (
+                                    _assert_no_open_tree_references,
+                                )
 
                                 _assert_no_open_tree_references((candidate.source,))
                             else:
-                                from the_hive.maintenance import _assert_no_open_tree_references
+                                from the_hive.maintenance import (
+                                    _assert_no_open_tree_references,
+                                )
 
                                 _assert_no_open_tree_references((candidate.source,))
                             host_gate = "clear_at_preview"
@@ -13895,7 +13934,9 @@ def _worktree_maintenance_plan() -> dict[str, object]:
 def _read_worktree_maintenance_approval() -> dict[str, object] | None:
     try:
         state = HiveStateStore(STATE_ROOT / "hive", read_only=True)
-        value = state.read_json(_WORKTREE_MAINTENANCE_APPROVAL_PATH, max_bytes=64 * 1024)
+        value = state.read_json(
+            _WORKTREE_MAINTENANCE_APPROVAL_PATH, max_bytes=64 * 1024
+        )
     except Exception:
         return None
     if (
@@ -13963,7 +14004,12 @@ def _approve_worktree_maintenance(preview_digest: str) -> dict[str, object]:
 def _worktree_maintenance_run_guard() -> Iterator[None]:
     HiveStateStore(STATE_ROOT / "hive")
     lock_path = STATE_ROOT / "hive" / ".worktree-maintenance-run.lock"
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(lock_path, flags, 0o600)
     try:
         info = os.fstat(descriptor)
@@ -13986,13 +14032,21 @@ def _restore_worktree_archive_by_id(
     repository_id: str, archive_id: str, destination_name: str
 ) -> Path:
     """Restore one verified archive from the configured project's private store."""
-    from the_hive.maintenance import ArchiveReceipt, MaintenanceError, _open_tree, restore_archive
+    from the_hive.maintenance import (
+        ArchiveReceipt,
+        MaintenanceError,
+        _open_tree,
+        restore_archive,
+    )
 
     if (
         type(repository_id) is not str
         or type(archive_id) is not str
         or type(destination_name) is not str
-        or re.fullmatch(r"(?:archive|temporary)-[0-9a-f]+-[0-9a-f]+-[0-9a-f]{16}", archive_id) is None
+        or re.fullmatch(
+            r"(?:archive|temporary)-[0-9a-f]+-[0-9a-f]+-[0-9a-f]{16}", archive_id
+        )
+        is None
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", destination_name) is None
         or destination_name in {".", ".."}
     ):
@@ -14027,14 +14081,24 @@ def _restore_worktree_archive_by_id(
     archive_fd = -1
     try:
         archive_fd, archive_info, _ = _open_tree(archive_root / archive_id)
-        if archive_info.st_uid != os.geteuid() or stat_module.S_IMODE(archive_info.st_mode) != 0o700:
+        if (
+            archive_info.st_uid != os.geteuid()
+            or stat_module.S_IMODE(archive_info.st_mode) != 0o700
+        ):
             raise MaintenanceError("archive_identity_invalid")
-        archive_stat = os.stat(archive_id, dir_fd=archive_root_fd, follow_symlinks=False)
-        if (archive_stat.st_dev, archive_stat.st_ino) != (archive_info.st_dev, archive_info.st_ino):
+        archive_stat = os.stat(
+            archive_id, dir_fd=archive_root_fd, follow_symlinks=False
+        )
+        if (archive_stat.st_dev, archive_stat.st_ino) != (
+            archive_info.st_dev,
+            archive_info.st_ino,
+        ):
             raise MaintenanceError("archive_identity_invalid")
 
         def read_private_file(name: str, limit: int) -> bytes:
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            flags = (
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
             descriptor = os.open(name, flags, dir_fd=archive_fd)
             try:
                 info = os.fstat(descriptor)
@@ -14062,8 +14126,16 @@ def _restore_worktree_archive_by_id(
 
         receipt_data = json.loads(read_private_file("receipt.json", 64 * 1024))
         manifest_data = read_private_file("manifest.json", 16 * 1024 * 1024)
-        digest = receipt_data.get("manifest_sha256") if isinstance(receipt_data, Mapping) else None
-        count = receipt_data.get("entry_count") if isinstance(receipt_data, Mapping) else None
+        digest = (
+            receipt_data.get("manifest_sha256")
+            if isinstance(receipt_data, Mapping)
+            else None
+        )
+        count = (
+            receipt_data.get("entry_count")
+            if isinstance(receipt_data, Mapping)
+            else None
+        )
         if (
             not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
@@ -14098,7 +14170,9 @@ def _restore_worktree_archive_by_id(
     return restore_archive(receipt, restore_root / destination_name)
 
 
-def _recover_worktree_maintenance_by_id(repository_id: str, source: Path) -> dict[str, object]:
+def _recover_worktree_maintenance_by_id(
+    repository_id: str, source: Path
+) -> dict[str, object]:
     """Fence an abandoned claim into recovery_hold; never replay its mutations."""
     from the_hive.maintenance import (
         _recover_maintenance_claim_under_archive_lock,
@@ -14146,9 +14220,13 @@ def _recover_worktree_maintenance_by_id(repository_id: str, source: Path) -> dic
     common = Path(common_text)
     common = (common if common.is_absolute() else root / common).resolve(strict=True)
     if (
-        binding.repository_id != f"repo:{root_identity.st_dev:x}:{root_identity.st_ino:x}"
+        binding.repository_id
+        != f"repo:{root_identity.st_dev:x}:{root_identity.st_ino:x}"
         or binding.git_common_directory != common
-        or (temporary_binding is None and binding.canonical_source_path != canonical_source)
+        or (
+            temporary_binding is None
+            and binding.canonical_source_path != canonical_source
+        )
     ):
         raise AgentError("maintenance_source_unattested")
     claim = _recover_maintenance_claim_under_archive_lock(
@@ -14190,7 +14268,10 @@ def _run_worktree_maintenance() -> dict[str, object]:
                     "reason": "maintenance_contract_changed",
                 }
             coverage = preview.get("caller_coverage")
-            if not isinstance(coverage, Mapping) or coverage.get("complete") is not True:
+            if (
+                not isinstance(coverage, Mapping)
+                or coverage.get("complete") is not True
+            ):
                 return {
                     "operation": "run",
                     "started": False,
@@ -14199,7 +14280,11 @@ def _run_worktree_maintenance() -> dict[str, object]:
             candidates = preview.get("candidates")
             if not isinstance(candidates, list):
                 raise AgentError("maintenance_preview_invalid")
-            eligible = [candidate for candidate in candidates if candidate.get("eligible") is True]
+            eligible = [
+                candidate
+                for candidate in candidates
+                if candidate.get("eligible") is True
+            ]
             if not eligible:
                 return {
                     "operation": "run",
@@ -14278,7 +14363,9 @@ def _archive_worktree_by_id(repository_id: str, source: Path) -> Any:
         if common_text is None:
             raise AgentError("repository_git_unavailable")
         common = Path(common_text)
-        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        common = (common if common.is_absolute() else root / common).resolve(
+            strict=True
+        )
         if (
             binding is None
             or binding.repository_id != expected_repository_id
@@ -14361,10 +14448,13 @@ def _archive_temporary_by_id(repository_id: str, source: Path) -> Any:
         if common_text is None:
             raise AgentError("repository_git_unavailable")
         common = Path(common_text)
-        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        common = (common if common.is_absolute() else root / common).resolve(
+            strict=True
+        )
         if (
             binding is None
-            or binding.repository_id != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
+            or binding.repository_id
+            != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
             or binding.canonical_source_path != worktree_root
             and worktree_root not in binding.canonical_source_path.parents
             or binding.git_common_directory != common
@@ -14400,7 +14490,9 @@ def _archive_temporary_by_id(repository_id: str, source: Path) -> Any:
         )
         if candidate is None or not candidate.eligible:
             raise MaintenanceError("candidate_not_eligible")
-        return archive_temporary_candidate(candidate, policy=policy, lifecycle=lifecycle)
+        return archive_temporary_candidate(
+            candidate, policy=policy, lifecycle=lifecycle
+        )
     except (KeyError, OSError, ValueError) as exc:
         if isinstance(exc, AgentError | MaintenanceError):
             raise
@@ -14420,9 +14512,12 @@ def _apply_worktree_by_id(repository_id: str, source: Path) -> Any:
     if type(repository_id) is not str or not isinstance(source, Path):
         raise AgentError("maintenance_selection_invalid")
     try:
-        if _worktree_lifecycle_store().binding_for_temporary_source(
-            source.resolve(strict=True)
-        ) is not None:
+        if (
+            _worktree_lifecycle_store().binding_for_temporary_source(
+                source.resolve(strict=True)
+            )
+            is not None
+        ):
             return _apply_temporary_by_id(repository_id, source)
     except WorktreeLifecycleError as exc:
         raise AgentError("maintenance_source_unattested") from exc
@@ -14460,13 +14555,19 @@ def _apply_worktree_by_id(repository_id: str, source: Path) -> Any:
         lifecycle = _worktree_lifecycle_store()
         binding = lifecycle.binding_for_source(canonical_source)
         root_info = root.stat(follow_symlinks=False)
-        if binding is None or binding.repository_id != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}":
+        if (
+            binding is None
+            or binding.repository_id
+            != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
+        ):
             raise AgentError("maintenance_source_unattested")
         common_text = RepositoryRegistry._git(root, "rev-parse", "--git-common-dir")
         if common_text is None:
             raise AgentError("repository_git_unavailable")
         common = Path(common_text)
-        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        common = (common if common.is_absolute() else root / common).resolve(
+            strict=True
+        )
         if binding.git_common_directory != common:
             raise AgentError("maintenance_source_unattested")
         archive_root = root / ".hive-archive"
@@ -14486,7 +14587,10 @@ def _apply_worktree_by_id(repository_id: str, source: Path) -> Any:
         try:
             common_fd, common_info, common_mount = _open_tree(common)
             try:
-                if archive_info.st_dev != common_info.st_dev or archive_mount != common_mount:
+                if (
+                    archive_info.st_dev != common_info.st_dev
+                    or archive_mount != common_mount
+                ):
                     raise AgentError("maintenance_archive_filesystem_mismatch")
             finally:
                 os.close(common_fd)
@@ -14551,11 +14655,17 @@ def _apply_temporary_by_id(repository_id: str, source: Path) -> Any:
         if common_text is None:
             raise AgentError("repository_git_unavailable")
         common = Path(common_text)
-        common = (common if common.is_absolute() else root / common).resolve(strict=True)
+        common = (common if common.is_absolute() else root / common).resolve(
+            strict=True
+        )
         if (
             binding is None
-            or binding.repository_id != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
-            or (binding.canonical_source_path != worktree_root and worktree_root not in binding.canonical_source_path.parents)
+            or binding.repository_id
+            != f"repo:{root_info.st_dev:x}:{root_info.st_ino:x}"
+            or (
+                binding.canonical_source_path != worktree_root
+                and worktree_root not in binding.canonical_source_path.parents
+            )
             or binding.git_common_directory != common
         ):
             raise AgentError("maintenance_source_unattested")
@@ -14616,7 +14726,10 @@ def _claim_worktree_maintenance(binding: WorktreeBinding, *, now: int) -> Any:
                 raise WorktreeLifecycleError("native_inventory_unavailable") from exc
             if state != "ready" or pins is None:
                 raise WorktreeLifecycleError("native_inventory_unavailable")
-            if any(registry.get(key) for key in ("agents", "sessions", "reservations")) or pins:
+            if (
+                any(registry.get(key) for key in ("agents", "sessions", "reservations"))
+                or pins
+            ):
                 lifecycle = _worktree_lifecycle_store()
                 lifecycle.reserve_native_reference(
                     reference_id="native-inventory-legacy", now=now
@@ -14656,7 +14769,13 @@ def _g5_runner_env_prefix(
         if not isinstance(managed_home, Path):
             raise AgentError("managed_codex_home_invalid")
         arguments.extend(
-            ["-u", "CODEX_ACCESS_TOKEN", "-u", "OPENAI_API_KEY", f"CODEX_HOME={managed_home}"]
+            [
+                "-u",
+                "CODEX_ACCESS_TOKEN",
+                "-u",
+                "OPENAI_API_KEY",
+                f"CODEX_HOME={managed_home}",
+            ]
         )
     if producer_tmpdir is not None:
         arguments.append(f"TMPDIR={producer_tmpdir}")
@@ -15503,7 +15622,9 @@ def _run_headless_process(
                 ):
                     raise AgentError("headless_worktree_identity_changed")
                 run_cwd = Path(f"/proc/self/fd/{worktree_fd}")
-                lifecycle_assignment = assignment_id or write_scope_binding.assignment_id
+                lifecycle_assignment = (
+                    assignment_id or write_scope_binding.assignment_id
+                )
                 if lifecycle_use is None:
                     _begin_tracked_worktree_use(
                         verified_worktree,
@@ -16166,7 +16287,8 @@ def _assign_headless_agent(
                         and (
                             write_scope_binding.attestation_id
                             != available_attestation.attestation_id
-                            or write_scope_binding.agent_id != available_attestation.agent_id
+                            or write_scope_binding.agent_id
+                            != available_attestation.agent_id
                             or write_scope_binding.repository_root
                             != available_attestation.repository_root
                             or write_scope_binding.repository_device
@@ -16727,7 +16849,10 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
                 "lease": current_lease,
                 "raw_output": "not_returned",
             }
-    if home_confirmed_empty and release.get("lease", {}).get("state") in {"unclaimed", "expired"}:
+    if home_confirmed_empty and release.get("lease", {}).get("state") in {
+        "unclaimed",
+        "expired",
+    }:
         _native_registry_after_confirmed_managed_stop(session)
     close_runner_execution_fd(agent)
     return {
@@ -16820,10 +16945,13 @@ def limit_model_pool(model: Any) -> str:
     text = str(model or "").lower()
     if "spark" in text or WRITE_AGENT_MODEL in text:
         return "spark_write_model"
-    if any(
-        model_id in text
-        for model_id in ("gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra")
-    ) or "5.4" in text:
+    if (
+        any(
+            model_id in text
+            for model_id in ("gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra")
+        )
+        or "5.4" in text
+    ):
         return "default_agent_model"
     return "unknown"
 
@@ -24814,9 +24942,7 @@ def check_mcp_registration(
     return result
 
 
-def check_legacy_mcp_registration(
-    *, binding: _CodexMcpBinding
-) -> dict[str, Any]:
+def check_legacy_mcp_registration(*, binding: _CodexMcpBinding) -> dict[str, Any]:
     try:
         cp = _run_bound_codex_mcp_command(binding, "get", LEGACY_MCP_SERVER_NAME)
     except AgentError:
@@ -25644,7 +25770,9 @@ def _install_enrolled_unlocked(
                 raise AgentError("MCP server registration could not be inspected")
             legacy = check_legacy_mcp_registration(binding=binding)
             if legacy.get("lookup_status") == "unavailable":
-                raise AgentError("legacy MCP server registration could not be inspected")
+                raise AgentError(
+                    "legacy MCP server registration could not be inspected"
+                )
             if legacy.get("registered"):
                 if not force:
                     raise AgentError(
@@ -40553,7 +40681,9 @@ def _main_cli_impl(argv: list[str]) -> int:
             if args.worktree_maintenance_command == "archive":
                 receipt = _archive_worktree_by_id(args.repository_id, Path(args.source))
             elif args.worktree_maintenance_command == "archive-temp":
-                receipt = _archive_temporary_by_id(args.repository_id, Path(args.source))
+                receipt = _archive_temporary_by_id(
+                    args.repository_id, Path(args.source)
+                )
             elif args.worktree_maintenance_command == "apply":
                 receipt = _apply_worktree_by_id(args.repository_id, Path(args.source))
             else:
@@ -41349,7 +41479,6 @@ def build_current_hive_runtime(
 def _require_hive_probe_result(
     *, operation: str, gate: Mapping[str, object] | None
 ) -> Mapping[str, object]:
-
     if (
         not isinstance(operation, str)
         or not 1 <= len(operation) <= MAX_OPERATION_LENGTH

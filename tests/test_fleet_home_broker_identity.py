@@ -157,7 +157,9 @@ def test_import_closure_is_nonempty_canonical_and_digest_bound() -> None:
     closure = ImportClosure.from_entries(entries)
 
     assert closure.paths == ("codex_master/a.py", "codex_master/b.py")
-    assert closure.digest() == ImportClosure.from_entries(list(reversed(entries))).digest()
+    assert (
+        closure.digest() == ImportClosure.from_entries(list(reversed(entries))).digest()
+    )
 
     changed = ImportClosure.from_entries(
         [ImportClosureEntry("codex_master/a.py", _digest("changed"))]
@@ -227,7 +229,9 @@ def test_import_closure_entry_post_init_rejects_a_mutated_noncanonical_path() ->
         entry.__post_init__()
 
 
-def test_canonical_import_closure_returns_the_sorted_digest_bound_factory_result() -> None:
+def test_canonical_import_closure_returns_the_sorted_digest_bound_factory_result() -> (
+    None
+):
     closure = canonical_import_closure(
         (
             ImportClosureEntry("codex_master/z.py", _digest("z")),

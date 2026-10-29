@@ -176,11 +176,46 @@ def test_default_state_preserves_the_existing_disabled_inactive_and_enabled_acti
 @pytest.mark.parametrize(
     ("responses", "load_state"),
     (
-        ((4, 0), {"LoadState": "not-found", "UnitFileState": "disabled", "ActiveState": "inactive"}),
-        ((0, 4), {"LoadState": "not-found", "UnitFileState": "disabled", "ActiveState": "inactive"}),
-        ((4, 4), {"LoadState": "loaded", "UnitFileState": "disabled", "ActiveState": "inactive"}),
-        ((4, 4), {"LoadState": "unknown", "UnitFileState": "disabled", "ActiveState": "inactive"}),
-        ((4, 4), {"LoadState": "not-found", "UnitFileState": "enabled", "ActiveState": "inactive"}),
+        (
+            (4, 0),
+            {
+                "LoadState": "not-found",
+                "UnitFileState": "disabled",
+                "ActiveState": "inactive",
+            },
+        ),
+        (
+            (0, 4),
+            {
+                "LoadState": "not-found",
+                "UnitFileState": "disabled",
+                "ActiveState": "inactive",
+            },
+        ),
+        (
+            (4, 4),
+            {
+                "LoadState": "loaded",
+                "UnitFileState": "disabled",
+                "ActiveState": "inactive",
+            },
+        ),
+        (
+            (4, 4),
+            {
+                "LoadState": "unknown",
+                "UnitFileState": "disabled",
+                "ActiveState": "inactive",
+            },
+        ),
+        (
+            (4, 4),
+            {
+                "LoadState": "not-found",
+                "UnitFileState": "enabled",
+                "ActiveState": "inactive",
+            },
+        ),
     ),
 )
 def test_default_state_rejects_mixed_or_unattested_exit_four_responses(
@@ -199,7 +234,9 @@ def test_default_state_rejects_mixed_or_unattested_exit_four_responses(
     monkeypatch.setattr(module["subprocess"], "run", run)
     _patch_readonly_load_state_adapter(monkeypatch, load_state)
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"
+    ):
         module["_default_state"](NEW_UNITS[1])
 
 
@@ -222,7 +259,9 @@ def test_default_state_fails_closed_for_readonly_systemd_timeout_or_oserror(
 
     monkeypatch.setattr(module["subprocess"], "run", run)
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"
+    ):
         module["_default_state"](NEW_UNITS[0])
 
 
@@ -239,16 +278,22 @@ def test_default_state_fails_closed_when_the_validated_absent_state_adapter_fail
         return SimpleNamespace(returncode=4)
 
     monkeypatch.setattr(module["subprocess"], "run", run)
-    adapter_calls = _patch_readonly_load_state_adapter(monkeypatch, OSError("unavailable"))
+    adapter_calls = _patch_readonly_load_state_adapter(
+        monkeypatch, OSError("unavailable")
+    )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"
+    ):
         module["_default_state"](NEW_UNITS[0])
 
     assert calls == [
         ("/usr/bin/systemctl", "--user", "is-enabled", "--quiet", NEW_UNITS[0]),
         ("/usr/bin/systemctl", "--user", "is-active", "--quiet", NEW_UNITS[0]),
     ]
-    assert [received_unit for _adapter, received_unit in adapter_calls] == [NEW_UNITS[0]]
+    assert [received_unit for _adapter, received_unit in adapter_calls] == [
+        NEW_UNITS[0]
+    ]
 
 
 @pytest.mark.parametrize("returncode", (2, 5, 255))
@@ -264,7 +309,9 @@ def test_default_state_rejects_unknown_systemd_returncodes(
 
     monkeypatch.setattr(module["subprocess"], "run", run)
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"
+    ):
         module["_default_state"](NEW_UNITS[0])
 
 
@@ -315,16 +362,19 @@ def _link_identity(path: Path) -> tuple[int, int, int, int, int, str]:
     )
 
 
-def test_public_successor_source_binds_the_attested_stable_launcher_and_fleet_semantics() -> None:
+def test_public_successor_source_binds_the_attested_stable_launcher_and_fleet_semantics() -> (
+    None
+):
     """Break caught: a successor unit points at a non-attested launcher or changes Fleet policy."""
 
     module = _script()
 
     units = module["_source_units"]()
 
-    assert b"%h/.local/lib/the-hive-runtime/the-hive-mcp watchdog active" in units[
-        "the-hive-watchdog.service"
-    ]
+    assert (
+        b"%h/.local/lib/the-hive-runtime/the-hive-mcp watchdog active"
+        in units["the-hive-watchdog.service"]
+    )
     assert b"--idle-seconds 60" in units["the-hive-watchdog.service"]
     assert b"--poll-interval-seconds 15" in units["the-hive-watchdog.service"]
     assert b"--report-grace-seconds 15" in units["the-hive-watchdog.service"]
@@ -340,11 +390,14 @@ def test_source_contract_rejects_extra_or_conflicting_watchdog_directives() -> N
     module = _script()
     conflicting = _successor_units()
     conflicting[NEW_UNITS[0]] = conflicting[NEW_UNITS[0]].replace(
-        b"--manage-unclaimed --quiet\n", b"--manage-unclaimed --quiet --foreign-flag\n",
+        b"--manage-unclaimed --quiet\n",
+        b"--manage-unclaimed --quiet --foreign-flag\n",
     )
     conflicting[NEW_UNITS[1]] += b"OnUnitActiveSec=1s\n"
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_untrusted"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_input_untrusted"
+    ):
         module["_validate_successor_units"](conflicting)
 
 
@@ -368,7 +421,11 @@ def test_bounded_observer_uses_the_target_home_not_an_ancestor(
     module["_default_observe"]((str(launcher), "watchdog", "active"))
 
     assert observed["arguments"] == [str(launcher), "watchdog", "active"]
-    assert observed["environment"] == {"HOME": str(home), "LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+    assert observed["environment"] == {
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
 
 
 def test_cutover_replaces_the_legacy_fleet_supervisor_without_a_parallel_timer(
@@ -379,33 +436,53 @@ def test_cutover_replaces_the_legacy_fleet_supervisor_without_a_parallel_timer(
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     observed: list[tuple[str, ...]] = []
 
     def observe(command: tuple[str, ...]) -> None:
         assert command == (
-            "/home/test/.local/lib/the-hive-runtime/the-hive-mcp", "watchdog", "active",
-            "--idle-seconds", "60", "--poll-interval-seconds", "15",
-            "--report-grace-seconds", "15", "--action", "stop", "--manage-unclaimed", "--quiet",
+            "/home/test/.local/lib/the-hive-runtime/the-hive-mcp",
+            "watchdog",
+            "active",
+            "--idle-seconds",
+            "60",
+            "--poll-interval-seconds",
+            "15",
+            "--report-grace-seconds",
+            "15",
+            "--action",
+            "stop",
+            "--manage-unclaimed",
+            "--quiet",
         )
         assert not set(OLD_UNITS).intersection(systemd.active)
         assert not set(OLD_UNITS).intersection(systemd.enabled)
         assert "the-hive-watchdog.timer" in systemd.active
         observed.append(command)
 
-    result = module["cutover"](home=home, systemctl=systemd, observe=observe, state=systemd.state)
+    result = module["cutover"](
+        home=home, systemctl=systemd, observe=observe, state=systemd.state
+    )
 
     assert result["status"] == "cutover_complete"
     assert observed
-    assert systemd.calls.index(("stop", "codex-master-watchdog.timer")) < systemd.calls.index(
-        ("stop", "codex-master-watchdog.service")
-    )
+    assert systemd.calls.index(
+        ("stop", "codex-master-watchdog.timer")
+    ) < systemd.calls.index(("stop", "codex-master-watchdog.service"))
     assert systemd.enabled == {"the-hive-watchdog.timer"}
     assert systemd.active == {"the-hive-watchdog.timer"}
     assert not any((units / name).exists() for name in OLD_UNITS)
-    assert not any((units / "timers.target.wants" / name).exists() for name in OLD_UNITS)
-    assert not any((units / "timers.target.wants" / name).is_symlink() for name in OLD_UNITS)
+    assert not any(
+        (units / "timers.target.wants" / name).exists() for name in OLD_UNITS
+    )
+    assert not any(
+        (units / "timers.target.wants" / name).is_symlink() for name in OLD_UNITS
+    )
     assert not _legacy_alias_path(home).is_symlink()
     service = (units / "the-hive-watchdog.service").read_text(encoding="utf-8")
     assert "--manage-unclaimed" in service
@@ -453,11 +530,22 @@ def test_cutover_rejects_a_missing_legacy_alias_before_any_systemd_mutation(
     home, units, legacy = _setup_legacy_tree(tmp_path)
     _legacy_alias_path(home).unlink()
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_untrusted"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_input_untrusted"
+    ):
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert {name: (units / name).read_bytes() for name in OLD_UNITS} == legacy
@@ -479,11 +567,22 @@ def test_cutover_rejects_a_nonexact_legacy_alias_before_any_systemd_mutation(
     else:
         _write_private_unit(alias, b"foreign regular launcher\n")
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_untrusted"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_input_untrusted"
+    ):
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert {name: (units / name).read_bytes() for name in OLD_UNITS} == legacy
@@ -502,8 +601,12 @@ def test_cutover_rejects_a_legacy_alias_parent_rebind_before_any_systemd_mutatio
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     alias_parent = _legacy_alias_path(home).parent
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original_create = module["_create_backup_directory"]
 
     def rebind_alias_parent(directory: object) -> object:
@@ -511,10 +614,17 @@ def test_cutover_rejects_a_legacy_alias_parent_rebind_before_any_systemd_mutatio
         alias_parent.mkdir(mode=0o700)
         return original_create(directory)
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_create_backup_directory", rebind_alias_parent)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_create_backup_directory", rebind_alias_parent
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert not list(alias_parent.iterdir())
@@ -529,15 +639,26 @@ def test_cutover_never_removes_a_legacy_alias_rebound_after_successor_observatio
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     alias = _legacy_alias_path(home)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     def rebind_after_observation(_command: tuple[str, ...]) -> None:
         alias.unlink()
         alias.symlink_to("/foreign/rebound-codex-master-mcp")
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
-        module["cutover"](home=home, systemctl=systemd, observe=rebind_after_observation, state=systemd.state)
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=rebind_after_observation,
+            state=systemd.state,
+        )
 
     assert os.readlink(alias) == "/foreign/rebound-codex-master-mcp"
 
@@ -552,14 +673,20 @@ def test_cutover_restores_the_exact_legacy_alias_when_observation_fails_before_r
     alias = _legacy_alias_path(home)
     before = _link_identity(alias)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
         module["cutover"](
             home=home,
             systemctl=systemd,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observer failed")),
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observer failed")
+            ),
             state=systemd.state,
         )
 
@@ -576,8 +703,12 @@ def test_cutover_restores_the_exact_legacy_alias_after_postremoval_reload_failur
     alias = _legacy_alias_path(home)
     before = _link_identity(alias)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
     observed: list[tuple[str, ...]] = []
     alias_absent_after_observation = False
@@ -609,8 +740,12 @@ def test_cutover_accepts_and_binds_the_successor_want_created_by_systemd_enable(
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
     successor_want = units / "timers.target.wants" / "the-hive-watchdog.timer"
 
@@ -620,7 +755,10 @@ def test_cutover_accepts_and_binds_the_successor_want_created_by_systemd_enable(
             successor_want.symlink_to(units / "the-hive-watchdog.timer")
 
     result = module["cutover"](
-        home=home, systemctl=enable_creates_want, observe=lambda _command: None, state=systemd.state,
+        home=home,
+        systemctl=enable_creates_want,
+        observe=lambda _command: None,
+        state=systemd.state,
     )
 
     assert result["status"] == "cutover_complete"
@@ -636,8 +774,12 @@ def test_cutover_rejects_a_systemd_created_successor_want_with_a_foreign_target(
     module = _script()
     home, units, legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
     successor_want = units / "timers.target.wants" / "the-hive-watchdog.timer"
 
@@ -646,9 +788,13 @@ def test_cutover_rejects_a_systemd_created_successor_want_with_a_foreign_target(
         if arguments == ("enable", "the-hive-watchdog.timer"):
             successor_want.symlink_to("/foreign/the-hive-watchdog.timer")
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
-            home=home, systemctl=enable_creates_foreign_want, observe=lambda _command: None,
+            home=home,
+            systemctl=enable_creates_foreign_want,
+            observe=lambda _command: None,
             state=systemd.state,
         )
 
@@ -665,8 +811,12 @@ def test_rollback_preserves_a_rebound_successor_want_instead_of_unlinking_it(
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
     successor_want = units / "timers.target.wants" / NEW_UNITS[1]
 
@@ -680,9 +830,13 @@ def test_rollback_preserves_a_rebound_successor_want_instead_of_unlinking_it(
         successor_want.symlink_to("/foreign/rebound.timer")
         raise RuntimeError("observation failed")
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
-            home=home, systemctl=enable_creates_bound_want, observe=rebind_want_then_fail,
+            home=home,
+            systemctl=enable_creates_bound_want,
+            observe=rebind_want_then_fail,
             state=systemd.state,
         )
 
@@ -698,13 +852,21 @@ def test_cutover_restores_bound_legacy_files_and_systemd_state_when_observation_
     module = _script()
     home, units, legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
         module["cutover"](
-            home=home, systemctl=systemd,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observer_failed")), state=systemd.state,
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observer_failed")
+            ),
+            state=systemd.state,
         )
 
     assert systemd.enabled == set(OLD_UNITS)
@@ -724,8 +886,12 @@ def test_postmutation_failure_removes_the_private_rollback_directory(
     systemd = _FakeSystemd()
     if failure == "systemd":
         systemd.fail_once_on = ("enable", NEW_UNITS[1])
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     observe = (
         (lambda _command: (_ for _ in ()).throw(RuntimeError("observation failed")))
         if failure == "observation"
@@ -733,7 +899,9 @@ def test_postmutation_failure_removes_the_private_rollback_directory(
     )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
-        module["cutover"](home=home, systemctl=systemd, observe=observe, state=systemd.state)
+        module["cutover"](
+            home=home, systemctl=systemd, observe=observe, state=systemd.state
+        )
 
     assert not list(units.glob(".the-hive-watchdog.rollback.*"))
 
@@ -746,19 +914,27 @@ def test_postmutation_rollback_reports_cleanup_failure_as_fail_closed(
     module = _script()
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     monkeypatch.setitem(
         module["cutover"].__globals__,
         "_remove_empty_backup_directory",
         lambda *_arguments: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
     )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
             home=home,
             systemctl=systemd,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observe failed")),
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observe failed")
+            ),
             state=systemd.state,
         )
 
@@ -775,12 +951,19 @@ def test_cutover_restores_legacy_wants_and_state_when_commit_reload_fails(
         for name in OLD_UNITS
     }
     legacy_wants_identity = {
-        name: ((units / "timers.target.wants" / name).lstat().st_dev, (units / "timers.target.wants" / name).lstat().st_ino)
+        name: (
+            (units / "timers.target.wants" / name).lstat().st_dev,
+            (units / "timers.target.wants" / name).lstat().st_ino,
+        )
         for name in OLD_UNITS
     }
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
 
     def fail_second_reload(*arguments: str) -> None:
@@ -789,18 +972,28 @@ def test_cutover_restores_legacy_wants_and_state_when_commit_reload_fails(
         original(*arguments)
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
-        module["cutover"](home=home, systemctl=fail_second_reload, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=fail_second_reload,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.enabled == set(OLD_UNITS)
     assert systemd.active == set(OLD_UNITS)
     assert {name: (units / name).read_bytes() for name in OLD_UNITS} == legacy
-    assert all((units / "timers.target.wants" / name).is_symlink() for name in OLD_UNITS)
+    assert all(
+        (units / "timers.target.wants" / name).is_symlink() for name in OLD_UNITS
+    )
     assert {
         name: ((units / name).stat().st_dev, (units / name).stat().st_ino)
         for name in OLD_UNITS
     } == legacy_identity
     assert {
-        name: ((units / "timers.target.wants" / name).lstat().st_dev, (units / "timers.target.wants" / name).lstat().st_ino)
+        name: (
+            (units / "timers.target.wants" / name).lstat().st_dev,
+            (units / "timers.target.wants" / name).lstat().st_ino,
+        )
         for name in OLD_UNITS
     } == legacy_wants_identity
 
@@ -813,8 +1006,12 @@ def test_final_postcondition_readback_rejects_successor_drift_after_commit_reloa
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
 
     def drift_after_commit_reload(*arguments: str) -> None:
@@ -825,13 +1022,19 @@ def test_final_postcondition_readback_rejects_successor_drift_after_commit_reloa
             replacement.chmod(0o644)
             os.replace(replacement, units / "the-hive-watchdog.timer")
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
-            home=home, systemctl=drift_after_commit_reload, observe=lambda _command: None,
+            home=home,
+            systemctl=drift_after_commit_reload,
+            observe=lambda _command: None,
             state=systemd.state,
         )
 
-    assert (units / "the-hive-watchdog.timer").read_bytes() == b"foreign after final reload\n"
+    assert (
+        units / "the-hive-watchdog.timer"
+    ).read_bytes() == b"foreign after final reload\n"
 
 
 def test_commit_failure_restores_every_bound_old_new_unit_and_want_identity(
@@ -855,8 +1058,12 @@ def test_commit_failure_restores_every_bound_old_new_unit_and_want_identity(
         name: _link_identity(units / "timers.target.wants" / name) for name in all_units
     }
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
 
     def fail_commit_reload(*arguments: str) -> None:
@@ -866,7 +1073,9 @@ def test_commit_failure_restores_every_bound_old_new_unit_and_want_identity(
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
         module["cutover"](
-            home=home, systemctl=fail_commit_reload, observe=lambda _command: None,
+            home=home,
+            systemctl=fail_commit_reload,
+            observe=lambda _command: None,
             state=systemd.state,
         )
 
@@ -896,13 +1105,20 @@ def test_observation_failure_restores_every_bound_old_new_unit_and_want_identity
         name: _link_identity(units / "timers.target.wants" / name) for name in all_units
     }
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
         module["cutover"](
-            home=home, systemctl=systemd,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observation failed")),
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observation failed")
+            ),
             state=systemd.state,
         )
 
@@ -933,12 +1149,19 @@ def test_systemd_failure_restores_every_bound_old_new_unit_and_want_identity(
     }
     systemd = _FakeSystemd()
     systemd.fail_once_on = ("enable", "the-hive-watchdog.timer")
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
         module["cutover"](
-            home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state,
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
         )
 
     assert {name: _regular_identity(units / name) for name in all_units} == before_units
@@ -955,8 +1178,12 @@ def test_cutover_rejects_a_rebound_legacy_unit_before_any_systemd_mutation(
     module = _script()
     home, units, legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = module["_revalidate_phase"]
 
     def rebind_then_validate(*arguments: object, **kwargs: object) -> None:
@@ -967,14 +1194,23 @@ def test_cutover_rejects_a_rebound_legacy_unit_before_any_systemd_mutation(
         os.replace(replacement, target)
         original(*arguments, **kwargs)
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_revalidate_phase", rebind_then_validate)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_revalidate_phase", rebind_then_validate
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert (units / "codex-master-watchdog.service").read_bytes() == b"foreign\n"
-    assert (units / "codex-master-watchdog.timer").read_bytes() == legacy["codex-master-watchdog.timer"]
+    assert (units / "codex-master-watchdog.timer").read_bytes() == legacy[
+        "codex-master-watchdog.timer"
+    ]
 
 
 def test_cutover_rejects_successor_unit_source_drift_before_any_systemd_mutation(
@@ -985,8 +1221,13 @@ def test_cutover_rejects_successor_unit_source_drift_before_any_systemd_mutation
     module = _script()
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    values = [_successor_units(), {**_successor_units(), "the-hive-watchdog.timer": b"foreign\n"}]
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    values = [
+        _successor_units(),
+        {**_successor_units(), "the-hive-watchdog.timer": b"foreign\n"},
+    ]
 
     def source_units() -> dict[str, bytes]:
         return values.pop(0)
@@ -994,7 +1235,12 @@ def test_cutover_rejects_successor_unit_source_drift_before_any_systemd_mutation
     monkeypatch.setitem(module["cutover"].__globals__, "_source_units", source_units)
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
 
@@ -1007,7 +1253,9 @@ def test_precommit_refusal_does_not_leak_a_rollback_directory(
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
     values = [_successor_units(), {**_successor_units(), NEW_UNITS[1]: b"foreign\n"}]
 
     def source_units() -> dict[str, bytes]:
@@ -1016,7 +1264,12 @@ def test_precommit_refusal_does_not_leak_a_rollback_directory(
     monkeypatch.setitem(module["cutover"].__globals__, "_source_units", source_units)
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert not list(units.glob(".the-hive-watchdog.rollback.*"))
 
@@ -1029,8 +1282,12 @@ def test_directory_rebind_before_backup_creation_does_not_create_in_the_foreign_
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original_create = module["_create_backup_directory"]
 
     def rebind_before_backup_create(directory: object) -> object:
@@ -1039,10 +1296,19 @@ def test_directory_rebind_before_backup_creation_does_not_create_in_the_foreign_
         units.mkdir(mode=0o700)
         return original_create(directory)
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_create_backup_directory", rebind_before_backup_create)
+    monkeypatch.setitem(
+        module["cutover"].__globals__,
+        "_create_backup_directory",
+        rebind_before_backup_create,
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert not list(units.glob(".the-hive-watchdog.rollback.*"))
@@ -1069,10 +1335,19 @@ def test_lifecycle_lock_rejects_a_state_root_rebind_without_creating_in_the_fore
             state_root.mkdir(mode=0o700)
         return descriptor
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_open_bound_directory", rebind_after_root_fd_open)
+    monkeypatch.setitem(
+        module["cutover"].__globals__,
+        "_open_bound_directory",
+        rebind_after_root_fd_open,
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert not (state_root / ".the-hive-watchdog-cutover.lock").exists()
@@ -1086,8 +1361,12 @@ def test_cutover_never_unlinks_or_overwrites_a_legacy_unit_rebound_during_the_tr
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     target = units / "codex-master-watchdog.service"
 
     def rebind_after_activation(_command: tuple[str, ...]) -> None:
@@ -1096,8 +1375,15 @@ def test_cutover_never_unlinks_or_overwrites_a_legacy_unit_rebound_during_the_tr
         replacement.chmod(0o644)
         os.replace(replacement, target)
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
-        module["cutover"](home=home, systemctl=systemd, observe=rebind_after_activation, state=systemd.state)
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=rebind_after_activation,
+            state=systemd.state,
+        )
 
     assert target.read_bytes() == b"foreign after activation\n"
 
@@ -1110,8 +1396,12 @@ def test_rollback_never_unlinks_a_successor_unit_rebound_after_staging(
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     target = units / "the-hive-watchdog.service"
 
     def rebind_then_fail(_command: tuple[str, ...]) -> None:
@@ -1121,8 +1411,12 @@ def test_rollback_never_unlinks_a_successor_unit_rebound_after_staging(
         os.replace(replacement, target)
         raise RuntimeError("observation failed")
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
-        module["cutover"](home=home, systemctl=systemd, observe=rebind_then_fail, state=systemd.state)
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
+        module["cutover"](
+            home=home, systemctl=systemd, observe=rebind_then_fail, state=systemd.state
+        )
 
     assert target.read_bytes() == b"foreign successor\n"
 
@@ -1135,8 +1429,12 @@ def test_cutover_rolls_back_when_the_successor_timer_does_not_become_active(
     module = _script()
     home, units, legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
 
     def start_without_activation(*arguments: str) -> None:
@@ -1146,7 +1444,12 @@ def test_cutover_rolls_back_when_the_successor_timer_does_not_become_active(
         original(*arguments)
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
-        module["cutover"](home=home, systemctl=start_without_activation, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=start_without_activation,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.enabled == set(OLD_UNITS)
     assert systemd.active == set(OLD_UNITS)
@@ -1169,8 +1472,12 @@ def test_cutover_is_idempotent_for_an_already_exclusive_green_successor(
     systemd = _FakeSystemd()
     systemd.enabled = {"the-hive-watchdog.timer"}
     systemd.active = {"the-hive-watchdog.timer"}
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     observed: list[tuple[str, ...]] = []
 
     result = module["cutover"](
@@ -1196,7 +1503,9 @@ def test_status_with_a_missing_unit_directory_never_creates_a_namespace_or_chang
     systemd = _FakeSystemd()
     systemd.enabled.clear()
     systemd.active.clear()
-    monkeypatch.setitem(module["status"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(
+        module["status"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
 
     result = module["status"](home=home, state=systemd.state)
 
@@ -1223,7 +1532,11 @@ def test_actual_public_status_does_not_emit_runtime_import_bytecode_or_mutate_ho
     runtime.mkdir(mode=0o700, parents=True)
     cache = tmp_path / "pycache-prefix"
     home_before = {
-        path.relative_to(home): (path.lstat().st_dev, path.lstat().st_ino, path.lstat().st_mode)
+        path.relative_to(home): (
+            path.lstat().st_dev,
+            path.lstat().st_ino,
+            path.lstat().st_mode,
+        )
         for path in home.rglob("*")
     }
     import the_hive
@@ -1235,12 +1548,18 @@ def test_actual_public_status_does_not_emit_runtime_import_bytecode_or_mutate_ho
     monkeypatch.setattr(sys, "pycache_prefix", str(cache))
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_untrusted"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_input_untrusted"
+    ):
         module["status"](home=home, state=lambda _unit: (False, False))
 
     assert not list(cache.rglob("*.pyc"))
     assert {
-        path.relative_to(home): (path.lstat().st_dev, path.lstat().st_ino, path.lstat().st_mode)
+        path.relative_to(home): (
+            path.lstat().st_dev,
+            path.lstat().st_ino,
+            path.lstat().st_mode,
+        )
         for path in home.rglob("*")
     } == home_before
 
@@ -1255,10 +1574,16 @@ def test_cutover_migrates_real_legacy_0600_units_without_rewriting_them_before_c
     for name in OLD_UNITS:
         (units / name).chmod(0o600)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
-    result = module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+    result = module["cutover"](
+        home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state
+    )
 
     assert result["status"] == "cutover_complete"
     assert stat.S_IMODE((units / "the-hive-watchdog.service").stat().st_mode) == 0o644
@@ -1274,20 +1599,27 @@ def test_rollback_restores_the_bound_legacy_0600_modes(
     for name in OLD_UNITS:
         (units / name).chmod(0o600)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
         module["cutover"](
-            home=home, systemctl=systemd,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observe failed")),
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observe failed")
+            ),
             state=systemd.state,
         )
 
     assert {name: (units / name).read_bytes() for name in OLD_UNITS} == legacy
-    assert {name: stat.S_IMODE((units / name).stat().st_mode) for name in OLD_UNITS} == {
-        name: 0o600 for name in OLD_UNITS
-    }
+    assert {
+        name: stat.S_IMODE((units / name).stat().st_mode) for name in OLD_UNITS
+    } == {name: 0o600 for name in OLD_UNITS}
 
 
 def test_rollback_restores_bound_preexisting_successor_files_byte_for_byte(
@@ -1308,13 +1640,20 @@ def test_rollback_restores_bound_preexisting_successor_files_byte_for_byte(
         for name in NEW_UNITS
     }
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
         module["cutover"](
-            home=home, systemctl=systemd,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observe failed")),
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observe failed")
+            ),
             state=systemd.state,
         )
 
@@ -1338,8 +1677,12 @@ def test_rollback_never_restores_a_backup_over_a_rebound_preexisting_successor(
     }.items():
         _write_private_unit(units / name, content)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     target = units / NEW_UNITS[0]
 
     def rebind_after_backup(_command: tuple[str, ...]) -> None:
@@ -1349,9 +1692,14 @@ def test_rollback_never_restores_a_backup_over_a_rebound_preexisting_successor(
         os.replace(replacement, target)
         raise RuntimeError("observe failed")
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
-            home=home, systemctl=systemd, observe=rebind_after_backup, state=systemd.state,
+            home=home,
+            systemctl=systemd,
+            observe=rebind_after_backup,
+            state=systemd.state,
         )
 
     assert target.read_bytes() == b"foreign after backup\n"
@@ -1384,11 +1732,20 @@ def test_backup_restats_its_named_entry_after_parent_fd_open_before_rename(
             os.replace(replacement, target)
         return descriptor
 
-    monkeypatch.setitem(module["_backup_file"].__globals__, "_open_bound_directory", swap_after_source_parent_open)
+    monkeypatch.setitem(
+        module["_backup_file"].__globals__,
+        "_open_bound_directory",
+        swap_after_source_parent_open,
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
         module["_backup_file"](
-            target, expected, backup.path, {}, source_directory=backup_parent, backup_directory=backup,
+            target,
+            expected,
+            backup.path,
+            {},
+            source_directory=backup_parent,
+            backup_directory=backup,
         )
 
     assert target.read_bytes() == b"foreign after fd open\n"
@@ -1423,7 +1780,9 @@ def test_backup_cleanup_does_not_rmdir_a_rebound_empty_leaf_after_parent_fd_open
         rebind_backup_after_parent_open,
     )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_verification_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_verification_failed"
+    ):
         module["_remove_empty_backup_directory"](backup, parent)
 
     assert backup.path.is_dir()
@@ -1437,8 +1796,12 @@ def test_old_want_parent_rebind_before_backup_fd_open_leaves_foreign_directory_u
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original_backup = module["_backup_link"]
     rebound = False
     wants = units / "timers.target.wants"
@@ -1451,10 +1814,19 @@ def test_old_want_parent_rebind_before_backup_fd_open_leaves_foreign_directory_u
             wants.mkdir(mode=0o700)
         original_backup(*arguments, **kwargs)
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_backup_link", rebind_before_backup)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_backup_link", rebind_before_backup
+    )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert wants.is_dir()
     assert not list(wants.iterdir())
@@ -1469,11 +1841,20 @@ def test_cutover_rejects_an_initially_active_successor_service_before_any_mutati
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
     systemd.active.add("the-hive-watchdog.service")
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_mixed_prestate"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
 
@@ -1486,8 +1867,12 @@ def test_phase_revalidation_rejects_a_legacy_rebind_before_the_first_systemd_pha
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = module["_revalidate_phase"]
     calls = 0
 
@@ -1502,10 +1887,17 @@ def test_phase_revalidation_rejects_a_legacy_rebind_before_the_first_systemd_pha
             os.replace(replacement, target)
         original(*arguments, **kwargs)
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_revalidate_phase", rebind_before_first_systemd)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_revalidate_phase", rebind_before_first_systemd
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert (units / "codex-master-watchdog.timer").read_bytes() == b"foreign timer\n"
@@ -1519,8 +1911,12 @@ def test_stage_replace_revalidates_after_temp_creation_before_replacing_a_bound_
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = module["_revalidate_phase"]
     calls = 0
 
@@ -1535,10 +1931,17 @@ def test_stage_replace_revalidates_after_temp_creation_before_replacing_a_bound_
             os.replace(replacement, target)
         original(*arguments, **kwargs)
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_revalidate_phase", rebind_before_stage_replace)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_revalidate_phase", rebind_before_stage_replace
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=systemd.state,
+        )
 
     assert systemd.calls == []
     assert (units / OLD_UNITS[0]).read_bytes() == b"foreign between temp and replace\n"
@@ -1563,11 +1966,20 @@ def test_phase_revalidation_rejects_systemd_state_drift_before_the_first_phase(
             return False, False
         return systemd.state(unit)
 
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_state_changed"):
-        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=drift_after_capture)
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: None,
+            state=drift_after_capture,
+        )
 
     assert systemd.calls == []
 
@@ -1580,14 +1992,25 @@ def test_rollback_fails_closed_when_independent_bound_state_verification_fails(
     module = _script()
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
-    monkeypatch.setitem(module["cutover"].__globals__, "_restore_states", lambda *_arguments: None)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_restore_states", lambda *_arguments: None
+    )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
-            home=home, systemctl=systemd,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observe failed")),
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observe failed")
+            ),
             state=systemd.state,
         )
 
@@ -1599,7 +2022,9 @@ def test_restore_wants_rechecks_the_bound_leaf_after_parent_fd_open(
 
     module = _script()
     home, units, _legacy = _setup_legacy_tree(tmp_path)
-    monkeypatch.setitem(module["_bind"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(
+        module["_bind"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
     binding = module["_bind"](home, lambda _name: (False, False), create_unit_dir=True)
     want = units / "timers.target.wants" / NEW_UNITS[1]
     want.symlink_to(units / NEW_UNITS[1])
@@ -1619,10 +2044,14 @@ def test_restore_wants_rechecks_the_bound_leaf_after_parent_fd_open(
         return descriptor
 
     monkeypatch.setitem(
-        module["_restore_wants"].__globals__, "_open_bound_directory", swap_leaf_after_parent_open,
+        module["_restore_wants"].__globals__,
+        "_open_bound_directory",
+        swap_leaf_after_parent_open,
     )
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_verification_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_verification_failed"
+    ):
         module["_restore_wants"](binding, expected_wants)
 
     assert os.readlink(want) == "/foreign/after-parent-fd-open"
@@ -1654,7 +2083,11 @@ def test_remove_rechecks_the_bound_leaf_after_parent_fd_open(
             os.replace(replacement, target)
         return descriptor
 
-    monkeypatch.setitem(module["_remove"].__globals__, "_open_bound_directory", swap_leaf_after_parent_open)
+    monkeypatch.setitem(
+        module["_remove"].__globals__,
+        "_open_bound_directory",
+        swap_leaf_after_parent_open,
+    )
 
     with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
         module["_remove"](target, expected=expected, directory=parent)
@@ -1707,7 +2140,9 @@ def test_lifecycle_lock_rejects_a_second_namespace_after_root_rebind(
         os.replace(root, root.parent / "bound-transaction-root")
         root.mkdir(mode=0o700)
 
-        with pytest.raises(module["CutoverError"], match="watchdog_cutover_in_progress"):
+        with pytest.raises(
+            module["CutoverError"], match="watchdog_cutover_in_progress"
+        ):
             module["_acquire_lifecycle_lock"](home)
     finally:
         os.close(first.descriptor)
@@ -1749,9 +2184,15 @@ def test_committed_backup_cleanup_rechecks_every_leaf_after_listing(
 
     monkeypatch.setattr(module["os"], "listdir", swap_after_list)
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_verification_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_verification_failed"
+    ):
         module["_discard_committed_backups"](
-            {target: module["_Backup"](leaf, module["_maybe_file"](leaf).identity, False)},
+            {
+                target: module["_Backup"](
+                    leaf, module["_maybe_file"](leaf).identity, False
+                )
+            },
             backup,
             parent,
         )
@@ -1767,8 +2208,12 @@ def test_observe_phase_rechecks_the_lifecycle_namespace_after_start(
     module = _script()
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
     observed: list[tuple[str, ...]] = []
     competing_lock_rejected = False
@@ -1780,11 +2225,15 @@ def test_observe_phase_rechecks_the_lifecycle_namespace_after_start(
             root = home / ".local" / "state" / "codex-master-mcp"
             os.replace(root, root.parent / "bound-start-root")
             root.mkdir(mode=0o700)
-            with pytest.raises(module["CutoverError"], match="watchdog_cutover_in_progress"):
+            with pytest.raises(
+                module["CutoverError"], match="watchdog_cutover_in_progress"
+            ):
                 module["_acquire_lifecycle_lock"](home)
             competing_lock_rejected = True
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
             home=home,
             systemctl=rebind_after_start,
@@ -1804,8 +2253,12 @@ def test_observe_phase_rechecks_the_guard_parent_namespace_after_start(
     module = _script()
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
     observed: list[tuple[str, ...]] = []
     competing_lock_rejected = False
@@ -1819,11 +2272,15 @@ def test_observe_phase_rechecks_the_guard_parent_namespace_after_start(
             os.replace(state, local / "bound-state-parent")
             state.mkdir(mode=0o700)
             (state / "codex-master-mcp").mkdir(mode=0o700)
-            with pytest.raises(module["CutoverError"], match="watchdog_cutover_in_progress"):
+            with pytest.raises(
+                module["CutoverError"], match="watchdog_cutover_in_progress"
+            ):
                 module["_acquire_lifecycle_lock"](home)
             competing_lock_rejected = True
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
             home=home,
             systemctl=rebind_guard_parent_after_start,
@@ -1850,7 +2307,10 @@ def test_create_backup_directory_uses_one_real_bound_parent_fd_creation_without_
     item = backup.path.stat()
     assert backup.path.parent == parent_path
     assert backup.identity == (
-        item.st_dev, item.st_ino, stat.S_IMODE(item.st_mode), item.st_uid,
+        item.st_dev,
+        item.st_ino,
+        stat.S_IMODE(item.st_mode),
+        item.st_uid,
     )
     assert stat.S_IMODE(item.st_mode) == 0o700
     assert [path.name for path in parent_path.iterdir()] == [backup.path.name]
@@ -1868,8 +2328,12 @@ def test_rollback_systemd_phase_rejects_manager_drift_before_its_next_mutation(
     module = _script()
     home, _units, _legacy = _setup_legacy_tree(tmp_path)
     systemd = _FakeSystemd()
-    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
-    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime()
+    )
+    monkeypatch.setitem(
+        module["cutover"].__globals__, "_source_units", _successor_units
+    )
     original = systemd
     rollback_stop_seen = False
 
@@ -1880,15 +2344,21 @@ def test_rollback_systemd_phase_rejects_manager_drift_before_its_next_mutation(
             rollback_stop_seen = True
             systemd.active.add(OLD_UNITS[0])
 
-    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+    with pytest.raises(
+        module["CutoverError"], match="watchdog_cutover_rollback_failed"
+    ):
         module["cutover"](
             home=home,
             systemctl=drift_after_first_rollback_stop,
-            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observe failed")),
+            observe=lambda _command: (_ for _ in ()).throw(
+                RuntimeError("observe failed")
+            ),
             state=systemd.state,
         )
 
     assert rollback_stop_seen
     rollback_stop = ("stop", NEW_UNITS[1])
     assert rollback_stop in systemd.calls
-    assert ("disable", NEW_UNITS[1]) not in systemd.calls[systemd.calls.index(rollback_stop) + 1:]
+    assert ("disable", NEW_UNITS[1]) not in systemd.calls[
+        systemd.calls.index(rollback_stop) + 1 :
+    ]

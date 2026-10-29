@@ -59,7 +59,7 @@ Live cutover remains correctly blocked by independent safety evidence:
   and unintegrated identity/Linux primitives exist.
 
 Therefore no runtime home, auth projection, or inventory mutation is allowed
-from this slice.  The next owner must first install an attested broker and
+from this slice. The next owner must first install an attested broker and
 atomically publish a V2 registry/profile binding, then wire the existing
-contract to that one broker and Registry CAS path.  Do not re-enable or repair
+contract to that one broker and Registry CAS path. Do not re-enable or repair
 the legacy Teamleiterin route.

@@ -77,7 +77,9 @@ class TestEvidenceRunner:
                     timeout=2,
                 )
                 if probe.returncode == 0 and len(probe.stdout) <= 128:
-                    node_version = probe.stdout.decode("ascii", errors="replace").strip()
+                    node_version = probe.stdout.decode(
+                        "ascii", errors="replace"
+                    ).strip()
             except (OSError, subprocess.TimeoutExpired):
                 pass
         self._runner_version_digest = _digest_text(
@@ -188,7 +190,13 @@ class TestEvidenceRunner:
 
     def _execute(self, test: TestEntryV1) -> tuple[str, str]:
         if test.runner == "pytest":
-            argv = [sys.executable, "-m", "pytest", "-q", f"{test.path}::{test.node_id}"]
+            argv = [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"{test.path}::{test.node_id}",
+            ]
         elif self._node_path is not None:
             argv = [
                 self._node_path,

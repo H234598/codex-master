@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
 import sys
+import time
 import uuid
 
 sys.dont_write_bytecode = True
@@ -28,6 +30,7 @@ from the_hive.runtime_lifecycle import (  # noqa: E402
 
 _BUNDLE = "TheHivePluginBundleV1"
 _DESCRIPTOR = "release-binding.json"
+_EFFECT_RECEIPT = "plugin-release-effect-receipt-v1.json"
 _PLUGIN_FILES = (
     ".codex-plugin/plugin.json",
     ".mcp.json",
@@ -70,6 +73,259 @@ def _source_file(home: Path, path: Path, maximum: int = 2 * 1024 * 1024) -> byte
     return value
 
 
+def _canonical(value: object) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+
+def _validate_effect_receipt(value: object) -> dict[str, object]:
+    expected = {
+        "descriptor_sha256",
+        "effect",
+        "generation",
+        "issued_at_unix_ns",
+        "manifest_digest",
+        "marketplace_sha256",
+        "owner",
+        "plugin_identity",
+        "schema_version",
+        "target",
+        "target_identity",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        _fail("plugin_receipt_untrusted")
+    if (
+        value.get("schema_version") != 1
+        or value.get("owner") != "plugin_release_publisher"
+        or value.get("effect") != "plugin_release_descriptor_verified_present"
+        or value.get("target") != "plugins/the-hive/release-binding.json"
+        or not isinstance(value.get("generation"), str)
+        or not value["generation"]
+        or "/" in value["generation"]
+        or value["generation"] in {".", ".."}
+        or type(value.get("issued_at_unix_ns")) is not int
+        or value["issued_at_unix_ns"] <= 0
+        or any(
+            not isinstance(value.get(field), str)
+            or not value[field].startswith("sha256:")
+            or len(value[field]) != 71
+            or any(c not in "0123456789abcdef" for c in value[field][7:])
+            for field in ("descriptor_sha256", "manifest_digest")
+        )
+        or not isinstance(value.get("marketplace_sha256"), str)
+        or len(value["marketplace_sha256"]) != 64
+        or any(c not in "0123456789abcdef" for c in value["marketplace_sha256"])
+    ):
+        _fail("plugin_receipt_untrusted")
+    for field, keys in (
+        ("plugin_identity", {"dev", "ino"}),
+        ("target_identity", {"dev", "gid", "ino", "mode", "nlink", "size", "uid"}),
+    ):
+        item = value.get(field)
+        if (
+            not isinstance(item, dict)
+            or set(item) != keys
+            or any(type(item[key]) is not int or item[key] < 0 for key in keys)
+        ):
+            _fail("plugin_receipt_untrusted")
+    target = value["target_identity"]
+    if (
+        target["mode"] != 0o644
+        or target["nlink"] != 1
+        or target["size"] <= 0
+    ):
+        _fail("plugin_receipt_untrusted")
+    return value
+
+
+def _existing_effect_receipt(home: Path) -> dict[str, object] | None:
+    state_root = home / ".local/state/codex-master-mcp/hive"
+    _bound_path_from_home(home, state_root)
+    path = state_root / _EFFECT_RECEIPT
+    try:
+        raw = _regular_bytes(path, maximum=65536, mode=0o600)
+    except OSError as exc:
+        raise PublishError("plugin_receipt_untrusted") from exc
+    if raw is None:
+        return None
+
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise PublishError("plugin_receipt_untrusted")
+        return result
+
+    try:
+        decoded = json.loads(raw.decode("ascii"), object_pairs_hook=unique)
+    except (UnicodeError, ValueError) as exc:
+        raise PublishError("plugin_receipt_untrusted") from exc
+    return _validate_effect_receipt(decoded)
+
+
+def _write_effect_receipt(
+    *,
+    home: Path,
+    plugin: Path,
+    target: Path,
+    plugin_identity: tuple[int, int],
+    generation: str,
+    manifest_digest: str,
+    descriptor: bytes,
+    descriptor_digest: str,
+    marketplace: bytes,
+) -> str:
+    state_root = home / ".local/state/codex-master-mcp/hive"
+    _bound_path_from_home(home, state_root)
+    state_identity = _directory(state_root)
+    state_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    state_fd = os.open(state_root, state_flags)
+    temporary_name = f".{_EFFECT_RECEIPT}.{uuid.uuid4().hex}"
+    temporary_fd = -1
+    visible = False
+    old_fd = -1
+    try:
+        state_info = os.fstat(state_fd)
+        if (state_info.st_dev, state_info.st_ino) != state_identity:
+            _fail("plugin_receipt_parent_raced")
+        current_descriptor = _source_file(home, target, 65536)
+        descriptor_info = target.lstat()
+        if (
+            current_descriptor != descriptor
+            or "sha256:" + hashlib.sha256(current_descriptor).hexdigest()
+            != descriptor_digest
+            or not stat.S_ISREG(descriptor_info.st_mode)
+            or descriptor_info.st_uid != os.geteuid()
+            or descriptor_info.st_nlink != 1
+            or stat.S_IMODE(descriptor_info.st_mode) != 0o644
+            or _directory(plugin) != plugin_identity
+        ):
+            _fail("plugin_receipt_effect_changed")
+        receipt = {
+            "descriptor_sha256": descriptor_digest,
+            "effect": "plugin_release_descriptor_verified_present",
+            "generation": generation,
+            "issued_at_unix_ns": time.time_ns(),
+            "manifest_digest": manifest_digest,
+            "marketplace_sha256": hashlib.sha256(marketplace).hexdigest(),
+            "owner": "plugin_release_publisher",
+            "plugin_identity": {"dev": plugin_identity[0], "ino": plugin_identity[1]},
+            "schema_version": 1,
+            "target": "plugins/the-hive/release-binding.json",
+            "target_identity": {
+                "dev": descriptor_info.st_dev,
+                "gid": descriptor_info.st_gid,
+                "ino": descriptor_info.st_ino,
+                "mode": stat.S_IMODE(descriptor_info.st_mode),
+                "nlink": descriptor_info.st_nlink,
+                "size": descriptor_info.st_size,
+                "uid": descriptor_info.st_uid,
+            },
+        }
+        encoded = _canonical(receipt)
+        old_identity = None
+        try:
+            old_fd = os.open(
+                _EFFECT_RECEIPT,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=state_fd,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            old_info = os.fstat(old_fd)
+            if (
+                not stat.S_ISREG(old_info.st_mode)
+                or old_info.st_uid != os.geteuid()
+                or old_info.st_nlink != 1
+                or stat.S_IMODE(old_info.st_mode) != 0o600
+                or not 0 < old_info.st_size <= 65536
+            ):
+                _fail("plugin_receipt_untrusted")
+            old_raw = os.read(old_fd, old_info.st_size + 1)
+            after = os.fstat(old_fd)
+            if (
+                len(old_raw) != old_info.st_size
+                or old_info[:7] != after[:7]
+                or old_info.st_mtime_ns != after.st_mtime_ns
+                or old_info.st_ctime_ns != after.st_ctime_ns
+            ):
+                _fail("plugin_receipt_untrusted")
+            def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                result = dict(pairs)
+                if len(result) != len(pairs):
+                    raise PublishError("plugin_receipt_untrusted")
+                return result
+
+            try:
+                _validate_effect_receipt(
+                    json.loads(old_raw.decode("ascii"), object_pairs_hook=unique)
+                )
+            except (UnicodeError, ValueError) as exc:
+                raise PublishError("plugin_receipt_untrusted") from exc
+            old_identity = (old_info.st_dev, old_info.st_ino)
+
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=state_fd,
+        )
+        os.fchmod(temporary_fd, 0o600)
+        view = memoryview(encoded)
+        while view:
+            view = view[os.write(temporary_fd, view):]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        if old_identity is None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.renameat2(
+                state_fd,
+                temporary_name.encode(),
+                state_fd,
+                _EFFECT_RECEIPT.encode(),
+                1,
+            ):
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+        else:
+            current = os.stat(
+                _EFFECT_RECEIPT, dir_fd=state_fd, follow_symlinks=False
+            )
+            if (current.st_dev, current.st_ino) != old_identity:
+                _fail("plugin_receipt_raced")
+            os.replace(
+                temporary_name,
+                _EFFECT_RECEIPT,
+                src_dir_fd=state_fd,
+                dst_dir_fd=state_fd,
+            )
+        visible = True
+        os.fsync(state_fd)
+        _bound_path_from_home(home, state_root)
+        if _directory(state_root) != state_identity:
+            _fail("plugin_receipt_parent_raced")
+        return hashlib.sha256(encoded).hexdigest()
+    except PublishError:
+        raise
+    except OSError as exc:
+        raise PublishError("plugin_receipt_persist_failed") from exc
+    finally:
+        if old_fd >= 0:
+            os.close(old_fd)
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if not visible:
+            try:
+                os.unlink(temporary_name, dir_fd=state_fd)
+                os.fsync(state_fd)
+            except FileNotFoundError:
+                pass
+        os.close(state_fd)
+
+
 def publish(
     home: Path, generation: str, manifest_digest: str, descriptor_digest: str
 ) -> dict[str, str]:
@@ -92,6 +348,7 @@ def publish(
     target = plugin / _DESCRIPTOR
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     with _lifecycle_lock(home):
+        _existing_effect_receipt(home)
         _bound_path_from_home(home, target)
         plugin_identity = _directory(plugin)
         marketplace_path = home / ".agents" / "plugins" / "marketplace.json"
@@ -137,9 +394,22 @@ def publish(
         if present is not None:
             if present != descriptor:
                 _fail("plugin_descriptor_conflict")
+            validate_source()
+            receipt_sha256 = _write_effect_receipt(
+                home=home,
+                plugin=plugin,
+                target=target,
+                plugin_identity=plugin_identity,
+                generation=generation,
+                manifest_digest=manifest_digest,
+                descriptor=descriptor,
+                descriptor_digest=descriptor_digest,
+                marketplace=marketplace,
+            )
             return {
                 "status": "already_published",
                 "descriptor_sha256": descriptor_digest,
+                "receipt_sha256": receipt_sha256,
             }
 
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -189,7 +459,25 @@ def publish(
             if published != descriptor:
                 _fail("plugin_publish_postcheck_failed")
             validate_source()
-            return {"status": "published", "descriptor_sha256": descriptor_digest}
+            # The descriptor is now a verified durable effect. A later receipt
+            # failure must leave it available for an idempotent owner retry.
+            linked = False
+            receipt_sha256 = _write_effect_receipt(
+                home=home,
+                plugin=plugin,
+                target=target,
+                plugin_identity=plugin_identity,
+                generation=generation,
+                manifest_digest=manifest_digest,
+                descriptor=descriptor,
+                descriptor_digest=descriptor_digest,
+                marketplace=marketplace,
+            )
+            return {
+                "status": "published",
+                "descriptor_sha256": descriptor_digest,
+                "receipt_sha256": receipt_sha256,
+            }
         except FileExistsError as exc:
             raise PublishError("plugin_descriptor_raced") from exc
         except Exception:

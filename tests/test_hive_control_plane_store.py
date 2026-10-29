@@ -17,7 +17,9 @@ NOW = datetime(2026, 8, 16, 20, 45, tzinfo=timezone.utc)
 TASK9_PATH = PurePosixPath("control-plane/task9.json")
 
 
-def _empty_document(*, created: datetime = NOW, updated: datetime = NOW) -> dict[str, object]:
+def _empty_document(
+    *, created: datetime = NOW, updated: datetime = NOW
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "revision": 0,
@@ -51,7 +53,9 @@ class RecordingStore(HiveStateStore):
             finally:
                 self.lock_depth -= 1
 
-    def read_json_locked(self, relative: PurePosixPath, *, max_bytes: int) -> dict[str, object]:
+    def read_json_locked(
+        self, relative: PurePosixPath, *, max_bytes: int
+    ) -> dict[str, object]:
         assert self.lock_depth > 0
         self.reads.append(relative)
         return dict(super().read_json_locked(relative, max_bytes=max_bytes))
@@ -98,7 +102,9 @@ def test_constructor_accepts_only_hive_state_store(tmp_path: Path) -> None:
         HiveControlPlaneStore(tmp_path)  # type: ignore[arg-type]
 
 
-def test_load_rejects_missing_invalid_unknown_and_incomplete_documents_without_mutation(tmp_path: Path) -> None:
+def test_load_rejects_missing_invalid_unknown_and_incomplete_documents_without_mutation(
+    tmp_path: Path,
+) -> None:
     state = HiveStateStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     path = tmp_path / "state" / TASK9_PATH
@@ -110,7 +116,13 @@ def test_load_rejects_missing_invalid_unknown_and_incomplete_documents_without_m
     invalid_documents = (
         b"{",
         json.dumps({**_empty_document(), "unexpected": "field"}).encode("utf-8"),
-        json.dumps({key: value for key, value in _empty_document().items() if key != "messages"}).encode("utf-8"),
+        json.dumps(
+            {
+                key: value
+                for key, value in _empty_document().items()
+                if key != "messages"
+            }
+        ).encode("utf-8"),
     )
     for raw in invalid_documents:
         state.replace_private_bytes(TASK9_PATH, raw)
@@ -120,7 +132,9 @@ def test_load_rejects_missing_invalid_unknown_and_incomplete_documents_without_m
         assert path.read_bytes() == before
 
 
-def test_load_normalizes_legacy_v1_document_missing_pool_dispatches_under_its_lock(tmp_path: Path) -> None:
+def test_load_normalizes_legacy_v1_document_missing_pool_dispatches_under_its_lock(
+    tmp_path: Path,
+) -> None:
     state = RecordingStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     legacy = _empty_document()
@@ -131,12 +145,21 @@ def test_load_normalizes_legacy_v1_document_missing_pool_dispatches_under_its_lo
 
     assert loaded["pool_dispatches"] == []
     assert state.replacements == [TASK9_PATH]
-    candidate = control.replace_task9(loaded, expected_revision=0, now=NOW + timedelta(minutes=1))
+    candidate = control.replace_task9(
+        loaded, expected_revision=0, now=NOW + timedelta(minutes=1)
+    )
     assert candidate["pool_dispatches"] == []
-    assert json.loads((tmp_path / "state" / TASK9_PATH).read_text(encoding="utf-8"))["pool_dispatches"] == []
+    assert (
+        json.loads((tmp_path / "state" / TASK9_PATH).read_text(encoding="utf-8"))[
+            "pool_dispatches"
+        ]
+        == []
+    )
 
 
-def test_initialize_is_only_missing_file_bootstrap_and_returns_defensive_v1_document(tmp_path: Path) -> None:
+def test_initialize_is_only_missing_file_bootstrap_and_returns_defensive_v1_document(
+    tmp_path: Path,
+) -> None:
     state = HiveStateStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     path = tmp_path / "state" / TASK9_PATH
@@ -164,7 +187,9 @@ def test_initialize_and_replace_require_aware_utc_time(tmp_path: Path) -> None:
 
     control.initialize_task9(now=NOW)
     with pytest.raises(HiveStateError):
-        control.replace_task9(control.load_task9(), expected_revision=0, now=NOW.replace(tzinfo=None))
+        control.replace_task9(
+            control.load_task9(), expected_revision=0, now=NOW.replace(tzinfo=None)
+        )
     with pytest.raises(HiveStateError):
         control.replace_task9(
             control.load_task9(),
@@ -173,7 +198,9 @@ def test_initialize_and_replace_require_aware_utc_time(tmp_path: Path) -> None:
         )
 
 
-def test_replace_rejects_stale_revision_and_backward_time_without_mutation(tmp_path: Path) -> None:
+def test_replace_rejects_stale_revision_and_backward_time_without_mutation(
+    tmp_path: Path,
+) -> None:
     state = HiveStateStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     path = tmp_path / "state" / TASK9_PATH
@@ -182,22 +209,30 @@ def test_replace_rejects_stale_revision_and_backward_time_without_mutation(tmp_p
     before = path.read_bytes()
 
     with pytest.raises(HiveStateError, match="^stale_control_plane_revision$"):
-        control.replace_task9(document, expected_revision=1, now=NOW + timedelta(minutes=1))
+        control.replace_task9(
+            document, expected_revision=1, now=NOW + timedelta(minutes=1)
+        )
     assert path.read_bytes() == before
 
     with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
-        control.replace_task9(document, expected_revision=0, now=NOW - timedelta(seconds=1))
+        control.replace_task9(
+            document, expected_revision=0, now=NOW - timedelta(seconds=1)
+        )
     assert path.read_bytes() == before
 
 
-def test_replace_increments_revision_preserves_created_updates_time_and_returns_defensive_copy(tmp_path: Path) -> None:
+def test_replace_increments_revision_preserves_created_updates_time_and_returns_defensive_copy(
+    tmp_path: Path,
+) -> None:
     state = HiveStateStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     control.initialize_task9(now=NOW)
     document = control.load_task9()
     document["grants"].append({"grant_id": "grant-one"})  # type: ignore[union-attr]
 
-    replaced = control.replace_task9(document, expected_revision=0, now=NOW + timedelta(minutes=1))
+    replaced = control.replace_task9(
+        document, expected_revision=0, now=NOW + timedelta(minutes=1)
+    )
 
     assert replaced["revision"] == 1
     assert replaced["created_at_utc"] == NOW.isoformat()
@@ -207,20 +242,28 @@ def test_replace_increments_revision_preserves_created_updates_time_and_returns_
     assert control.load_task9()["grants"] == [{"grant_id": "grant-one"}]
 
 
-def test_replace_valid_standard_json_candidate_returns_exact_following_load(tmp_path: Path) -> None:
+def test_replace_valid_standard_json_candidate_returns_exact_following_load(
+    tmp_path: Path,
+) -> None:
     state = HiveStateStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     control.initialize_task9(now=NOW)
     candidate = control.load_task9()
-    candidate["messages"].append({"message_id": "message-one", "nested": [None, True, 1, 1.5, {"key": "value"}]})  # type: ignore[union-attr]
+    candidate["messages"].append(
+        {"message_id": "message-one", "nested": [None, True, 1, 1.5, {"key": "value"}]}
+    )  # type: ignore[union-attr]
     candidate["by_message_id"] = {"message-one": {"sequence": 1}}
 
-    replaced = control.replace_task9(candidate, expected_revision=0, now=NOW + timedelta(minutes=1))
+    replaced = control.replace_task9(
+        candidate, expected_revision=0, now=NOW + timedelta(minutes=1)
+    )
 
     assert replaced == control.load_task9()
 
 
-def test_replace_checks_expected_revision_and_custom_mapping_before_root_lock(tmp_path: Path) -> None:
+def test_replace_checks_expected_revision_and_custom_mapping_before_root_lock(
+    tmp_path: Path,
+) -> None:
     state = RecordingStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     control.initialize_task9(now=NOW)
@@ -228,11 +271,15 @@ def test_replace_checks_expected_revision_and_custom_mapping_before_root_lock(tm
     before = state.locked_calls
 
     with pytest.raises(HiveStateError, match="^stale_control_plane_revision$"):
-        control.replace_task9(candidate, expected_revision=True, now=NOW + timedelta(minutes=1))  # type: ignore[arg-type]
+        control.replace_task9(
+            candidate, expected_revision=True, now=NOW + timedelta(minutes=1)
+        )  # type: ignore[arg-type]
     assert state.locked_calls == before
 
     with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
-        control.replace_task9(LockAwareMapping(state), expected_revision=0, now=NOW + timedelta(minutes=1))
+        control.replace_task9(
+            LockAwareMapping(state), expected_revision=0, now=NOW + timedelta(minutes=1)
+        )
     assert state.locked_calls == before
 
 
@@ -260,7 +307,9 @@ def test_replace_rejects_nonstandard_json_candidate_before_root_lock_without_mut
     locked_before = state.locked_calls
 
     with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
-        control.replace_task9(candidate, expected_revision=0, now=NOW + timedelta(minutes=1))
+        control.replace_task9(
+            candidate, expected_revision=0, now=NOW + timedelta(minutes=1)
+        )
 
     assert state.locked_calls == locked_before
     assert path.read_bytes() == before
@@ -293,13 +342,17 @@ def test_replace_normalizes_recursive_candidate_validation_before_root_lock_with
     locked_before = state.locked_calls
 
     with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
-        control.replace_task9(candidate, expected_revision=0, now=NOW + timedelta(minutes=1))
+        control.replace_task9(
+            candidate, expected_revision=0, now=NOW + timedelta(minutes=1)
+        )
 
     assert state.locked_calls == locked_before
     assert path.read_bytes() == before
 
 
-def test_mutations_use_one_reentrant_root_lock_and_one_atomic_replace(tmp_path: Path) -> None:
+def test_mutations_use_one_reentrant_root_lock_and_one_atomic_replace(
+    tmp_path: Path,
+) -> None:
     state = RecordingStore(tmp_path / "state")
     control = HiveControlPlaneStore(state)
     path = tmp_path / "state" / TASK9_PATH
@@ -312,7 +365,9 @@ def test_mutations_use_one_reentrant_root_lock_and_one_atomic_replace(tmp_path: 
     assert not list(path.parent.glob(".task9.json.*"))
 
     with state.locked():
-        replaced = control.replace_task9(initialized, expected_revision=0, now=NOW + timedelta(minutes=1))
+        replaced = control.replace_task9(
+            initialized, expected_revision=0, now=NOW + timedelta(minutes=1)
+        )
 
     assert replaced["revision"] == 1
     assert state.locked_calls == 3

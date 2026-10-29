@@ -79,8 +79,12 @@ class FleetSnapshot:
                 }
             ),
         )
-        object.__setattr__(self, "tmux_sessions", MappingProxyType(dict(self.tmux_sessions)))
-        object.__setattr__(self, "agent_process_map", MappingProxyType(dict(self.agent_process_map)))
+        object.__setattr__(
+            self, "tmux_sessions", MappingProxyType(dict(self.tmux_sessions))
+        )
+        object.__setattr__(
+            self, "agent_process_map", MappingProxyType(dict(self.agent_process_map))
+        )
 
 
 def _read_proc_environ(pid_dir: Path) -> dict[str, str] | None:
@@ -95,13 +99,19 @@ def _read_proc_environ(pid_dir: Path) -> dict[str, str] | None:
         if not item or b"=" not in item:
             continue
         key, value = item.split(b"=", 1)
-        env[key.decode("utf-8", errors="replace")] = value.decode("utf-8", errors="replace")
+        env[key.decode("utf-8", errors="replace")] = value.decode(
+            "utf-8", errors="replace"
+        )
     return env
 
 
 def _read_proc_status(pid_dir: Path) -> dict[str, str] | object | None:
     try:
-        lines = (pid_dir / "status").read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = (
+            (pid_dir / "status")
+            .read_text(encoding="utf-8", errors="replace")
+            .splitlines()
+        )
     except FileNotFoundError:
         return _PROC_VANISHED
     except OSError:
@@ -184,7 +194,11 @@ def _process_snapshot(
         if unavailable:
             return None, not codex_like
         resolved_home = cwd
-        if codex_like and resolved_home is not None and str(resolved_home) in home_by_path:
+        if (
+            codex_like
+            and resolved_home is not None
+            and str(resolved_home) in home_by_path
+        ):
             return None, False
     else:
         configured_home = env.get("CODEX_HOME", "")
@@ -209,9 +223,11 @@ def _process_snapshot(
         return None, True
     pid = int(pid_text)
     ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
-    managed = bool(env) and (
-        env.get("CODEX_AGENT_MCP") == "1" or env.get("THE_HIVE_MCP") == "1"
-    ) and codex_like
+    managed = (
+        bool(env)
+        and (env.get("CODEX_AGENT_MCP") == "1" or env.get("THE_HIVE_MCP") == "1")
+        and codex_like
+    )
     return (
         ProcessSnapshot(
             pid=pid,
@@ -255,7 +271,9 @@ def _scan_processes(
         if status.get("State", "").startswith("Z"):
             continue
         uid_parts = status.get("Uid", "").split()
-        foreign_uid = bool(uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid())
+        foreign_uid = bool(
+            uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid()
+        )
         env = _read_proc_environ(pid_dir)
         argv = _read_proc_cmdline(pid_dir)
         snapshot, readable = _process_snapshot(
@@ -303,7 +321,10 @@ def _scan_tmux(
     runner: Callable[..., Any] | None,
 ) -> tuple[dict[str, TmuxSessionSnapshot], bool]:
     if runner is None:
-        return {name: TmuxSessionSnapshot(alive=False, pane_pid=None) for name in sessions.values()}, False
+        return {
+            name: TmuxSessionSnapshot(alive=False, pane_pid=None)
+            for name in sessions.values()
+        }, False
     try:
         result = runner(
             ["list-panes", "-a", "-F", "#{session_name}\t#{pane_active}\t#{pane_pid}"],
@@ -312,7 +333,10 @@ def _scan_tmux(
     except (OSError, TypeError):
         result = None
     if result is None or getattr(result, "returncode", 1) != 0:
-        return {name: TmuxSessionSnapshot(alive=False, pane_pid=None) for name in sessions.values()}, False
+        return {
+            name: TmuxSessionSnapshot(alive=False, pane_pid=None)
+            for name in sessions.values()
+        }, False
 
     observed: dict[str, tuple[bool, int | None]] = {}
     for line in str(getattr(result, "stdout", "") or "").splitlines():
@@ -350,7 +374,9 @@ def create_fleet_snapshot(
         resolved_homes = {}
         processes, processes_by_home, process_available = (), {}, False
     else:
-        processes, processes_by_home, process_available = _scan_processes(agent_homes, proc_root)
+        processes, processes_by_home, process_available = _scan_processes(
+            agent_homes, proc_root
+        )
     tmux_sessions, tmux_available = _scan_tmux(agent_sessions, tmux_runner)
     agent_process_map = {
         agent: AgentProcessSnapshot(

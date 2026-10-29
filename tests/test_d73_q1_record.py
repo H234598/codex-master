@@ -32,7 +32,9 @@ MANIFEST = (
 
 # This is intentionally a static wire oracle, not a re-encoding in the test.
 GOLDEN_SHA256 = "15a326627b0f1b63fb29ec785326a68299cd55e81cd116db26a10486d8159344"
-GOLDEN_BYTES = base64.b64decode("VEhENzNRMQAAAQEsAAAGsDAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1NjcAAAPpAAAD6gAAAYAAAAAAAQIDBAUGBwgREhMUFRYXGAAAAHgAAACdAAAEbwAAAA8AAAABifB8KKi14e4esYiZrcuMCqCWRQj4URXDloB6Imm5h7vySnSM25a9gNwXi8mdoW37tZXcZ3rtGQXr+7bENErrgnLMuRpvA7H9V9ILJ17THXWFbJm9xethdNVXwfd9NPf3ooLUcmoWAPukVJsG/jcljO47QUPSEmwJeerjHrh6QJQCJGZonKlDH1nvHiIcSEh6G1NpfYzi59rAUa/GZhIjR7YN5nOmsB2jusHyQPoUh8QXao1zzkG1YgNWilN7VgcxdGhlLWhpdmUuZDczLmV4ZWN1dGlvbi1wb2xpY3kAAQAAAAAH0QABZwASb3JnLmV4YW1wbGUuUG9saWN5ACZzeW50aGV0aWNfdTpzeW50aGV0aWNfcjpzeW50aGV0aWNfdDpzMAASb3JnLmV4YW1wbGUucG9saWN5VEhENzNUMQAAAQAAAAAAnTAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1NjcAAQAA8kp0jNuWvYDcF4vJnaFt+7WV3Gd67RkF6/u2xDRK64KJ8HwoqLXh7h6xiJmty4wKoJZFCPhRFcOWgHoiabmHuwIkZmicqUMfWe8eIhxISHobU2l9jOLn2sBRr8ZmEiNHZ3siY29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImRpcmVjdG9yaWVzIjp7fSwiZmlsZXMiOnsieCI6eyJtb2RlIjozODQsIm5saW5rIjoxLCJzaGEyNTYiOiI1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1Iiwic2l6ZSI6MX19LCJnZW5lcmF0aW9uIjoiZyIsImhpc3RvcmljYWxfbGluZWFnZSI6eyJkNjkiOnsiY29tbWl0IjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImR5bmFtaWNfcG9vbF9ibG9iIjoiZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZiIsInBhcmVudCI6ImVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWUiLCJ0cmVlIjoiZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZCJ9LCJkNzMiOnsiY29tbWl0IjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSIsInBhcmVudCI6IjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJ0cmVlIjoiMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMiJ9fSwicjJfYmFzZSI6eyJjb21taXQiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidHJlZSI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIifSwicmVsZWFzZSI6eyJiaW5kX3NvdXJjZXMiOltdLCJoNF91bml0cyI6W10sImhvb2tfYWJpIjoieCIsImhvb2tfYWJpX2NvbXBhbmlvbiI6IngiLCJob29rX2FiaV9jb3JlIjoieCIsImhvb2tfYWJpX3NvdXJjZSI6IngiLCJob29rX2VudHJ5cG9pbnRzIjpbXSwibW9uaXRvcl9lbnRyeXBvaW50IjoieCIsInBsdWdpbl9idW5kbGUiOiJ4IiwicHl0aG9uX3RyZWUiOiJ4Iiwicm9vdF9pbnN0YWxsX3BsYW4iOiJ4Iiwic3RhYmxlX2xhdW5jaGVycyI6W119LCJzY2hlbWFfdmVyc2lvbiI6Miwic3VjY2Vzc29yX3dpdG5lc3MiOnsicGF0aCI6InN5bnRoZXRpYy13aXRuZXNzIiwic2hhMjU2IjoiNDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NCJ9fQo=")  # noqa: E501
+GOLDEN_BYTES = base64.b64decode(
+    "VEhENzNRMQAAAQEsAAAGsDAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1NjcAAAPpAAAD6gAAAYAAAAAAAQIDBAUGBwgREhMUFRYXGAAAAHgAAACdAAAEbwAAAA8AAAABifB8KKi14e4esYiZrcuMCqCWRQj4URXDloB6Imm5h7vySnSM25a9gNwXi8mdoW37tZXcZ3rtGQXr+7bENErrgnLMuRpvA7H9V9ILJ17THXWFbJm9xethdNVXwfd9NPf3ooLUcmoWAPukVJsG/jcljO47QUPSEmwJeerjHrh6QJQCJGZonKlDH1nvHiIcSEh6G1NpfYzi59rAUa/GZhIjR7YN5nOmsB2jusHyQPoUh8QXao1zzkG1YgNWilN7VgcxdGhlLWhpdmUuZDczLmV4ZWN1dGlvbi1wb2xpY3kAAQAAAAAH0QABZwASb3JnLmV4YW1wbGUuUG9saWN5ACZzeW50aGV0aWNfdTpzeW50aGV0aWNfcjpzeW50aGV0aWNfdDpzMAASb3JnLmV4YW1wbGUucG9saWN5VEhENzNUMQAAAQAAAAAAnTAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1NjcAAQAA8kp0jNuWvYDcF4vJnaFt+7WV3Gd67RkF6/u2xDRK64KJ8HwoqLXh7h6xiJmty4wKoJZFCPhRFcOWgHoiabmHuwIkZmicqUMfWe8eIhxISHobU2l9jOLn2sBRr8ZmEiNHZ3siY29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImRpcmVjdG9yaWVzIjp7fSwiZmlsZXMiOnsieCI6eyJtb2RlIjozODQsIm5saW5rIjoxLCJzaGEyNTYiOiI1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1Iiwic2l6ZSI6MX19LCJnZW5lcmF0aW9uIjoiZyIsImhpc3RvcmljYWxfbGluZWFnZSI6eyJkNjkiOnsiY29tbWl0IjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImR5bmFtaWNfcG9vbF9ibG9iIjoiZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZiIsInBhcmVudCI6ImVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWUiLCJ0cmVlIjoiZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZCJ9LCJkNzMiOnsiY29tbWl0IjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSIsInBhcmVudCI6IjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJ0cmVlIjoiMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMiJ9fSwicjJfYmFzZSI6eyJjb21taXQiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidHJlZSI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIifSwicmVsZWFzZSI6eyJiaW5kX3NvdXJjZXMiOltdLCJoNF91bml0cyI6W10sImhvb2tfYWJpIjoieCIsImhvb2tfYWJpX2NvbXBhbmlvbiI6IngiLCJob29rX2FiaV9jb3JlIjoieCIsImhvb2tfYWJpX3NvdXJjZSI6IngiLCJob29rX2VudHJ5cG9pbnRzIjpbXSwibW9uaXRvcl9lbnRyeXBvaW50IjoieCIsInBsdWdpbl9idW5kbGUiOiJ4IiwicHl0aG9uX3RyZWUiOiJ4Iiwicm9vdF9pbnN0YWxsX3BsYW4iOiJ4Iiwic3RhYmxlX2xhdW5jaGVycyI6W119LCJzY2hlbWFfdmVyc2lvbiI6Miwic3VjY2Vzc29yX3dpdG5lc3MiOnsicGF0aCI6InN5bnRoZXRpYy13aXRuZXNzIiwic2hhMjU2IjoiNDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NCJ9fQo="
+)  # noqa: E501
 
 
 def _identity(*, size: int) -> record._DescriptorIdentity:
@@ -1060,9 +1062,7 @@ def test_d341_new_helpers_are_direct_and_fail_closed() -> None:
     assert record._hex_text("a" * 40, 40) == "a" * 40
     assert record._text("synthetic") == "synthetic"
     assert record._bounded_int(1, 0, 1) == 1
-    record._validate_manifest_grammar(
-        manifest, commit=COMMIT, generation=GENERATION
-    )
+    record._validate_manifest_grammar(manifest, commit=COMMIT, generation=GENERATION)
     for function in (
         lambda: record._exact_object({}, {"key"}),
         lambda: record._hex_text("A" * 40, 40),
@@ -1201,9 +1201,10 @@ def test_direct_value_manifest_and_digest_primitives_fail_closed() -> None:
     with pytest.raises(record._Reject):
         record._identity(object())
 
-    assert record._digest(b"label", b"payload") == hashlib.sha256(
-        b"label\0\0\0\0\x07payload"
-    ).digest()
+    assert (
+        record._digest(b"label", b"payload")
+        == hashlib.sha256(b"label\0\0\0\0\x07payload").digest()
+    )
     assert record._unique_json_object([("key", 1)]) == {"key": 1}
     with pytest.raises(record._Reject):
         record._unique_json_object([("key", 1), ("key", 2)])
@@ -1261,14 +1262,17 @@ def test_direct_leaf_tuple_header_and_sized_decoders_fail_closed() -> None:
         leaf_digest=leaf_digest,
         binder=binder,
     )
-    assert record._decode_tuple(
-        tuple_bytes,
-        commit=COMMIT,
-        generation=GENERATION,
-        manifest_digest=manifest_digest,
-        leaf_digest=leaf_digest,
-        binder=binder,
-    ) is None
+    assert (
+        record._decode_tuple(
+            tuple_bytes,
+            commit=COMMIT,
+            generation=GENERATION,
+            manifest_digest=manifest_digest,
+            leaf_digest=leaf_digest,
+            binder=binder,
+        )
+        is None
+    )
     with pytest.raises(record._Reject):
         record._decode_tuple(
             tuple_bytes[:-1],
@@ -1377,9 +1381,7 @@ def test_codec_accepts_the_declared_minimum_and_maximum_field_bounds() -> None:
     _rejects(minimum[:-1])
 
     generation = b"g" * 255
-    manifest = _canonical_manifest_with_padding(
-        generation, record._MAX_MANIFEST_LENGTH
-    )
+    manifest = _canonical_manifest_with_padding(generation, record._MAX_MANIFEST_LENGTH)
     maximum = _encode(
         generation=generation,
         bus_name=b"b" * 255,
@@ -1390,9 +1392,7 @@ def test_codec_accepts_the_declared_minimum_and_maximum_field_bounds() -> None:
     assert struct.unpack(">I", maximum[88:92])[0] == 4906
     assert struct.unpack(">I", maximum[92:96])[0] == 411
     assert struct.unpack(">I", maximum[96:100])[0] == 524288
-    decoded = record._decode_record_bytes(
-        maximum, _identity(size=len(maximum))
-    )
+    decoded = record._decode_record_bytes(maximum, _identity(size=len(maximum)))
     assert decoded.generation == generation
     assert decoded.manifest == manifest
 
@@ -1452,7 +1452,7 @@ def test_manifest_is_ascii_duplicate_rejecting_schema_two_and_canonical() -> Non
         b'"generation":"g","schema_version":2,"schema_version":2}\n',
         b'{"commit":"0123456789abcdef0123456789abcdef01234567",'
         b'"generation":"g","schema_version":NaN}\n',
-        b'\xff',
+        b"\xff",
     )
 
     for manifest in invalid_manifests:
@@ -1528,9 +1528,7 @@ def _sealed_fd(
     cloexec: bool = True,
     raw_mutator: Callable[[bytes], bytes] | None = None,
 ) -> int:
-    fd = os.memfd_create(
-        "d73-q1-synthetic", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC
-    )
+    fd = os.memfd_create("d73-q1-synthetic", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
     os.fchmod(fd, mode)
     initial = os.fstat(fd)
     provisional = record._DescriptorIdentity(
@@ -1636,9 +1634,7 @@ def test_capability_copy_forgery_and_reused_fd_number_are_rejected() -> None:
 def test_decoder_closes_and_consumes_sealed_fd_on_digest_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fd = _sealed_fd(
-        raw_mutator=lambda raw: _replace_byte(raw, 108, raw[108] ^ 1)
-    )
+    fd = _sealed_fd(raw_mutator=lambda raw: _replace_byte(raw, 108, raw[108] ^ 1))
     capability = record._capability_from_fd(fd)
     size = os.fstat(fd).st_size
     original_pread = record.os.pread
@@ -1943,12 +1939,16 @@ def test_s4_materializer_uses_one_encoder_and_the_required_fd_contract(
     final_stat = original_fstat(descriptor)
     final_state = record._fd_state(descriptor)
 
-    assert memfd_calls == [
-        ("the-hive-d73-q1", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
-    ]
+    assert memfd_calls == [("the-hive-d73-q1", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)]
     assert chmod_calls == [(descriptor, 0o600)]
     assert events[:7] == [
-        "memfd", "fchmod", "fstat", "encoder", "write", "seals", "fstat"
+        "memfd",
+        "fchmod",
+        "fstat",
+        "encoder",
+        "write",
+        "seals",
+        "fstat",
     ]
     assert encoder_descriptors == [
         record._DescriptorIdentity(
@@ -2024,6 +2024,7 @@ def test_s4_materializer_closes_the_owned_fd_on_every_pretransfer_failure(
             lambda *_: (_ for _ in ()).throw(OSError("synthetic fchmod failure")),
         )
     elif failure == "fstat":
+
         def fail_owned_fstat(descriptor: int):
             info = original_fstat(descriptor)
             if created_identity.get(descriptor) == (info.st_dev, info.st_ino):
@@ -2053,6 +2054,7 @@ def test_s4_materializer_closes_the_owned_fd_on_every_pretransfer_failure(
             lambda *_: (_ for _ in ()).throw(OSError("synthetic write failure")),
         )
     elif failure == "seals":
+
         def fail_add_seals(descriptor: int, command: int, *args: int) -> int:
             if command == fcntl.F_ADD_SEALS:
                 raise OSError("synthetic seal failure")

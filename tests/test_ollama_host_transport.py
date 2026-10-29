@@ -68,11 +68,17 @@ def instance(
 
 def owner_instance(ref: str = "ollama-worker-west") -> dict[str, object]:
     return {
-        "ref": ref, "label": "Worker West", "host_ref": "worker-west",
-        "ollama_executable": "/private/worker/ollama", "models_directory": "/private/worker/models",
-        "selected_model_refs": ["llama-small"], "allowed_cpus": "2-3",
-        "cpu_quota_percent": 200, "cpu_weight": 50,
-        "lifecycle_state": "planned", "readiness_state": "unknown",
+        "ref": ref,
+        "label": "Worker West",
+        "host_ref": "worker-west",
+        "ollama_executable": "/private/worker/ollama",
+        "models_directory": "/private/worker/models",
+        "selected_model_refs": ["llama-small"],
+        "allowed_cpus": "2-3",
+        "cpu_quota_percent": 200,
+        "cpu_weight": 50,
+        "lifecycle_state": "planned",
+        "readiness_state": "unknown",
     }
 
 
@@ -129,7 +135,9 @@ class FakeLocalAdapter:
 
     def probe(self, running):
         self.calls.append(("probe", running))
-        return OllamaReadinessStatus(True, (), True, True, True, ("provider-llama-small",))
+        return OllamaReadinessStatus(
+            True, (), True, True, True, ("provider-llama-small",)
+        )
 
     def stop(self, running):
         self.calls.append(("stop", running))
@@ -234,7 +242,9 @@ def test_remote_plan_enqueues_and_local_plan_stays_direct() -> None:
     local_instance = replace(instance(CONTROL_HOST_REF), ref="ollama-control")
     remote_instance = replace(instance("worker-west"), ref="ollama-worker-west")
     source = RegistrySource(
-        OllamaRegistryV1(1, MODEL_GENERATION, (model(),), (local_instance, remote_instance))
+        OllamaRegistryV1(
+            1, MODEL_GENERATION, (model(),), (local_instance, remote_instance)
+        )
     )
     remote = _QueuedRemoteOllamaPort()
     local = FakeLocalAdapter()
@@ -298,14 +308,14 @@ def test_agent_queue_port_enqueues_only_remote_ollama_plan(tmp_path: Path) -> No
     assert queued.plan_digest == remote.plan_digest
     leased = agent_store.poll(
         AgentPrincipalV1("worker-west", hosts.document_generation()),
-        AgentPollV1(
-            hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
-        ),
+        AgentPollV1(hosts.document_generation(), 3, "sha256:" + "c" * 64, 0),
     )
     assert leased.host_ref == "worker-west"
 
 
-def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(tmp_path: Path) -> None:
+def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(
+    tmp_path: Path,
+) -> None:
     hosts = _agent_host_registry(tmp_path)
     store = AgentOperationStore.for_test(tmp_path / "agent-operations")
     port = AgentQueueRemoteOllamaOperationPort(
@@ -314,27 +324,66 @@ def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(tmp_path: Pat
     digest = "b" * 64
     plan = port.plan(
         OllamaRemotePlanRequestV1(
-            "worker-west", "ollama-worker-west", 8, 13, 3, 3, digest,
-            "a" * 64, ("llama-small",), "2-3", 200, 50, None, owner_instance(),
+            "worker-west",
+            "ollama-worker-west",
+            8,
+            13,
+            3,
+            3,
+            digest,
+            "a" * 64,
+            ("llama-small",),
+            "2-3",
+            200,
+            50,
+            None,
+            owner_instance(),
         )
     )
     apply = port.apply(
         OllamaRemoteApplyRequestV1(
-            "worker-west", "ollama-worker-west", 8, None, 3, digest, "plan-one", None, "plan-one", owner_instance()
+            "worker-west",
+            "ollama-worker-west",
+            8,
+            None,
+            3,
+            digest,
+            "plan-one",
+            None,
+            "plan-one",
+            owner_instance(),
         )
     )
     probe = port.probe(
         OllamaRemoteProbeRequestV1(
-            "worker-west", "ollama-worker-west", 8, None, 3, digest, None, "plan-one", owner_instance()
+            "worker-west",
+            "ollama-worker-west",
+            8,
+            None,
+            3,
+            digest,
+            None,
+            "plan-one",
+            owner_instance(),
         )
     )
     stopped = port.stop(
         OllamaRemoteStopRequestV1(
-            "worker-west", "ollama-worker-west", 8, None, 3, digest, None, "plan-one", owner_instance()
+            "worker-west",
+            "ollama-worker-west",
+            8,
+            None,
+            3,
+            digest,
+            None,
+            "plan-one",
+            owner_instance(),
         )
     )
 
-    queued = tuple(store.get(operation.id) for operation in (plan, apply, probe, stopped))
+    queued = tuple(
+        store.get(operation.id) for operation in (plan, apply, probe, stopped)
+    )
     assert [(item.kind, item.action) for item in queued] == [
         ("ollama.instance", "plan"),
         ("ollama.instance", "apply"),
@@ -344,9 +393,7 @@ def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(tmp_path: Pat
     leases = tuple(
         store.poll(
             AgentPrincipalV1("worker-west", hosts.document_generation()),
-            AgentPollV1(
-                hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
-            ),
+            AgentPollV1(hosts.document_generation(), 3, "sha256:" + "c" * 64, 0),
         )
         for _ in queued
     )
@@ -359,7 +406,15 @@ def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(tmp_path: Pat
     with pytest.raises(OllamaHostError, match=r"^control\.plan_stale$"):
         port.probe(
             OllamaRemoteProbeRequestV1(
-                "worker-west", "ollama-worker-west", 8, None, 4, digest, None, "plan-one", owner_instance()
+                "worker-west",
+                "ollama-worker-west",
+                8,
+                None,
+                4,
+                digest,
+                None,
+                "plan-one",
+                owner_instance(),
             )
         )
 
@@ -404,9 +459,7 @@ def test_remote_queue_terminalizes_epoch_rotated_operation_before_lease(
 
     no_work = store.poll(
         AgentPrincipalV1("worker-west", hosts.document_generation()),
-        AgentPollV1(
-            hosts.document_generation(), 4, "sha256:" + "c" * 64, 0
-        ),
+        AgentPollV1(hosts.document_generation(), 4, "sha256:" + "c" * 64, 0),
     )
 
     assert type(no_work) is AgentNoWorkV1
@@ -470,6 +523,7 @@ def test_local_stop_targets_only_execution_created_by_transport():
     transport.stop(execution, current_fence=FENCE)
     transport.stop(execution, current_fence=FENCE)
     assert [call[0] for call in local.calls] == ["plan", "apply", "stop"]
+
 
 def test_local_plan_provenance_is_not_copied_or_serialized():
     class NonCopyable:

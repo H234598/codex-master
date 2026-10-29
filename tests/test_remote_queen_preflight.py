@@ -54,6 +54,7 @@ def test_json_constant_rejection_is_fail_closed() -> None:
         remote_queen_preflight._reject_json_constant("NaN")
     assert caught.value.code == "RQ_E_PLAN_INCONSISTENT"
 
+
 HOST_FACTS_PAYLOAD = {
     "schema_version": "RemoteQueenHostFactsV1",
     "distribution_id": "fedora",
@@ -274,9 +275,9 @@ def test_success_collects_facts_with_exact_call_order_and_fixed_digest():
     assert tuple(item.path_id for item in preflight.host_facts.network_paths) == tuple(
         NetworkPathIdV1
     )
-    assert tuple(item.object_id for item in preflight.host_facts.managed_states) == tuple(
-        ManagedStateIdV1
-    )
+    assert tuple(
+        item.object_id for item in preflight.host_facts.managed_states
+    ) == tuple(ManagedStateIdV1)
     assert (
         preflight.preflight_digest
         == "sha256:72f51bfaa17a54c8a3672a536525317d540dc4de2b4a503ba2cb48c1cf4c3e52"
@@ -413,7 +414,9 @@ def test_hostkey_failures_happen_before_read_only_operation(known_host_keys):
     assert "SHA256:" not in str(error)
 
 
-@pytest.mark.parametrize("method", ["known_host_keys", "presented_host_key", "run_read_only"])
+@pytest.mark.parametrize(
+    "method", ["known_host_keys", "presented_host_key", "run_read_only"]
+)
 def test_operation_exception_is_redacted_as_transport_blocker(method):
     fake = FakeSshOperations(exception_method=method)
 
@@ -519,9 +522,7 @@ def test_host_fact_paths_reject_unicode_control_characters(field, value):
     payload[field] = value
 
     assert_domain_error(
-        lambda: collect(
-            FakeSshOperations(result=_result(stdout=_json_bytes(payload)))
-        ),
+        lambda: collect(FakeSshOperations(result=_result(stdout=_json_bytes(payload)))),
         "RQ_E_PLAN_INCONSISTENT",
     )
 
@@ -590,7 +591,9 @@ def test_unknown_distribution_manager_is_well_formed_but_unsupported():
 @pytest.mark.parametrize("object_id", ["codex", "mcp", "queen", "syncthing"])
 def test_every_foreign_managed_state_blocks_without_leaking_generation(object_id):
     payload = copy.deepcopy(HOST_FACTS_PAYLOAD)
-    state = next(item for item in payload["managed_states"] if item["object_id"] == object_id)
+    state = next(
+        item for item in payload["managed_states"] if item["object_id"] == object_id
+    )
     state.update(state="foreign", generation="foreign-generation-secret")
 
     error = assert_domain_error(

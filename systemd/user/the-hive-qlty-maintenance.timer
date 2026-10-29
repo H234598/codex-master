@@ -1,0 +1,10 @@
+[Unit]
+Description=Check whether daily Qlty maintenance is due
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=the-hive-qlty-maintenance.service
+
+[Install]
+WantedBy=timers.target

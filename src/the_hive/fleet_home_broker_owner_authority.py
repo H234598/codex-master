@@ -96,7 +96,10 @@ def _selinux_type(value: object) -> str:
     if (
         not label.endswith("_t")
         or not label[0].islower()
-        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in label)
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+            for character in label
+        )
     ):
         _fail("owner layout is invalid")
     return label
@@ -114,7 +117,9 @@ def _integer(value: object, maximum: int) -> int:
     return value
 
 
-def _duplicate_rejecting_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
+def _duplicate_rejecting_object(
+    pairs: list[tuple[object, object]],
+) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if type(key) is not str or key in result:
@@ -162,7 +167,11 @@ class RootBrokerOwnerLayoutV1:
 
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> RootBrokerOwnerLayoutV1:
-        if type(payload) is not bytes or not payload or len(payload) > _MAX_LAYOUT_BYTES:
+        if (
+            type(payload) is not bytes
+            or not payload
+            or len(payload) > _MAX_LAYOUT_BYTES
+        ):
             _fail("owner layout is invalid")
         try:
             document = json.loads(

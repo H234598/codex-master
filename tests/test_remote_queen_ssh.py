@@ -109,7 +109,9 @@ def test_limits_reject_bool_null_negative_and_oversized_values(field, value):
     }
     values[field] = value
 
-    assert_domain_error(lambda: SshOperationLimitsV1(**values), "RQ_E_PLAN_INCONSISTENT")
+    assert_domain_error(
+        lambda: SshOperationLimitsV1(**values), "RQ_E_PLAN_INCONSISTENT"
+    )
 
 
 @pytest.mark.parametrize(
@@ -355,7 +357,9 @@ def test_validate_ssh_operation_result_returns_only_stdout_for_valid_result():
         ("returncode", 7, "RQ_E_SSH_PREFLIGHT"),
     ],
 )
-def test_validate_ssh_operation_result_rejects_invalid_result(field, value, expected_code):
+def test_validate_ssh_operation_result_rejects_invalid_result(
+    field, value, expected_code
+):
     result = make_result(**{field: value})
 
     error = assert_domain_error(

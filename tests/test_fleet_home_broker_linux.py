@@ -54,9 +54,7 @@ EXPECTED_DIRECTORY = DirectoryIdentity(17, 29, 0o40700)
 EXPECTED_STAT = FdStat(17, 29, 0o40700, 0, 0)
 VALID_CGROUP_STAT = FdStat(17, 29, 0o40755, 1000, 1000)
 EXPECTED_PID_IDENTITY = PidfdIdentity(PEER_PID, PID_START_TIME)
-EXPECTED_SELINUX_CONTEXT = (
-    "system_u:system_r:the_hive_agent_t:s0:c0,c1"
-)
+EXPECTED_SELINUX_CONTEXT = "system_u:system_r:the_hive_agent_t:s0:c0,c1"
 
 
 def principal(**changes):
@@ -139,9 +137,7 @@ def agent_start_envelope():
             "b" * 64,
             4,
         ),
-        AgentStartExecutablePin(
-            "/usr/libexec/the-hive-agent-launcher", "b" * 64
-        ),
+        AgentStartExecutablePin("/usr/libexec/the-hive-agent-launcher", "b" * 64),
         AgentStartEnvironmentProjection(
             (
                 ("CODEX_HOME", "/run/the-hive-agent/home"),
@@ -308,9 +304,7 @@ class FakeOperations:
         self._raise_if_configured("read_pid1_control_group")
         return self.pid1_control_group
 
-    def read_peer_mcs_pair(
-        self, pidfd, proc_fd, cgroup_fd, cgroup_dev, cgroup_ino
-    ):
+    def read_peer_mcs_pair(self, pidfd, proc_fd, cgroup_fd, cgroup_dev, cgroup_ino):
         self.calls.append(
             (
                 "read_peer_mcs_pair",
@@ -340,7 +334,10 @@ def test_linux_value_types_are_frozen_and_slotted():
 def test_open_pinned_child_directory_uses_exact_openat2_contract():
     operations = FakeOperations()
 
-    assert open_pinned_child_directory(operations, 11, "child", EXPECTED_DIRECTORY) == CHILD_FD
+    assert (
+        open_pinned_child_directory(operations, 11, "child", EXPECTED_DIRECTORY)
+        == CHILD_FD
+    )
     assert operations.calls == [
         (
             "openat2",
@@ -399,7 +396,9 @@ def test_invalid_observed_fd_stat_closes_child_fd(observed):
     assert operations.calls[-1] == ("close", CHILD_FD)
 
 
-@pytest.mark.parametrize("child_name", ["", ".", "..", "a/b", "a\\b", "a\x00b", "/absolute"])
+@pytest.mark.parametrize(
+    "child_name", ["", ".", "..", "a/b", "a\\b", "a\x00b", "/absolute"]
+)
 def test_invalid_child_names_call_no_operations(child_name):
     operations = FakeOperations()
 
@@ -750,12 +749,8 @@ def test_invalid_snapshot_field_closes_all_peer_fds():
 )
 def test_invalid_peer_fields_close_all_open_peer_fds(field, value):
     kwargs = {"peer_mcs_pair": value} if field == "mcs_pair" else {}
-    kwargs.update(
-        {"pid1_invocation_id": value} if field == "invocation_id" else {}
-    )
-    kwargs.update(
-        {"pid1_unit_generation": value} if field == "unit_generation" else {}
-    )
+    kwargs.update({"pid1_invocation_id": value} if field == "invocation_id" else {})
+    kwargs.update({"pid1_unit_generation": value} if field == "unit_generation" else {})
     if field == "pid":
         kwargs.update({"reuse_at": 5, "reuse_pid": value})
     if field in {"cgroup_dev", "cgroup_ino"}:
@@ -827,8 +822,7 @@ def test_linux_operations_has_no_aggregate_peer_snapshot_operation():
 
 def test_linux_module_import_scope_excludes_real_system_and_lifecycle_apis():
     source = (
-        Path(__file__).resolve().parents[1]
-        / "src/the_hive/fleet_home_broker_linux.py"
+        Path(__file__).resolve().parents[1] / "src/the_hive/fleet_home_broker_linux.py"
     ).read_text()
     tree = ast.parse(source)
     imported = set()
@@ -1085,7 +1079,9 @@ def test_agent_start_observation_keeps_v1_peer_snapshot_shape_untouched():
         "unit_generation",
         "mcs_pair",
     )
-    assert tuple(field.name for field in dataclasses.fields(AgentStartPeerObservation)) == (
+    assert tuple(
+        field.name for field in dataclasses.fields(AgentStartPeerObservation)
+    ) == (
         "pid",
         "uid",
         "gid",

@@ -24,7 +24,10 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from the_hive.native_registry import (  # noqa: E402
-    RegistryByteBudgetError, encode_registry_for_write, normalize_registry, reservation_is_live,
+    RegistryByteBudgetError,
+    encode_registry_for_write,
+    normalize_registry,
+    reservation_is_live,
 )
 from the_hive.hive.state import HiveStateStore  # noqa: E402
 from the_hive.worktree_lifecycle import WorktreeLifecycleStore  # noqa: E402
@@ -103,7 +106,9 @@ def _read_registry(root_fd: int) -> dict[str, object] | None:
             os.close(fd)
 
 
-def _write_registry(root_fd: int, registry: dict[str, object], *, now: float | None = None) -> bool:
+def _write_registry(
+    root_fd: int, registry: dict[str, object], *, now: float | None = None
+) -> bool:
     timestamp = time.time() if now is None else now
     if any(registry.get(key) for key in ("agents", "sessions", "reservations")):
         try:
@@ -116,7 +121,9 @@ def _write_registry(root_fd: int, registry: dict[str, object], *, now: float | N
             sys.stderr.write("error_code=native_lifecycle_protection_unavailable\n")
             return False
     try:
-        encoded = encode_registry_for_write(registry, now=timestamp, max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES)
+        encoded = encode_registry_for_write(
+            registry, now=timestamp, max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES
+        )
     except RegistryByteBudgetError:
         sys.stderr.write("error_code=native_registry_byte_budget_exceeded\n")
         return False
@@ -184,16 +191,28 @@ def _update_registry(mutator, *, now: float | None = None) -> bool:
             os.mkdir("locks", 0o700, dir_fd=root_fd)
         except FileExistsError:
             pass
-        locks_fd = os.open("locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        locks_fd = os.open(
+            "locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+        )
         locks_info = os.fstat(locks_fd)
-        if locks_info.st_uid != os.geteuid() or stat.S_IMODE(locks_info.st_mode) != 0o700:
+        if (
+            locks_info.st_uid != os.geteuid()
+            or stat.S_IMODE(locks_info.st_mode) != 0o700
+        ):
             return False
         lock_fd = os.open(
-            "native-agents.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600, dir_fd=locks_fd,
+            "native-agents.lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=locks_fd,
         )
         lock_info = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1 or lock_info.st_uid != os.geteuid() or stat.S_IMODE(lock_info.st_mode) != 0o600:
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or lock_info.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+        ):
             return False
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         registry = _read_registry(root_fd)
@@ -233,19 +252,24 @@ def _terminal_agent_ids(payload: dict[str, object]) -> set[str]:
         for agent_id in ids
         if _native_id(agent_id)
         and (
-            (isinstance(statuses.get(agent_id), dict) and any(
-                key in statuses[agent_id] for key in {"completed", "errored"}
-            ))
+            (
+                isinstance(statuses.get(agent_id), dict)
+                and any(key in statuses[agent_id] for key in {"completed", "errored"})
+            )
             or statuses.get(agent_id) in {"interrupted", "shutdown", "not_found"}
         )
     }
 
 
-def _legacy_parent_from_transcript(payload: dict[str, object], agent_id: str) -> str | None:
+def _legacy_parent_from_transcript(
+    payload: dict[str, object], agent_id: str
+) -> str | None:
     raw_path = payload.get("transcript_path")
     if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096:
         return None
-    sessions_root = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions"
+    sessions_root = (
+        Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions"
+    )
     try:
         path = Path(raw_path).resolve(strict=True)
         sessions = sessions_root.resolve(strict=True)
@@ -258,7 +282,9 @@ def _legacy_parent_from_transcript(payload: dict[str, object], agent_id: str) ->
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
     try:
-        parent = document["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"]
+        parent = document["payload"]["source"]["subagent"]["thread_spawn"][
+            "parent_thread_id"
+        ]
     except (KeyError, TypeError):
         return None
     return parent if _native_id(parent) else None
@@ -270,8 +296,13 @@ def _record_native_event(payload: dict[str, object]) -> None:
     agent_id = payload.get("agent_id")
     agent_type = payload.get("agent_type")
     if event not in {
-        "SessionStart", "UserPromptSubmit", "PostToolUse", "SubagentStart",
-        "SubagentStop", "Stop", "SessionEnd",
+        "SessionStart",
+        "UserPromptSubmit",
+        "PostToolUse",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "SessionEnd",
     } or not _native_id(session_id):
         return
     if event in {"SubagentStart", "SubagentStop"} and not _native_id(agent_id):
@@ -287,7 +318,11 @@ def _record_native_event(payload: dict[str, object]) -> None:
         if event == "PostToolUse":
             completed = _terminal_agent_ids(payload)
             for row in agents:
-                if isinstance(row, dict) and row.get("session_id") == session_id and row.get("agent_id") in completed:
+                if (
+                    isinstance(row, dict)
+                    and row.get("session_id") == session_id
+                    and row.get("agent_id") in completed
+                ):
                     row.update(activity_state="completed", updated_at=timestamp)
             return
         if event in {"UserPromptSubmit", "Stop"}:
@@ -300,40 +335,95 @@ def _record_native_event(payload: dict[str, object]) -> None:
             if event == "UserPromptSubmit" and not matched:
                 parent = _legacy_parent_from_transcript(payload, session_id)
                 if parent is not None:
-                    agents.append({"session_id": parent, "agent_id": session_id, "agent_type": "subagent", "activity_state": "active", "updated_at": timestamp})
+                    agents.append(
+                        {
+                            "session_id": parent,
+                            "agent_id": session_id,
+                            "agent_type": "subagent",
+                            "activity_state": "active",
+                            "updated_at": timestamp,
+                        }
+                    )
             return
-        managed_session = next((row.get("managed_session") for row in sessions if row.get("session_id") == session_id), None)
-        sessions[:] = [row for row in sessions if not isinstance(row, dict) or row.get("session_id") != session_id]
-        session_row = {"session_id": session_id, "activity_state": "ended" if event == "SessionEnd" else "active", "updated_at": timestamp}
+        managed_session = next(
+            (
+                row.get("managed_session")
+                for row in sessions
+                if row.get("session_id") == session_id
+            ),
+            None,
+        )
+        sessions[:] = [
+            row
+            for row in sessions
+            if not isinstance(row, dict) or row.get("session_id") != session_id
+        ]
+        session_row = {
+            "session_id": session_id,
+            "activity_state": "ended" if event == "SessionEnd" else "active",
+            "updated_at": timestamp,
+        }
         if _native_id(managed_session):
             session_row["managed_session"] = managed_session
         sessions.append(session_row)
         if event == "SessionStart":
             for row in agents:
-                if isinstance(row, dict) and row.get("session_id") == session_id and row.get("activity_state") != "completed":
+                if (
+                    isinstance(row, dict)
+                    and row.get("session_id") == session_id
+                    and row.get("activity_state") != "completed"
+                ):
                     row.update(activity_state="unconfirmed", updated_at=timestamp)
             return
         if event == "SubagentStart":
             reservations = registry["reservations"]
             for index, row in enumerate(reservations):
-                if row.get("kind") == "native_spawn" and row.get("parent_session_id") == session_id and reservation_is_live(row, timestamp):
+                if (
+                    row.get("kind") == "native_spawn"
+                    and row.get("parent_session_id") == session_id
+                    and reservation_is_live(row, timestamp)
+                ):
                     reservations.pop(index)
                     break
             for row in agents:
-                if isinstance(row, dict) and row.get("session_id") == session_id and row.get("agent_id") == agent_id:
-                    row.update(agent_type=agent_type, activity_state="active", updated_at=timestamp)
+                if (
+                    isinstance(row, dict)
+                    and row.get("session_id") == session_id
+                    and row.get("agent_id") == agent_id
+                ):
+                    row.update(
+                        agent_type=agent_type,
+                        activity_state="active",
+                        updated_at=timestamp,
+                    )
                     break
             else:
-                agents.append({"session_id": session_id, "agent_id": agent_id, "agent_type": agent_type, "activity_state": "active", "updated_at": timestamp})
+                agents.append(
+                    {
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "agent_type": agent_type,
+                        "activity_state": "active",
+                        "updated_at": timestamp,
+                    }
+                )
             return
         if event == "SubagentStop":
             for row in agents:
-                if isinstance(row, dict) and row.get("session_id") == session_id and row.get("agent_id") == agent_id:
+                if (
+                    isinstance(row, dict)
+                    and row.get("session_id") == session_id
+                    and row.get("agent_id") == agent_id
+                ):
                     row.update(activity_state="completed", updated_at=timestamp)
             return
         if event == "SessionEnd":
             for row in agents:
-                if isinstance(row, dict) and row.get("session_id") == session_id and row.get("activity_state") != "completed":
+                if (
+                    isinstance(row, dict)
+                    and row.get("session_id") == session_id
+                    and row.get("activity_state") != "completed"
+                ):
                     row.update(activity_state="unconfirmed", updated_at=timestamp)
 
     _update_registry(mutate, now=timestamp)
@@ -362,7 +452,11 @@ def _resume_association_is_known(payload: dict[str, object]) -> bool:
     registry = state_root / "native-agents.json"
     try:
         info = registry.lstat()
-        if not registry.is_file() or registry.is_symlink() or info.st_size > MAX_NATIVE_AGENT_REGISTRY_BYTES:
+        if (
+            not registry.is_file()
+            or registry.is_symlink()
+            or info.st_size > MAX_NATIVE_AGENT_REGISTRY_BYTES
+        ):
             return False
         document = json.loads(registry.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):

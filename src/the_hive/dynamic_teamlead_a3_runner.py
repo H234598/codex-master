@@ -49,7 +49,9 @@ class _NonTransferableBindingEvidence:
     __slots__ = ()
 
     def __init__(self) -> None:
-        raise TypeError("root_dynamic_teamlead_runner_binding_evidence_factory_required")
+        raise TypeError(
+            "root_dynamic_teamlead_runner_binding_evidence_factory_required"
+        )
 
     def __copy__(self):
         raise TypeError("root_dynamic_teamlead_runner_binding_evidence_not_cloneable")
@@ -76,7 +78,9 @@ class RootDynamicTeamleadRunnerBindingEvidence(_NonTransferableBindingEvidence):
     release_identity: object
 
     def __init_subclass__(cls, **_kwargs: object) -> None:
-        raise TypeError("root_dynamic_teamlead_runner_binding_evidence_not_subclassable")
+        raise TypeError(
+            "root_dynamic_teamlead_runner_binding_evidence_not_subclassable"
+        )
 
 
 class _NonTransferableStartComposition:

@@ -18,7 +18,10 @@ _PHASES = frozenset({"change", "branch", "merge", "release"})
 
 
 def _digest_set(values: tuple[str, ...]) -> str:
-    return "sha256:" + hashlib.sha256("\n".join(sorted(values)).encode("utf-8")).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256("\n".join(sorted(values)).encode("utf-8")).hexdigest()
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,10 +92,14 @@ def evidence_context(
         index_digest=index.digest,
         function_ids=test.covers,
         test_id=test.test_id,
-        source_digest_set_digest=_digest_set(tuple(item.source_digest for item in covered)),
+        source_digest_set_digest=_digest_set(
+            tuple(item.source_digest for item in covered)
+        ),
         test_digest=test.test_digest,
         assertion_digest=test.assertion_digest,
-        dependency_digest_set_digest=_digest_set(tuple(item.dependency_digest for item in covered)),
+        dependency_digest_set_digest=_digest_set(
+            tuple(item.dependency_digest for item in covered)
+        ),
         executor_fingerprint=request.executor_fingerprint,
         boot_id_digest=request.boot_id_digest,
         runner_version_digest=request.runner_version_digest,
@@ -113,7 +120,10 @@ class TestPlanner:
         now_monotonic_ns: int,
         base_index: TestIndexV1 | None = None,
     ) -> PlanResultV1:
-        if request.repository_id != index.repository_id or request.index_digest != index.digest:
+        if (
+            request.repository_id != index.repository_id
+            or request.index_digest != index.digest
+        ):
             raise ValueError("test.generation_stale")
         selected_functions = self._impacted_functions(request, index, base_index)
         selected: dict[str, str | None] = {
@@ -126,7 +136,11 @@ class TestPlanner:
             if gate.required and gate.phase == request.requested_phase:
                 for test_id in gate.test_ids:
                     selected[test_id] = gate.gate_id
-                    if not gate.cooldown_allowed or gate.phase in {"branch", "merge", "release"}:
+                    if not gate.cooldown_allowed or gate.phase in {
+                        "branch",
+                        "merge",
+                        "release",
+                    }:
                         gate_mandatory.add(test_id)
         tests = {item.test_id: item for item in index.tests}
         receipts = evidence or {}
@@ -163,7 +177,11 @@ class TestPlanner:
     ) -> tuple[FunctionEntryV1, ...]:
         explicit = set(request.function_ids)
         paths = set(request.changed_paths)
-        base = {item.function_id: item for item in base_index.functions} if base_index is not None else {}
+        base = (
+            {item.function_id: item for item in base_index.functions}
+            if base_index is not None
+            else {}
+        )
         impacted: list[FunctionEntryV1] = []
         for function in index.functions:
             prior = base.get(function.function_id)
@@ -171,7 +189,11 @@ class TestPlanner:
                 prior.source_digest != function.source_digest
                 or prior.dependency_digest != function.dependency_digest
             )
-            if function.function_id in explicit or function.path in paths or digest_changed:
+            if (
+                function.function_id in explicit
+                or function.path in paths
+                or digest_changed
+            ):
                 impacted.append(function)
         return tuple(impacted)
 

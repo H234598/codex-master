@@ -26,7 +26,9 @@ from the_hive.fleet_home_broker_linux_contract import (
 
 SLOT_IDENTITY = ObjectIdentity(8, 101, 0o40700, 0, 0, 2)
 CGROUP_IDENTITY = ObjectIdentity(8, 202, 0o40755, 0, 0, 2)
-UNIT = SystemdUnitEvidence("codex-agent@bee_1.service", "a" * 32, CGROUP_IDENTITY, 4, "c10,c20")
+UNIT = SystemdUnitEvidence(
+    "codex-agent@bee_1.service", "a" * 32, CGROUP_IDENTITY, 4, "c10,c20"
+)
 
 
 class FakeOps:
@@ -71,7 +73,9 @@ class FakeOps:
     def fsync(self, fd: int) -> None:
         self.calls.append(("fsync", fd))
 
-    def renameat2_noreplace(self, parent_fd: int, staging_name: str, final_name: str) -> None:
+    def renameat2_noreplace(
+        self, parent_fd: int, staging_name: str, final_name: str
+    ) -> None:
         self.calls.append(("renameat2_noreplace", parent_fd, staging_name, final_name))
         if self.rename_error is not None:
             raise self.rename_error
@@ -97,20 +101,30 @@ def test_require_linux_platform_is_fail_closed_and_bool_exact() -> None:
         LinuxPlatformContract(1, True, True, True),
         object(),
     ):
-        expect_code(LinuxBrokerCode.UNSUPPORTED_PLATFORM, lambda value=value: require_linux_platform(value))
+        expect_code(
+            LinuxBrokerCode.UNSUPPORTED_PLATFORM,
+            lambda value=value: require_linux_platform(value),
+        )
 
 
 def test_open_beneath_uses_one_openat2_with_all_guards_and_cloexec() -> None:
     ops = FakeOps()
     pinned = open_beneath_no_symlink(ops, 7, "slot", flags=0)
     assert pinned is ops.open_result
-    assert ops.calls == [("openat2", 7, "slot", OpenHow(O_CLOEXEC, 0, REQUIRED_RESOLVE_FLAGS))]
+    assert ops.calls == [
+        ("openat2", 7, "slot", OpenHow(O_CLOEXEC, 0, REQUIRED_RESOLVE_FLAGS))
+    ]
 
 
-@pytest.mark.parametrize("name", ("", ".", "..", "/slot", "../slot", "slot/child", "slot\x00"))
+@pytest.mark.parametrize(
+    "name", ("", ".", "..", "/slot", "../slot", "slot/child", "slot\x00")
+)
 def test_open_beneath_rejects_unsafe_component_before_adapter_call(name: str) -> None:
     ops = FakeOps()
-    expect_code(LinuxBrokerCode.UNSAFE_PATH, lambda: open_beneath_no_symlink(ops, 7, name, flags=0))
+    expect_code(
+        LinuxBrokerCode.UNSAFE_PATH,
+        lambda: open_beneath_no_symlink(ops, 7, name, flags=0),
+    )
     assert ops.calls == []
 
 
@@ -123,7 +137,9 @@ def test_open_beneath_rejects_unsafe_component_before_adapter_call(name: str) ->
         (OSError(errno.EIO, "io"), LinuxBrokerCode.IO_FAILURE),
     ),
 )
-def test_open_beneath_maps_openat2_failures_without_fallback(error: BaseException, code: LinuxBrokerCode) -> None:
+def test_open_beneath_maps_openat2_failures_without_fallback(
+    error: BaseException, code: LinuxBrokerCode
+) -> None:
     ops = FakeOps()
     ops.open_result = error
     expect_code(code, lambda: open_beneath_no_symlink(ops, 7, "slot", flags=0))
@@ -133,7 +149,10 @@ def test_open_beneath_maps_openat2_failures_without_fallback(error: BaseExceptio
 def test_open_beneath_rejects_an_unpinned_adapter_result() -> None:
     ops = FakeOps()
     ops.open_result = 41  # type: ignore[assignment]
-    expect_code(LinuxBrokerCode.IO_FAILURE, lambda: open_beneath_no_symlink(ops, 7, "slot", flags=0))
+    expect_code(
+        LinuxBrokerCode.IO_FAILURE,
+        lambda: open_beneath_no_symlink(ops, 7, "slot", flags=0),
+    )
 
 
 def test_pin_peer_cgroup_requires_liveness_before_and_after_and_exact_inode() -> None:
@@ -166,26 +185,40 @@ def test_pin_peer_cgroup_rejects_stale_before_read_and_after_read() -> None:
     after.alive_results = [True, False]
     expect_code(LinuxBrokerCode.STALE_PEER, lambda: pin_peer_cgroup(after, 4242, UNIT))
     assert "read_cgroup_v2" in [call[0] for call in after.calls]
-    assert [call[0] for call in after.calls][-4:] == ["pidfd_alive", "close", "close", "close"]
+    assert [call[0] for call in after.calls][-4:] == [
+        "pidfd_alive",
+        "close",
+        "close",
+        "close",
+    ]
 
 
 def test_pin_peer_cgroup_rejects_mismatched_or_unsafe_evidence() -> None:
     mismatch = FakeOps()
     mismatch.cgroup_identity = ObjectIdentity(8, 203, 0o40755, 0, 0, 2)
-    expect_code(LinuxBrokerCode.IDENTITY_MISMATCH, lambda: pin_peer_cgroup(mismatch, 4242, UNIT))
+    expect_code(
+        LinuxBrokerCode.IDENTITY_MISMATCH, lambda: pin_peer_cgroup(mismatch, 4242, UNIT)
+    )
 
     unsafe = FakeOps()
     unsafe.cgroup_name = "../escape"
-    expect_code(LinuxBrokerCode.UNSAFE_PATH, lambda: pin_peer_cgroup(unsafe, 4242, UNIT))
+    expect_code(
+        LinuxBrokerCode.UNSAFE_PATH, lambda: pin_peer_cgroup(unsafe, 4242, UNIT)
+    )
 
     malformed = FakeOps()
     malformed.cgroup_identity = object()  # type: ignore[assignment]
-    expect_code(LinuxBrokerCode.IDENTITY_MISMATCH, lambda: pin_peer_cgroup(malformed, 4242, UNIT))
+    expect_code(
+        LinuxBrokerCode.IDENTITY_MISMATCH,
+        lambda: pin_peer_cgroup(malformed, 4242, UNIT),
+    )
 
 
 def test_pin_peer_cgroup_closes_pinned_fds_when_an_adapter_read_fails() -> None:
     ops = FakeOps()
-    ops.read_cgroup_v2 = lambda proc_fd: (_ for _ in ()).throw(OSError(errno.EIO, "read"))  # type: ignore[method-assign]
+    ops.read_cgroup_v2 = lambda proc_fd: (_ for _ in ()).throw(
+        OSError(errno.EIO, "read")
+    )  # type: ignore[method-assign]
     expect_code(LinuxBrokerCode.IO_FAILURE, lambda: pin_peer_cgroup(ops, 4242, UNIT))
     assert [call[0] for call in ops.calls][-2:] == ["close", "close"]
 
@@ -195,18 +228,38 @@ def test_idmapped_mount_contract_is_immutable_data_validation_only() -> None:
     valid = IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c10,c20", True, True)
     assert validate_idmapped_mount_contract(valid) is valid
     for value, code in (
-        (IdmappedMountContract(source, "/tmp/home", "c10,c20", True, True), LinuxBrokerCode.UNSAFE_PATH),
-        (IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c20,c10", True, True), LinuxBrokerCode.IDENTITY_MISMATCH),
-        (IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c10,c20", False, True), LinuxBrokerCode.IDENTITY_MISMATCH),
-        (IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c10,c20", True, False), LinuxBrokerCode.IDENTITY_MISMATCH),
-        (IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c10,c20", 1, True), LinuxBrokerCode.IDENTITY_MISMATCH),
+        (
+            IdmappedMountContract(source, "/tmp/home", "c10,c20", True, True),
+            LinuxBrokerCode.UNSAFE_PATH,
+        ),
+        (
+            IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c20,c10", True, True),
+            LinuxBrokerCode.IDENTITY_MISMATCH,
+        ),
+        (
+            IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c10,c20", False, True),
+            LinuxBrokerCode.IDENTITY_MISMATCH,
+        ),
+        (
+            IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c10,c20", True, False),
+            LinuxBrokerCode.IDENTITY_MISMATCH,
+        ),
+        (
+            IdmappedMountContract(source, CANONICAL_AGENT_HOME, "c10,c20", 1, True),
+            LinuxBrokerCode.IDENTITY_MISMATCH,
+        ),
     ):
         expect_code(code, lambda value=value: validate_idmapped_mount_contract(value))
-    expect_code(LinuxBrokerCode.IDENTITY_MISMATCH, lambda: validate_idmapped_mount_contract(object()))
+    expect_code(
+        LinuxBrokerCode.IDENTITY_MISMATCH,
+        lambda: validate_idmapped_mount_contract(object()),
+    )
     expect_code(
         LinuxBrokerCode.IDENTITY_MISMATCH,
         lambda: validate_idmapped_mount_contract(
-            IdmappedMountContract(object(), CANONICAL_AGENT_HOME, "c10,c20", True, True),  # type: ignore[arg-type]
+            IdmappedMountContract(
+                object(), CANONICAL_AGENT_HOME, "c10,c20", True, True
+            ),  # type: ignore[arg-type]
         ),
     )
 
@@ -227,22 +280,34 @@ def test_rename_noreplace_calls_only_noreplace_then_exact_parent_fsync() -> None
         (OSError(errno.EIO, "io"), LinuxBrokerCode.IO_FAILURE),
     ),
 )
-def test_rename_noreplace_has_no_fallback_on_any_failure(error: BaseException, code: LinuxBrokerCode) -> None:
+def test_rename_noreplace_has_no_fallback_on_any_failure(
+    error: BaseException, code: LinuxBrokerCode
+) -> None:
     ops = FakeOps()
     ops.rename_error = error
-    expect_code(code, lambda: rename_noreplace_and_fsync_parent(ops, 7, "staging", "final"))
+    expect_code(
+        code, lambda: rename_noreplace_and_fsync_parent(ops, 7, "staging", "final")
+    )
     assert [call[0] for call in ops.calls] == ["renameat2_noreplace"]
 
 
 def test_rename_noreplace_reports_parent_fsync_failure_after_single_publish() -> None:
     ops = FakeOps()
     ops.fsync = lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "fsync"))  # type: ignore[method-assign]
-    expect_code(LinuxBrokerCode.IO_FAILURE, lambda: rename_noreplace_and_fsync_parent(ops, 7, "staging", "final"))
+    expect_code(
+        LinuxBrokerCode.IO_FAILURE,
+        lambda: rename_noreplace_and_fsync_parent(ops, 7, "staging", "final"),
+    )
     assert [call[0] for call in ops.calls] == ["renameat2_noreplace"]
 
 
-@pytest.mark.parametrize("name", ("", ".", "..", "../escape", "nested/name", "/absolute"))
+@pytest.mark.parametrize(
+    "name", ("", ".", "..", "../escape", "nested/name", "/absolute")
+)
 def test_rename_rejects_unsafe_relative_names_before_adapter_call(name: str) -> None:
     ops = FakeOps()
-    expect_code(LinuxBrokerCode.UNSAFE_PATH, lambda: rename_noreplace_and_fsync_parent(ops, 7, name, "final"))
+    expect_code(
+        LinuxBrokerCode.UNSAFE_PATH,
+        lambda: rename_noreplace_and_fsync_parent(ops, 7, name, "final"),
+    )
     assert ops.calls == []

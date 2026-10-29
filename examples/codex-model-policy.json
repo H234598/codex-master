@@ -3,36 +3,21 @@
   "models": [
     {
       "model_id": "gpt-6-luna",
-      "aliases": [
-        "luna"
-      ],
+      "aliases": ["luna"],
       "role": "primary",
       "provider": "openai",
-      "capabilities": [
-        "tools",
-        "complex_task_eligible",
-        "read",
-        "write"
-      ],
+      "capabilities": ["tools", "complex_task_eligible", "read", "write"],
       "budget_key": "luna",
       "family": "luna",
       "rank": 20,
-      "reasoning_levels": [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ],
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
       "default_reasoning": "medium",
       "cost_tier": "standard",
       "spawn_behavior": "manual"
     },
     {
       "model_id": "gpt-6-sol",
-      "aliases": [
-        "sol"
-      ],
+      "aliases": ["sol"],
       "role": "primary",
       "provider": "openai",
       "capabilities": [
@@ -45,22 +30,14 @@
       "budget_key": "sol",
       "family": "sol",
       "rank": 40,
-      "reasoning_levels": [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ],
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
       "default_reasoning": "medium",
       "cost_tier": "standard",
       "spawn_behavior": "manual"
     },
     {
       "model_id": "gpt-6.1-sol",
-      "aliases": [
-        "sol-latest"
-      ],
+      "aliases": ["sol-latest"],
       "role": "primary",
       "provider": "openai",
       "capabilities": [
@@ -73,22 +50,14 @@
       "budget_key": "sol-latest",
       "family": "sol",
       "rank": 41,
-      "reasoning_levels": [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ],
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
       "default_reasoning": "low",
       "cost_tier": "standard",
       "spawn_behavior": "manual"
     },
     {
       "model_id": "gpt-6-astra",
-      "aliases": [
-        "astra"
-      ],
+      "aliases": ["astra"],
       "role": "primary",
       "provider": "openai",
       "capabilities": [
@@ -101,13 +70,7 @@
       "budget_key": "astra",
       "family": "astra",
       "rank": 50,
-      "reasoning_levels": [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ],
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
       "default_reasoning": "low",
       "cost_tier": "standard",
       "spawn_behavior": "manual"

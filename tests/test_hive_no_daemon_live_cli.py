@@ -21,14 +21,21 @@ import pytest
 from the_hive import server
 
 
-CODEX = Path(os.environ.get(
-    "HIVE_CODEX_BINARY",
-    "/home/teladi/.codex/packages/app-server-daemon/releases/0.161.0-x86_64-unknown-linux-musl/bin/codex",
-))
+CODEX = Path(
+    os.environ.get(
+        "HIVE_CODEX_BINARY",
+        "/home/teladi/.codex/packages/app-server-daemon/releases/0.161.0-x86_64-unknown-linux-musl/bin/codex",
+    )
+)
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 HIVE_BUNDLE_FILES = (
-    "release-binding.json", ".codex-plugin/plugin.json", ".mcp.json", ".app.json",
-    "hooks/hooks.json", "hooks/native_bee_event.py", "hooks/native_spawn_admission.py",
+    "release-binding.json",
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    ".app.json",
+    "hooks/hooks.json",
+    "hooks/native_bee_event.py",
+    "hooks/native_spawn_admission.py",
     "skills/the-hive-fleet/SKILL.md",
     "skills/the-hive-fleet/references/common-invariants.md",
     "skills/the-hive-fleet/references/diagnostics-retry-reporting.md",
@@ -37,20 +44,32 @@ HIVE_BUNDLE_FILES = (
 )
 
 
-def _run(argv: list[str], *, env: dict[str, str], cwd: Path,
-         input_text: str = "") -> subprocess.CompletedProcess[str]:
+def _run(
+    argv: list[str], *, env: dict[str, str], cwd: Path, input_text: str = ""
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        argv, env=env, cwd=cwd, input=input_text, capture_output=True, text=True,
-        timeout=30, check=False,
+        argv,
+        env=env,
+        cwd=cwd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
     )
 
 
 def _pin_own_scope_cgroup(
-    control_group: str, *, root: Path = CGROUP_ROOT,
+    control_group: str,
+    *,
+    root: Path = CGROUP_ROOT,
 ) -> tuple[str, Path, int, int]:
     relative = Path(control_group)
-    if (not relative.is_absolute() or not relative.parts[1:]
-            or any(part in {".", ".."} for part in relative.parts)):
+    if (
+        not relative.is_absolute()
+        or not relative.parts[1:]
+        or any(part in {".", ".."} for part in relative.parts)
+    ):
         raise AssertionError("own scope returned an invalid cgroup path")
     path = root.joinpath(*relative.parts[1:])
     descriptor = os.open(
@@ -79,7 +98,9 @@ def _read_cgroup_file_at(directory_fd: int, name: str) -> bytes:
 
 
 def _own_scope_cgroup_empty(
-    identity: tuple[str, Path, int, int], *, missing_is_empty: bool = False,
+    identity: tuple[str, Path, int, int],
+    *,
+    missing_is_empty: bool = False,
 ) -> bool:
     _control_group, path, device, inode = identity
     try:
@@ -92,13 +113,16 @@ def _own_scope_cgroup_empty(
         return False
     try:
         info = os.fstat(descriptor)
-        if (not stat.S_ISDIR(info.st_mode)
-                or (info.st_dev, info.st_ino) != (device, inode)):
+        if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != (
+            device,
+            inode,
+        ):
             return False
         events = _read_cgroup_file_at(descriptor, "cgroup.events").decode("ascii")
         processes = _read_cgroup_file_at(descriptor, "cgroup.procs").split()
-        populated = [line for line in events.splitlines()
-                     if line.startswith("populated ")]
+        populated = [
+            line for line in events.splitlines() if line.startswith("populated ")
+        ]
         return populated == ["populated 0"] and not processes
     except (OSError, UnicodeError, AssertionError):
         return False
@@ -117,24 +141,38 @@ def _systemd_properties(result: subprocess.CompletedProcess[str]) -> dict[str, s
 
 
 def _wait_own_scope_empty(
-    unit: str, identity: tuple[str, Path, int, int] | None,
-    env: dict[str, str], root: Path,
+    unit: str,
+    identity: tuple[str, Path, int, int] | None,
+    env: dict[str, str],
+    root: Path,
 ) -> None:
     if identity is None:
         raise AssertionError("own scope cgroup identity unavailable; holding test tree")
     for _ in range(50):
-        state = _run(["systemctl", "--user", "show", unit,
-                      "-p", "ActiveState", "-p", "ControlGroup", "-p", "LoadState"],
-                     env=env, cwd=root)
+        state = _run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "-p",
+                "ActiveState",
+                "-p",
+                "ControlGroup",
+                "-p",
+                "LoadState",
+            ],
+            env=env,
+            cwd=root,
+        )
         properties = _systemd_properties(state)
         inactive = state.returncode == 0 and properties.get("ActiveState") == "inactive"
         control_group = properties.get("ControlGroup", "")
         if inactive:
-            if (control_group in {"", identity[0]}
-                    and _own_scope_cgroup_empty(
-                        identity,
-                        missing_is_empty=properties.get("LoadState") == "not-found",
-                    )):
+            if control_group in {"", identity[0]} and _own_scope_cgroup_empty(
+                identity,
+                missing_is_empty=properties.get("LoadState") == "not-found",
+            ):
                 return
         time.sleep(0.1)
     pytest.fail(f"own scope cgroup did not drain: {unit}")
@@ -157,28 +195,57 @@ def _fixture_plugin(root: Path, home: Path) -> None:
     )
     command = 'python3 -I "${PLUGIN_ROOT}/hooks/record.py"'
     groups = {
-        "SessionStart": [{
-            "matcher": "startup|resume",
-            "hooks": [{"type": "command", "command": command, "commandWindows": command,
-                       "timeout": 5, "statusMessage": "fixture recording"}],
-        }],
-        "Stop": [{
-            "hooks": [{"type": "command", "command": command, "commandWindows": command,
-                       "timeout": 5}],
-        }],
+        "SessionStart": [
+            {
+                "matcher": "startup|resume",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "commandWindows": command,
+                        "timeout": 5,
+                        "statusMessage": "fixture recording",
+                    }
+                ],
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "commandWindows": command,
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ],
     }
     (plugin / "hooks" / "hooks.json").write_text(json.dumps({"hooks": groups}))
     marketplace = root / ".agents" / "plugins"
     marketplace.mkdir(parents=True)
-    (marketplace / "marketplace.json").write_text(json.dumps({
-        "name": "local-fixture",
-        "plugins": [{
-            "name": "fixture-plugin",
-            "source": {"source": "local", "path": "./plugins/fixture-plugin"},
-            "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
-            "category": "Productivity",
-        }],
-    }))
+    (marketplace / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "local-fixture",
+                "plugins": [
+                    {
+                        "name": "fixture-plugin",
+                        "source": {
+                            "source": "local",
+                            "path": "./plugins/fixture-plugin",
+                        },
+                        "policy": {
+                            "installation": "AVAILABLE",
+                            "authentication": "ON_INSTALL",
+                        },
+                        "category": "Productivity",
+                    }
+                ],
+            }
+        )
+    )
     with (home / "config.toml").open("a") as config:
         for event, key in (("session_start", "SessionStart"), ("stop", "Stop")):
             hook_id = f"fixture-plugin@local-fixture:hooks/hooks.json:{event}:0:0"
@@ -196,10 +263,13 @@ def _attest_hive_bundle(source: Path, release: Path, cache: Path) -> None:
         assert (cache / name).read_bytes() == expected
 
 
-def _trust_installed_hive(home: Path, plugin: Path, release: Path,
-                          personal_home: Path) -> None:
+def _trust_installed_hive(
+    home: Path, plugin: Path, release: Path, personal_home: Path
+) -> None:
     """Reuse only the nine previously approved hashes for identical hook bytes."""
-    personal_cache = personal_home / "plugins/cache/personal/the-hive/0.10.5+codex.20260808003125"
+    personal_cache = (
+        personal_home / "plugins/cache/personal/the-hive/0.10.5+codex.20260808003125"
+    )
     _attest_hive_bundle(plugin, release, personal_cache)
     groups = json.loads((plugin / "hooks/hooks.json").read_text())["hooks"]
     expected = set()
@@ -207,50 +277,105 @@ def _trust_installed_hive(home: Path, plugin: Path, release: Path,
         key = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
         for rule_index, rule in enumerate(rules):
             for hook_index, _hook in enumerate(rule["hooks"]):
-                expected.add(f"the-hive@personal:hooks/hooks.json:{key}:{rule_index}:{hook_index}")
-    approved = tomllib.loads((personal_home / "config.toml").read_text())["hooks"]["state"]
-    approved = {key: value for key, value in approved.items()
-                if key.startswith("the-hive@personal:hooks/hooks.json:")}
+                expected.add(
+                    f"the-hive@personal:hooks/hooks.json:{key}:{rule_index}:{hook_index}"
+                )
+    approved = tomllib.loads((personal_home / "config.toml").read_text())["hooks"][
+        "state"
+    ]
+    approved = {
+        key: value
+        for key, value in approved.items()
+        if key.startswith("the-hive@personal:hooks/hooks.json:")
+    }
     assert len(expected) == 9 and set(approved) == expected
     approved_hashes = {}
     for hook_id in expected:
         value = approved[hook_id]
         trusted_hash = value.get("trusted_hash")
         assert set(value) == {"enabled", "trusted_hash"} and value["enabled"] is True
-        assert isinstance(trusted_hash, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", trusted_hash)
+        assert isinstance(trusted_hash, str) and re.fullmatch(
+            r"sha256:[0-9a-f]{64}", trusted_hash
+        )
         approved_hashes[hook_id] = trusted_hash
     with (home / "config.toml").open("a") as config:
         for hook_id in sorted(expected):
-            config.write(f'[hooks.state."{hook_id}"]\n'
-                         f'trusted_hash="{approved_hashes[hook_id]}"\nenabled=true\n')
+            config.write(
+                f'[hooks.state."{hook_id}"]\n'
+                f'trusted_hash="{approved_hashes[hook_id]}"\nenabled=true\n'
+            )
     (home / "config.toml").chmod(0o600)
 
 
 def _event_stream(index: int) -> bytes:
-    message = {"id": f"msg_{index}", "type": "message", "status": "completed",
-               "role": "assistant", "content": [{"type": "output_text",
-               "text": "fixture answer", "annotations": []}]}
-    response = {"id": f"resp_{index}", "object": "response", "created_at": 0,
-                "status": "completed", "model": "fixture-model", "output": [message],
-                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}}
+    message = {
+        "id": f"msg_{index}",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {"type": "output_text", "text": "fixture answer", "annotations": []}
+        ],
+    }
+    response = {
+        "id": f"resp_{index}",
+        "object": "response",
+        "created_at": 0,
+        "status": "completed",
+        "model": "fixture-model",
+        "output": [message],
+        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+    }
     events = [
-        ("response.created", {"type": "response.created",
-                              "response": {**response, "status": "in_progress", "output": []}}),
-        ("response.output_item.added", {"type": "response.output_item.added",
-                                        "output_index": 0, "item": {**message,
-                                        "status": "in_progress", "content": []}}),
-        ("response.content_part.added", {"type": "response.content_part.added",
-                                         "output_index": 0, "item_id": message["id"],
-                                         "content_index": 0, "part": {"type": "output_text",
-                                         "text": "", "annotations": []}}),
-        ("response.output_text.delta", {"type": "response.output_text.delta",
-                                        "output_index": 0, "item_id": message["id"],
-                                        "content_index": 0, "delta": "fixture answer"}),
-        ("response.content_part.done", {"type": "response.content_part.done",
-                                        "output_index": 0, "item_id": message["id"],
-                                        "content_index": 0, "part": message["content"][0]}),
-        ("response.output_item.done", {"type": "response.output_item.done",
-                                       "output_index": 0, "item": message}),
+        (
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {**response, "status": "in_progress", "output": []},
+            },
+        ),
+        (
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {**message, "status": "in_progress", "content": []},
+            },
+        ),
+        (
+            "response.content_part.added",
+            {
+                "type": "response.content_part.added",
+                "output_index": 0,
+                "item_id": message["id"],
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+        ),
+        (
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": message["id"],
+                "content_index": 0,
+                "delta": "fixture answer",
+            },
+        ),
+        (
+            "response.content_part.done",
+            {
+                "type": "response.content_part.done",
+                "output_index": 0,
+                "item_id": message["id"],
+                "content_index": 0,
+                "part": message["content"][0],
+            },
+        ),
+        (
+            "response.output_item.done",
+            {"type": "response.output_item.done", "output_index": 0, "item": message},
+        ),
         ("response.completed", {"type": "response.completed", "response": response}),
     ]
     return "".join(
@@ -262,20 +387,36 @@ def _installed_pin_active(pin_root: Path, session_id: str) -> bool:
     pin = pin_root / (hashlib.sha256(session_id.encode()).hexdigest() + ".json")
     try:
         before = pin.lstat()
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
-                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1):
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+        ):
             return False
         binding = json.loads(pin.read_text())
         after = pin.lstat()
     except (OSError, ValueError):
         return False
+
     def stable(item: os.stat_result) -> tuple[int, ...]:
-        return (item.st_dev, item.st_ino, item.st_mode, item.st_uid,
-                item.st_gid, item.st_nlink, item.st_size, item.st_mtime_ns)
-    return (stable(before) == stable(after)
-            and binding.get("session_id") == session_id
-            and binding.get("state") == "active"
-            and binding.get("ended_at_unix_ns") is None)
+        return (
+            item.st_dev,
+            item.st_ino,
+            item.st_mode,
+            item.st_uid,
+            item.st_gid,
+            item.st_nlink,
+            item.st_size,
+            item.st_mtime_ns,
+        )
+
+    return (
+        stable(before) == stable(after)
+        and binding.get("session_id") == session_id
+        and binding.get("state") == "active"
+        and binding.get("ended_at_unix_ns") is None
+    )
 
 
 def test_own_scope_empty_requires_same_cgroup_inode(tmp_path: Path) -> None:
@@ -299,11 +440,14 @@ def test_own_scope_empty_requires_same_cgroup_inode(tmp_path: Path) -> None:
 
 
 def test_run_requires_a_finite_child_process_timeout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     observed: dict[str, object] = {}
 
-    def capture_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def capture_run(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         observed.update(kwargs)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -315,7 +459,8 @@ def test_run_requires_a_finite_child_process_timeout(
 
 
 def test_scope_cleanup_rejects_missing_identity_after_unit_disappears(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(
         sys.modules[__name__],
@@ -332,28 +477,43 @@ def test_scope_cleanup_rejects_missing_identity_after_unit_disappears(
 def test_installed_probe_requires_active_pin(tmp_path: Path) -> None:
     session_id = "own-session"
     pin = tmp_path / (hashlib.sha256(session_id.encode()).hexdigest() + ".json")
-    pin.write_text(json.dumps({"session_id": session_id, "state": "active",
-                               "ended_at_unix_ns": None}))
+    pin.write_text(
+        json.dumps(
+            {"session_id": session_id, "state": "active", "ended_at_unix_ns": None}
+        )
+    )
     pin.chmod(0o600)
     assert _installed_pin_active(tmp_path, session_id)
-    pin.write_text(json.dumps({"session_id": session_id, "state": "ended",
-                               "ended_at_unix_ns": 2}))
+    pin.write_text(
+        json.dumps({"session_id": session_id, "state": "ended", "ended_at_unix_ns": 2})
+    )
     assert not _installed_pin_active(tmp_path, session_id)
 
 
 def test_installed_admission_fixture_denies_before_reservation(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
-    event = {"session_id": "own-session", "hook_event_name": "PreToolUse",
-             "tool_name": "spawn_agent", "tool_input": [], "cwd": str(tmp_path)}
-    result = _run([sys.executable, "-I", str(root / "hooks/native_spawn_admission.py")],
-                  env={"PATH": os.environ["PATH"], "PLUGIN_ROOT": str(root),
-                       "CODEX_MASTER_MCP_STATE": str(tmp_path / "state")},
-                  cwd=tmp_path, input_text=json.dumps(event) + "\n")
+    event = {
+        "session_id": "own-session",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "spawn_agent",
+        "tool_input": [],
+        "cwd": str(tmp_path),
+    }
+    result = _run(
+        [sys.executable, "-I", str(root / "hooks/native_spawn_admission.py")],
+        env={
+            "PATH": os.environ["PATH"],
+            "PLUGIN_ROOT": str(root),
+            "CODEX_MASTER_MCP_STATE": str(tmp_path / "state"),
+        },
+        cwd=tmp_path,
+        input_text=json.dumps(event) + "\n",
+    )
     specific = json.loads(result.stdout)["hookSpecificOutput"]
     assert result.returncode == 0 and specific == {
-        "hookEventName": "PreToolUse", "permissionDecision": "deny",
-        "permissionDecisionReason":
-        "error_code=invalid_pretooluse_input reason_codes=invalid_input",
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "error_code=invalid_pretooluse_input reason_codes=invalid_input",
     }
     assert not (tmp_path / "state/native-agents.json").exists()
 
@@ -361,21 +521,36 @@ def test_installed_admission_fixture_denies_before_reservation(tmp_path: Path) -
 def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> None:
     if os.environ.get("HIVE_LIVE_CODEX_TEST") != "1":
         pytest.skip("set HIVE_LIVE_CODEX_TEST=1 for the local live CLI regression")
-    if not (CODEX.is_file() and shutil.which("systemd-run") and shutil.which("systemctl")):
+    if not (
+        CODEX.is_file() and shutil.which("systemd-run") and shutil.which("systemctl")
+    ):
         pytest.skip("Codex binary or systemd user tools unavailable")
     root = tmp_path
     home = root / "home"
     home.mkdir(mode=0o700)
-    env = {key: os.environ[key] for key in (
-        "PATH", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "USER", "LOGNAME",
-    ) if key in os.environ}
-    env.update(HOME=str(root), CODEX_HOME=str(home),
-               LOCAL_RESPONSES_DUMMY_TOKEN="dummy-local-only")
+    env = {
+        key: os.environ[key]
+        for key in (
+            "PATH",
+            "LANG",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "USER",
+            "LOGNAME",
+        )
+        if key in os.environ
+    }
+    env.update(
+        HOME=str(root),
+        CODEX_HOME=str(home),
+        LOCAL_RESPONSES_DUMMY_TOKEN="dummy-local-only",
+    )
     version = _run([str(CODEX), "--no-daemon", "--version"], env=env, cwd=root)
     if version.stdout.strip() != "codex-cli 0.161.0":
         pytest.skip("Codex CLI 0.161.0 unavailable")
-    if _run(["systemctl", "--user", "show", "--property=Version"],
-            env=env, cwd=root).returncode:
+    if _run(
+        ["systemctl", "--user", "show", "--property=Version"], env=env, cwd=root
+    ).returncode:
         pytest.skip("systemd user manager unavailable")
 
     requests: list[dict] = []
@@ -391,9 +566,20 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(payload)
             observed = _run(
-                ["systemctl", "--user", "show", unit, "-p", "ControlGroup",
-                 "-p", "InvocationID", "-p", "LoadState"],
-                env=env, cwd=root,
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "-p",
+                    "ControlGroup",
+                    "-p",
+                    "InvocationID",
+                    "-p",
+                    "LoadState",
+                ],
+                env=env,
+                cwd=root,
             )
             properties = _systemd_properties(observed)
             assert observed.returncode == 0 and properties.get("LoadState") == "loaded"
@@ -420,12 +606,18 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
             f'[model_providers.local]\nname="local"\n'
             f'base_url="http://127.0.0.1:{transport.server_port}/v1"\n'
             f'wire_api="responses"\nenv_key="LOCAL_RESPONSES_DUMMY_TOKEN"\n'
-            f'[features]\ndaemon_auto_start=false\n'
+            f"[features]\ndaemon_auto_start=false\n"
         )
         _fixture_plugin(root, home)
         for command in (
             [str(CODEX), "--no-daemon", "plugin", "marketplace", "add", str(root)],
-            [str(CODEX), "--no-daemon", "plugin", "add", "fixture-plugin@local-fixture"],
+            [
+                str(CODEX),
+                "--no-daemon",
+                "plugin",
+                "add",
+                "fixture-plugin@local-fixture",
+            ],
         ):
             if command[2:4] == ["plugin", "add"]:
                 scanner = Path(
@@ -433,9 +625,16 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
                     "agent-skillguard/0.1.5/scripts/skillguard.py"
                 )
                 scan = _run(
-                    [sys.executable, str(scanner), "scan",
-                     str(root / "plugins" / "fixture-plugin"), "--format", "json"],
-                    env=env, cwd=root,
+                    [
+                        sys.executable,
+                        str(scanner),
+                        "scan",
+                        str(root / "plugins" / "fixture-plugin"),
+                        "--format",
+                        "json",
+                    ],
+                    env=env,
+                    cwd=root,
                 )
                 assert scan.returncode == 0, scan.stderr[-500:]
                 report = json.loads(scan.stdout)
@@ -450,37 +649,57 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
             server._require_managed_codex_daemon_free(home)
             args = [str(wrapper), "exec"]
             if turn:
-                args += ["resume", "--skip-git-repo-check", "--json", thread_id, "say again"]
+                args += [
+                    "resume",
+                    "--skip-git-repo-check",
+                    "--json",
+                    thread_id,
+                    "say again",
+                ]
             else:
                 args += ["--skip-git-repo-check", "--json", "say fixture"]
             unit = f"hive-cli-fixture-{uuid.uuid4().hex[:12]}.scope"
             scope_safe_to_remove = False
             try:
                 result = _run(
-                    ["systemd-run", "--user", "--scope", "--quiet", "--unit", unit, *args],
-                    env=env, cwd=root,
+                    [
+                        "systemd-run",
+                        "--user",
+                        "--scope",
+                        "--quiet",
+                        "--unit",
+                        unit,
+                        *args,
+                    ],
+                    env=env,
+                    cwd=root,
                 )
                 assert result.returncode == 0, result.stderr[-500:]
                 events = [json.loads(line) for line in result.stdout.splitlines()]
-                started = [event["thread_id"] for event in events
-                           if event.get("type") == "thread.started"]
+                started = [
+                    event["thread_id"]
+                    for event in events
+                    if event.get("type") == "thread.started"
+                ]
                 assert len(started) == 1
                 thread_id = thread_id or started[0]
                 assert started[0] == thread_id
                 assert any(event.get("type") == "turn.completed" for event in events)
-                _wait_own_scope_empty(
-                    unit, active_cgroup_identities[turn], env, root
-                )
+                _wait_own_scope_empty(unit, active_cgroup_identities[turn], env, root)
                 assert active_cgroups[turn].endswith("/" + unit)
                 scope = Path("/sys/fs/cgroup" + active_cgroups[turn])
-                assert not scope.exists() or not (scope / "cgroup.procs").read_text().strip()
+                assert (
+                    not scope.exists()
+                    or not (scope / "cgroup.procs").read_text().strip()
+                )
             finally:
                 try:
                     _run(["systemctl", "--user", "stop", unit], env=env, cwd=root)
                 finally:
                     identity = (
                         active_cgroup_identities[turn]
-                        if len(active_cgroup_identities) > turn else None
+                        if len(active_cgroup_identities) > turn
+                        else None
                     )
                     _wait_own_scope_empty(unit, identity, env, root)
                     scope_safe_to_remove = True
@@ -490,14 +709,22 @@ def test_real_cli_start_resume_stop_hooks_and_empty_scopes(tmp_path: Path) -> No
         assert len(requests) == 2
         assert any("say fixture" in str(item) for item in requests[1]["input"])
         assert any("fixture answer" in str(item) for item in requests[1]["input"])
-        hooks = [json.loads(line) for line in (root / "hook-events.jsonl").read_text().splitlines()]
+        hooks = [
+            json.loads(line)
+            for line in (root / "hook-events.jsonl").read_text().splitlines()
+        ]
         assert [(event["hook_event_name"], event.get("source")) for event in hooks] == [
-            ("SessionStart", "startup"), ("Stop", None),
-            ("SessionStart", "resume"), ("Stop", None),
+            ("SessionStart", "startup"),
+            ("Stop", None),
+            ("SessionStart", "resume"),
+            ("Stop", None),
         ]
         assert all(event["session_id"] == thread_id for event in hooks)
         assert [event["cgroup"].removeprefix("0::") for event in hooks] == [
-            active_cgroups[0], active_cgroups[0], active_cgroups[1], active_cgroups[1],
+            active_cgroups[0],
+            active_cgroups[0],
+            active_cgroups[1],
+            active_cgroups[1],
         ]
     finally:
         transport.shutdown()
@@ -522,15 +749,33 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
     pins = home / ".local/state/the-hive/hook-session-pins-v1"
     registry_path = home / ".local/state/codex-master-mcp/native-agents.json"
     launcher = "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
+
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
-    if (not CODEX.is_file() or not shutil.which("systemd-run")
-            or digest(source_plugin / "release-binding.json")
-            != digest(release / "TheHivePluginBundleV1/release-binding.json")):
+
+    if (
+        not CODEX.is_file()
+        or not shutil.which("systemd-run")
+        or digest(source_plugin / "release-binding.json")
+        != digest(release / "TheHivePluginBundleV1/release-binding.json")
+    ):
         pytest.skip("installed Hive source and runtime descriptor unavailable")
-    assert digest(CODEX) == "9a820c17865fa825d04db416818679a9d63bd72e50835c396f496e5684626c9c"
-    verify = _run([str(Path(__file__).resolve().parents[1] / "scripts/the-hive-runtime-service"),
-                   "verify", "--home", str(home)], env=os.environ.copy(), cwd=tmp_path)
+    assert (
+        digest(CODEX)
+        == "9a820c17865fa825d04db416818679a9d63bd72e50835c396f496e5684626c9c"
+    )
+    verify = _run(
+        [
+            str(
+                Path(__file__).resolve().parents[1] / "scripts/the-hive-runtime-service"
+            ),
+            "verify",
+            "--home",
+            str(home),
+        ],
+        env=os.environ.copy(),
+        cwd=tmp_path,
+    )
     assert verify.returncode == 0
     identity = json.loads(verify.stdout)["runtime_identity"]
     assert identity["generation"] == generation
@@ -538,9 +783,14 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
     config_digest = digest(personal_codex_home / "config.toml")
     updater_pid = 886704
     assert b"pid-update-loop" in Path(f"/proc/{updater_pid}/cmdline").read_bytes()
-    children = Path(f"/proc/{updater_pid}/task/{updater_pid}/children").read_text().split()
-    daemons = [int(pid) for pid in children if b"app-server\x00--listen\x00" in
-               Path(f"/proc/{pid}/cmdline").read_bytes()]
+    children = (
+        Path(f"/proc/{updater_pid}/task/{updater_pid}/children").read_text().split()
+    )
+    daemons = [
+        int(pid)
+        for pid in children
+        if b"app-server\x00--listen\x00" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    ]
     assert len(daemons) == 1
     process_ticks = {
         pid: Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
@@ -549,18 +799,40 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
     before = json.loads(registry_path.read_text())
     probe_before = server.read_probe_gate()
     assert len(before["sessions"]) < 1024 and len(before["agents"]) < 1024
-    env = {key: os.environ[key] for key in (
-        "PATH", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "USER", "LOGNAME",
-    ) if key in os.environ}
-    env.update(HOME=str(tmp_path), CODEX_HOME=str(codex_home),
-               LOCAL_RESPONSES_DUMMY_TOKEN="dummy-local-only")
-    assert _run([str(CODEX), "--no-daemon", "--version"], env=env,
-                cwd=tmp_path).stdout.strip() == "codex-cli 0.161.0"
+    env = {
+        key: os.environ[key]
+        for key in (
+            "PATH",
+            "LANG",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "USER",
+            "LOGNAME",
+        )
+        if key in os.environ
+    }
+    env.update(
+        HOME=str(tmp_path),
+        CODEX_HOME=str(codex_home),
+        LOCAL_RESPONSES_DUMMY_TOKEN="dummy-local-only",
+    )
+    assert (
+        _run(
+            [str(CODEX), "--no-daemon", "--version"], env=env, cwd=tmp_path
+        ).stdout.strip()
+        == "codex-cli 0.161.0"
+    )
     (codex_home / "config.toml").write_text("[features]\ndaemon_auto_start=false\n")
     _fixture_plugin(tmp_path, codex_home)
-    _trust_installed_hive(codex_home, source_plugin,
-                          release / "TheHivePluginBundleV1", personal_codex_home)
-    trusted_before = tomllib.loads((codex_home / "config.toml").read_text())["hooks"]["state"]
+    _trust_installed_hive(
+        codex_home,
+        source_plugin,
+        release / "TheHivePluginBundleV1",
+        personal_codex_home,
+    )
+    trusted_before = tomllib.loads((codex_home / "config.toml").read_text())["hooks"][
+        "state"
+    ]
     for command in (
         [str(CODEX), "--no-daemon", "plugin", "marketplace", "add", str(home)],
         [str(CODEX), "--no-daemon", "plugin", "marketplace", "add", str(tmp_path)],
@@ -568,15 +840,24 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
         [str(CODEX), "--no-daemon", "plugin", "add", "fixture-plugin@local-fixture"],
     ):
         result = _run(command, env=env, cwd=tmp_path)
-        assert result.returncode == 0, f"native plugin materialization rc={result.returncode}"
+        assert result.returncode == 0, (
+            f"native plugin materialization rc={result.returncode}"
+        )
     server._require_managed_codex_daemon_free(codex_home)
     _attest_hive_bundle(source_plugin, release / "TheHivePluginBundleV1", plugin)
-    hook_state = tomllib.loads((codex_home / "config.toml").read_text())["hooks"]["state"]
-    hive_hooks = [value for key, value in hook_state.items()
-                  if key.startswith("the-hive@personal:hooks/hooks.json:")]
-    assert len(hive_hooks) == 9 and all(value.get("enabled") is True
-                                        and value.get("trusted_hash", "").startswith("sha256:")
-                                        for value in hive_hooks)
+    hook_state = tomllib.loads((codex_home / "config.toml").read_text())["hooks"][
+        "state"
+    ]
+    hive_hooks = [
+        value
+        for key, value in hook_state.items()
+        if key.startswith("the-hive@personal:hooks/hooks.json:")
+    ]
+    assert len(hive_hooks) == 9 and all(
+        value.get("enabled") is True
+        and value.get("trusted_hash", "").startswith("sha256:")
+        for value in hive_hooks
+    )
     assert all(hook_state[key] == value for key, value in trusted_before.items())
     requests: list[dict[str, bool]] = []
     probes: list[dict[str, object]] = []
@@ -588,87 +869,171 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
 
     def scope_empty(unit: str) -> bool:
         for _ in range(50):
-            state = _run(["systemctl", "--user", "show", unit,
-                          "-p", "ActiveState", "-p", "ControlGroup"],
-                         env=env, cwd=tmp_path)
-            if (state.returncode == 0 and "ActiveState=inactive" in state.stdout
-                    and "ControlGroup=\n" in state.stdout):
+            state = _run(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "-p",
+                    "ActiveState",
+                    "-p",
+                    "ControlGroup",
+                ],
+                env=env,
+                cwd=tmp_path,
+            )
+            if (
+                state.returncode == 0
+                and "ActiveState=inactive" in state.stdout
+                and "ControlGroup=\n" in state.stdout
+            ):
                 return True
             time.sleep(0.1)
         return False
 
-    def direct_hook(name: str, event: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    def direct_hook(
+        name: str, event: dict[str, object]
+    ) -> subprocess.CompletedProcess[str]:
         unit = f"hive-resume-{name}-{uuid.uuid4().hex[:10]}.scope"
         units.append(unit)
-        result = _run(["systemd-run", "--user", "--scope", "--quiet", "--unit", unit,
-                       launcher, "native_spawn_admission" if name == "admission"
-                       else "native_bee_event"],
-                      env={**env, "PLUGIN_ROOT": str(plugin)}, cwd=tmp_path,
-                      input_text=json.dumps(event) + "\n")
+        result = _run(
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--unit",
+                unit,
+                launcher,
+                "native_spawn_admission" if name == "admission" else "native_bee_event",
+            ],
+            env={**env, "PLUGIN_ROOT": str(plugin)},
+            cwd=tmp_path,
+            input_text=json.dumps(event) + "\n",
+        )
         return result
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            requests.append({"local": self.path == "/v1/responses",
-                             "dummy": self.headers.get("Authorization") ==
-                             "Bearer dummy-local-only",
-                             "prior": "fixture answer" in str(payload.get("input", []))})
+            requests.append(
+                {
+                    "local": self.path == "/v1/responses",
+                    "dummy": self.headers.get("Authorization")
+                    == "Bearer dummy-local-only",
+                    "prior": "fixture answer" in str(payload.get("input", [])),
+                }
+            )
             observation: dict[str, object] = {"phase": current_phase[0]}
             observation["cgroup"] = _run(
-                ["systemctl", "--user", "show", current_unit[0],
-                 "-p", "ControlGroup", "--value"], env=env,
-                cwd=tmp_path).stdout.strip()
-            observation["active_cgroup"] = observation["cgroup"].endswith("/" + current_unit[0])
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    current_unit[0],
+                    "-p",
+                    "ControlGroup",
+                    "--value",
+                ],
+                env=env,
+                cwd=tmp_path,
+            ).stdout.strip()
+            observation["active_cgroup"] = observation["cgroup"].endswith(
+                "/" + current_unit[0]
+            )
             if started.wait(5):
                 sid = started_id[0]
                 observation["pin_active"] = _installed_pin_active(pins, sid)
                 pin_path = pins / (hashlib.sha256(sid.encode()).hexdigest() + ".json")
                 try:
                     observation["pin_transitions"] = [
-                        item["state"] for item in json.loads(pin_path.read_text())["state_transitions"]
+                        item["state"]
+                        for item in json.loads(pin_path.read_text())[
+                            "state_transitions"
+                        ]
                     ]
                 except (OSError, ValueError, KeyError):
                     observation["pin_transitions"] = []
                 if current_phase[0] == "start" and observation["pin_active"]:
-                    reservations_before = json.loads(registry_path.read_text())["reservations"]
+                    reservations_before = json.loads(registry_path.read_text())[
+                        "reservations"
+                    ]
                     try:
-                        admission = direct_hook("admission", {
-                            "session_id": sid, "hook_event_name": "PreToolUse",
-                            "tool_name": "spawn_agent",
-                            "tool_input": {"task_name": "fixture-admission", "message": "local no-op"},
-                            "cwd": str(tmp_path),
-                        })
+                        admission = direct_hook(
+                            "admission",
+                            {
+                                "session_id": sid,
+                                "hook_event_name": "PreToolUse",
+                                "tool_name": "spawn_agent",
+                                "tool_input": {
+                                    "task_name": "fixture-admission",
+                                    "message": "local no-op",
+                                },
+                                "cwd": str(tmp_path),
+                            },
+                        )
                     finally:
-                        reservations_after = json.loads(registry_path.read_text())["reservations"]
-                        own_before = {row["reservation_id"] for row in reservations_before
-                                      if row.get("parent_session_id") == sid}
-                        own_new = [row for row in reservations_after
-                                   if row.get("parent_session_id") == sid
-                                   and row["reservation_id"] not in own_before]
+                        reservations_after = json.loads(registry_path.read_text())[
+                            "reservations"
+                        ]
+                        own_before = {
+                            row["reservation_id"]
+                            for row in reservations_before
+                            if row.get("parent_session_id") == sid
+                        }
+                        own_new = [
+                            row
+                            for row in reservations_after
+                            if row.get("parent_session_id") == sid
+                            and row["reservation_id"] not in own_before
+                        ]
                         observation["reservation_delta"] = len(own_new)
                         if own_new:
                             agent_id = f"fixture-{uuid.uuid4().hex[:12]}"
-                            agent = {"session_id": sid, "agent_id": agent_id,
-                                     "agent_type": "fixture"}
-                            started_agent = direct_hook("agent-start", {
-                                **agent, "hook_event_name": "SubagentStart"})
-                            stopped_agent = direct_hook("agent-stop", {
-                                **agent, "hook_event_name": "SubagentStop"})
+                            agent = {
+                                "session_id": sid,
+                                "agent_id": agent_id,
+                                "agent_type": "fixture",
+                            }
+                            started_agent = direct_hook(
+                                "agent-start",
+                                {**agent, "hook_event_name": "SubagentStart"},
+                            )
+                            stopped_agent = direct_hook(
+                                "agent-stop",
+                                {**agent, "hook_event_name": "SubagentStop"},
+                            )
                             observation["reservation_cleanup"] = (
-                                started_agent.returncode == stopped_agent.returncode == 0
-                                and not any(row.get("reservation_id") == own_new[0]["reservation_id"]
-                                            for row in json.loads(registry_path.read_text())["reservations"])
+                                started_agent.returncode
+                                == stopped_agent.returncode
+                                == 0
+                                and not any(
+                                    row.get("reservation_id")
+                                    == own_new[0]["reservation_id"]
+                                    for row in json.loads(registry_path.read_text())[
+                                        "reservations"
+                                    ]
+                                )
                             )
                     try:
-                        decision = json.loads(admission.stdout)["hookSpecificOutput"] if admission.stdout else {}
+                        decision = (
+                            json.loads(admission.stdout)["hookSpecificOutput"]
+                            if admission.stdout
+                            else {}
+                        )
                     except (KeyError, TypeError, ValueError):
                         decision = {}
                     observation["admission_rc"] = admission.returncode
-                    observation["admission_decision"] = decision.get("permissionDecision", "allow" if not admission.stdout else None)
-                    observation["admission_reason"] = decision.get("permissionDecisionReason")
-                    stop = direct_hook("stop", {"session_id": sid,
-                                                "hook_event_name": "Stop"})
+                    observation["admission_decision"] = decision.get(
+                        "permissionDecision", "allow" if not admission.stdout else None
+                    )
+                    observation["admission_reason"] = decision.get(
+                        "permissionDecisionReason"
+                    )
+                    stop = direct_hook(
+                        "stop", {"session_id": sid, "hook_event_name": "Stop"}
+                    )
                     observation["direct_stop_rc"] = stop.returncode
                     observation["direct_stop_json"] = stop.stdout.strip() == "{}"
             probes.append(observation)
@@ -685,13 +1050,28 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
     transport = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=transport.serve_forever, daemon=True)
     thread.start()
-    cli = [str(CODEX), "--no-daemon", "-c", "features.daemon_auto_start=false",
-           "-c", 'model_provider="local"', "-c", 'model="fixture-model"',
-           "-c", 'approval_policy="never"', "-c", 'sandbox_mode="read-only"',
-           "-c", 'model_providers.local.name="local"',
-           "-c", f'model_providers.local.base_url="http://127.0.0.1:{transport.server_port}/v1"',
-           "-c", 'model_providers.local.wire_api="responses"',
-           "-c", 'model_providers.local.env_key="LOCAL_RESPONSES_DUMMY_TOKEN"']
+    cli = [
+        str(CODEX),
+        "--no-daemon",
+        "-c",
+        "features.daemon_auto_start=false",
+        "-c",
+        'model_provider="local"',
+        "-c",
+        'model="fixture-model"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'sandbox_mode="read-only"',
+        "-c",
+        'model_providers.local.name="local"',
+        "-c",
+        f'model_providers.local.base_url="http://127.0.0.1:{transport.server_port}/v1"',
+        "-c",
+        'model_providers.local.wire_api="responses"',
+        "-c",
+        'model_providers.local.env_key="LOCAL_RESPONSES_DUMMY_TOKEN"',
+    ]
     sid = ""
     turns: list[dict[str, object]] = []
     try:
@@ -701,15 +1081,31 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
             current_unit[0] = f"hive-resume-cli-{uuid.uuid4().hex[:12]}.scope"
             units.append(current_unit[0])
             started.clear()
-            tail = (["resume", "--skip-git-repo-check", "--json", sid, "say again"]
-                    if sid else ["--skip-git-repo-check", "--json", "say fixture"])
+            tail = (
+                ["resume", "--skip-git-repo-check", "--json", sid, "say again"]
+                if sid
+                else ["--skip-git-repo-check", "--json", "say fixture"]
+            )
             events: list[dict[str, object]] = []
             with tempfile.TemporaryFile() as stderr_file:
                 process = subprocess.Popen(
-                    ["systemd-run", "--user", "--scope", "--quiet", "--unit",
-                     current_unit[0], *cli, "exec", *tail], env=env, cwd=tmp_path,
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                    stderr=stderr_file, text=True,
+                    [
+                        "systemd-run",
+                        "--user",
+                        "--scope",
+                        "--quiet",
+                        "--unit",
+                        current_unit[0],
+                        *cli,
+                        "exec",
+                        *tail,
+                    ],
+                    env=env,
+                    cwd=tmp_path,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    text=True,
                 )
                 assert process.stdout is not None
 
@@ -735,68 +1131,121 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
                 reader.join(timeout=5)
             _wait_own_scope_empty(current_unit[0], codex_home, env, tmp_path)
             server._require_managed_codex_daemon_free(codex_home)
-            ids = [event["thread_id"] for event in events
-                   if event.get("type") == "thread.started"]
+            ids = [
+                event["thread_id"]
+                for event in events
+                if event.get("type") == "thread.started"
+            ]
             sid = sid or (str(ids[0]) if ids else "")
-            turns.append({"phase": phase, "rc": rc, "same_thread": ids == [sid],
-                          "completed": any(event.get("type") == "turn.completed"
-                                           for event in events)})
+            turns.append(
+                {
+                    "phase": phase,
+                    "rc": rc,
+                    "same_thread": ids == [sid],
+                    "completed": any(
+                        event.get("type") == "turn.completed" for event in events
+                    ),
+                }
+            )
             assert rc == 0 and turns[-1]["same_thread"] and turns[-1]["completed"]
-        assert len(requests) == 2 and all(item["local"] and item["dummy"]
-                                          for item in requests)
+        assert len(requests) == 2 and all(
+            item["local"] and item["dummy"] for item in requests
+        )
         assert requests[1]["prior"]
         assert probes[0]["pin_active"] and probes[0]["active_cgroup"]
         assert probes[1]["pin_active"] and probes[1]["active_cgroup"]
         assert probes[1]["pin_transitions"][-3:] == ["active", "ended", "active"]
         assert probes[0]["direct_stop_rc"] == 0 and probes[0]["direct_stop_json"]
-        recorded = [json.loads(line) for line in (tmp_path / "hook-events.jsonl").read_text().splitlines()]
-        assert [(event["hook_event_name"], event.get("source")) for event in recorded] == [
-            ("SessionStart", "startup"), ("Stop", None),
-            ("SessionStart", "resume"), ("Stop", None),
+        recorded = [
+            json.loads(line)
+            for line in (tmp_path / "hook-events.jsonl").read_text().splitlines()
+        ]
+        assert [
+            (event["hook_event_name"], event.get("source")) for event in recorded
+        ] == [
+            ("SessionStart", "startup"),
+            ("Stop", None),
+            ("SessionStart", "resume"),
+            ("Stop", None),
         ]
         assert all(event["session_id"] == sid for event in recorded)
         assert [event["cgroup"].removeprefix("0::") for event in recorded] == [
-            probes[0]["cgroup"], probes[0]["cgroup"],
-            probes[1]["cgroup"], probes[1]["cgroup"],
+            probes[0]["cgroup"],
+            probes[0]["cgroup"],
+            probes[1]["cgroup"],
+            probes[1]["cgroup"],
         ]
         for item in probes:
             scope = Path("/sys/fs/cgroup" + item["cgroup"])
-            assert not scope.exists() or not (scope / "cgroup.procs").read_text().strip()
+            assert (
+                not scope.exists() or not (scope / "cgroup.procs").read_text().strip()
+            )
         after = json.loads(registry_path.read_text())
-        assert [item for item in after["sessions"] if item.get("session_id") != sid] == before["sessions"]
-        assert [item for item in after["agents"] if item.get("session_id") != sid] == before["agents"]
-        assert [item for item in after["reservations"] if item.get("parent_session_id") != sid] == before["reservations"]
-        assert not any(item.get("parent_session_id") == sid for item in after["reservations"])
-        assert not any(item.get("session_id") == sid and item.get("activity_state") == "active"
-                       for item in after["agents"])
-        assert any(item.get("session_id") == sid and item.get("activity_state") == "ended"
-                   for item in after["sessions"])
+        assert [
+            item for item in after["sessions"] if item.get("session_id") != sid
+        ] == before["sessions"]
+        assert [
+            item for item in after["agents"] if item.get("session_id") != sid
+        ] == before["agents"]
+        assert [
+            item
+            for item in after["reservations"]
+            if item.get("parent_session_id") != sid
+        ] == before["reservations"]
+        assert not any(
+            item.get("parent_session_id") == sid for item in after["reservations"]
+        )
+        assert not any(
+            item.get("session_id") == sid and item.get("activity_state") == "active"
+            for item in after["agents"]
+        )
+        assert any(
+            item.get("session_id") == sid and item.get("activity_state") == "ended"
+            for item in after["sessions"]
+        )
         assert not _installed_pin_active(pins, sid)
         server._require_managed_codex_daemon_free(codex_home)
         assert digest(personal_codex_home / "config.toml") == config_digest
-        assert all(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-                   == tick for pid, tick in process_ticks.items())
+        assert all(
+            Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] == tick
+            for pid, tick in process_ticks.items()
+        )
         gate_after = server.read_probe_gate()
-        print(json.dumps({"cli_turns": turns, "admission":
-                          {"decision": probes[0]["admission_decision"],
-                           "reason": probes[0]["admission_reason"],
-                           "reservation_delta": probes[0]["reservation_delta"]},
-                          "probe_before": probe_before.get("reason_code"),
-                          "probe_after": gate_after.get("reason_code"),
-                          "fixture_direct_stop": True, "codex_auto_stop": True,
-                          "resume_pin_active": probes[1]["pin_active"],
-                          "foreign_registry_preserved": True,
-                          "own_scopes_empty": True}, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "cli_turns": turns,
+                    "admission": {
+                        "decision": probes[0]["admission_decision"],
+                        "reason": probes[0]["admission_reason"],
+                        "reservation_delta": probes[0]["reservation_delta"],
+                    },
+                    "probe_before": probe_before.get("reason_code"),
+                    "probe_after": gate_after.get("reason_code"),
+                    "fixture_direct_stop": True,
+                    "codex_auto_stop": True,
+                    "resume_pin_active": probes[1]["pin_active"],
+                    "foreign_registry_preserved": True,
+                    "own_scopes_empty": True,
+                },
+                sort_keys=True,
+            )
+        )
         assert probes[0]["admission_rc"] == 0
         assert probes[0]["admission_decision"] in {"allow", "deny"}
-        assert probes[0]["admission_reason"] is None or "invalid_pretooluse_input" not in probes[0]["admission_reason"]
+        assert (
+            probes[0]["admission_reason"] is None
+            or "invalid_pretooluse_input" not in probes[0]["admission_reason"]
+        )
         if probes[0]["admission_decision"] == "allow":
             assert probes[0]["reservation_delta"] == 1
             assert probes[0]["reservation_cleanup"]
         else:
             assert probes[0]["reservation_delta"] == 0
             assert isinstance(probes[0]["admission_reason"], str)
-            assert "hook_error" not in probes[0]["admission_reason"], "valid admission blocked; inspect probe gate"
+            assert "hook_error" not in probes[0]["admission_reason"], (
+                "valid admission blocked; inspect probe gate"
+            )
     finally:
         cleanup_errors = []
         try:
@@ -809,8 +1258,10 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
             cleanup_errors.append("transport_shutdown_failed")
         try:
             if started_id[0] and _installed_pin_active(pins, started_id[0]):
-                ended = direct_hook("end", {"session_id": started_id[0],
-                                            "hook_event_name": "SessionEnd"})
+                ended = direct_hook(
+                    "end",
+                    {"session_id": started_id[0], "hook_event_name": "SessionEnd"},
+                )
                 if ended.returncode != 0:
                     cleanup_errors.append("own_pin_end_failed")
         except Exception:

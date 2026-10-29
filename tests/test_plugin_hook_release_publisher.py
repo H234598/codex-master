@@ -52,10 +52,11 @@ def _offline_stage_diagnostic(
     """Replace only external diagnostic processes for publisher unit tests."""
 
     prefix = ["/usr/bin/python3", "-I", "-B", "-c", STAGE_SERVER_BOOTSTRAP, str(cwd)]
-    suffix = arguments[len(prefix):]
+    suffix = arguments[len(prefix) :]
     if (
-        arguments[:len(prefix)] != prefix
-        or suffix not in (["--runtime-status-mcp"], ["hive", "status"], ["hive", "doctor"])
+        arguments[: len(prefix)] != prefix
+        or suffix
+        not in (["--runtime-status-mcp"], ["hive", "status"], ["hive", "doctor"])
         or not isinstance(runtime_layout, RuntimeLayout)
         or runtime_layout.root != cwd
         or not home.is_absolute()
@@ -70,9 +71,12 @@ def _offline_stage_diagnostic(
         requests = [json.loads(line) for line in input_data.splitlines()]
         if requests != [
             {
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
                     "clientInfo": {"name": "the-hive-runtime-status", "version": "1"},
                 },
             },
@@ -89,11 +93,33 @@ def _offline_stage_diagnostic(
 
 
 def _installer() -> dict[str, object]:
-    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
     installer["_validate_runtime_image_stage"].__globals__["run_bounded"] = (
         _offline_stage_diagnostic
     )
     return installer
+
+
+def _install_runtime_for_test(
+    installer: dict[str, object], home: Path
+) -> dict[str, object]:
+    function = installer["_install_attested_runtime"]
+    local = home / ".local"
+    if not local.exists():
+        local.mkdir(mode=0o700)
+    stage_name = (
+        ".the-hive-runtime.stage.test-"
+        + hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:12]
+    )
+    return function(  # type: ignore[operator,return-value]
+        home=home,
+        stage_name=stage_name,
+        record_setup=lambda _stage: None,
+        reserve_setup=lambda _target, _temporary, _digest: None,
+        before_publish=lambda _stage, _layout, _outputs: None,
+    )
 
 
 def test_publisher_fixture_rejects_unexpected_diagnostic_without_external_process(
@@ -131,7 +157,9 @@ def test_publisher_stage_rejects_malformed_mcp_before_publication(
             returncode=0, stdout="{}\n", stderr=""
         ),
     )
-    with pytest.raises(installer["InstallError"], match="^install_stage_validation_failed$"):
+    with pytest.raises(
+        installer["InstallError"], match="^install_stage_validation_failed$"
+    ):
         installer["_validate_runtime_image_stage"](stage=stage, home=home)
     assert stage.is_dir()
     assert not (home / ".local" / "lib" / "the-hive-runtime").exists()
@@ -623,7 +651,7 @@ def test_pre_pricing_legacy_release_without_pin_store_upgrades_to_current_runtim
         "_verified_release_commit",
         lambda _repository: release_commit["value"],
     )
-    upgraded = installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+    upgraded = _install_runtime_for_test(installer, home)
     assert upgraded["generation"] == "b" * 40
     pointer = release_root / ".the-hive-release-pointers.json"
     upgraded_pointer = json.loads(pointer.read_text(encoding="utf-8"))
@@ -646,7 +674,7 @@ def test_pre_pricing_legacy_release_without_pin_store_upgrades_to_current_runtim
         home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
     )
     release_commit["value"] = "c" * 40
-    subsequent = installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+    subsequent = _install_runtime_for_test(installer, home)
     assert subsequent["generation"] == "c" * 40
     subsequent_pointer = json.loads(pointer.read_text(encoding="utf-8"))
     assert subsequent_pointer["current"]["generation"] == "c" * 40
@@ -682,9 +710,7 @@ def test_pre_pricing_legacy_upgrade_rejects_any_nonobserved_pointer_pair(
     else:
         invalid["previous"] = invalid["current"]
     invalid_bytes = (
-        json.dumps(
-            invalid, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-        )
+        json.dumps(invalid, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("ascii")
     pointer.write_bytes(invalid_bytes)
@@ -696,9 +722,10 @@ def test_pre_pricing_legacy_upgrade_rejects_any_nonobserved_pointer_pair(
     )
 
     with pytest.raises(
-        installer["InstallError"], match="install_release_pointer_invalid"  # type: ignore[index]
+        installer["InstallError"],
+        match="install_release_pointer_invalid",  # type: ignore[index]
     ):
-        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+        _install_runtime_for_test(installer, home)
 
     assert pointer.read_bytes() == invalid_bytes
     assert not (release_root / "generations" / ("b" * 40)).exists()
@@ -711,9 +738,7 @@ def test_pre_pricing_legacy_attestation_binds_generation_to_known_digest(
 
     installer = _installer()
     generation = "c7efc03f00eee1933f86808902d109f81bad446e"
-    stage, original_digest = _pre_pricing_legacy_stage(
-        installer, tmp_path, generation
-    )
+    stage, original_digest = _pre_pricing_legacy_stage(installer, tmp_path, generation)
     runtime = tmp_path / "generations" / generation
     runtime.parent.mkdir(mode=0o700)
     stage.rename(runtime)
@@ -774,9 +799,10 @@ def test_pre_pricing_legacy_upgrade_rejects_untrusted_generation_pre_visible(
     )
 
     with pytest.raises(
-        installer["InstallError"], match="install_release_pointer_invalid"  # type: ignore[index]
+        installer["InstallError"],
+        match="install_release_pointer_invalid",  # type: ignore[index]
     ):
-        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+        _install_runtime_for_test(installer, home)
 
     assert (
         release_root / ".the-hive-release-pointers.json"
@@ -820,9 +846,10 @@ def test_pre_pricing_legacy_upgrade_rejects_physical_current_era_artifact(
     )
 
     with pytest.raises(
-        installer["InstallError"], match="install_release_pointer_invalid"  # type: ignore[index]
+        installer["InstallError"],
+        match="install_release_pointer_invalid",  # type: ignore[index]
     ):
-        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+        _install_runtime_for_test(installer, home)
 
     assert (
         release_root / ".the-hive-release-pointers.json"
@@ -847,9 +874,7 @@ def test_pre_pricing_legacy_upgrade_rolls_back_postrename_failure(
         lambda _repository: "b" * 40,
     )
 
-    def fail_pointer(
-        _root: Path, _pointers: dict[str, dict[str, str] | None]
-    ) -> None:
+    def fail_pointer(_root: Path, _pointers: dict[str, dict[str, str] | None]) -> None:
         raise installer["InstallError"]("injected_pointer_failure")  # type: ignore[index]
 
     monkeypatch.setitem(
@@ -858,7 +883,7 @@ def test_pre_pricing_legacy_upgrade_rolls_back_postrename_failure(
         fail_pointer,
     )
     with pytest.raises(installer["InstallError"], match="injected_pointer_failure"):  # type: ignore[index]
-        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+        _install_runtime_for_test(installer, home)
 
     assert (
         release_root / ".the-hive-release-pointers.json"
@@ -971,7 +996,10 @@ def test_post_visibility_pointer_failure_restores_pointer_mcp_and_units(
         installer["InstallError"], match="install_release_pointer_write_failed"
     ):  # type: ignore[index]
         installer["_publish_runtime_generation"](  # type: ignore[operator]
-            stage=second, release_root=release_root, live_unit_dir=units, live_bin=live_bin
+            stage=second,
+            release_root=release_root,
+            live_unit_dir=units,
+            live_bin=live_bin,
         )
     assert (
         pointer.read_bytes(),
@@ -1014,7 +1042,10 @@ def test_late_pointer_failure_restores_the_prior_hourly_unit_pair(
         installer["InstallError"], match="install_release_pointer_write_failed"
     ):  # type: ignore[index]
         installer["_publish_runtime_generation"](  # type: ignore[operator]
-            stage=second, release_root=release_root, live_unit_dir=units, live_bin=live_bin
+            stage=second,
+            release_root=release_root,
+            live_unit_dir=units,
+            live_bin=live_bin,
         )
 
     assert tuple((units / name).read_bytes() for name in names) == before

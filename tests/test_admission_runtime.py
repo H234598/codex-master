@@ -29,7 +29,12 @@ from the_hive.hive import hourly_probe as hourly_probe_module
 from the_hive.hive.dispatch import plan_queen_assignment
 from the_hive.hive.hourly_probe import PROBE_GATE_LOCK_NAME, run_probe
 from the_hive.runtime_layout import RuntimeLayout
-from the_hive.server import AgentError, build_server_admission_runtime, build_server_lease_executor, build_server_selection_service
+from the_hive.server import (
+    AgentError,
+    build_server_admission_runtime,
+    build_server_lease_executor,
+    build_server_selection_service,
+)
 from the_hive.selection_service import SelectionDeniedError, SelectionService
 from the_hive.usage_snapshot import UsageEvidenceV2
 
@@ -75,7 +80,14 @@ def materialize_probe_record(
         "plugin-status": ({"ok": True}, True),
         "hive status": (runtime, True),
         "hive doctor": (
-            {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
+            {
+                "healthy": True,
+                "checks": {
+                    "authority": "ready",
+                    "repository": "ready",
+                    "state": "ready",
+                },
+            },
             True,
         ),
     }
@@ -124,7 +136,9 @@ def materialize_probe_record(
             else lambda _command, *arguments: checks[" ".join(arguments)]
         ),
     )
-    monkeypatch.setattr(hourly_probe_module, "_probe_state_root", lambda: state_directory)
+    monkeypatch.setattr(
+        hourly_probe_module, "_probe_state_root", lambda: state_directory
+    )
     state_file = state_directory / "hive-hourly-health.json"
     if probe_state == "missing":
         state_file.unlink()
@@ -203,19 +217,26 @@ def revalidating_record():
 def executing_record():
     store = AdmissionStore()
     reserved = store.reserve(admission(), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=1, now=NOW)
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=1, now=NOW
+    )
     admitted = store.complete_revalidation(
         revalidating.admission_id,
         expected_revision=revalidating.revision,
         valid=True,
         now=NOW,
     )
-    return store.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
+    return store.begin_execution(
+        admitted.admission_id, expected_revision=admitted.revision, now=NOW
+    )
 
 
 def allow_all(events: list[str]):
     return {
-        name: (lambda _record, name=name: events.append(name) or RuntimeGateDecision(True, f"{name}_verified"))
+        name: (
+            lambda _record, name=name: events.append(name)
+            or RuntimeGateDecision(True, f"{name}_verified")
+        )
         for name in ADMISSION_RUNTIME_GATES
     }
 
@@ -266,19 +287,25 @@ def test_runtime_requires_every_gate_in_fixed_order_before_execute() -> None:
     assert runtime.revalidate(record) is True
     assert events == list(ADMISSION_RUNTIME_GATES)
     executing = executing_record()
-    assert runtime.execute(executing, "assign") == {"operation": "assign", "status": "ok"}
+    assert runtime.execute(executing, "assign") == {
+        "operation": "assign",
+        "status": "ok",
+    }
 
 
 def test_runtime_composes_with_selection_service_revision_transitions() -> None:
     executed: list[str] = []
     runtime = ServerAdmissionRuntime(
         allow_all([]),
-        execute=lambda _record, operation: executed.append(operation) or {"status": "ok"},
+        execute=lambda _record, operation: executed.append(operation)
+        or {"status": "ok"},
         pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
     store = AdmissionStore()
-    service = SelectionService(store, runtime, now=lambda: NOW, sleeper=lambda _delay: None)
+    service = SelectionService(
+        store, runtime, now=lambda: NOW, sleeper=lambda _delay: None
+    )
 
     result = service.execute_with_retry(lambda: admission(), "start")
 
@@ -286,7 +313,9 @@ def test_runtime_composes_with_selection_service_revision_transitions() -> None:
     assert executed == ["start"]
 
 
-def test_server_selection_factory_uses_persistent_store_but_missing_hive_stays_closed(tmp_path) -> None:
+def test_server_selection_factory_uses_persistent_store_but_missing_hive_stays_closed(
+    tmp_path,
+) -> None:
     state_path = tmp_path / "admissions.json"
     lock_path = tmp_path / "admission.lock"
     service = build_server_selection_service(
@@ -305,18 +334,22 @@ def test_server_selection_factory_uses_persistent_store_but_missing_hive_stays_c
 
 
 def test_selection_service_persists_every_transition_with_file_store(tmp_path) -> None:
-    store = FileAdmissionStore(tmp_path / "admissions.json", tmp_path / "admission.lock")
+    store = FileAdmissionStore(
+        tmp_path / "admissions.json", tmp_path / "admission.lock"
+    )
     runtime = ServerAdmissionRuntime(
         allow_all([]),
         execute=lambda _record, _operation: {"status": "ok"},
         pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
-    result = SelectionService(store, runtime, now=lambda: NOW, sleeper=lambda _delay: None).execute_with_retry(
-        lambda: admission(), "start"
-    )
+    result = SelectionService(
+        store, runtime, now=lambda: NOW, sleeper=lambda _delay: None
+    ).execute_with_retry(lambda: admission(), "start")
 
-    fresh = FileAdmissionStore(tmp_path / "admissions.json", tmp_path / "admission.lock")
+    fresh = FileAdmissionStore(
+        tmp_path / "admissions.json", tmp_path / "admission.lock"
+    )
     stored = fresh.get(result["admission"]["admission_id"])
     assert stored.state is AdmissionState.FINALIZED
     assert stored.revision == result["admission"]["revision"]
@@ -332,7 +365,10 @@ def test_runtime_missing_hive_bindings_denies_and_never_executes() -> None:
     record = revalidating_record()
 
     assert runtime.revalidate(record) is False
-    assert runtime.last_failure() == {"allowed": False, "reason_code": "missing_authority_gate"}
+    assert runtime.last_failure() == {
+        "allowed": False,
+        "reason_code": "missing_authority_gate",
+    }
     assert called == []
     with pytest.raises(AdmissionRuntimeError, match="invalid_admission_state"):
         runtime.execute(record, "assign")
@@ -363,7 +399,10 @@ def test_server_lease_executor_rechecks_binding_and_routes_only_named_operations
     lease = {"state": "unclaimed", "held_by_this_server": False, "lease_id": None}
     executor = build_server_lease_executor(
         operations={
-            "hive_assignment_callback": lambda record, current: seen.append((record.admission_id, dict(current))) or {"status": "ok"},
+            "hive_assignment_callback": lambda record, current: seen.append(
+                (record.admission_id, dict(current))
+            )
+            or {"status": "ok"},
         },
         lease_reader=lambda _agent: lease,
     )
@@ -381,8 +420,16 @@ def test_server_lease_executor_composes_with_runtime_revalidation(
     materialize_probe_record(tmp_path, monkeypatch, "fresh-green")
     configure_real_mutation_lock(tmp_path, monkeypatch)
     executor = build_server_lease_executor(
-        operations={"hive_assignment_callback": lambda _record, lease: {"lease_state": lease["state"]}},
-        lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
+        operations={
+            "hive_assignment_callback": lambda _record, lease: {
+                "lease_state": lease["state"]
+            }
+        },
+        lease_reader=lambda _agent: {
+            "state": "unclaimed",
+            "held_by_this_server": False,
+            "lease_id": None,
+        },
     )
     runtime = ServerAdmissionRuntime(
         allow_all([]),
@@ -392,7 +439,9 @@ def test_server_lease_executor_composes_with_runtime_revalidation(
     )
     assert runtime.revalidate(revalidating_record()) is True
 
-    assert runtime.execute(executing_record(), "hive_assignment_callback") == {"lease_state": "unclaimed"}
+    assert runtime.execute(executing_record(), "hive_assignment_callback") == {
+        "lease_state": "unclaimed"
+    }
 
 
 def test_server_lease_executor_rechecks_after_its_mutation_lock(
@@ -425,9 +474,14 @@ def test_server_lease_executor_rechecks_after_its_mutation_lock(
     monkeypatch.setattr(server, "agent_lifecycle_lock", mutation_lock)
     executor = build_server_lease_executor(
         operations={
-            "hive_assignment_callback": lambda *_args: seen.append("callback") or {"status": "unexpected"}
+            "hive_assignment_callback": lambda *_args: seen.append("callback")
+            or {"status": "unexpected"}
         },
-        lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
+        lease_reader=lambda _agent: {
+            "state": "unclaimed",
+            "held_by_this_server": False,
+            "lease_id": None,
+        },
     )
 
     with pytest.raises(AgentError, match="hive_spawn_probe_blocked"):
@@ -500,7 +554,11 @@ def test_each_hive_capacity_sink_accepts_only_an_actual_fresh_green_record(
             operation: lambda *_args: callback_calls.append(operation)
             or {"status": "started"}
         },
-        lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
+        lease_reader=lambda _agent: {
+            "state": "unclaimed",
+            "held_by_this_server": False,
+            "lease_id": None,
+        },
     )
 
     if allowed:
@@ -521,8 +579,14 @@ def test_each_hive_assignment_capacity_sink_waits_for_the_real_shared_probe_lock
     callback_called = threading.Event()
     completed = threading.Event()
     executor = build_server_lease_executor(
-        operations={operation: lambda *_args: callback_called.set() or {"status": "started"}},
-        lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
+        operations={
+            operation: lambda *_args: callback_called.set() or {"status": "started"}
+        },
+        lease_reader=lambda _agent: {
+            "state": "unclaimed",
+            "held_by_this_server": False,
+            "lease_id": None,
+        },
     )
 
     def execute_sink() -> None:
@@ -570,12 +634,17 @@ def test_each_queen_capacity_sink_accepts_only_an_actual_fresh_green_record(
 
     if allowed:
         assert server._execute_server_queen_assignment_capacity_sink(
-            step, lambda _plan: callback_calls.append(operation) or {"status": "started"}, plan
+            step,
+            lambda _plan: callback_calls.append(operation) or {"status": "started"},
+            plan,
         ) == {"status": "started"}
     else:
         with pytest.raises(AgentError, match="hive_spawn_probe_blocked"):
             server._execute_server_queen_assignment_capacity_sink(
-                step, lambda _plan: callback_calls.append(operation) or {"status": "unexpected"}, plan
+                step,
+                lambda _plan: callback_calls.append(operation)
+                or {"status": "unexpected"},
+                plan,
             )
 
     assert callback_calls == ([operation] if allowed else [])
@@ -621,10 +690,12 @@ def test_server_queen_enforced_forward_steps_use_only_real_named_capacity_sinks(
         confirmed_accounts={"sha256:" + "a" * 64},
         primary_models={"gpt-primary"},
         create_teamlead_principal=lambda _plan: events.append("teamlead") or "lead",
-        create_specialist_principal=lambda _plan: events.append("specialist") or "specialist",
+        create_specialist_principal=lambda _plan: events.append("specialist")
+        or "specialist",
         issue_grant=lambda _plan: events.append("grant") or "grant",
         reserve_admission=lambda _plan: events.append("admission") or "admission",
-        execute_assignment=lambda _plan: events.append("assignment") or {"status": "started"},
+        execute_assignment=lambda _plan: events.append("assignment")
+        or {"status": "started"},
         compensate=lambda name, *_args: events.append(f"compensate:{name}"),
     )
 
@@ -647,7 +718,8 @@ def test_server_queen_shadow_and_red_compensation_stay_outside_capacity_sinks(
         create_specialist_principal=lambda _plan: events.append("specialist"),
         issue_grant=lambda _plan: events.append("grant"),
         reserve_admission=lambda _plan: events.append("admission"),
-        execute_assignment=lambda _plan: events.append("assignment") or {"status": "unexpected"},
+        execute_assignment=lambda _plan: events.append("assignment")
+        or {"status": "unexpected"},
         compensate=lambda name, *_args: events.append(f"compensate:{name}"),
     )
 
@@ -665,7 +737,10 @@ def test_server_lease_executor_rejects_changed_or_non_executing_binding() -> Non
     lease = {"state": "unclaimed", "held_by_this_server": False, "lease_id": None}
     called: list[bool] = []
     executor = build_server_lease_executor(
-        operations={"hive_assignment_callback": lambda *_args: called.append(True) or {"status": "ok"}},
+        operations={
+            "hive_assignment_callback": lambda *_args: called.append(True)
+            or {"status": "ok"}
+        },
         lease_reader=lambda _agent: lease,
     )
     lease["state"] = "held"
@@ -682,7 +757,9 @@ def test_server_lease_executor_pins_a_claimed_lease_id() -> None:
     record = replace(record, lease_context=LeaseBinding("claimed", "lease-expected"))
     lease = {"state": "held", "held_by_this_server": True, "lease_id": "lease-other"}
     executor = build_server_lease_executor(
-        operations={"hive_assignment_callback": lambda *_args: {"status": "must-not-run"}},
+        operations={
+            "hive_assignment_callback": lambda *_args: {"status": "must-not-run"}
+        },
         lease_reader=lambda _agent: lease,
     )
 
@@ -692,7 +769,9 @@ def test_server_lease_executor_pins_a_claimed_lease_id() -> None:
 
 def test_runtime_gate_exception_and_unknown_completion_fail_closed() -> None:
     gates = allow_all([])
-    gates["scope"] = lambda _record: (_ for _ in ()).throw(RuntimeError("scope unavailable"))
+    gates["scope"] = lambda _record: (_ for _ in ()).throw(
+        RuntimeError("scope unavailable")
+    )
     runtime = ServerAdmissionRuntime(
         gates,
         execution_completed=lambda _record: "yes",
@@ -702,7 +781,10 @@ def test_runtime_gate_exception_and_unknown_completion_fail_closed() -> None:
     record = revalidating_record()
 
     assert runtime.revalidate(record) is False
-    assert runtime.last_failure() == {"allowed": False, "reason_code": "scope_gate_unavailable"}
+    assert runtime.last_failure() == {
+        "allowed": False,
+        "reason_code": "scope_gate_unavailable",
+    }
     assert runtime.execution_completed(record) is False
 
 

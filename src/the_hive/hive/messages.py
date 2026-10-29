@@ -14,7 +14,12 @@ import hashlib
 import json
 from types import MappingProxyType
 
-from the_hive.hive.types import DispatchPriority, HiveValidationError, validate_identifier, validate_utc_datetime
+from the_hive.hive.types import (
+    DispatchPriority,
+    HiveValidationError,
+    validate_identifier,
+    validate_utc_datetime,
+)
 
 
 MESSAGE_TYPES = frozenset(
@@ -42,11 +47,23 @@ MESSAGE_TYPES = frozenset(
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_TEXT = 4096
 MAX_LIST = 128
-REPORT_MESSAGE_TYPES = frozenset({"progress.report", "result.report", "decision.request", "escalation", "completion"})
-REPORT_STATUSES = frozenset({
-    "planned", "queued", "executing", "integrating", "completed", "blocked", "decision_required",
-    "failed", "paused", "unknown",
-})
+REPORT_MESSAGE_TYPES = frozenset(
+    {"progress.report", "result.report", "decision.request", "escalation", "completion"}
+)
+REPORT_STATUSES = frozenset(
+    {
+        "planned",
+        "queued",
+        "executing",
+        "integrating",
+        "completed",
+        "blocked",
+        "decision_required",
+        "failed",
+        "paused",
+        "unknown",
+    }
+)
 
 
 class HiveMessageError(ValueError):
@@ -86,7 +103,9 @@ def _mapping(value: object, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise HiveMessageError(f"invalid_{field}")
     try:
-        encoded = json.dumps(dict(value), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        encoded = json.dumps(
+            dict(value), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
     except (TypeError, ValueError, RecursionError) as exc:
         raise HiveMessageError(f"invalid_{field}") from exc
     if len(encoded.encode("utf-8")) > MAX_MESSAGE_BYTES:
@@ -115,7 +134,11 @@ class AuthorizationEvidence:
     def __post_init__(self) -> None:
         _id(self.grant_id, "grant")
         _text(self.scope_digest, "scope_digest", maximum=192)
-        if isinstance(self.principal_version, bool) or not isinstance(self.principal_version, int) or self.principal_version < 1:
+        if (
+            isinstance(self.principal_version, bool)
+            or not isinstance(self.principal_version, int)
+            or self.principal_version < 1
+        ):
             raise HiveMessageError("invalid_principal_version")
 
 
@@ -147,7 +170,9 @@ class HiveMessage:
             raise HiveMessageError("message_self_causation")
         if self.message_type not in MESSAGE_TYPES:
             raise HiveMessageError("unknown_message_type")
-        if not isinstance(self.sender, PrincipalReference) or not isinstance(self.recipient, PrincipalReference):
+        if not isinstance(self.sender, PrincipalReference) or not isinstance(
+            self.recipient, PrincipalReference
+        ):
             raise HiveMessageError("invalid_message_principal")
         _optional_id(self.repo_id, "repo")
         _optional_id(self.dispatch_id, "dispatch")
@@ -173,8 +198,14 @@ class HiveMessage:
             "correlation_id": self.correlation_id,
             "causation_id": self.causation_id,
             "message_type": self.message_type,
-            "sender": {"principal_id": self.sender.principal_id, "class_id": self.sender.class_id},
-            "recipient": {"principal_id": self.recipient.principal_id, "class_id": self.recipient.class_id},
+            "sender": {
+                "principal_id": self.sender.principal_id,
+                "class_id": self.sender.class_id,
+            },
+            "recipient": {
+                "principal_id": self.recipient.principal_id,
+                "class_id": self.recipient.class_id,
+            },
             "repo_id": self.repo_id,
             "dispatch_id": self.dispatch_id,
             "workpackage_id": self.workpackage_id,
@@ -196,21 +227,47 @@ def validate_message(payload: Mapping[str, object]) -> HiveMessage:
     if not isinstance(payload, Mapping):
         raise HiveMessageError("invalid_message")
     allowed = {
-        "schema_version", "message_id", "correlation_id", "causation_id", "message_type", "sender", "recipient",
-        "repo_id", "dispatch_id", "workpackage_id", "dispatch_priority", "created_at_utc", "expires_at_utc",
-        "authorization", "payload", "raw_output",
+        "schema_version",
+        "message_id",
+        "correlation_id",
+        "causation_id",
+        "message_type",
+        "sender",
+        "recipient",
+        "repo_id",
+        "dispatch_id",
+        "workpackage_id",
+        "dispatch_priority",
+        "created_at_utc",
+        "expires_at_utc",
+        "authorization",
+        "payload",
+        "raw_output",
     }
-    if set(payload) - allowed or payload.get("raw_output") not in {None, "not_returned"}:
+    if set(payload) - allowed or payload.get("raw_output") not in {
+        None,
+        "not_returned",
+    }:
         raise HiveMessageError("invalid_message_fields")
     try:
         sender_raw = payload["sender"]
         recipient_raw = payload["recipient"]
         auth_raw = payload["authorization"]
-        if not isinstance(sender_raw, Mapping) or set(sender_raw) != {"principal_id", "class_id"}:
+        if not isinstance(sender_raw, Mapping) or set(sender_raw) != {
+            "principal_id",
+            "class_id",
+        }:
             raise HiveMessageError("invalid_message_sender")
-        if not isinstance(recipient_raw, Mapping) or set(recipient_raw) != {"principal_id", "class_id"}:
+        if not isinstance(recipient_raw, Mapping) or set(recipient_raw) != {
+            "principal_id",
+            "class_id",
+        }:
             raise HiveMessageError("invalid_message_recipient")
-        if not isinstance(auth_raw, Mapping) or set(auth_raw) != {"grant_id", "scope_digest", "principal_version"}:
+        if not isinstance(auth_raw, Mapping) or set(auth_raw) != {
+            "grant_id",
+            "scope_digest",
+            "principal_version",
+        }:
             raise HiveMessageError("invalid_authorization")
         created = _parse_time(payload["created_at_utc"], "message_timestamp")
         expires = _parse_time(payload["expires_at_utc"], "message_expiry")
@@ -221,14 +278,20 @@ def validate_message(payload: Mapping[str, object]) -> HiveMessage:
             payload.get("causation_id"),
             payload["message_type"],
             PrincipalReference(sender_raw["principal_id"], sender_raw["class_id"]),
-            PrincipalReference(recipient_raw["principal_id"], recipient_raw["class_id"]),
+            PrincipalReference(
+                recipient_raw["principal_id"], recipient_raw["class_id"]
+            ),
             payload.get("repo_id"),
             payload.get("dispatch_id"),
             payload.get("workpackage_id"),
             DispatchPriority(payload["dispatch_priority"]),
             created,
             expires,
-            AuthorizationEvidence(auth_raw["grant_id"], auth_raw["scope_digest"], auth_raw["principal_version"]),
+            AuthorizationEvidence(
+                auth_raw["grant_id"],
+                auth_raw["scope_digest"],
+                auth_raw["principal_version"],
+            ),
             _mapping(payload.get("payload", {}), "payload"),
         )
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
@@ -265,9 +328,14 @@ def _report_status(message: HiveMessage) -> str:
 def record_child_report(message: HiveMessage) -> Mapping[str, object]:
     """Reduce one child report to bounded, payload-free parent metadata."""
 
-    if not isinstance(message, HiveMessage) or message.message_type not in REPORT_MESSAGE_TYPES:
+    if (
+        not isinstance(message, HiveMessage)
+        or message.message_type not in REPORT_MESSAGE_TYPES
+    ):
         raise HiveMessageError("invalid_child_report")
-    encoded = json.dumps(dict(message.payload), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        dict(message.payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
     status = _report_status(message)
     return {
         "message_id": message.message_id,
@@ -281,8 +349,10 @@ def record_child_report(message: HiveMessage) -> Mapping[str, object]:
         "dispatch_id": message.dispatch_id,
         "workpackage_id": message.workpackage_id,
         "status": status,
-        "blocked": status in {"blocked", "failed", "decision_required"} or message.message_type == "escalation",
-        "payload_digest": "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "blocked": status in {"blocked", "failed", "decision_required"}
+        or message.message_type == "escalation",
+        "payload_digest": "sha256:"
+        + hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
         "raw_output": "not_returned",
     }
 

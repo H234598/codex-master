@@ -33,7 +33,9 @@ _STATUS_RANK = {
 MAX_AGGREGATE_REPORTS = 256
 
 
-def _runtime_evidence(runtime_evidence: HiveRuntimeEvidence | None) -> HiveRuntimeEvidence:
+def _runtime_evidence(
+    runtime_evidence: HiveRuntimeEvidence | None,
+) -> HiveRuntimeEvidence:
     if runtime_evidence is None:
         return read_hive_runtime_evidence()
     if not isinstance(runtime_evidence, HiveRuntimeEvidence):
@@ -77,7 +79,10 @@ def hive_status(
         if counts is None
         else dict(counts)
     )
-    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values.values()):
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in values.values()
+    ):
         raise ValueError("invalid_hive_counts")
     # The argument is retained for compatibility but cannot override runtime evidence.
     readiness = _global_pilot_readiness(
@@ -86,7 +91,11 @@ def hive_status(
     return {
         "schema_version": evidence.schema_version,
         "mode": evidence.mode,
-        "counts": {key: values[key] for key in sorted(values) if isinstance(key, str) and len(key) <= 64},
+        "counts": {
+            key: values[key]
+            for key in sorted(values)
+            if isinstance(key, str) and len(key) <= 64
+        },
         "authority": evidence.authority,
         "checks": evidence.checks,
         "repository": evidence.repository,
@@ -103,36 +112,85 @@ def hive_status(
 
 
 def godbee_status() -> Mapping[str, object]:
-    return {"principal_class": "gottbiene", "direct_repository_writes": False, "open_requests": 0, "raw_output": "not_returned"}
+    return {
+        "principal_class": "gottbiene",
+        "direct_repository_writes": False,
+        "open_requests": 0,
+        "raw_output": "not_returned",
+    }
 
 
-def queen_list(*, offset: int, limit: int, registry: PrincipalRegistry | None = None) -> Mapping[str, object]:
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or isinstance(limit, bool) or not 1 <= limit <= 256:
+def queen_list(
+    *, offset: int, limit: int, registry: PrincipalRegistry | None = None
+) -> Mapping[str, object]:
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or isinstance(limit, bool)
+        or not 1 <= limit <= 256
+    ):
         raise ValueError("invalid_status_pagination")
     values = registry.list(offset=offset, limit=limit) if registry is not None else ()
-    return {"items": [item.public() for item in values if item.class_id in {"koenigin", "queen"}], "offset": offset, "limit": limit, "raw_output": "not_returned"}
+    return {
+        "items": [
+            item.public() for item in values if item.class_id in {"koenigin", "queen"}
+        ],
+        "offset": offset,
+        "limit": limit,
+        "raw_output": "not_returned",
+    }
 
 
-def queen_status(queen_id: str, *, registry: PrincipalRegistry | None = None) -> Mapping[str, object]:
+def queen_status(
+    queen_id: str, *, registry: PrincipalRegistry | None = None
+) -> Mapping[str, object]:
     if registry is None:
         return {"queen_id": queen_id, "state": "unknown", "raw_output": "not_returned"}
     principal = registry.get(queen_id)
     if principal.class_id not in {"koenigin", "queen"}:
         raise ValueError("not_a_queen")
-    return {"principal_id": principal.principal_id, "class_id": principal.class_id, "repo_id": principal.repo_id, "state": principal.state, "raw_output": "not_returned"}
+    return {
+        "principal_id": principal.principal_id,
+        "class_id": principal.class_id,
+        "repo_id": principal.repo_id,
+        "state": principal.state,
+        "raw_output": "not_returned",
+    }
 
 
-def queue_status(*, offset: int, limit: int, items: Sequence[Mapping[str, object]] = ()) -> Mapping[str, object]:
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or isinstance(limit, bool) or not 1 <= limit <= 256:
+def queue_status(
+    *, offset: int, limit: int, items: Sequence[Mapping[str, object]] = ()
+) -> Mapping[str, object]:
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or isinstance(limit, bool)
+        or not 1 <= limit <= 256
+    ):
         raise ValueError("invalid_status_pagination")
     safe = tuple(item for item in items if isinstance(item, Mapping))
-    return {"items": [dict(item) for item in safe[offset : offset + limit]], "offset": offset, "limit": limit, "raw_output": "not_returned"}
+    return {
+        "items": [dict(item) for item in safe[offset : offset + limit]],
+        "offset": offset,
+        "limit": limit,
+        "raw_output": "not_returned",
+    }
 
 
-def admission_status(admission_id: str, *, state: str = "unknown") -> Mapping[str, object]:
+def admission_status(
+    admission_id: str, *, state: str = "unknown"
+) -> Mapping[str, object]:
     if not isinstance(admission_id, str) or not admission_id:
         raise ValueError("invalid_admission_id")
-    return {"admission_id": admission_id, "state": state, "account_key": "not_returned", "scope": "not_returned", "raw_output": "not_returned"}
+    return {
+        "admission_id": admission_id,
+        "state": state,
+        "account_key": "not_returned",
+        "scope": "not_returned",
+        "raw_output": "not_returned",
+    }
 
 
 def hive_doctor(
@@ -169,7 +227,11 @@ def hive_doctor(
 
 
 def selection_status() -> Mapping[str, object]:
-    return {"mode": "preview_only", "eligible_candidates": 0, "raw_output": "not_returned"}
+    return {
+        "mode": "preview_only",
+        "eligible_candidates": 0,
+        "raw_output": "not_returned",
+    }
 
 
 def proactive_anchor_status(
@@ -179,7 +241,18 @@ def proactive_anchor_status(
 
     if safety is None:
         safety = ProactiveAnchorSafetyStatus(
-            False, False, False, True, False, False, False, False, False, False, False, False
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
         )
     if not isinstance(safety, ProactiveAnchorSafetyStatus):
         raise ValueError("invalid_proactive_safety_status")
@@ -198,7 +271,11 @@ def _aggregate_reports(
     *,
     field: str,
 ) -> Mapping[str, object]:
-    if not isinstance(scope_id, str) or not 1 <= len(scope_id) <= 128 or any(ord(char) < 32 for char in scope_id):
+    if (
+        not isinstance(scope_id, str)
+        or not 1 <= len(scope_id) <= 128
+        or any(ord(char) < 32 for char in scope_id)
+    ):
         raise ValueError("invalid_aggregate_scope")
     if not isinstance(reports, (tuple, list)) or len(reports) > MAX_AGGREGATE_REPORTS:
         raise ValueError("invalid_aggregate_reports")
@@ -212,13 +289,25 @@ def _aggregate_reports(
     statuses = Counter(
         item["status"] for item in reduced if isinstance(item.get("status"), str)
     )
-    status = max(statuses, key=lambda value: (_STATUS_RANK.get(value, 0), value), default="unknown")
-    correlations = sorted({
-        value for value in (item.get("correlation_id") for item in reduced) if isinstance(value, str)
-    })
-    digests = sorted({
-        value for value in (item.get("payload_digest") for item in reduced) if isinstance(value, str)
-    })
+    status = max(
+        statuses,
+        key=lambda value: (_STATUS_RANK.get(value, 0), value),
+        default="unknown",
+    )
+    correlations = sorted(
+        {
+            value
+            for value in (item.get("correlation_id") for item in reduced)
+            if isinstance(value, str)
+        }
+    )
+    digests = sorted(
+        {
+            value
+            for value in (item.get("payload_digest") for item in reduced)
+            if isinstance(value, str)
+        }
+    )
     return {
         "scope": scope,
         f"{scope}_id": scope_id,
@@ -226,7 +315,9 @@ def _aggregate_reports(
         "report_count": len(reduced),
         "status_counts": {key: statuses[key] for key in sorted(statuses)},
         "blocked_count": sum(1 for item in reduced if item.get("blocked") is True),
-        "escalation_count": sum(1 for item in reduced if item.get("message_type") == "escalation"),
+        "escalation_count": sum(
+            1 for item in reduced if item.get("message_type") == "escalation"
+        ),
         "correlation_ids": correlations[:MAX_AGGREGATE_REPORTS],
         "payload_digest_count": len(digests),
         "raw_output": "not_returned",
@@ -236,7 +327,9 @@ def _aggregate_reports(
 def aggregate_teamlead_status(
     workpackage_id: str, reports: Sequence[HiveMessage] = ()
 ) -> Mapping[str, object]:
-    return _aggregate_reports("workpackage", workpackage_id, reports, field="workpackage_id")
+    return _aggregate_reports(
+        "workpackage", workpackage_id, reports, field="workpackage_id"
+    )
 
 
 def aggregate_queen_status(

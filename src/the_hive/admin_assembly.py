@@ -388,18 +388,20 @@ def provision_agent_bindings_from_credential(
                 seen_enabled_spkis.add(spki)
             seen_refs.add(ref)
             desired.append(
-                ({
-                    "ref": record["ref"],
-                    "label": record["label"],
-                    "role": record["role"],
-                    "capabilities": record["capabilities"],
-                },
-                AgentBindingV1(
-                    cast(str, record["ref"]),
-                    cast(str, record["client_spki_sha256"]),
-                    cast(int, record["lease_epoch"]),
-                    cast(bool, record["enabled"]),
-                ))
+                (
+                    {
+                        "ref": record["ref"],
+                        "label": record["label"],
+                        "role": record["role"],
+                        "capabilities": record["capabilities"],
+                    },
+                    AgentBindingV1(
+                        cast(str, record["ref"]),
+                        cast(str, record["client_spki_sha256"]),
+                        cast(int, record["lease_epoch"]),
+                        cast(bool, record["enabled"]),
+                    ),
+                )
             )
         registry.synchronize_agent_bindings(tuple(desired))
     except (HostRegistryError, TypeError, ValueError):

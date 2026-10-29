@@ -68,7 +68,14 @@ def _repo(tmp_path: Path) -> Path:
     root.mkdir()
     subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
-        ["git", "-C", str(root), "config", "remote.origin.url", "https://github.com/example/repo.git"],
+        [
+            "git",
+            "-C",
+            str(root),
+            "config",
+            "remote.origin.url",
+            "https://github.com/example/repo.git",
+        ],
         check=True,
     )
     return root
@@ -98,11 +105,43 @@ def _authority(tmp_path: Path) -> tuple[AuthorityEngine, RepositoryRegistry]:
     state = HiveStateStore(tmp_path / "state")
     principals = PrincipalRegistry(state)
     principals.create(_principal("godbee-main", "gottbiene", None, None, "global"))
-    principals.create(_principal("queen-codex-master", "koenigin", "godbee-main", "codex-master", "repository"))
-    principals.create(_principal("teamlead-one", "teamleiterin", "queen-codex-master", "codex-master", "repository"))
-    principals.create(_principal("specialist-one", "spezialistin", "teamlead-one", "codex-master", "repository"))
+    principals.create(
+        _principal(
+            "queen-codex-master",
+            "koenigin",
+            "godbee-main",
+            "codex-master",
+            "repository",
+        )
+    )
+    principals.create(
+        _principal(
+            "teamlead-one",
+            "teamleiterin",
+            "queen-codex-master",
+            "codex-master",
+            "repository",
+        )
+    )
+    principals.create(
+        _principal(
+            "specialist-one",
+            "spezialistin",
+            "teamlead-one",
+            "codex-master",
+            "repository",
+        )
+    )
     repositories = RepositoryRegistry(
-        [RepositoryBinding("codex-master", "https://github.com/example/repo.git", _repo(tmp_path), "main", DIGEST)]
+        [
+            RepositoryBinding(
+                "codex-master",
+                "https://github.com/example/repo.git",
+                _repo(tmp_path),
+                "main",
+                DIGEST,
+            )
+        ]
     )
     authority = AuthorityEngine(
         AuthorityContext(
@@ -243,12 +282,16 @@ def test_assignment_binding_materializes_only_a_planned_record(tmp_path: Path) -
     assert authority.get_grant("grant-one").status == "active"
     assert "hmac:account" not in str(record.public())
 
-    assert _server_hive_authority_gate(authority, record, "hive.specialist.assign").public() == {
+    assert _server_hive_authority_gate(
+        authority, record, "hive.specialist.assign"
+    ).public() == {
         "allowed": True,
         "reason_code": "grant_verified",
     }
     tampered = replace(record, grant_digest="sha256:" + "f" * 64)
-    assert _server_hive_authority_gate(authority, tampered, "hive.specialist.assign").public() == {
+    assert _server_hive_authority_gate(
+        authority, tampered, "hive.specialist.assign"
+    ).public() == {
         "allowed": False,
         "reason_code": "grant_digest_mismatch",
     }
@@ -320,7 +363,9 @@ def test_server_hive_assignment_bridge_requires_explicit_pool_authority_reader(
             budget_key="standard",
             expected_usage_micro=1,
             priority=AdmissionPriority("DP1", "selection"),
-            operations={"hive_assignment_callback": lambda *_args: {"status": "executed"}},
+            operations={
+                "hive_assignment_callback": lambda *_args: {"status": "executed"}
+            },
             now=lambda: NOW,
         )
 
@@ -337,7 +382,9 @@ def test_server_hive_assignment_bridge_requires_explicit_pool_authority_reader(
             budget_key="standard",
             expected_usage_micro=1,
             priority=AdmissionPriority("DP1", "selection"),
-            operations={"hive_assignment_callback": lambda *_args: {"status": "executed"}},
+            operations={
+                "hive_assignment_callback": lambda *_args: {"status": "executed"}
+            },
             pool_authority_reader=None,  # type: ignore[arg-type]
             now=lambda: NOW,
         )
@@ -386,9 +433,7 @@ def test_server_hive_assignment_execution_bridge_delegates_scope_digest_once(
     expected = repositories.scope_digest("codex-master", "write", ("src/task.py",))
     calls: list[tuple[str, str, tuple[str, ...]]] = []
 
-    def counted_scope_digest(
-        repo_id: str, mode: str, paths: tuple[str, ...]
-    ) -> str:
+    def counted_scope_digest(repo_id: str, mode: str, paths: tuple[str, ...]) -> str:
         calls.append((repo_id, mode, paths))
         return expected
 
@@ -727,28 +772,56 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
     assert json.loads(completed.stdout) == {"ok": True}
 
 
-def test_assignment_binding_rejects_shadow_and_mismatched_workpackage(tmp_path: Path) -> None:
+def test_assignment_binding_rejects_shadow_and_mismatched_workpackage(
+    tmp_path: Path,
+) -> None:
     authority, repositories = _authority(tmp_path)
     grant = _grant(authority)
     with pytest.raises(HiveAdmissionError, match="assignment_shadow_only"):
         create_assignment_admission(
-            plan=_plan(mode="shadow"), workpackage=_workpackage(), intent=_intent(), grant=grant,
-            authority=authority, repositories=repositories, admission_id="admission-shadow",
-            lease_context=LeaseBinding("claimed"), budget_key="standard", expected_usage_micro=1,
-            priority=AdmissionPriority("DP1", "selection"), now=NOW,
+            plan=_plan(mode="shadow"),
+            workpackage=_workpackage(),
+            intent=_intent(),
+            grant=grant,
+            authority=authority,
+            repositories=repositories,
+            admission_id="admission-shadow",
+            lease_context=LeaseBinding("claimed"),
+            budget_key="standard",
+            expected_usage_micro=1,
+            priority=AdmissionPriority("DP1", "selection"),
+            now=NOW,
         )
 
     mismatched = WorkPackage(
-        "workpackage-other", "dispatch-one", "teamlead-one", "Implement bounded task", ("src",),
-        ("src/task.py",), ("tests pass",), ("pytest",), "teamlead_commit", (), {},
-        state="admission_planned", version=7,
+        "workpackage-other",
+        "dispatch-one",
+        "teamlead-one",
+        "Implement bounded task",
+        ("src",),
+        ("src/task.py",),
+        ("tests pass",),
+        ("pytest",),
+        "teamlead_commit",
+        (),
+        {},
+        state="admission_planned",
+        version=7,
     )
     with pytest.raises(HiveAdmissionError, match="workpackage_binding_mismatch"):
         create_assignment_admission(
-            plan=_plan(), workpackage=mismatched, intent=_intent(), grant=grant,
-            authority=authority, repositories=repositories, admission_id="admission-mismatch",
-            lease_context=LeaseBinding("claimed"), budget_key="standard", expected_usage_micro=1,
-            priority=AdmissionPriority("DP1", "selection"), now=NOW,
+            plan=_plan(),
+            workpackage=mismatched,
+            intent=_intent(),
+            grant=grant,
+            authority=authority,
+            repositories=repositories,
+            admission_id="admission-mismatch",
+            lease_context=LeaseBinding("claimed"),
+            budget_key="standard",
+            expected_usage_micro=1,
+            priority=AdmissionPriority("DP1", "selection"),
+            now=NOW,
         )
 
 
@@ -757,23 +830,50 @@ def test_assignment_binding_rejects_changed_grant_and_scope(tmp_path: Path) -> N
     grant = _grant(authority)
     with pytest.raises(HiveAdmissionError, match="grant_binding_mismatch"):
         create_assignment_admission(
-            plan=_plan(), workpackage=_workpackage(), intent=_intent(),
+            plan=_plan(),
+            workpackage=_workpackage(),
+            intent=_intent(),
             grant=grant.__class__(
-                grant.schema_version, grant.grant_id, grant.issuer_principal_id, "other-specialist",
-                grant.repo_id, grant.dispatch_id, grant.capabilities, grant.scope, grant.write_paths,
-                grant.max_delegation_depth, grant.issued_at_utc, grant.expires_at_utc,
-                grant.nonce_digest, grant.request_digest, grant.status, grant.version,
+                grant.schema_version,
+                grant.grant_id,
+                grant.issuer_principal_id,
+                "other-specialist",
+                grant.repo_id,
+                grant.dispatch_id,
+                grant.capabilities,
+                grant.scope,
+                grant.write_paths,
+                grant.max_delegation_depth,
+                grant.issued_at_utc,
+                grant.expires_at_utc,
+                grant.nonce_digest,
+                grant.request_digest,
+                grant.status,
+                grant.version,
             ),
-            authority=authority, repositories=repositories, admission_id="admission-bad-grant",
-            lease_context=LeaseBinding("claimed"), budget_key="standard", expected_usage_micro=1,
-            priority=AdmissionPriority("DP1", "selection"), now=NOW,
+            authority=authority,
+            repositories=repositories,
+            admission_id="admission-bad-grant",
+            lease_context=LeaseBinding("claimed"),
+            budget_key="standard",
+            expected_usage_micro=1,
+            priority=AdmissionPriority("DP1", "selection"),
+            now=NOW,
         )
 
     authority.revoke_grant("grant-one", expected_version=grant.version)
     with pytest.raises(HiveAdmissionError, match="grant_state_changed|grant_inactive"):
         create_assignment_admission(
-            plan=_plan(), workpackage=_workpackage(), intent=_intent(), grant=grant,
-            authority=authority, repositories=repositories, admission_id="admission-revoked",
-            lease_context=LeaseBinding("claimed"), budget_key="standard", expected_usage_micro=1,
-            priority=AdmissionPriority("DP1", "selection"), now=NOW,
+            plan=_plan(),
+            workpackage=_workpackage(),
+            intent=_intent(),
+            grant=grant,
+            authority=authority,
+            repositories=repositories,
+            admission_id="admission-revoked",
+            lease_context=LeaseBinding("claimed"),
+            budget_key="standard",
+            expected_usage_micro=1,
+            priority=AdmissionPriority("DP1", "selection"),
+            now=NOW,
         )

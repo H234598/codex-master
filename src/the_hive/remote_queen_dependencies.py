@@ -157,9 +157,7 @@ class PythonDistributionPinV1:
             or not self.distribution
             or not _valid_pin_version(self.version)
             or not _exact(self.imports, tuple)
-            or not all(
-                _exact(item, PythonImportIdV1) for item in self.imports
-            )
+            or not all(_exact(item, PythonImportIdV1) for item in self.imports)
             or not _unique(tuple(self.imports))
             or self.distribution not in _DISTRIBUTION_IMPORTS
             or self.imports != _DISTRIBUTION_IMPORTS[self.distribution]
@@ -194,27 +192,22 @@ class PythonEnvironmentFactV1:
             not _exact(self.ownership, DependencyOwnershipV1)
             or (self.generation is not None and not _exact(self.generation, str))
             or (
-                self.python_version is not None
-                and not _exact(self.python_version, str)
+                self.python_version is not None and not _exact(self.python_version, str)
             )
             or not _exact(self.distributions, tuple)
             or not _exact(self.imports_available, tuple)
             or not all(
-                _exact(item, PythonDistributionPinV1)
-                for item in self.distributions
+                _exact(item, PythonDistributionPinV1) for item in self.distributions
             )
             or not all(
-                _exact(item, PythonImportIdV1)
-                for item in self.imports_available
+                _exact(item, PythonImportIdV1) for item in self.imports_available
             )
             or not _unique(tuple(item.distribution for item in self.distributions))
             or not _unique(tuple(self.imports_available))
         ):
             raise _inconsistent()
         if self.ownership is DependencyOwnershipV1.ABSENT and (
-            self.generation is not None
-            or self.distributions
-            or self.imports_available
+            self.generation is not None or self.distributions or self.imports_available
         ):
             raise _inconsistent()
         if self.ownership is DependencyOwnershipV1.OWNED and (
@@ -273,9 +266,7 @@ class RemoteQueenDependencyManifestV1:
                 tuple(item.distribution for item in self.python_distributions)
             )
             or not _exact(self.required_imports, tuple)
-            or not all(
-                _exact(item, PythonImportIdV1) for item in self.required_imports
-            )
+            or not all(_exact(item, PythonImportIdV1) for item in self.required_imports)
             or not _unique(tuple(self.required_imports))
             or not _exact(self.google_identity_required, bool)
             or not _exact(self.manifest_digest, str)
@@ -319,9 +310,7 @@ class RemoteQueenDependencyPlanV1:
             or not _exact(self.steps, tuple)
             or not all(_exact(item, DependencyPlanStepV1) for item in self.steps)
             or not _exact(self.rollback_packages, tuple)
-            or not all(
-                _exact(item, str) and item for item in self.rollback_packages
-            )
+            or not all(_exact(item, str) and item for item in self.rollback_packages)
             or not _unique(tuple(self.rollback_packages))
             or (
                 self.rollback_environment_generation is not None
@@ -440,9 +429,7 @@ class RemoteQueenDependencyOperations(Protocol):
         self, manifest: RemoteQueenDependencyManifestV1
     ) -> DependencySnapshotV1: ...
 
-    def apply(
-        self, plan: RemoteQueenDependencyPlanV1
-    ) -> DependencyApplyJournalV1: ...
+    def apply(self, plan: RemoteQueenDependencyPlanV1) -> DependencyApplyJournalV1: ...
 
     def rollback(
         self,
@@ -585,9 +572,7 @@ def _validate_manifest(manifest: RemoteQueenDependencyManifestV1) -> None:
     if canonical != manifest.python_distributions:
         raise _inconsistent()
     expected_imports = tuple(
-        import_id
-        for pin in canonical
-        for import_id in pin.imports
+        import_id for pin in canonical for import_id in pin.imports
     )
     if manifest.required_imports != expected_imports:
         raise _inconsistent()
@@ -678,8 +663,7 @@ def _snapshot_payload(snapshot: DependencySnapshotV1) -> dict[str, object]:
     return {
         "package_manager": snapshot.package_manager,
         "packages": [
-            {"name": item.name, "version": item.version}
-            for item in snapshot.packages
+            {"name": item.name, "version": item.version} for item in snapshot.packages
         ],
         "environment": {
             "ownership": snapshot.environment.ownership.value,
@@ -694,8 +678,7 @@ def _snapshot_payload(snapshot: DependencySnapshotV1) -> dict[str, object]:
                 for item in snapshot.environment.distributions
             ],
             "imports_available": [
-                import_id.value
-                for import_id in snapshot.environment.imports_available
+                import_id.value for import_id in snapshot.environment.imports_available
             ],
         },
         "noninteractive_sudo_available": snapshot.noninteractive_sudo_available,
@@ -981,8 +964,7 @@ def _validate_journal(
         or journal.manifest_digest != plan.manifest.manifest_digest
         or journal.plan_digest != plan.plan_digest
         or journal.installed_packages != plan.rollback_packages
-        or journal.prior_environment_generation
-        != plan.rollback_environment_generation
+        or journal.prior_environment_generation != plan.rollback_environment_generation
         or not _valid_digest(journal.resulting_snapshot_digest)
     ):
         raise _inconsistent()
@@ -1079,8 +1061,7 @@ def rollback_remote_queen_dependencies(
         raise _rollback_drift() from None
     if (
         _snapshot_digest(current) != journal.resulting_snapshot_digest
-        or current.environment.generation
-        != plan.manifest.desired_generation.generation
+        or current.environment.generation != plan.manifest.desired_generation.generation
     ):
         raise _rollback_drift()
     _rollback_operation(operations, plan, journal)

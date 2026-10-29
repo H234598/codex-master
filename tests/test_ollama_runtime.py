@@ -85,8 +85,13 @@ class FakeRuntime:
         return self.listener_matches
 
     def classify_running_identity(
-        self, unit_name: str, pid: int, control_group: str,
-        start_ticks: int, port: int, executable: object,
+        self,
+        unit_name: str,
+        pid: int,
+        control_group: str,
+        start_ticks: int,
+        port: int,
+        executable: object,
     ) -> str:
         if not self.process_up:
             return "absent"
@@ -118,9 +123,7 @@ class FakeRuntime:
     ) -> set[str] | None:
         assert pid == self.scope_pid
         assert port == 11435
-        assert re.fullmatch(
-            r"codex-master-ollama-[0-9a-f]{32}\.scope", unit_name
-        )
+        assert re.fullmatch(r"codex-master-ollama-[0-9a-f]{32}\.scope", unit_name)
         assert control_group == self.scope_control_group
         assert start_ticks == self.scope_start_ticks
         self.tag_probe_limits = (timeout_seconds, max_bytes)
@@ -208,13 +211,9 @@ def test_full_local_fleet_slice_is_idempotent_and_stops_only_failed_unit(
     first_plan = service.plan_ollama_instance(
         candidate("ollama-main"), expected_generation=1
     )
-    first = service.apply_ollama_instance(
-        first_plan.plan_id, expected_generation=1
-    )
+    first = service.apply_ollama_instance(first_plan.plan_id, expected_generation=1)
     reloaded = OllamaRegistryStore.for_test(registry_root).load()
-    retried = service.apply_ollama_instance(
-        first_plan.plan_id, expected_generation=1
-    )
+    retried = service.apply_ollama_instance(first_plan.plan_id, expected_generation=1)
 
     assert retried is first
     assert reloaded.generation == 2
@@ -231,9 +230,7 @@ def test_full_local_fleet_slice_is_idempotent_and_stops_only_failed_unit(
     )
     runtime.tags = {"llama-small"}
     with pytest.raises(FleetConflictError, match="ollama.instance_not_ready"):
-        service.apply_ollama_instance(
-            second_plan.plan_id, expected_generation=2
-        )
+        service.apply_ollama_instance(second_plan.plan_id, expected_generation=2)
 
     assert len(runtime.started) == 2
     assert [request.unit_name for request in runtime.stopped] == [  # type: ignore[attr-defined]
@@ -286,9 +283,7 @@ def valid_instance(
     )
 
 
-def valid_models(
-    *, qwen_installed: bool = True
-) -> tuple[OllamaModelV1, OllamaModelV1]:
+def valid_models(*, qwen_installed: bool = True) -> tuple[OllamaModelV1, OllamaModelV1]:
     return (
         OllamaModelV1(
             ref="llama",
@@ -374,9 +369,7 @@ def test_executable_must_be_regular_executable_and_not_mutable_by_other_users(
     executable.chmod(0o722)
 
     with pytest.raises(OllamaRuntimeError, match="resource.target_path_invalid"):
-        plan_from_registry(
-            valid_instance(tmp_path, ollama_executable=str(executable))
-        )
+        plan_from_registry(valid_instance(tmp_path, ollama_executable=str(executable)))
 
 
 def test_models_directory_must_be_private_or_administratively_owned(
@@ -418,7 +411,9 @@ def test_plan_pins_paths_and_maps_validated_cpu_profile(tmp_path: Path) -> None:
     assert plan.selected_provider_model_ids == ("provider/llama", "provider/qwen")
 
 
-def test_start_revalidates_pinned_executable_before_runtime_action(tmp_path: Path) -> None:
+def test_start_revalidates_pinned_executable_before_runtime_action(
+    tmp_path: Path,
+) -> None:
     runtime = FakeRuntime()
     plan = planned(tmp_path)
     executable = Path(plan.instance.ollama_executable)
@@ -697,7 +692,9 @@ def test_lane_is_not_ready_until_all_selected_models_answer(tmp_path: Path) -> N
     assert status.reason_codes == ("provider.model_unavailable",)
 
 
-def test_readiness_requires_process_scope_loopback_and_all_models(tmp_path: Path) -> None:
+def test_readiness_requires_process_scope_loopback_and_all_models(
+    tmp_path: Path,
+) -> None:
     runtime = FakeRuntime()
     active = running(tmp_path, runtime)
 
@@ -914,7 +911,9 @@ def test_executable_digest_rejects_concurrent_in_place_growth(
     def mutating_read(descriptor: int, size: int) -> bytes:
         nonlocal mutated
         data = real_read(descriptor, size)
-        if not mutated and os.readlink(f"/proc/self/fd/{descriptor}") == str(executable):
+        if not mutated and os.readlink(f"/proc/self/fd/{descriptor}") == str(
+            executable
+        ):
             mutated = True
             with executable.open("ab") as stream:
                 stream.write(b"# concurrent mutation\n")
@@ -948,9 +947,7 @@ def test_writable_non_sticky_path_ancestor_is_rejected(tmp_path: Path) -> None:
     executable = make_executable(unsafe / "ollama")
 
     with pytest.raises(OllamaRuntimeError, match="resource.target_path_invalid"):
-        plan_from_registry(
-            valid_instance(tmp_path, ollama_executable=str(executable))
-        )
+        plan_from_registry(valid_instance(tmp_path, ollama_executable=str(executable)))
 
 
 def test_owner_execute_bit_must_match_effective_uid(tmp_path: Path) -> None:
@@ -958,9 +955,7 @@ def test_owner_execute_bit_must_match_effective_uid(tmp_path: Path) -> None:
     executable.chmod(0o001)
 
     with pytest.raises(OllamaRuntimeError, match="resource.target_path_invalid"):
-        plan_from_registry(
-            valid_instance(tmp_path, ollama_executable=str(executable))
-        )
+        plan_from_registry(valid_instance(tmp_path, ollama_executable=str(executable)))
 
 
 def test_provider_model_ids_are_derived_from_complete_registry_models(
@@ -1019,9 +1014,7 @@ def test_public_adoption_strongly_validates_running_identity(tmp_path: Path) -> 
     runtime.listener_matches = False
     second = tmp_path / "second"
     second.mkdir()
-    with pytest.raises(
-        OllamaRuntimeError, match="provider.instance_identity_conflict"
-    ):
+    with pytest.raises(OllamaRuntimeError, match="provider.instance_identity_conflict"):
         adopt_running_instance(
             planned(second),
             unit_name=unit,
@@ -1098,13 +1091,19 @@ def test_system_runtime_checks_process_and_scope_identity(
     )
 
     assert runtime.process_running(FakeProcess(), 4343, 901) is True
-    assert runtime.scope_process_matches(
-        "codex-master-ollama-0123456789abcdef0123456789abcdef.scope",
-        4343,
-        "/user.slice/ollama.scope",
-        901,
-    ) is True
-    assert runtime.scope_process_matches("invalid", 4343, "/user.slice/ollama.scope", 901) is False
+    assert (
+        runtime.scope_process_matches(
+            "codex-master-ollama-0123456789abcdef0123456789abcdef.scope",
+            4343,
+            "/user.slice/ollama.scope",
+            901,
+        )
+        is True
+    )
+    assert (
+        runtime.scope_process_matches("invalid", 4343, "/user.slice/ollama.scope", 901)
+        is False
+    )
 
 
 def test_system_adoption_rejects_foreign_executable_and_final_pid_reuse(
@@ -1118,28 +1117,34 @@ def test_system_adoption_rejects_foreign_executable_and_final_pid_reuse(
     monkeypatch.setattr(
         ollama_runtime, "_process_executable_matches_evidence", lambda *_: False
     )
-    assert runtime.classify_running_identity(
-        "codex-master-ollama-" + "a" * 32 + ".scope",
-        4343,
-        "/user.slice/ollama.scope",
-        901,
-        11435,
-        evidence,
-    ) == "conflict"
+    assert (
+        runtime.classify_running_identity(
+            "codex-master-ollama-" + "a" * 32 + ".scope",
+            4343,
+            "/user.slice/ollama.scope",
+            901,
+            11435,
+            evidence,
+        )
+        == "conflict"
+    )
 
     monkeypatch.setattr(
         ollama_runtime, "_process_executable_matches_evidence", lambda *_: True
     )
     observations = iter((expected, (4343, "/user.slice/ollama.scope", 902)))
     monkeypatch.setattr(runtime, "_scope_observation", lambda _unit: next(observations))
-    assert runtime.classify_running_identity(
-        "codex-master-ollama-" + "a" * 32 + ".scope",
-        4343,
-        "/user.slice/ollama.scope",
-        901,
-        11435,
-        evidence,
-    ) == "conflict"
+    assert (
+        runtime.classify_running_identity(
+            "codex-master-ollama-" + "a" * 32 + ".scope",
+            4343,
+            "/user.slice/ollama.scope",
+            901,
+            11435,
+            evidence,
+        )
+        == "conflict"
+    )
 
 
 def test_system_runtime_cleanup_stops_only_recorded_scope(
@@ -1178,7 +1183,9 @@ def test_system_runtime_stop_and_pinned_executable_contracts(
 
     def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         calls.append((args, kwargs))
-        return subprocess.CompletedProcess(args=(), returncode=0, stdout=b"", stderr=b"")
+        return subprocess.CompletedProcess(
+            args=(), returncode=0, stdout=b"", stderr=b""
+        )
 
     monkeypatch.setattr(subprocess, "run", run)
     SystemOllamaRuntime()._stop_unit(
@@ -1194,7 +1201,9 @@ def test_system_runtime_stop_and_pinned_executable_contracts(
     )
     assert calls[0][1]["timeout"] == 5.0
 
-    monkeypatch.setattr(os, "readlink", lambda _path: "/memfd:codex-master-ollama-executable")
+    monkeypatch.setattr(
+        os, "readlink", lambda _path: "/memfd:codex-master-ollama-executable"
+    )
     assert ollama_runtime._process_executable_is_pinned(4343) is True
     monkeypatch.setattr(os, "readlink", lambda _path: "/usr/bin/ollama")
     assert ollama_runtime._process_executable_is_pinned(4343) is False
@@ -1216,7 +1225,9 @@ def test_system_scope_identity_uses_single_cgroup_procs_pid(
     )
     monkeypatch.setattr(ollama_runtime, "CGROUP_ROOT", tmp_path)
     monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: result)
-    monkeypatch.setattr(ollama_runtime, "_process_control_group", lambda _pid: control_group)
+    monkeypatch.setattr(
+        ollama_runtime, "_process_control_group", lambda _pid: control_group
+    )
     monkeypatch.setattr(ollama_runtime, "_process_start_ticks", lambda _pid: 901)
 
     assert SystemOllamaRuntime()._scope_observation(unit) == (
@@ -1313,7 +1324,9 @@ def test_partial_start_is_cleaned_on_baseexception_before_running_registration(
             raise KeyboardInterrupt
         return b"s" * length
 
-    monkeypatch.setattr(ollama_runtime.secrets, "token_bytes", interrupt_running_provenance)
+    monkeypatch.setattr(
+        ollama_runtime.secrets, "token_bytes", interrupt_running_provenance
+    )
 
     with pytest.raises(KeyboardInterrupt):
         start_local_instance(plan, runtime=runtime)
@@ -1358,10 +1371,7 @@ def test_exec_helper_holds_validated_executable_and_models_fds_until_exec(
     assert observed["executable_inode"] != plan.executable.inode
     assert observed["executable_bytes"] == original_bytes
     assert observed["executable_seals"] == (
-        fcntl.F_SEAL_SEAL
-        | fcntl.F_SEAL_SHRINK
-        | fcntl.F_SEAL_GROW
-        | fcntl.F_SEAL_WRITE
+        fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
     )
     assert observed["models_inode"] == plan.models_directory.inode
     assert observed["argv"] == (plan.instance.ollama_executable, "serve")
@@ -1393,9 +1403,7 @@ def test_exec_helper_payload_round_trip_preserves_pinned_evidence(
     with pytest.raises(RuntimeError, match="helper intercepted"):
         ollama_runtime._run_exec_helper(payload)
 
-    assert observed == [
-        (plan.executable, plan.models_directory, plan.host, 11435)
-    ]
+    assert observed == [(plan.executable, plan.models_directory, plan.host, 11435)]
 
 
 def test_exec_helper_rejects_malformed_payload_with_code_only_error() -> None:
@@ -1550,15 +1558,18 @@ def test_http_probe_rejects_connected_server_owned_by_foreign_pid(
         runtime, monkeypatch, os.getppid()
     )
 
-    assert runtime.fetch_tags(
-        os.getppid(),
-        port,
-        unit_name=unit_name,
-        control_group=control_group,
-        start_ticks=start_ticks,
-        timeout_seconds=0.5,
-        max_bytes=64 * 1024,
-    ) is None
+    assert (
+        runtime.fetch_tags(
+            os.getppid(),
+            port,
+            unit_name=unit_name,
+            control_group=control_group,
+            start_ticks=start_ticks,
+            timeout_seconds=0.5,
+            max_bytes=64 * 1024,
+        )
+        is None
+    )
 
 
 def test_http_probe_rejects_reused_pid_identity_before_request_bytes(

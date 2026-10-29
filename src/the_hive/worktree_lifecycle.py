@@ -175,9 +175,15 @@ class UseLease:
             raise WorktreeLifecycleError("use_lease_invalid")
         if type(self.owner_process) is not ProcessIdentity:
             raise WorktreeLifecycleError("use_lease_invalid")
-        if self.runtime_process is not None and type(self.runtime_process) is not RuntimeProcessIdentity:
+        if (
+            self.runtime_process is not None
+            and type(self.runtime_process) is not RuntimeProcessIdentity
+        ):
             raise WorktreeLifecycleError("use_lease_invalid")
-        if self.runtime_scope is not None and type(self.runtime_scope) is not G5ScopeIdentity:
+        if (
+            self.runtime_scope is not None
+            and type(self.runtime_scope) is not G5ScopeIdentity
+        ):
             raise WorktreeLifecycleError("use_lease_invalid")
         _require_text(self.lease_id, code="use_lease_invalid", maximum=128)
         for value in (self.principal_id, self.session_id, self.assignment_id):
@@ -352,7 +358,9 @@ class _TreeState:
 
 def _boot_id() -> str:
     try:
-        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        value = (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        )
     except OSError as exc:
         raise WorktreeLifecycleError("process_identity_unavailable") from exc
     _require_text(value, code="process_identity_unavailable", maximum=64)
@@ -457,7 +465,10 @@ def _validate_live_binding(binding: WorktreeBinding) -> None:
     try:
         source = binding.canonical_source_path
         common = binding.git_common_directory
-        if source.resolve(strict=True) != source or common.resolve(strict=True) != common:
+        if (
+            source.resolve(strict=True) != source
+            or common.resolve(strict=True) != common
+        ):
             raise WorktreeLifecycleError("worktree_binding_changed")
         source_info = source.stat(follow_symlinks=False)
         common_info = common.stat(follow_symlinks=False)
@@ -491,9 +502,9 @@ def _git_common_directory(source: Path) -> Path:
             if not content.startswith("gitdir:"):
                 raise WorktreeLifecycleError("worktree_git_metadata_invalid")
             target = Path(content.partition(":")[2].strip())
-            git_directory = (target if target.is_absolute() else source / target).resolve(
-                strict=True
-            )
+            git_directory = (
+                target if target.is_absolute() else source / target
+            ).resolve(strict=True)
         else:
             raise WorktreeLifecycleError("worktree_git_metadata_invalid")
         common_file = git_directory / "commondir"
@@ -657,7 +668,9 @@ def _lease_payload(lease: UseLease) -> dict[str, object]:
             else _runtime_process_payload(lease.runtime_process)
         ),
         "runtime_scope": (
-            None if lease.runtime_scope is None else _runtime_scope_payload(lease.runtime_scope)
+            None
+            if lease.runtime_scope is None
+            else _runtime_scope_payload(lease.runtime_scope)
         ),
         "started_at": lease.started_at,
     }
@@ -885,9 +898,7 @@ def _tree_state(key: str, value: object) -> _TreeState:
             raise WorktreeLifecycleError("lifecycle_state_invalid")
     if not isinstance(value["active_uses"], list):
         raise WorktreeLifecycleError("lifecycle_state_invalid")
-    uses = tuple(
-        _lease_from_payload(binding, row) for row in value["active_uses"]
-    )
+    uses = tuple(_lease_from_payload(binding, row) for row in value["active_uses"])
     if len({lease.lease_id for lease in uses}) != len(uses):
         raise WorktreeLifecycleError("lifecycle_state_invalid")
     raw_claim = value["maintenance_claim"]
@@ -946,21 +957,29 @@ def _tree_state(key: str, value: object) -> _TreeState:
             frozenset(operation_keys - {"collision_evidence"}),
             frozenset(previous_operation_keys),
             frozenset(previous_operation_keys - {"collision_evidence"}),
-            frozenset(previous_operation_keys - {
-                "archive_lock_path",
-                "archive_lock_device",
-                "archive_lock_inode",
-                "archive_lock_mount_id",
-            }),
-            frozenset(previous_operation_keys - {
-                "archive_lock_path",
-                "archive_lock_device",
-                "archive_lock_inode",
-                "archive_lock_mount_id",
-                "collision_evidence",
-            }),
+            frozenset(
+                previous_operation_keys
+                - {
+                    "archive_lock_path",
+                    "archive_lock_device",
+                    "archive_lock_inode",
+                    "archive_lock_mount_id",
+                }
+            ),
+            frozenset(
+                previous_operation_keys
+                - {
+                    "archive_lock_path",
+                    "archive_lock_device",
+                    "archive_lock_inode",
+                    "archive_lock_mount_id",
+                    "collision_evidence",
+                }
+            ),
         }
-        raw_operation_keys = frozenset(operation) if isinstance(operation, Mapping) else frozenset()
+        raw_operation_keys = (
+            frozenset(operation) if isinstance(operation, Mapping) else frozenset()
+        )
         phase = operation.get("phase") if isinstance(operation, Mapping) else None
         archive_recorded = phase in {
             "archive_verified",
@@ -969,13 +988,14 @@ def _tree_state(key: str, value: object) -> _TreeState:
             "deleting",
             "removed",
             "restored",
-            } or (phase == "recovery_hold" and operation.get("archive_path") is not None)
+        } or (phase == "recovery_hold" and operation.get("archive_path") is not None)
         if (
             claim is None
             or not isinstance(operation, Mapping)
             or raw_operation_keys not in accepted_operation_keys
             or operation.get("claim_id") != claim.claim_id
-            or phase not in {
+            or phase
+            not in {
                 "claimed",
                 "archiving",
                 "archive_verified",
@@ -989,7 +1009,8 @@ def _tree_state(key: str, value: object) -> _TreeState:
             or operation.get("source_device") != binding.device
             or operation.get("source_inode") != binding.inode
             or operation.get("source_mount_id") != binding.mount_id
-            or operation.get("operation_kind", "worktree") not in {"worktree", "temporary"}
+            or operation.get("operation_kind", "worktree")
+            not in {"worktree", "temporary"}
             or (
                 "collision_evidence" in operation
                 and operation.get("collision_evidence") is not None
@@ -1011,9 +1032,12 @@ def _tree_state(key: str, value: object) -> _TreeState:
                     != "source_name_occupied_after_handoff"
                     or operation["collision_evidence"].get("source_name")
                     != Path(operation.get("temporary_source_path", "")).name
-                    or operation["collision_evidence"].get("quarantine_name") != "temporary"
+                    or operation["collision_evidence"].get("quarantine_name")
+                    != "temporary"
                     or any(
-                        not _valid_integer(operation["collision_evidence"].get(key), minimum=1)
+                        not _valid_integer(
+                            operation["collision_evidence"].get(key), minimum=1
+                        )
                         for key in (
                             "source_parent_device",
                             "source_parent_inode",
@@ -1028,12 +1052,10 @@ def _tree_state(key: str, value: object) -> _TreeState:
             )
             or not _valid_integer(operation.get("git_common_device"))
             or not _valid_integer(operation.get("git_common_inode"), minimum=1)
-            or archive_recorded
-            != (isinstance(operation.get("archive_path"), str))
+            or archive_recorded != (isinstance(operation.get("archive_path"), str))
             or archive_recorded
             != (isinstance(operation.get("archive_manifest_sha256"), str))
-            or archive_recorded
-            != _valid_integer(operation.get("archive_device"))
+            or archive_recorded != _valid_integer(operation.get("archive_device"))
             or archive_recorded
             != _valid_integer(operation.get("archive_inode"), minimum=1)
             or archive_recorded
@@ -1060,8 +1082,12 @@ def _tree_state(key: str, value: object) -> _TreeState:
                     not isinstance(operation.get("temporary_source_path"), str)
                     or not Path(operation["temporary_source_path"]).is_absolute()
                     or not _valid_integer(operation.get("temporary_source_device"))
-                    or not _valid_integer(operation.get("temporary_source_inode"), minimum=1)
-                    or not _valid_integer(operation.get("temporary_source_mount_id"), minimum=1)
+                    or not _valid_integer(
+                        operation.get("temporary_source_inode"), minimum=1
+                    )
+                    or not _valid_integer(
+                        operation.get("temporary_source_mount_id"), minimum=1
+                    )
                     or not isinstance(operation.get("temporary_producer_lease_id"), str)
                 )
             )
@@ -1080,8 +1106,12 @@ def _tree_state(key: str, value: object) -> _TreeState:
                         and str(Path(operation["archive_lock_path"]))
                         == os.path.normpath(operation["archive_lock_path"])
                         and _valid_integer(operation.get("archive_lock_device"))
-                        and _valid_integer(operation.get("archive_lock_inode"), minimum=1)
-                        and _valid_integer(operation.get("archive_lock_mount_id"), minimum=1)
+                        and _valid_integer(
+                            operation.get("archive_lock_inode"), minimum=1
+                        )
+                        and _valid_integer(
+                            operation.get("archive_lock_mount_id"), minimum=1
+                        )
                     )
                 )
             )
@@ -1182,9 +1212,16 @@ class WorktreeLifecycleStore:
                 claims.append(tree.maintenance_claim)
         return WorktreeLifecycleSnapshot(
             revision=document["revision"],
-            active_uses=tuple(sorted(uses, key=lambda item: (item.binding.repository_id, item.lease_id))),
+            active_uses=tuple(
+                sorted(
+                    uses, key=lambda item: (item.binding.repository_id, item.lease_id)
+                )
+            ),
             maintenance_claims=tuple(
-                sorted(claims, key=lambda item: (item.candidate.repository_id, item.claim_id))
+                sorted(
+                    claims,
+                    key=lambda item: (item.candidate.repository_id, item.claim_id),
+                )
             ),
         )
 
@@ -1249,7 +1286,9 @@ class WorktreeLifecycleStore:
         _validate_live_binding(binding)
         with self._state.locked():
             document = self._read_locked()
-            tree = self._get_tree(document, _binding_key(binding), binding, create=False)
+            tree = self._get_tree(
+                document, _binding_key(binding), binding, create=False
+            )
             if tree is None or tree.get("origin") is None:
                 return ()
             if tree["active_uses"]:
@@ -1339,7 +1378,9 @@ class WorktreeLifecycleStore:
                 raise WorktreeLifecycleError("temporary_producer_identity_invalid")
             parent_fd = os.open(parent, _DIRECTORY_FLAGS)
             try:
-                child_fd = os.open(producer_path.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+                child_fd = os.open(
+                    producer_path.name, _DIRECTORY_FLAGS, dir_fd=parent_fd
+                )
                 try:
                     info = os.fstat(child_fd)
                     if (
@@ -1408,7 +1449,9 @@ class WorktreeLifecycleStore:
         _validate_live_binding(binding)
         with self._state.locked():
             document = self._read_locked()
-            tree = self._get_tree(document, _binding_key(binding), binding, create=False)
+            tree = self._get_tree(
+                document, _binding_key(binding), binding, create=False
+            )
             if (
                 tree is None
                 or tree.get("maintenance_claim") != _claim_payload(claim)
@@ -1508,7 +1551,9 @@ class WorktreeLifecycleStore:
             None,
         )
 
-    def _record_created_worktree(self, binding: WorktreeBinding, attestation: object) -> None:
+    def _record_created_worktree(
+        self, binding: WorktreeBinding, attestation: object
+    ) -> None:
         """Record only a freshly created worktree after the server verified its producer."""
         if type(binding) is not WorktreeBinding:
             raise WorktreeLifecycleError("worktree_binding_invalid")
@@ -1841,7 +1886,8 @@ class WorktreeLifecycleStore:
         with self._state.locked():
             document = self._read_locked()
             if any(
-                isinstance(value, Mapping) and value.get("maintenance_claim") is not None
+                isinstance(value, Mapping)
+                and value.get("maintenance_claim") is not None
                 for value in document["worktrees"].values()
             ):
                 raise WorktreeLifecycleError("maintenance_claim_active")
@@ -1867,7 +1913,10 @@ class WorktreeLifecycleStore:
             if tree["maintenance_claim"] != _claim_payload(claim):
                 raise WorktreeLifecycleError("maintenance_claim_mismatch")
             operation = tree.get("maintenance_operation")
-            if isinstance(operation, Mapping) and operation.get("phase") == "recovery_hold":
+            if (
+                isinstance(operation, Mapping)
+                and operation.get("phase") == "recovery_hold"
+            ):
                 raise WorktreeLifecycleError("maintenance_recovery_hold")
 
     def _bind_maintenance_archive_lock(
@@ -1888,7 +1937,9 @@ class WorktreeLifecycleStore:
             path_info = archive_root.stat(follow_symlinks=False)
             mount_id = _mount_id(archive_root)
         except OSError as exc:
-            raise WorktreeLifecycleError("maintenance_archive_lock_unavailable") from exc
+            raise WorktreeLifecycleError(
+                "maintenance_archive_lock_unavailable"
+            ) from exc
         if (
             canonical != archive_root
             or not stat.S_ISDIR(info.st_mode)
@@ -1950,9 +2001,10 @@ class WorktreeLifecycleStore:
             path = Path(operation["archive_lock_path"])
             if not path.is_absolute() or str(path) != os.path.normpath(str(path)):
                 raise WorktreeLifecycleError("maintenance_archive_lock_invalid")
-            if operation.get("archive_path") is not None and Path(
-                operation["archive_path"]
-            ).parent != path:
+            if (
+                operation.get("archive_path") is not None
+                and Path(operation["archive_path"]).parent != path
+            ):
                 raise WorktreeLifecycleError("maintenance_archive_lock_mismatch")
             return (
                 path,
@@ -2003,12 +2055,10 @@ class WorktreeLifecycleStore:
             manifest.get("source") != str(binding.canonical_source_path)
             or manifest.get("source_device") != binding.device
             or manifest.get("source_inode") != binding.inode
-            or manifest.get("git_common_device") != os.stat(
-                binding.git_common_directory, follow_symlinks=False
-            ).st_dev
-            or manifest.get("git_common_inode") != os.stat(
-                binding.git_common_directory, follow_symlinks=False
-            ).st_ino
+            or manifest.get("git_common_device")
+            != os.stat(binding.git_common_directory, follow_symlinks=False).st_dev
+            or manifest.get("git_common_inode")
+            != os.stat(binding.git_common_directory, follow_symlinks=False).st_ino
         ):
             raise WorktreeLifecycleError("maintenance_receipt_binding_mismatch")
         try:
@@ -2039,7 +2089,10 @@ class WorktreeLifecycleStore:
             if tree is None or tree["maintenance_claim"] != _claim_payload(claim):
                 raise WorktreeLifecycleError("maintenance_claim_mismatch")
             operation = tree.get("maintenance_operation")
-            if not isinstance(operation, Mapping) or operation.get("phase") not in {"claimed", "archiving"}:
+            if not isinstance(operation, Mapping) or operation.get("phase") not in {
+                "claimed",
+                "archiving",
+            }:
                 raise WorktreeLifecycleError("maintenance_phase_invalid")
             tree["maintenance_operation"] = {
                 **operation,
@@ -2053,10 +2106,18 @@ class WorktreeLifecycleStore:
                 "gitdir_device": None if gitdir_info is None else gitdir_info.st_dev,
                 "gitdir_inode": None if gitdir_info is None else gitdir_info.st_ino,
                 "temporary_source_path": None if producer is None else producer["path"],
-                "temporary_source_device": None if producer is None else producer["device"],
-                "temporary_source_inode": None if producer is None else producer["inode"],
-                "temporary_source_mount_id": None if producer is None else producer["mount_id"],
-                "temporary_producer_lease_id": None if producer is None else producer["lease_id"],
+                "temporary_source_device": None
+                if producer is None
+                else producer["device"],
+                "temporary_source_inode": None
+                if producer is None
+                else producer["inode"],
+                "temporary_source_mount_id": None
+                if producer is None
+                else producer["mount_id"],
+                "temporary_producer_lease_id": None
+                if producer is None
+                else producer["lease_id"],
             }
             document["revision"] += 1
             self._write_locked(document)
@@ -2075,7 +2136,10 @@ class WorktreeLifecycleStore:
             if tree is None or tree.get("maintenance_claim") != _claim_payload(claim):
                 raise WorktreeLifecycleError("maintenance_claim_mismatch")
             operation = tree.get("maintenance_operation")
-            if not isinstance(operation, Mapping) or operation.get("phase") == "recovery_hold":
+            if (
+                not isinstance(operation, Mapping)
+                or operation.get("phase") == "recovery_hold"
+            ):
                 raise WorktreeLifecycleError("maintenance_recovery_hold")
             return dict(operation)
 
@@ -2094,13 +2158,14 @@ class WorktreeLifecycleStore:
             if tree is None or tree.get("maintenance_claim") != _claim_payload(claim):
                 raise WorktreeLifecycleError("maintenance_claim_mismatch")
             operation = tree.get("maintenance_operation")
-            if not isinstance(operation, Mapping) or operation.get("phase") != "recovery_hold":
+            if (
+                not isinstance(operation, Mapping)
+                or operation.get("phase") != "recovery_hold"
+            ):
                 raise WorktreeLifecycleError("maintenance_recovery_hold")
             return dict(operation)
 
-    def advance_maintenance_phase(
-        self, claim: MaintenanceClaim, *, phase: str
-    ) -> None:
+    def advance_maintenance_phase(self, claim: MaintenanceClaim, *, phase: str) -> None:
         transitions = {
             "claimed": "archiving",
             "archive_verified": "quarantine_started",
@@ -2114,11 +2179,16 @@ class WorktreeLifecycleStore:
         self._assert_claim_owner(claim)
         with self._state.locked():
             document = self._read_locked()
-            tree = self._get_tree(document, _binding_key(claim.candidate), claim.candidate, create=False)
+            tree = self._get_tree(
+                document, _binding_key(claim.candidate), claim.candidate, create=False
+            )
             if tree is None or tree.get("maintenance_claim") != _claim_payload(claim):
                 raise WorktreeLifecycleError("maintenance_claim_mismatch")
             operation = tree.get("maintenance_operation")
-            if not isinstance(operation, Mapping) or transitions.get(operation.get("phase")) != phase:
+            if (
+                not isinstance(operation, Mapping)
+                or transitions.get(operation.get("phase")) != phase
+            ):
                 raise WorktreeLifecycleError("maintenance_phase_invalid")
             tree["maintenance_operation"] = {**operation, "phase": phase}
             document["revision"] += 1
@@ -2130,7 +2200,9 @@ class WorktreeLifecycleStore:
         self._assert_claim_owner(claim)
         with self._state.locked():
             document = self._read_locked()
-            tree = self._get_tree(document, _binding_key(claim.candidate), claim.candidate, create=False)
+            tree = self._get_tree(
+                document, _binding_key(claim.candidate), claim.candidate, create=False
+            )
             if tree is None or tree.get("maintenance_claim") != _claim_payload(claim):
                 raise WorktreeLifecycleError("maintenance_claim_mismatch")
             operation = tree.get("maintenance_operation")
@@ -2181,8 +2253,10 @@ class WorktreeLifecycleStore:
                 not isinstance(operation, Mapping)
                 or operation.get("operation_kind") != "temporary"
                 or not isinstance(operation.get("temporary_source_path"), str)
-                or evidence.get("source_name") != Path(operation["temporary_source_path"]).name
-                or operation.get("phase") not in {"quarantine_started", "quarantined", "recovery_hold"}
+                or evidence.get("source_name")
+                != Path(operation["temporary_source_path"]).name
+                or operation.get("phase")
+                not in {"quarantine_started", "quarantined", "recovery_hold"}
             ):
                 raise WorktreeLifecycleError("maintenance_phase_invalid")
             tree["maintenance_operation"] = {
@@ -2217,10 +2291,14 @@ class WorktreeLifecycleStore:
                 operation.get("operation_kind") != "temporary"
                 or not isinstance(source_text, str)
                 or manifest.get("source") != source_text
-                or manifest.get("source_device") != operation.get("temporary_source_device")
-                or manifest.get("source_inode") != operation.get("temporary_source_inode")
-                or manifest.get("source_mount_id") != operation.get("temporary_source_mount_id")
-                or manifest.get("producer_lease_id") != operation.get("temporary_producer_lease_id")
+                or manifest.get("source_device")
+                != operation.get("temporary_source_device")
+                or manifest.get("source_inode")
+                != operation.get("temporary_source_inode")
+                or manifest.get("source_mount_id")
+                != operation.get("temporary_source_mount_id")
+                or manifest.get("producer_lease_id")
+                != operation.get("temporary_producer_lease_id")
             ):
                 raise WorktreeLifecycleError("maintenance_receipt_binding_mismatch")
             source = Path(source_text)
@@ -2243,8 +2321,12 @@ class WorktreeLifecycleStore:
                 raise WorktreeLifecycleError("maintenance_removal_incomplete")
             with self._state.locked():
                 document = self._read_locked()
-                tree = self._get_tree(document, _binding_key(binding), binding, create=False)
-                if tree is None or tree.get("maintenance_claim") != _claim_payload(claim):
+                tree = self._get_tree(
+                    document, _binding_key(binding), binding, create=False
+                )
+                if tree is None or tree.get("maintenance_claim") != _claim_payload(
+                    claim
+                ):
                     raise WorktreeLifecycleError("maintenance_claim_mismatch")
                 current = tree.get("maintenance_operation")
                 if (
@@ -2278,7 +2360,10 @@ class WorktreeLifecycleStore:
             binding.canonical_source_path,
             binding.git_common_directory / gitdir_relative,
             binding.canonical_source_path.parent / ".hive-quarantine" / claim.claim_id,
-            binding.git_common_directory / "worktrees" / ".hive-quarantine" / claim.claim_id,
+            binding.git_common_directory
+            / "worktrees"
+            / ".hive-quarantine"
+            / claim.claim_id,
         )
         for path in absent_paths:
             try:
@@ -2308,9 +2393,7 @@ class WorktreeLifecycleStore:
             document["revision"] += 1
             self._write_locked(document)
 
-    def finish_maintenance(
-        self, claim: MaintenanceClaim, *, outcome: str
-    ) -> None:
+    def finish_maintenance(self, claim: MaintenanceClaim, *, outcome: str) -> None:
         if type(claim) is not MaintenanceClaim:
             raise WorktreeLifecycleError("maintenance_claim_invalid")
         _require_text(outcome, code="maintenance_outcome_invalid", maximum=512)
@@ -2357,7 +2440,11 @@ class WorktreeLifecycleStore:
             raise WorktreeLifecycleError("maintenance_claim_invalid")
         self._assert_claim_owner(claim)
         try:
-            from the_hive.maintenance import ArchiveReceipt, _read_archive_manifest, _verify_manifest_tree
+            from the_hive.maintenance import (
+                ArchiveReceipt,
+                _read_archive_manifest,
+                _verify_manifest_tree,
+            )
 
             if type(receipt) is not ArchiveReceipt:
                 raise WorktreeLifecycleError("maintenance_receipt_invalid")
@@ -2381,7 +2468,8 @@ class WorktreeLifecycleStore:
         source_text = operation.get("temporary_source_path")
         if (
             operation.get("operation_kind") != "temporary"
-            or operation.get("phase") not in {"quarantine_started", "quarantined", "recovery_hold"}
+            or operation.get("phase")
+            not in {"quarantine_started", "quarantined", "recovery_hold"}
             or not isinstance(source_text, str)
             or manifest.get("source") != source_text
             or operation.get("archive_path") != str(receipt.archive)
@@ -2392,8 +2480,10 @@ class WorktreeLifecycleStore:
         if (
             manifest.get("source_device") != operation.get("temporary_source_device")
             or manifest.get("source_inode") != operation.get("temporary_source_inode")
-            or manifest.get("source_mount_id") != operation.get("temporary_source_mount_id")
-            or manifest.get("producer_lease_id") != operation.get("temporary_producer_lease_id")
+            or manifest.get("source_mount_id")
+            != operation.get("temporary_source_mount_id")
+            or manifest.get("producer_lease_id")
+            != operation.get("temporary_producer_lease_id")
         ):
             raise WorktreeLifecycleError("maintenance_receipt_binding_mismatch")
         try:
@@ -2403,7 +2493,10 @@ class WorktreeLifecycleStore:
         try:
             if (
                 (info.st_dev, info.st_ino)
-                != (operation.get("temporary_source_device"), operation.get("temporary_source_inode"))
+                != (
+                    operation.get("temporary_source_device"),
+                    operation.get("temporary_source_inode"),
+                )
                 or _mount_id(source) != operation.get("temporary_source_mount_id")
                 or source.resolve(strict=True) != source
             ):
@@ -2423,13 +2516,16 @@ class WorktreeLifecycleStore:
             raise WorktreeLifecycleError("maintenance_source_restore_incomplete")
         with self._state.locked():
             document = self._read_locked()
-            tree = self._get_tree(document, _binding_key(claim.candidate), claim.candidate, create=False)
+            tree = self._get_tree(
+                document, _binding_key(claim.candidate), claim.candidate, create=False
+            )
             if tree is None or tree.get("maintenance_claim") != _claim_payload(claim):
                 raise WorktreeLifecycleError("maintenance_claim_mismatch")
             current = tree.get("maintenance_operation")
             if (
                 not isinstance(current, Mapping)
-                or current.get("phase") not in {"quarantine_started", "quarantined", "recovery_hold"}
+                or current.get("phase")
+                not in {"quarantine_started", "quarantined", "recovery_hold"}
                 or current.get("temporary_source_path") != source_text
                 or current.get("archive_manifest_sha256") != receipt.manifest_sha256
             ):
@@ -2456,7 +2552,10 @@ class WorktreeLifecycleStore:
             if _process_is_active(claim.owner_process):
                 raise WorktreeLifecycleError("maintenance_claim_owner_active")
             operation = tree.get("maintenance_operation")
-            if not isinstance(operation, Mapping) or operation.get("claim_id") != claim.claim_id:
+            if (
+                not isinstance(operation, Mapping)
+                or operation.get("claim_id") != claim.claim_id
+            ):
                 raise WorktreeLifecycleError("maintenance_journal_invalid")
             recovered = MaintenanceClaim(
                 claim_id=claim.claim_id,
@@ -2514,6 +2613,8 @@ class WorktreeLifecycleStore:
                 return None
             tree = _empty_tree(binding)
             worktrees[key] = tree
-        elif not isinstance(tree, Mapping) or tree.get("binding") != _binding_payload(binding):
+        elif not isinstance(tree, Mapping) or tree.get("binding") != _binding_payload(
+            binding
+        ):
             raise WorktreeLifecycleError("worktree_binding_alias")
         return tree

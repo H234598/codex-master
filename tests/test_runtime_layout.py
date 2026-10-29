@@ -61,8 +61,12 @@ def materialize_runtime_image(
         root / "systemd" / "user" / "the-hive-resource-monitor.service", "[Service]\n"
     )
     _write_file(root / "systemd" / "user" / "the-hive.slice", "[Slice]\n")
-    _write_file(root / "systemd" / "user" / "the-hive-openai-pricing.service", "[Service]\n")
-    _write_file(root / "systemd" / "user" / "the-hive-openai-pricing.timer", "[Timer]\n")
+    _write_file(
+        root / "systemd" / "user" / "the-hive-openai-pricing.service", "[Service]\n"
+    )
+    _write_file(
+        root / "systemd" / "user" / "the-hive-openai-pricing.timer", "[Timer]\n"
+    )
     _write_file(
         root / ".codex-plugin" / "plugin.json",
         json.dumps(
@@ -153,6 +157,152 @@ def materialize_runtime_image(
         before_manifest(root)
     installer["_write_runtime_image_manifest"](root=root, commit="a" * 40)
     return root
+
+
+def _runtime_compatibility_profile_bytes() -> bytes:
+    value = {
+        "observations": [
+            {
+                "client": {
+                    "artifact_sha256": "a" * 64,
+                    "features": ["hooks", "resume"],
+                    "version": "0.161.0",
+                },
+                "evidence": {
+                    "expires_at_unix_ns": 20,
+                    "fixture_sha256": "b" * 64,
+                    "observed_at_unix_ns": 10,
+                    "source_commit": "c" * 40,
+                    "source_tree_sha256": "d" * 64,
+                },
+                "manager": {"features": ["scopes"], "version": "257.8"},
+                "predecessor": {
+                    "consumer_sha256": "e" * 64,
+                    "generation": "f" * 40,
+                    "manifest_digest": "sha256:" + "1" * 64,
+                },
+                "runtime": {
+                    "features": ["resource-gate"],
+                    "generation": "2" * 40,
+                    "manifest_digest": "sha256:" + "3" * 64,
+                },
+            }
+        ],
+        "profile_id": "runtime-release-compatibility-v1",
+        "schema_version": 1,
+        "status": "unvalidated",
+    }
+    return (
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+
+def _runtime_structural_compatibility_profile_bytes() -> bytes:
+    value = {
+        "profile_id": "runtime-release-compatibility-v2",
+        "requirements": {
+            "client_argv": ["--no-daemon", "features", "list"],
+            "client_config_key": "features.daemon_auto_start",
+            "client_probe_schema_revision": 1,
+            "manager_api_schema_revision": 1,
+            "predecessor_required": True,
+            "runtime_criteria": ["runtime_canary", "runtime_features"],
+        },
+        "schema_version": 2,
+        "status": "structural_requirements",
+    }
+    return (
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+
+def test_runtime_compatibility_profile_v1_has_closed_unvalidated_schema() -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    raw = _runtime_compatibility_profile_bytes()
+
+    profile = module.validate_runtime_release_compatibility_profile(raw)
+
+    assert profile["status"] == "unvalidated"
+    assert profile["observations"][0]["client"]["version"] == "0.161.0"
+
+
+def test_runtime_compatibility_profile_v2_has_closed_structural_requirements() -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+
+    profile = module.validate_runtime_release_compatibility_profile(
+        _runtime_structural_compatibility_profile_bytes()
+    )
+
+    assert profile["status"] == "structural_requirements"
+    assert profile["requirements"]["client_argv"] == [
+        "--no-daemon",
+        "features",
+        "list",
+    ]
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("status", "argv", "extra", "bool_revision"),
+)
+def test_runtime_compatibility_profile_v2_rejects_open_or_claimed_schema(
+    change: str,
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    value = json.loads(_runtime_structural_compatibility_profile_bytes())
+    if change == "status":
+        value["status"] = "qualified"
+    elif change == "argv":
+        value["requirements"]["client_argv"] = ["--help"]
+    elif change == "extra":
+        value["requirements"]["unreviewed"] = True
+    else:
+        value["requirements"]["client_probe_schema_revision"] = True
+    raw = (
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module.validate_runtime_release_compatibility_profile(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"schema_version":1,"schema_version":1}',
+        b'{"profile_id":"runtime-release-compatibility-v1","schema_version":1,"status":"supported","observations":[]}',
+    ],
+)
+def test_runtime_compatibility_profile_v1_rejects_duplicate_and_claimed_support(
+    raw: bytes,
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module.validate_runtime_release_compatibility_profile(raw)
+
+
+def test_runtime_compatibility_profile_v1_rejects_unknown_members_and_bad_evidence() -> (
+    None
+):
+    module = _runtime_layout_module()
+    assert module is not None
+    value = json.loads(_runtime_compatibility_profile_bytes())
+    value["unexpected"] = True
+    raw = (
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module.validate_runtime_release_compatibility_profile(raw)
 
 
 def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(
@@ -293,9 +443,10 @@ def test_runtime_layout_manifest_bytes_parser_derives_local_facts(
     assert digest == "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
     assert metadata["commit"] == manifest["commit"]
     assert metadata["generation"] == manifest["generation"]
-    assert spawn_digest == manifest["files"]["src/the_hive/_runtime_spawn_helper.so"][
-        "sha256"
-    ]
+    assert (
+        spawn_digest
+        == manifest["files"]["src/the_hive/_runtime_spawn_helper.so"]["sha256"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -743,6 +894,7 @@ def test_runtime_layout_same_run_attestation_remains_frozen_ram_only_after_swap(
     with pytest.raises(TypeError):
         pickle.dumps(attestation)
 
+
 @pytest.mark.parametrize("breakage", ("untrusted_root", "missing", "malformed"))
 def test_runtime_layout_same_run_attestation_rejects_invalid_target(
     tmp_path: Path, breakage: str
@@ -1012,9 +1164,7 @@ def _dispatch_allowlist_inputs(
     assert module is not None
     root = materialize_runtime_image(tmp_path)
     manifest, manifest_digest = module._validated_manifest(root)
-    descriptor = (
-        root / "TheHivePluginBundleV1" / "release-binding.json"
-    ).read_bytes()
+    descriptor = (root / "TheHivePluginBundleV1" / "release-binding.json").read_bytes()
     root_install_plan = (root / "root-install-plan.json").read_bytes()
     return module, manifest, manifest_digest, descriptor, root_install_plan
 
@@ -1085,8 +1235,7 @@ def test_dispatch_allowlist_rejects_duplicate_unknown_and_missing_fields(
     encoded = module.dispatch_allowlist_bytes(manifest, manifest_digest)
     if mutation == "duplicate":
         candidate = (
-            encoded.rstrip(b"\n")[:-1]
-            + b',"schema":"D320DispatchAllowlistV1"}\n'
+            encoded.rstrip(b"\n")[:-1] + b',"schema":"D320DispatchAllowlistV1"}\n'
         )
     else:
         decoded = json.loads(encoded)

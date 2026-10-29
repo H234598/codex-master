@@ -98,7 +98,10 @@ def operation_for_checkpoint(checkpoint):
         BrokerCheckpoint.SWITCHED,
     }:
         return ChpbTransactionOperation.REPLACE
-    if checkpoint in {BrokerCheckpoint.DEPROVISION_INTENT, BrokerCheckpoint.DEPROVISIONED}:
+    if checkpoint in {
+        BrokerCheckpoint.DEPROVISION_INTENT,
+        BrokerCheckpoint.DEPROVISIONED,
+    }:
         return ChpbTransactionOperation.DEPROVISION
     return ChpbTransactionOperation.PROVISION
 
@@ -115,11 +118,20 @@ def binding(checkpoint=BrokerCheckpoint.CREATE_INTENT, **changes):
     return TransactionBinding(**values)
 
 
-def observation(state=BrokerObjectState.ABSENT, registry=BrokerRegistryState.NOT_APPLICABLE, index=0):
+def observation(
+    state=BrokerObjectState.ABSENT, registry=BrokerRegistryState.NOT_APPLICABLE, index=0
+):
     return BrokerObservation(state, registry, index)
 
 
-def status(checkpoint=BrokerCheckpoint.CREATE_INTENT, *, obs=None, total=1, bind=None, terminal=None):
+def status(
+    checkpoint=BrokerCheckpoint.CREATE_INTENT,
+    *,
+    obs=None,
+    total=1,
+    bind=None,
+    terminal=None,
+):
     if obs is None:
         obs = observation()
     if bind is None:
@@ -131,7 +143,9 @@ def status(checkpoint=BrokerCheckpoint.CREATE_INTENT, *, obs=None, total=1, bind
             BrokerCheckpoint.ROLLED_BACK: BrokerResultCode.ROLLED_BACK,
             BrokerCheckpoint.BLOCKED_DRIFT: BrokerResultCode.BLOCKED_DRIFT,
         }.get(checkpoint)
-    return TransactionStatus(bind, b2a_phase_for_checkpoint(checkpoint), checkpoint, obs, total, terminal)
+    return TransactionStatus(
+        bind, b2a_phase_for_checkpoint(checkpoint), checkpoint, obs, total, terminal
+    )
 
 
 def wire_with_fields(sequence, previous_digest, payload):
@@ -156,13 +170,19 @@ def test_wal_module_exports_immutable_slotted_contract_types():
         assert dataclasses.is_dataclass(klass)
         assert klass.__dataclass_params__.frozen
         assert hasattr(klass, "__slots__")
-    assert all(hasattr(WalOperations, name) for name in ("read_all", "append", "fsync_wal", "fsync_parent"))
+    assert all(
+        hasattr(WalOperations, name)
+        for name in ("read_all", "append", "fsync_wal", "fsync_parent")
+    )
 
 
 def test_status_payload_matches_chpb2_golden_and_roundtrips():
     value = status()
     raw = encode_status_payload(value)
-    assert raw == b'{"attestation":null,"kind":"reply","protocol":"CHPB/2","request_id":"22222222222222222222222222222222","result":"pending","transaction":{"b2a_phase":"absent_create_pending","binding":{"operation":"provision","policy":{"policy_generation":7,"projection_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"principal":{"agent_id":"bee_1","cgroup_dev":0,"cgroup_ino":1,"fencing_epoch":4,"invocation_id":"11111111111111111111111111111111","manifest_generation":3,"mcs_pair":"c0,c1","unit_generation":9},"store_uuid":"33333333333333333333333333333333","transaction_id":"22222222222222222222222222222222"},"checkpoint":"create_intent","observation":{"object_state":"absent","population_index":0,"registry_state":"not_applicable"},"population_total":1,"terminal_result":null}}\n'
+    assert (
+        raw
+        == b'{"attestation":null,"kind":"reply","protocol":"CHPB/2","request_id":"22222222222222222222222222222222","result":"pending","transaction":{"b2a_phase":"absent_create_pending","binding":{"operation":"provision","policy":{"policy_generation":7,"projection_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"principal":{"agent_id":"bee_1","cgroup_dev":0,"cgroup_ino":1,"fencing_epoch":4,"invocation_id":"11111111111111111111111111111111","manifest_generation":3,"mcs_pair":"c0,c1","unit_generation":9},"store_uuid":"33333333333333333333333333333333","transaction_id":"22222222222222222222222222222222"},"checkpoint":"create_intent","observation":{"object_state":"absent","population_index":0,"registry_state":"not_applicable"},"population_total":1,"terminal_result":null}}\n'
+    )
     assert decode_status_payload(raw) == value
     assert encode_status_payload(decode_status_payload(raw)) == raw
 
@@ -170,7 +190,9 @@ def test_status_payload_matches_chpb2_golden_and_roundtrips():
 def test_terminal_status_payload_uses_terminal_result_and_no_attestation():
     value = status(
         BrokerCheckpoint.COMMITTED,
-        obs=observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1),
+        obs=observation(
+            BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1
+        ),
     )
     raw = encode_status_payload(value)
     assert b'"result":"committed"' in raw
@@ -185,10 +207,27 @@ def test_terminal_status_payload_uses_terminal_result_and_no_attestation():
         b"{}\n",
         b'{"kind":"attest_home"}\n',
         encode_chpb_message(
-            BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, TRANSACTION, BrokerResultCode.PENDING, status(), None)
-        ).replace(b'"request_id":"22222222222222222222222222222222"', b'"request_id":"11111111111111111111111111111111"'),
+            BrokerReply(
+                CHPB_PROTOCOL,
+                ChpbMessageKind.REPLY,
+                TRANSACTION,
+                BrokerResultCode.PENDING,
+                status(),
+                None,
+            )
+        ).replace(
+            b'"request_id":"22222222222222222222222222222222"',
+            b'"request_id":"11111111111111111111111111111111"',
+        ),
         encode_chpb_message(
-            BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, TRANSACTION, BrokerResultCode.PENDING, status(), None)
+            BrokerReply(
+                CHPB_PROTOCOL,
+                ChpbMessageKind.REPLY,
+                TRANSACTION,
+                BrokerResultCode.PENDING,
+                status(),
+                None,
+            )
         ).replace(b'"result":"pending"', b'"result":"ok"'),
     ],
 )
@@ -213,7 +252,9 @@ def test_framing_digest_length_and_roundtrip_are_byte_exact():
         lambda raw: b"X" + raw[1:],
         lambda raw: raw[:-1],
         lambda raw: raw + b"trailing",
-        lambda raw: raw[:len(MAGIC) + 8 + 64] + (999999).to_bytes(4, "big") + raw[len(MAGIC) + 8 + 68:],
+        lambda raw: raw[: len(MAGIC) + 8 + 64]
+        + (999999).to_bytes(4, "big")
+        + raw[len(MAGIC) + 8 + 68 :],
         lambda raw: raw[:-64] + raw[-64:].upper(),
         lambda raw: raw[:-64] + (b"f" * 64),
     ],
@@ -279,9 +320,24 @@ def test_following_record_requires_allowed_transition_same_binding_total_and_mon
     for invalid in (
         status(BrokerCheckpoint.POPULATE_PENDING),
         status(BrokerCheckpoint.STAGING_PINNED, total=2),
-        status(BrokerCheckpoint.STAGING_PINNED, bind=binding(BrokerCheckpoint.STAGING_PINNED, principal=principal(agent_id="bee_2"))),
-        status(BrokerCheckpoint.STAGING_PINNED, bind=binding(BrokerCheckpoint.STAGING_PINNED, policy=PolicyBinding(8, PROJECTION))),
-        status(BrokerCheckpoint.STAGING_PINNED, bind=binding(BrokerCheckpoint.STAGING_PINNED, principal=principal(fencing_epoch=5))),
+        status(
+            BrokerCheckpoint.STAGING_PINNED,
+            bind=binding(
+                BrokerCheckpoint.STAGING_PINNED, principal=principal(agent_id="bee_2")
+            ),
+        ),
+        status(
+            BrokerCheckpoint.STAGING_PINNED,
+            bind=binding(
+                BrokerCheckpoint.STAGING_PINNED, policy=PolicyBinding(8, PROJECTION)
+            ),
+        ),
+        status(
+            BrokerCheckpoint.STAGING_PINNED,
+            bind=binding(
+                BrokerCheckpoint.STAGING_PINNED, principal=principal(fencing_epoch=5)
+            ),
+        ),
         status(BrokerCheckpoint.STAGING_PINNED, obs=observation(index=2), total=3),
     ):
         candidate = FakeWalOperations()
@@ -292,7 +348,10 @@ def test_following_record_requires_allowed_transition_same_binding_total_and_mon
     indexed = FakeWalOperations()
     append_status(indexed, status(obs=observation(index=1), total=2))
     with pytest.raises(WalValidationError):
-        append_status(indexed, status(BrokerCheckpoint.STAGING_PINNED, obs=observation(index=0), total=2))
+        append_status(
+            indexed,
+            status(BrokerCheckpoint.STAGING_PINNED, obs=observation(index=0), total=2),
+        )
 
 
 def test_existing_sequence_gap_hash_fork_and_tampered_chain_are_rejected_before_append():
@@ -377,7 +436,9 @@ def test_recovery_calls_existing_decision_only_after_full_chain_validation(monke
     value = status()
     append_status(fake, value)
     calls = []
-    expected = decide_broker_recovery(value, observation(BrokerObjectState.STAGING_EMPTY))
+    expected = decide_broker_recovery(
+        value, observation(BrokerObjectState.STAGING_EMPTY)
+    )
 
     def decide(last_status, observed):
         calls.append((last_status, observed))
@@ -458,8 +519,7 @@ def test_private_lookup_rejects_terminal_binding_as_inactive():
     fake.events.clear()
 
     assert (
-        wal._lookup_active_principal_binding(fake, 0, 1, INVOCATION, 9, "c0,c1")
-        is None
+        wal._lookup_active_principal_binding(fake, 0, 1, INVOCATION, 9, "c0,c1") is None
     )
     assert fake.events == ["read"]
 
@@ -484,9 +544,7 @@ def test_private_lookup_keeps_empty_or_invalid_wal_fail_closed():
     ):
         invalid = FakeWalOperations(records)
         with pytest.raises(WalValidationError):
-            wal._lookup_active_principal_binding(
-                invalid, 0, 1, INVOCATION, 9, "c0,c1"
-            )
+            wal._lookup_active_principal_binding(invalid, 0, 1, INVOCATION, 9, "c0,c1")
         assert invalid.events == ["read"]
 
 
@@ -540,9 +598,12 @@ def test_private_lookup_has_no_second_authority_or_live_surface():
         and node.func.id == "_lookup_active_principal_binding"
         for node in ast.walk(tree)
     )
-    assert {
-        node.name for node in tree.body if isinstance(node, ast.ClassDef)
-    } == {"WalValidationError", "WalRecord", "WalRecovery", "WalOperations"}
+    assert {node.name for node in tree.body if isinstance(node, ast.ClassDef)} == {
+        "WalValidationError",
+        "WalRecord",
+        "WalRecovery",
+        "WalOperations",
+    }
     assert not hasattr(WalOperations, "_lookup_active_principal_binding")
     assert "_lookup_active_principal_binding" not in wal.__all__
     assert wal.__all__ == [
@@ -574,4 +635,6 @@ def test_wal_import_scope_has_no_legacy_or_runtime_boundaries():
         "fleet_home_broker_protocol",
     }
     forbidden = {"v1", "compat", "server", "linux", "os", "socket", "lifecycle"}
-    assert not any(any(word in module.lower() for word in forbidden) for module in modules)
+    assert not any(
+        any(word in module.lower() for word in forbidden) for module in modules
+    )

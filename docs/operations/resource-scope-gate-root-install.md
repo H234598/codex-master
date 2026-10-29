@@ -16,14 +16,14 @@ Diese Anleitung beschreibt den geprüften Installationsvertrag. Sie ist keine Fr
 
 Die Freigabeperson muss die folgenden Werte aus einem unveränderlichen, unabhängig geprüften Paket beziehen. Sie darf Generation oder Digest nicht erst aus dem aktuellen Pointer des installierenden Benutzers ableiten.
 
-| Wert | Quelle und Prüfung |
-| --- | --- |
-| `APPROVED_SOURCE_COMMIT` | Vollständiger Commit des geprüften Hive-Sourcepakets. |
+| Wert                       | Quelle und Prüfung                                                    |
+| -------------------------- | --------------------------------------------------------------------- |
+| `APPROVED_SOURCE_COMMIT`   | Vollständiger Commit des geprüften Hive-Sourcepakets.                 |
 | `APPROVED_CONSUMER_SHA256` | SHA-256 des geprüften `scripts/install-the-hive-resource-scope-gate`. |
-| `APPROVED_GATE_SHA256` | SHA-256 des geprüften `bin/the-hive-resource-scope-gate`. |
-| `APPROVED_UID` | Numerische UID der Benutzerin, deren Release geprüft wurde. |
-| `APPROVED_GENERATION` | Generation aus dem unabhängig geprüften Releasepaket. |
-| `APPROVED_MANIFEST_SHA256` | SHA-256 der zugehörigen Runtime-Manifestdatei aus demselben Paket. |
+| `APPROVED_GATE_SHA256`     | SHA-256 des geprüften `bin/the-hive-resource-scope-gate`.             |
+| `APPROVED_UID`             | Numerische UID der Benutzerin, deren Release geprüft wurde.           |
+| `APPROVED_GENERATION`      | Generation aus dem unabhängig geprüften Releasepaket.                 |
+| `APPROVED_MANIFEST_SHA256` | SHA-256 der zugehörigen Runtime-Manifestdatei aus demselben Paket.    |
 
 Die Werte in Großbuchstaben sind Dokumentationsnamen und keine ausführbaren Shellvariablen. Vor einem Einsatz müssen sie durch konkrete Werte aus dem geprüften Paket ersetzt und von der Operatorin gegengeprüft werden. Solange diese Pin-Werte fehlen, darf die Installation nicht ausgeführt werden.
 

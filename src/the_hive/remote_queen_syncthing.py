@@ -17,9 +17,7 @@ from the_hive.remote_queen_bootstrap import (
 VAULT_FOLDER_ID = "teladi-programming"
 VAULT_FOLDER_LABEL = "Teladi_Programming"
 VAULT_RELATIVE_PATH = "Dokumente/Obsidian_Vaults/Teladi_Programming"
-ANNOTATION_SIDECAR_PATTERN = (
-    ".obsidian/plugins/annotation-marker/annotations/**"
-)
+ANNOTATION_SIDECAR_PATTERN = ".obsidian/plugins/annotation-marker/annotations/**"
 
 VAULT_REQUIRED_PATHS = (ANNOTATION_SIDECAR_PATTERN,)
 
@@ -113,19 +111,14 @@ def _is_raw_sha256(value: object) -> bool:
 
 
 def _is_generation(value: object) -> bool:
-    return (
-        type(value) is str
-        and _GENERATION.fullmatch(value) is not None
-    )
+    return type(value) is str and _GENERATION.fullmatch(value) is not None
 
 
 def _is_clean_string(value: object) -> bool:
     return (
         type(value) is str
         and bool(value)
-        and not any(
-            unicodedata.category(char).startswith("C") for char in value
-        )
+        and not any(unicodedata.category(char).startswith("C") for char in value)
     )
 
 
@@ -308,7 +301,10 @@ class SyncthingVaultApplyResultV1:
     def __post_init__(self) -> None:
         if type(self.changed) is not bool:
             raise _inconsistent()
-        if self.journal is not None and type(self.journal) is not SyncthingVaultApplyJournalV1:
+        if (
+            self.journal is not None
+            and type(self.journal) is not SyncthingVaultApplyJournalV1
+        ):
             raise _inconsistent()
         if not self.changed and self.journal is not None:
             raise _inconsistent()
@@ -412,12 +408,9 @@ def _validate_snapshot(snapshot: object) -> None:
         or type(snapshot.folder) is not SyncthingFolderFactV1
     ):
         raise _inconsistent()
-    if (
-        type(snapshot.gui.enabled) is not bool
-        or (
-            snapshot.gui.listen_address is not None
-            and type(snapshot.gui.listen_address) is not str
-        )
+    if type(snapshot.gui.enabled) is not bool or (
+        snapshot.gui.listen_address is not None
+        and type(snapshot.gui.listen_address) is not str
     ):
         raise _inconsistent()
     _validate_folder_fields(snapshot.folder)
@@ -539,9 +532,9 @@ def _manifest_payload(
 
 
 def _canonical_digest(payload: dict[str, object]) -> str:
-    canonical = json.dumps(
-        payload, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
@@ -587,7 +580,10 @@ def _validate_manifest(manifest: object) -> None:
     if type(manifest.gui_policy) is not str:
         raise _inconsistent()
     _validate_digest(manifest.manifest_digest)
-    if _canonical_digest(_manifest_payload(manifest, include_digest=False)) != manifest.manifest_digest:
+    if (
+        _canonical_digest(_manifest_payload(manifest, include_digest=False))
+        != manifest.manifest_digest
+    ):
         raise _inconsistent()
 
 
@@ -758,8 +754,7 @@ def _classify_plan(
     if folder.generation == manifest.desired_generation.generation:
         if (
             folder.config_manifest_digest != manifest.manifest_digest
-            or folder.device_binding_sha256
-            != manifest.device_binding_generation.sha256
+            or folder.device_binding_sha256 != manifest.device_binding_generation.sha256
             or folder.sync_complete is not True
         ):
             raise _conflict()
@@ -786,8 +781,7 @@ def _attest(
     if (
         folder.generation != manifest.desired_generation.generation
         or folder.config_manifest_digest != manifest.manifest_digest
-        or folder.device_binding_sha256
-        != manifest.device_binding_generation.sha256
+        or folder.device_binding_sha256 != manifest.device_binding_generation.sha256
         or folder.sync_complete is not True
     ):
         raise _conflict()
@@ -983,9 +977,7 @@ def verify_remote_queen_syncthing_vault(
     )
     snapshot = _inspect(operations, manifest)
     _attest(manifest, snapshot)
-    return SyncthingVaultVerifyResultV1(
-        snapshot_digest=_snapshot_digest(snapshot)
-    )
+    return SyncthingVaultVerifyResultV1(snapshot_digest=_snapshot_digest(snapshot))
 
 
 def rollback_remote_queen_syncthing_vault(

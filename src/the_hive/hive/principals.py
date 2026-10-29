@@ -19,7 +19,11 @@ from the_hive.dynamic_pool import (
 from the_hive.admission import AdmissionRecord
 from the_hive.hive.capabilities import ROOT_EXECUTIVE_CLASSES
 from the_hive.hive.state import HiveStateError, HiveStateStore
-from the_hive.hive.types import HiveValidationError, validate_identifier, validate_utc_datetime
+from the_hive.hive.types import (
+    HiveValidationError,
+    validate_identifier,
+    validate_utc_datetime,
+)
 
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -47,7 +51,11 @@ class PrincipalError(ValueError):
 
 
 def _text(value: object, code: str, maximum: int = 128) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= maximum or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= maximum
+        or any(ord(char) < 32 for char in value)
+    ):
         raise PrincipalError(code)
     return value
 
@@ -80,13 +88,21 @@ class Principal:
             raise PrincipalError("invalid_scope_kind")
         if self.state not in _STATES:
             raise PrincipalError("invalid_principal_state")
-        if not isinstance(self.config_digest, str) or not _DIGEST_RE.fullmatch(self.config_digest):
+        if not isinstance(self.config_digest, str) or not _DIGEST_RE.fullmatch(
+            self.config_digest
+        ):
             raise PrincipalError("invalid_principal_config_digest")
-        if isinstance(self.version, bool) or not isinstance(self.version, int) or not 1 <= self.version <= 10**12:
+        if (
+            isinstance(self.version, bool)
+            or not isinstance(self.version, int)
+            or not 1 <= self.version <= 10**12
+        ):
             raise PrincipalError("invalid_principal_version")
         if self.created_at_utc is not None:
             try:
-                validate_utc_datetime(datetime.fromisoformat(self.created_at_utc.replace("Z", "+00:00")))
+                validate_utc_datetime(
+                    datetime.fromisoformat(self.created_at_utc.replace("Z", "+00:00"))
+                )
             except (HiveValidationError, TypeError, ValueError):
                 raise PrincipalError("invalid_principal_timestamp") from None
 
@@ -151,7 +167,9 @@ class ExecutionBinding:
         ):
             raise PrincipalError("invalid_dynamic_pool_binding")
         try:
-            validate_utc_datetime(datetime.fromisoformat(self.expires_at_utc.replace("Z", "+00:00")))
+            validate_utc_datetime(
+                datetime.fromisoformat(self.expires_at_utc.replace("Z", "+00:00"))
+            )
         except (HiveValidationError, TypeError, ValueError):
             raise PrincipalError("invalid_binding_timestamp") from None
 
@@ -224,13 +242,19 @@ class PrincipalRegistry:
             except (HiveValidationError, KeyError) as exc:
                 raise PrincipalError("principal_not_found") from exc
 
-    def list(self, *, offset: int = 0, limit: int = _MAX_LIST_LIMIT) -> tuple[Principal, ...]:
+    def list(
+        self, *, offset: int = 0, limit: int = _MAX_LIST_LIMIT
+    ) -> tuple[Principal, ...]:
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise PrincipalError("invalid_principal_offset")
         if isinstance(limit, bool) or not 1 <= limit <= _MAX_LIST_LIMIT:
             raise PrincipalError("invalid_principal_limit")
         with self._transaction():
-            return tuple(sorted(self._principals.values(), key=lambda item: item.principal_id)[offset : offset + limit])
+            return tuple(
+                sorted(self._principals.values(), key=lambda item: item.principal_id)[
+                    offset : offset + limit
+                ]
+            )
 
     def create(self, principal: Principal) -> Principal:
         if not isinstance(principal, Principal):
@@ -317,7 +341,9 @@ class PrincipalRegistry:
                     continue
                 try:
                     expires_at = validate_utc_datetime(
-                        datetime.fromisoformat(binding.expires_at_utc.replace("Z", "+00:00"))
+                        datetime.fromisoformat(
+                            binding.expires_at_utc.replace("Z", "+00:00")
+                        )
                     )
                 except Exception:
                     continue
@@ -357,7 +383,11 @@ class PrincipalRegistry:
             if principal.state != "active":
                 raise PrincipalError("execution_binding_inactive")
             try:
-                expires_at = validate_utc_datetime(datetime.fromisoformat(binding.expires_at_utc.replace("Z", "+00:00")))
+                expires_at = validate_utc_datetime(
+                    datetime.fromisoformat(
+                        binding.expires_at_utc.replace("Z", "+00:00")
+                    )
+                )
             except (HiveValidationError, ValueError):
                 raise PrincipalError("execution_binding_invalid") from None
             if expires_at <= normalized_now:
@@ -398,14 +428,20 @@ class PrincipalRegistry:
         self._principals.clear()
         self._bindings.clear()
         try:
-            payload = self._state.read_json_locked(PurePosixPath("principals.json"), max_bytes=4 * 1024 * 1024)
+            payload = self._state.read_json_locked(
+                PurePosixPath("principals.json"), max_bytes=4 * 1024 * 1024
+            )
         except HiveStateError as exc:
             if str(exc) == "state_not_found":
                 return
             raise PrincipalError("principal_state_invalid") from exc
         raw_principals = payload.get("principals")
         raw_bindings = payload.get("bindings")
-        if payload.get("schema_version") != 1 or not isinstance(raw_principals, list) or not isinstance(raw_bindings, list):
+        if (
+            payload.get("schema_version") != 1
+            or not isinstance(raw_principals, list)
+            or not isinstance(raw_bindings, list)
+        ):
             raise PrincipalError("principal_state_invalid")
         for raw in raw_principals:
             principal = self._principal_from_payload(raw)
@@ -427,15 +463,23 @@ class PrincipalRegistry:
             PurePosixPath("principals.json"),
             {
                 "schema_version": 1,
-                "principals": [self._principal_payload(item) for item in self._principals.values()],
-                "bindings": [self._binding_payload(item) for item in self._bindings.values()],
+                "principals": [
+                    self._principal_payload(item) for item in self._principals.values()
+                ],
+                "bindings": [
+                    self._binding_payload(item) for item in self._bindings.values()
+                ],
             },
         )
 
     @contextlib.contextmanager
     def _transaction(self):
         with self._lock:
-            state_lock = self._state.locked() if self._state is not None else contextlib.nullcontext()
+            state_lock = (
+                self._state.locked()
+                if self._state is not None
+                else contextlib.nullcontext()
+            )
             with state_lock:
                 if self._state is not None:
                     self._load_locked()
@@ -483,9 +527,16 @@ class PrincipalRegistry:
             raise PrincipalError("principal_state_invalid")
         try:
             return Principal(
-                raw["principal_id"], raw["class_id"], raw.get("parent_principal_id"),
-                raw["authority_profile"], raw["scope_kind"], raw.get("repo_id"), raw["state"],
-                raw["config_digest"], raw["version"], raw.get("created_at_utc"),
+                raw["principal_id"],
+                raw["class_id"],
+                raw.get("parent_principal_id"),
+                raw["authority_profile"],
+                raw["scope_kind"],
+                raw.get("repo_id"),
+                raw["state"],
+                raw["config_digest"],
+                raw["version"],
+                raw.get("created_at_utc"),
             )
         except (KeyError, PrincipalError, TypeError) as exc:
             raise PrincipalError("principal_state_invalid") from exc
@@ -496,9 +547,17 @@ class PrincipalRegistry:
             raise PrincipalError("principal_state_invalid")
         try:
             return ExecutionBinding(
-                raw["binding_id"], raw["principal_id"], raw.get("repo_id"), raw.get("dispatch_id"),
-                raw["agent_id"], raw["account_key"], raw["model_id"], raw["lease_id"],
-                raw["admission_id"], raw["state"], raw["expires_at_utc"],
+                raw["binding_id"],
+                raw["principal_id"],
+                raw.get("repo_id"),
+                raw.get("dispatch_id"),
+                raw["agent_id"],
+                raw["account_key"],
+                raw["model_id"],
+                raw["lease_id"],
+                raw["admission_id"],
+                raw["state"],
+                raw["expires_at_utc"],
                 (
                     account_pool_binding_from_payload(raw["account_pool_binding"])
                     if raw.get("account_pool_binding") is not None

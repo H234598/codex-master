@@ -24,7 +24,9 @@ def atomic_fix_request(**overrides: object) -> TaskClassificationRequest:
 
 
 def test_only_positive_read_only_evidence_is_not_spark_eligible() -> None:
-    profile = TaskClassifier().classify(TaskClassificationRequest("read status", "read"))
+    profile = TaskClassifier().classify(
+        TaskClassificationRequest("read status", "read")
+    )
     assert profile.complexity is TaskComplexity.SIMPLE
     assert profile.spark_eligible is False
     assert profile.required_capabilities == ("read",)
@@ -46,7 +48,9 @@ def test_hard_boundary_and_simple_downgrade_remain_conservative() -> None:
     assert "simple_override_rejected" in profile.reason_codes
 
 
-def test_confirmed_atomic_low_risk_write_stays_simple_without_spark_eligibility() -> None:
+def test_confirmed_atomic_low_risk_write_stays_simple_without_spark_eligibility() -> (
+    None
+):
     profile = TaskClassifier().classify(atomic_fix_request())
 
     assert profile.complexity is TaskComplexity.SIMPLE
@@ -70,7 +74,10 @@ def test_explicit_medium_remains_luna_only() -> None:
 def test_simple_hint_without_positive_evidence_is_not_spark_eligible() -> None:
     profile = TaskClassifier().classify(
         TaskClassificationRequest(
-            "Fix it.", "write", changed_files=("src/example.py",), complexity_override=TaskComplexity.SIMPLE
+            "Fix it.",
+            "write",
+            changed_files=("src/example.py",),
+            complexity_override=TaskComplexity.SIMPLE,
         )
     )
 
@@ -90,7 +97,9 @@ def test_simple_hint_without_positive_evidence_is_not_spark_eligible() -> None:
     ],
 )
 def test_missing_positive_write_evidence_stays_unknown(field: str, reason: str) -> None:
-    profile = TaskClassifier().classify(atomic_fix_request(**{field: False if field != "task_phase" else "unknown"}))
+    profile = TaskClassifier().classify(
+        atomic_fix_request(**{field: False if field != "task_phase" else "unknown"})
+    )
 
     assert profile.complexity is TaskComplexity.UNKNOWN
     assert profile.spark_eligible is False
@@ -159,7 +168,9 @@ def test_read_request_with_changed_files_explains_unknown_classification() -> No
     assert profile.reason_codes == ("read_scope_with_changed_files",)
 
 
-@pytest.mark.parametrize("field", ["fully_specified", "reversible", "low_risk", "root_cause_known"])
+@pytest.mark.parametrize(
+    "field", ["fully_specified", "reversible", "low_risk", "root_cause_known"]
+)
 def test_evidence_requires_real_booleans(field: str) -> None:
     with pytest.raises(TaskClassificationError, match="invalid_task_evidence"):
         atomic_fix_request(**{field: 1})

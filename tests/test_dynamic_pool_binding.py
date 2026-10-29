@@ -219,9 +219,12 @@ def test_fresh_reader_rejects_unknown_stale_and_exact_provider_mismatch(
 def test_fresh_reader_rejects_an_exact_but_unavailable_pool_authority() -> None:
     """An exact triple is not executable while its Hive availability is false."""
 
-    assert exact_pool_authority_revalidation(
-        binding(), reader=lambda: evidence(hive_available=False)
-    ) is False
+    assert (
+        exact_pool_authority_revalidation(
+            binding(), reader=lambda: evidence(hive_available=False)
+        )
+        is False
+    )
 
 
 def test_resolver_selects_only_the_explicit_injected_inventory_entry() -> None:

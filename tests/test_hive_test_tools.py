@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 from the_hive.hive.evidence_runner import TestEvidenceRunner as EvidenceRunner
-from the_hive.hive.evidence_service import HiveTestEvidenceService, build_local_test_service
+from the_hive.hive.evidence_service import (
+    HiveTestEvidenceService,
+    build_local_test_service,
+)
 from the_hive.hive.evidence_store import TestStatusStore as StatusStore
 from the_hive.hive.indexed_test_inventory import PythonTestIndexBuilder
 from the_hive.hive.tools import call_hive_tool, hive_tool_definitions
@@ -17,9 +20,7 @@ def project(root: Path, body: str):
     (root / "tests").mkdir()
     (root / "src/example.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     (root / "tests/test_example.py").write_text(
-        "from example import run\n\n"
-        "def test_run():\n"
-        f"{body}",
+        f"from example import run\n\ndef test_run():\n{body}",
         encoding="utf-8",
     )
     function_id = "python:src/example.py:run"
@@ -47,7 +48,9 @@ def service(root: Path, body: str):
     return HiveTestEvidenceService(index, store, runner), test_id
 
 
-def test_mcp_test_tools_share_service_contract_and_closed_schemas(tmp_path: Path) -> None:
+def test_mcp_test_tools_share_service_contract_and_closed_schemas(
+    tmp_path: Path,
+) -> None:
     evidence_service, test_id = service(tmp_path, "    assert run() == 1\n")
     names = {item["name"] for item in hive_tool_definitions()}
 
@@ -72,7 +75,13 @@ def test_mcp_test_tools_share_service_contract_and_closed_schemas(tmp_path: Path
         test_service=evidence_service,
     )
 
-    assert {"hive_test_index_status", "hive_test_plan", "hive_test_run", "hive_test_status", "hive_test_invalidate"} <= names
+    assert {
+        "hive_test_index_status",
+        "hive_test_plan",
+        "hive_test_run",
+        "hive_test_status",
+        "hive_test_invalidate",
+    } <= names
     assert plan["tests"][0]["action"] == "run"
     assert run["receipt"]["result"] == "passed"
     assert projected["counts"]["passed"] == 1

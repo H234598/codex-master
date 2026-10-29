@@ -26,7 +26,9 @@ def test_test_index_schema_accepts_contract_and_rejects_unknown_fields() -> None
 
 
 def test_evidence_receipt_schema_accepts_receipt_and_rejects_bool_integer() -> None:
-    validator = Draft202012Validator(schema("hive-test-evidence-receipt-v1.schema.json"))
+    validator = Draft202012Validator(
+        schema("hive-test-evidence-receipt-v1.schema.json")
+    )
     value = receipt().public()
 
     assert not list(validator.iter_errors(value))

@@ -89,9 +89,7 @@ def test_parse_ssh_target_rejects_unsafe_targets(value):
         ("debian", "apt", None),
     ],
 )
-def test_package_plan_for_supported_hosts(
-    distribution_id, package_manager, expected
-):
+def test_package_plan_for_supported_hosts(distribution_id, package_manager, expected):
     host_facts = rb.HostFactsV1(
         distribution_id=distribution_id,
         distribution_version="41",
@@ -115,9 +113,7 @@ def test_package_plan_for_supported_hosts(
     ("distribution_id", "package_manager"),
     [("ubuntu", "dnf"), ("arch", "pacman")],
 )
-def test_package_plan_for_rejects_unsupported_hosts(
-    distribution_id, package_manager
-):
+def test_package_plan_for_rejects_unsupported_hosts(distribution_id, package_manager):
     host_facts = rb.HostFactsV1(
         distribution_id=distribution_id,
         distribution_version="41",
@@ -229,8 +225,7 @@ def _object_states(generations, owners=None):
 
 def _plan_for(states, ssh_target=None):
     return rb.build_remote_queen_bootstrap_plan(
-        ssh_target=ssh_target
-        or SshTargetV1(user="queen", host="host.example.net"),
+        ssh_target=ssh_target or SshTargetV1(user="queen", host="host.example.net"),
         host_facts=rb.HostFactsV1(
             distribution_id="fedora",
             distribution_version="41",

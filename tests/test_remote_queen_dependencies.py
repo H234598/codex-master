@@ -142,8 +142,7 @@ def _snapshot_dict(snapshot):
     return {
         "package_manager": snapshot.package_manager,
         "packages": [
-            {"name": item.name, "version": item.version}
-            for item in snapshot.packages
+            {"name": item.name, "version": item.version} for item in snapshot.packages
         ],
         "environment": {
             "ownership": snapshot.environment.ownership.value,
@@ -158,8 +157,7 @@ def _snapshot_dict(snapshot):
                 for item in snapshot.environment.distributions
             ],
             "imports_available": [
-                import_id.value
-                for import_id in snapshot.environment.imports_available
+                import_id.value for import_id in snapshot.environment.imports_available
             ],
         },
         "noninteractive_sudo_available": snapshot.noninteractive_sudo_available,
@@ -302,9 +300,7 @@ def test_public_contract_uses_frozen_slots_dataclasses_and_string_enums():
     assert deps.DependencyActionV1.REPLACE_PYTHON_ENVIRONMENT.value == (
         "replace-python-environment"
     )
-    assert deps.PythonImportIdV1.GOOGLE_AUTH_OAUTHLIB.value == (
-        "google_auth_oauthlib"
-    )
+    assert deps.PythonImportIdV1.GOOGLE_AUTH_OAUTHLIB.value == ("google_auth_oauthlib")
 
 
 @pytest.mark.parametrize(
@@ -414,9 +410,7 @@ def test_manifest_rejects_duplicate_or_noncanonical_distribution_pins():
         ("unknown", "1.0.0", ("yaml",)),
     ],
 )
-def test_manifest_rejects_invalid_distribution_pinsets(
-    distribution, version, imports
-):
+def test_manifest_rejects_invalid_distribution_pinsets(distribution, version, imports):
     values = list(_pins())
     if distribution in {"google-auth", "google-auth-oauthlib"}:
         values.append(_pin(distribution, version, imports))
@@ -750,9 +744,7 @@ def test_fixed_before_and_plan_digest_vectors_use_literal_nested_contract():
         },
         "before": {
             "package_manager": "dnf",
-            "packages": [
-                {"name": name, "version": None} for name in DNF_PACKAGES
-            ],
+            "packages": [{"name": name, "version": None} for name in DNF_PACKAGES],
             "environment": {
                 "ownership": "absent",
                 "generation": None,
@@ -1113,7 +1105,9 @@ def test_rollback_rejects_noop_plan_before_any_operations_call():
 def test_rollback_passes_only_journalized_new_packages():
     manifest = _manifest()
     existing = manifest.package_plan.packages[::2]
-    before = _absent_snapshot(manifest, missing=set(manifest.package_plan.packages) - set(existing))
+    before = _absent_snapshot(
+        manifest, missing=set(manifest.package_plan.packages) - set(existing)
+    )
     plan = deps.plan_remote_queen_dependencies(
         manifest=manifest,
         operations=FakeDependencyOperations(before),
@@ -1203,9 +1197,7 @@ def test_unknown_operation_exception_is_redacted():
 
 def test_verify_and_rollback_request_bindings_fail_closed():
     manifest = _manifest()
-    wrong_verify = replace(
-        _verify_request_for(manifest), generation="other-generation"
-    )
+    wrong_verify = replace(_verify_request_for(manifest), generation="other-generation")
     with pytest.raises(RemoteQueenBootstrapError) as verify_error:
         deps.verify_remote_queen_dependencies(
             manifest=manifest,
@@ -1233,7 +1225,9 @@ def test_verify_and_rollback_request_bindings_fail_closed():
 
 
 def test_runtime_effect_gate_rejects_forbidden_imports_and_calls():
-    source_path = Path(__file__).parents[1] / "src/the_hive/remote_queen_dependencies.py"
+    source_path = (
+        Path(__file__).parents[1] / "src/the_hive/remote_queen_dependencies.py"
+    )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     forbidden_imports = {
         "os",
@@ -1295,8 +1289,10 @@ def test_runtime_effect_gate_rejects_forbidden_imports_and_calls():
         ), ast.dump(node)
 
         if isinstance(node, ast.Call):
-            function_name = node.func.attr if isinstance(node.func, ast.Attribute) else (
-                node.func.id if isinstance(node.func, ast.Name) else None
+            function_name = (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else (node.func.id if isinstance(node.func, ast.Name) else None)
             )
             assert function_name not in forbidden_calls, ast.dump(node)
 

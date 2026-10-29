@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily attested Qlty upgrade and owner-bound quality maintenance
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/the_hive/scripts/the-hive-qlty-maintenance daily
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes

@@ -157,15 +157,15 @@ def _positive_integer(value: object, code: str) -> int:
 def _token_tuple(value: object, *, maximum: int, code: str) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= maximum:
         raise FleetControlError(code)
-    result = tuple(
-        _text(item, maximum=MAX_MODEL_CHARS, code=code) for item in value
-    )
+    result = tuple(_text(item, maximum=MAX_MODEL_CHARS, code=code) for item in value)
     if len(set(result)) != len(result):
         raise FleetControlError(code)
     return result
 
 
-def _rows(payload: Mapping[str, object], key: str, maximum: int) -> list[Mapping[str, object]]:
+def _rows(
+    payload: Mapping[str, object], key: str, maximum: int
+) -> list[Mapping[str, object]]:
     value = payload.get(key, [])
     if not isinstance(value, list):
         raise FleetControlError("invalid_fleet_payload")
@@ -176,7 +176,9 @@ def _rows(payload: Mapping[str, object], key: str, maximum: int) -> list[Mapping
     return rows
 
 
-def _provider_rule(provider: str, runner: str, account_id: str | None, auth_kind: str | None = None) -> None:
+def _provider_rule(
+    provider: str, runner: str, account_id: str | None, auth_kind: str | None = None
+) -> None:
     if provider == "ollama_local":
         if runner != "codex_cli" or account_id is not None:
             raise FleetControlError("provider_runner_account_mismatch")
@@ -197,7 +199,9 @@ def _provider_rule(provider: str, runner: str, account_id: str | None, auth_kind
         raise FleetControlError("provider_auth_mismatch")
 
 
-def parse_fleet_page(accounts_payload: object, series_payload: object) -> FleetPageState:
+def parse_fleet_page(
+    accounts_payload: object, series_payload: object
+) -> FleetPageState:
     accounts_raw = _mapping(accounts_payload)
     series_raw = _mapping(series_payload)
     generation = _generation(accounts_raw)
@@ -206,18 +210,26 @@ def parse_fleet_page(accounts_payload: object, series_payload: object) -> FleetP
     account_rows: list[FleetAccountRow] = []
     for item in _rows(accounts_raw, "accounts", MAX_ACCOUNTS):
         try:
-            account_id = _text(item.get("account_id"), maximum=MAX_ID_CHARS, code="invalid_account")
+            account_id = _text(
+                item.get("account_id"), maximum=MAX_ID_CHARS, code="invalid_account"
+            )
             if not _ACCOUNT_ID_RE.fullmatch(account_id):
                 raise FleetControlError("invalid_account")
-            account_rows.append(FleetAccountRow(
-                account_id,
-                _text(item.get("label"), maximum=MAX_LABEL_CHARS, code="invalid_account"),
-                _text(item.get("provider"), maximum=64, code="invalid_account"),
-                _text(item.get("auth_kind"), maximum=64, code="invalid_account"),
-                _text(item.get("secret_state"), maximum=32, code="invalid_account"),
-                _text(item.get("limit_state"), maximum=32, code="invalid_account"),
-                _bool(item.get("enabled"), "invalid_account"),
-            ))
+            account_rows.append(
+                FleetAccountRow(
+                    account_id,
+                    _text(
+                        item.get("label"),
+                        maximum=MAX_LABEL_CHARS,
+                        code="invalid_account",
+                    ),
+                    _text(item.get("provider"), maximum=64, code="invalid_account"),
+                    _text(item.get("auth_kind"), maximum=64, code="invalid_account"),
+                    _text(item.get("secret_state"), maximum=32, code="invalid_account"),
+                    _text(item.get("limit_state"), maximum=32, code="invalid_account"),
+                    _bool(item.get("enabled"), "invalid_account"),
+                )
+            )
         except FleetControlError:
             continue
     account_ids = {row.account_id for row in account_rows}
@@ -228,27 +240,49 @@ def parse_fleet_page(accounts_payload: object, series_payload: object) -> FleetP
             if not _PREFIX_RE.fullmatch(prefix):
                 raise FleetControlError("invalid_series")
             count = item.get("count")
-            if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_SERIES_COUNT:
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or not 1 <= count <= MAX_SERIES_COUNT
+            ):
                 raise FleetControlError("invalid_series")
             provider = _text(item.get("provider"), maximum=64, code="invalid_series")
             runner = _text(item.get("runner"), maximum=64, code="invalid_series")
-            account_id = _optional_text(item.get("account_id"), maximum=MAX_ID_CHARS, code="invalid_series")
-            _provider_rule(provider, runner, account_id)
-            eligibility = "disabled" if item.get("enabled") is not True else (
-                "eligible" if account_id is None or account_id in account_ids else "account_unavailable"
+            account_id = _optional_text(
+                item.get("account_id"), maximum=MAX_ID_CHARS, code="invalid_series"
             )
-            series_rows.append(FleetSeriesRow(
-                prefix,
-                _text(item.get("display_name"), maximum=MAX_LABEL_CHARS, code="invalid_series"),
-                count,
-                runner,
-                provider,
-                _text(item.get("model"), maximum=MAX_MODEL_CHARS, code="invalid_series"),
-                account_id,
-                _bool(item.get("enabled"), "invalid_series"),
-                eligibility,
-                _error(item.get("error_code")),
-            ))
+            _provider_rule(provider, runner, account_id)
+            eligibility = (
+                "disabled"
+                if item.get("enabled") is not True
+                else (
+                    "eligible"
+                    if account_id is None or account_id in account_ids
+                    else "account_unavailable"
+                )
+            )
+            series_rows.append(
+                FleetSeriesRow(
+                    prefix,
+                    _text(
+                        item.get("display_name"),
+                        maximum=MAX_LABEL_CHARS,
+                        code="invalid_series",
+                    ),
+                    count,
+                    runner,
+                    provider,
+                    _text(
+                        item.get("model"),
+                        maximum=MAX_MODEL_CHARS,
+                        code="invalid_series",
+                    ),
+                    account_id,
+                    _bool(item.get("enabled"), "invalid_series"),
+                    eligibility,
+                    _error(item.get("error_code")),
+                )
+            )
         except FleetControlError:
             continue
     return FleetPageState(generation, tuple(account_rows), tuple(series_rows))
@@ -262,7 +296,11 @@ def parse_ollama_page(
     generation = _generation(instances_raw)
     model_rows: list[OllamaModelRow] = []
     model_items = _rows(models_raw, "models", MAX_OLLAMA_MODELS)
-    rejected_models = min(MAX_OLLAMA_MODELS, len(models_raw.get("models", []))) - len(model_items) if isinstance(models_raw.get("models", []), list) else 0
+    rejected_models = (
+        min(MAX_OLLAMA_MODELS, len(models_raw.get("models", []))) - len(model_items)
+        if isinstance(models_raw.get("models", []), list)
+        else 0
+    )
     for item in model_items:
         try:
             capabilities = _token_tuple(
@@ -291,7 +329,12 @@ def parse_ollama_page(
             rejected_models += 1
     instance_rows: list[OllamaInstanceRow] = []
     instance_items = _rows(instances_raw, "instances", MAX_OLLAMA_INSTANCES)
-    rejected_instances = min(MAX_OLLAMA_INSTANCES, len(instances_raw.get("instances", []))) - len(instance_items) if isinstance(instances_raw.get("instances", []), list) else 0
+    rejected_instances = (
+        min(MAX_OLLAMA_INSTANCES, len(instances_raw.get("instances", [])))
+        - len(instance_items)
+        if isinstance(instances_raw.get("instances", []), list)
+        else 0
+    )
     for item in instance_items:
         try:
             allowed_cpus = _text(
@@ -308,7 +351,9 @@ def parse_ollama_page(
                         code="invalid_ollama_instance",
                     ),
                     _text(
-                        item.get("host_ref"), maximum=128, code="invalid_ollama_instance"
+                        item.get("host_ref"),
+                        maximum=128,
+                        code="invalid_ollama_instance",
                     ),
                     _token_tuple(
                         item.get("selected_model_refs"),
@@ -357,13 +402,23 @@ def _expected_generation(value: object) -> int:
 
 
 def account_upsert_args(
-    *, account_id: str, label: str, provider: str, auth_kind: str,
-    enabled: bool, expected_generation: int,
+    *,
+    account_id: str,
+    label: str,
+    provider: str,
+    auth_kind: str,
+    enabled: bool,
+    expected_generation: int,
 ) -> dict[str, object]:
     account_id = _text(account_id, maximum=MAX_ID_CHARS, code="invalid_account")
     if not _ACCOUNT_ID_RE.fullmatch(account_id):
         raise FleetControlError("invalid_account")
-    _provider_rule(provider, "gemini_cli" if provider == "gemini_api" else "codex_cli", account_id, auth_kind)
+    _provider_rule(
+        provider,
+        "gemini_cli" if provider == "gemini_api" else "codex_cli",
+        account_id,
+        auth_kind,
+    )
     return {
         "account_id": account_id,
         "label": _text(label, maximum=MAX_LABEL_CHARS, code="invalid_account"),
@@ -374,7 +429,9 @@ def account_upsert_args(
     }
 
 
-def account_secret_args(*, account_id: str, secret: str, expected_generation: int) -> dict[str, object]:
+def account_secret_args(
+    *, account_id: str, secret: str, expected_generation: int
+) -> dict[str, object]:
     account_id = _text(account_id, maximum=MAX_ID_CHARS, code="invalid_account")
     if not _ACCOUNT_ID_RE.fullmatch(account_id):
         raise FleetControlError("invalid_account")
@@ -387,14 +444,25 @@ def account_secret_args(*, account_id: str, secret: str, expected_generation: in
 
 
 def _series_args(
-    *, prefix: str, count: int, runner: str, provider: str, model: str,
-    account_id: str | None, enabled: bool, expected_generation: int,
+    *,
+    prefix: str,
+    count: int,
+    runner: str,
+    provider: str,
+    model: str,
+    account_id: str | None,
+    enabled: bool,
+    expected_generation: int,
     confirmed_remove_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     prefix = _text(prefix, maximum=1, code="invalid_series")
     if not _PREFIX_RE.fullmatch(prefix):
         raise FleetControlError("invalid_series")
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_SERIES_COUNT:
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 1 <= count <= MAX_SERIES_COUNT
+    ):
         raise FleetControlError("invalid_series")
     model = _text(model, maximum=MAX_MODEL_CHARS, code="invalid_series")
     account_id = _optional_text(account_id, maximum=MAX_ID_CHARS, code="invalid_series")
@@ -403,12 +471,17 @@ def _series_args(
     provider = _text(provider, maximum=64, code="invalid_series")
     runner = _text(runner, maximum=64, code="invalid_series")
     _provider_rule(provider, runner, account_id)
-    if not isinstance(confirmed_remove_ids, (list, tuple)) and confirmed_remove_ids is not None:
+    if (
+        not isinstance(confirmed_remove_ids, (list, tuple))
+        and confirmed_remove_ids is not None
+    ):
         raise FleetControlError("invalid_series")
     confirmed = list(confirmed_remove_ids or ())
     if len(confirmed) > MAX_SERIES_COUNT:
         raise FleetControlError("invalid_series")
-    confirmed = [_text(value, maximum=MAX_ID_CHARS, code="invalid_series") for value in confirmed]
+    confirmed = [
+        _text(value, maximum=MAX_ID_CHARS, code="invalid_series") for value in confirmed
+    ]
     return {
         "prefix": prefix,
         "count": count,
@@ -423,25 +496,51 @@ def _series_args(
 
 
 def series_plan_args(
-    *, prefix: str, count: int, runner: str, provider: str, model: str,
-    account_id: str | None, enabled: bool, expected_generation: int,
+    *,
+    prefix: str,
+    count: int,
+    runner: str,
+    provider: str,
+    model: str,
+    account_id: str | None,
+    enabled: bool,
+    expected_generation: int,
     confirmed_remove_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     return _series_args(
-        prefix=prefix, count=count, runner=runner, provider=provider, model=model,
-        account_id=account_id, enabled=enabled, expected_generation=expected_generation,
+        prefix=prefix,
+        count=count,
+        runner=runner,
+        provider=provider,
+        model=model,
+        account_id=account_id,
+        enabled=enabled,
+        expected_generation=expected_generation,
         confirmed_remove_ids=confirmed_remove_ids,
     )
 
 
 def series_apply_args(
-    *, prefix: str, count: int, runner: str, provider: str, model: str,
-    account_id: str | None, enabled: bool, expected_generation: int,
+    *,
+    prefix: str,
+    count: int,
+    runner: str,
+    provider: str,
+    model: str,
+    account_id: str | None,
+    enabled: bool,
+    expected_generation: int,
     confirmed_remove_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     return _series_args(
-        prefix=prefix, count=count, runner=runner, provider=provider, model=model,
-        account_id=account_id, enabled=enabled, expected_generation=expected_generation,
+        prefix=prefix,
+        count=count,
+        runner=runner,
+        provider=provider,
+        model=model,
+        account_id=account_id,
+        enabled=enabled,
+        expected_generation=expected_generation,
         confirmed_remove_ids=confirmed_remove_ids,
     )
 
@@ -465,9 +564,7 @@ def ollama_instance_plan_args(
     idempotency_key = _text(
         idempotency_key, maximum=128, code="invalid_ollama_instance"
     )
-    allowed_cpus = _text(
-        allowed_cpus, maximum=256, code="invalid_ollama_instance"
-    )
+    allowed_cpus = _text(allowed_cpus, maximum=256, code="invalid_ollama_instance")
     if (
         _CONTROL_TOKEN_RE.fullmatch(ref) is None
         or _CONTROL_TOKEN_RE.fullmatch(host_ref) is None
@@ -475,19 +572,13 @@ def ollama_instance_plan_args(
         or _CPUSET_RE.fullmatch(allowed_cpus) is None
     ):
         raise FleetControlError("invalid_ollama_instance")
-    executable = _text(
-        ollama_executable, maximum=1024, code="invalid_ollama_instance"
-    )
-    model_root = _text(
-        models_directory, maximum=1024, code="invalid_ollama_instance"
-    )
+    executable = _text(ollama_executable, maximum=1024, code="invalid_ollama_instance")
+    model_root = _text(models_directory, maximum=1024, code="invalid_ollama_instance")
     if not executable.startswith("/") or not model_root.startswith("/"):
         raise FleetControlError("invalid_ollama_instance")
     return {
         "ref": ref,
-        "label": _text(
-            label, maximum=MAX_LABEL_CHARS, code="invalid_ollama_instance"
-        ),
+        "label": _text(label, maximum=MAX_LABEL_CHARS, code="invalid_ollama_instance"),
         "host_ref": host_ref,
         "ollama_executable": executable,
         "models_directory": model_root,

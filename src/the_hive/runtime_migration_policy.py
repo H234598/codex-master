@@ -361,7 +361,9 @@ def _read_bounded(path: Path) -> bytes:
         with path.open("rb") as policy_file:
             value = policy_file.read(MAX_RUNTIME_MIGRATION_POLICY_BYTES + 1)
     except OSError as exc:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_unavailable") from exc
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_unavailable"
+        ) from exc
     if len(value) > MAX_RUNTIME_MIGRATION_POLICY_BYTES:
         raise RuntimeMigrationPolicyError("runtime_migration_policy_oversized")
     return value
@@ -393,7 +395,9 @@ def _canonical_json_bytes(value: object) -> bytes:
             + b"\n"
         )
     except (TypeError, ValueError) as exc:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid") from exc
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_json_invalid"
+        ) from exc
 
 
 def _deep_freeze_json(value: object) -> object:
@@ -403,7 +407,9 @@ def _deep_freeze_json(value: object) -> object:
         frozen: dict[str, object] = {}
         for key, nested_value in value.items():
             if type(key) is not str:
-                raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
+                raise RuntimeMigrationPolicyError(
+                    "runtime_migration_policy_json_invalid"
+                )
             frozen[key] = _deep_freeze_json(nested_value)
         return MappingProxyType(frozen)
     if type(value) is list:
@@ -422,7 +428,9 @@ def _thaw_frozen_json(value: object) -> object:
         thawed: dict[str, object] = {}
         for key, nested_value in value.items():
             if type(key) is not str:
-                raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
+                raise RuntimeMigrationPolicyError(
+                    "runtime_migration_policy_json_invalid"
+                )
             thawed[key] = _thaw_frozen_json(nested_value)
         return thawed
     if type(value) in {list, tuple}:
@@ -467,12 +475,8 @@ def _strict_contract_value(observed: object, expected: object) -> bool:
     if type(observed) is not type(expected):
         return False
     if type(expected) is dict:
-        return (
-            set(observed) == set(expected)
-            and all(
-                _strict_contract_value(observed[key], expected[key])
-                for key in expected
-            )
+        return set(observed) == set(expected) and all(
+            _strict_contract_value(observed[key], expected[key]) for key in expected
         )
     if type(expected) is list:
         return len(observed) == len(expected) and all(
@@ -554,13 +558,19 @@ def _validate_machine_contract_bounds(
 
 def _parse_machine_contract(identifier: str, value: object) -> Mapping[str, object]:
     if type(value) is not dict:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_machine_contract_invalid")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_machine_contract_invalid"
+        )
     expected = _EXPECTED_MACHINE_CONTRACTS.get(identifier)
     if expected is None or not _machine_contract_shape(value, expected):
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_machine_contract_invalid")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_machine_contract_invalid"
+        )
     _validate_machine_contract_bounds(identifier, value)
     if not _strict_contract_value(value, expected):
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_machine_contract_invalid")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_machine_contract_invalid"
+        )
     frozen = _deep_freeze_json(value)
     if not isinstance(frozen, Mapping):
         raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
@@ -607,15 +617,22 @@ def _validate_required_rule_catalog(
         for group in groups
     )
     if observed != _EXPECTED_RULE_GROUPS:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_rule_catalog_invalid")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_rule_catalog_invalid"
+        )
     compatibility_rule = next(
         rule
         for group in groups
         for rule in group.rules
         if rule.identifier == "bounded-compatibility-window"
     )
-    if any(term not in compatibility_rule.requirement for term in _COMPATIBILITY_REQUIRED_TERMS):
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_compatibility_invalid")
+    if any(
+        term not in compatibility_rule.requirement
+        for term in _COMPATIBILITY_REQUIRED_TERMS
+    ):
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_compatibility_invalid"
+        )
 
 
 def load_runtime_migration_policy(
@@ -633,7 +650,9 @@ def load_runtime_migration_policy(
     except RuntimeMigrationPolicyError:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid") from exc
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_json_invalid"
+        ) from exc
     if type(source) is not dict or set(source) != {"format", "rule_groups", "version"}:
         raise RuntimeMigrationPolicyError("runtime_migration_policy_fields_invalid")
     if source_bytes != _canonical_json_bytes(source):
@@ -641,13 +660,19 @@ def load_runtime_migration_policy(
     if source["format"] != _FORMAT or type(source["version"]) is not int:
         raise RuntimeMigrationPolicyError("runtime_migration_policy_version_invalid")
     if source["version"] != _VERSION:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_version_unsupported")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_version_unsupported"
+        )
     raw_groups = source["rule_groups"]
     if type(raw_groups) is not list or not raw_groups or len(raw_groups) > 16:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_rule_groups_invalid")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_rule_groups_invalid"
+        )
     rule_groups = tuple(_parse_rule_group(raw_group) for raw_group in raw_groups)
     if len({group.identifier for group in rule_groups}) != len(rule_groups):
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_rule_groups_invalid")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_rule_groups_invalid"
+        )
     _validate_required_rule_catalog(rule_groups)
     return RuntimeMigrationPolicyContract(
         version=_VERSION,
@@ -736,11 +761,15 @@ def validate_runtime_migration_policy_materialization(
     expected = render_runtime_migration_policy_block(contract)
     expected_begin = _marker_bytes(contract)
     if common_bytes.count(_BEGIN_PREFIX) != 1 or common_bytes.count(_END_MARKER) != 1:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_block_missing_or_duplicated")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_block_missing_or_duplicated"
+        )
     begin = common_bytes.find(_BEGIN_PREFIX)
     end = common_bytes.find(_END_MARKER, begin)
     if begin < 0 or end < begin:
-        raise RuntimeMigrationPolicyError("runtime_migration_policy_block_missing_or_duplicated")
+        raise RuntimeMigrationPolicyError(
+            "runtime_migration_policy_block_missing_or_duplicated"
+        )
     actual = common_bytes[begin : end + len(_END_MARKER)]
     if not actual.startswith(expected_begin):
         raise RuntimeMigrationPolicyError("runtime_migration_policy_block_digest_stale")

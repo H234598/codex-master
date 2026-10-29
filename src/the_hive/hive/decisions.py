@@ -11,7 +11,11 @@ import re
 from types import MappingProxyType
 
 from the_hive.hive.principals import Principal
-from the_hive.hive.types import HiveValidationError, validate_identifier, validate_utc_datetime
+from the_hive.hive.types import (
+    HiveValidationError,
+    validate_identifier,
+    validate_utc_datetime,
+)
 
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -33,7 +37,11 @@ def _id(value: object, field: str) -> str:
 
 
 def _text(value: object, field: str, maximum: int = 4096) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= maximum or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= maximum
+        or any(ord(char) < 32 for char in value)
+    ):
         raise DecisionError(f"invalid_{field}")
     return value
 
@@ -85,7 +93,10 @@ class DecisionRecord:
             raise DecisionError("invalid_decision_options")
         frozen_options: list[Mapping[str, object]] = []
         for option in self.options:
-            if not isinstance(option, Mapping) or set(option) - {"option_id", "summary"}:
+            if not isinstance(option, Mapping) or set(option) - {
+                "option_id",
+                "summary",
+            }:
                 raise DecisionError("invalid_decision_option")
             option_id = _id(option.get("option_id"), "option")
             summary = _text(option.get("summary"), "option_summary", 1024)
@@ -95,7 +106,9 @@ class DecisionRecord:
         object.__setattr__(self, "options", tuple(frozen_options))
         if self.selected_option_id is not None:
             _id(self.selected_option_id, "selected_option")
-            if self.selected_option_id not in {option["option_id"] for option in self.options}:
+            if self.selected_option_id not in {
+                option["option_id"] for option in self.options
+            }:
                 raise DecisionError("selected_option_not_found")
         _text(self.rationale, "decision_rationale", MAX_DECISION_BYTES)
         _refs(self.evidence_refs, "evidence_refs")
@@ -114,7 +127,14 @@ class DecisionRecord:
             _digest(self.previous_record_hash, "previous_record_hash")
         if self.record_hash is not None:
             _digest(self.record_hash, "record_hash")
-        if len(json.dumps(self.public(), ensure_ascii=True, sort_keys=True).encode("utf-8")) > MAX_DECISION_BYTES:
+        if (
+            len(
+                json.dumps(self.public(), ensure_ascii=True, sort_keys=True).encode(
+                    "utf-8"
+                )
+            )
+            > MAX_DECISION_BYTES
+        ):
             raise DecisionError("decision_oversize")
 
     def public(self) -> dict[str, object]:
@@ -138,7 +158,11 @@ class DecisionRecord:
 
 
 def _authorized(record: DecisionRecord, actor: Principal) -> None:
-    if not isinstance(actor, Principal) or actor.state != "active" or record.created_by != actor.principal_id:
+    if (
+        not isinstance(actor, Principal)
+        or actor.state != "active"
+        or record.created_by != actor.principal_id
+    ):
         raise DecisionError("decision_actor_unauthorized")
     allowed = _ROLES_GLOBAL if record.scope_kind == "global" else _ROLES_REPOSITORY
     if actor.class_id not in allowed:
@@ -147,14 +171,19 @@ def _authorized(record: DecisionRecord, actor: Principal) -> None:
         raise DecisionError("decision_repository_mismatch")
     if record.status == "accepted" and not record.approved_by:
         raise DecisionError("accepted_decision_needs_approval")
-    if any(approver == actor.principal_id for approver in record.approved_by) is False and record.status == "accepted":
+    if (
+        any(approver == actor.principal_id for approver in record.approved_by) is False
+        and record.status == "accepted"
+    ):
         raise DecisionError("decision_approval_mismatch")
 
 
 def _canonical_for_hash(record: DecisionRecord) -> bytes:
     payload = record.public()
     payload["record_hash"] = None
-    return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
 
 
 def record_decision(record: DecisionRecord, *, actor: Principal) -> DecisionRecord:
@@ -163,19 +192,38 @@ def record_decision(record: DecisionRecord, *, actor: Principal) -> DecisionReco
     if not isinstance(record, DecisionRecord):
         raise DecisionError("invalid_decision")
     _authorized(record, actor)
-    computed = "sha256:" + hashlib.sha256(
-        (record.previous_record_hash or "genesis").encode("utf-8") + b"\0" + _canonical_for_hash(record)
-    ).hexdigest()
+    computed = (
+        "sha256:"
+        + hashlib.sha256(
+            (record.previous_record_hash or "genesis").encode("utf-8")
+            + b"\0"
+            + _canonical_for_hash(record)
+        ).hexdigest()
+    )
     if record.record_hash is not None and record.record_hash != computed:
         raise DecisionError("decision_hash_mismatch")
     return DecisionRecord(
-        record.decision_id, record.scope_kind, record.repo_id, record.topic, record.status, record.options,
-        record.selected_option_id, record.rationale, record.evidence_refs, record.created_by, record.approved_by,
-        record.created_at_utc, record.supersedes, record.previous_record_hash, computed,
+        record.decision_id,
+        record.scope_kind,
+        record.repo_id,
+        record.topic,
+        record.status,
+        record.options,
+        record.selected_option_id,
+        record.rationale,
+        record.evidence_refs,
+        record.created_by,
+        record.approved_by,
+        record.created_at_utc,
+        record.supersedes,
+        record.previous_record_hash,
+        computed,
     )
 
 
-def supersede_decision(decision_id: str, replacement: DecisionRecord, *, actor: Principal) -> DecisionRecord:
+def supersede_decision(
+    decision_id: str, replacement: DecisionRecord, *, actor: Principal
+) -> DecisionRecord:
     _id(decision_id, "decision")
     if (
         not isinstance(replacement, DecisionRecord)
@@ -201,19 +249,19 @@ def _verify_decision_chain_values(
     for record in values:
         if not isinstance(record, DecisionRecord) or record.decision_id in seen:
             return values, "duplicate_or_invalid_record"
-        expected = "sha256:" + hashlib.sha256(
-            (record.previous_record_hash or "genesis").encode("utf-8")
-            + b"\0"
-            + _canonical_for_hash(record)
-        ).hexdigest()
+        expected = (
+            "sha256:"
+            + hashlib.sha256(
+                (record.previous_record_hash or "genesis").encode("utf-8")
+                + b"\0"
+                + _canonical_for_hash(record)
+            ).hexdigest()
+        )
         if record.previous_record_hash != previous or record.record_hash != expected:
             return values, "decision_chain_mismatch"
-        if (
-            record.supersedes is not None
-            and (
-                record.supersedes == record.decision_id
-                or record.supersedes not in earlier_ids
-            )
+        if record.supersedes is not None and (
+            record.supersedes == record.decision_id
+            or record.supersedes not in earlier_ids
         ):
             return values, "decision_chain_mismatch"
         seen.add(record.decision_id)
@@ -222,7 +270,9 @@ def _verify_decision_chain_values(
     return values, None
 
 
-def verify_decision_chain(records: Iterable[DecisionRecord] = ()) -> Mapping[str, object]:
+def verify_decision_chain(
+    records: Iterable[DecisionRecord] = (),
+) -> Mapping[str, object]:
     """Verify record hashes, links, and supersede references without exposing content."""
 
     values, reason_code = _verify_decision_chain_values(records)
@@ -239,4 +289,10 @@ def verify_decision_chain(records: Iterable[DecisionRecord] = ()) -> Mapping[str
     }
 
 
-__all__ = ["DecisionError", "DecisionRecord", "record_decision", "supersede_decision", "verify_decision_chain"]
+__all__ = [
+    "DecisionError",
+    "DecisionRecord",
+    "record_decision",
+    "supersede_decision",
+    "verify_decision_chain",
+]

@@ -123,13 +123,25 @@ def _inventory() -> DynamicPoolInventoryV1:
     )
 
 
-def _real_assignment_authority(tmp_path: Path) -> tuple[AuthorityEngine, RepositoryRegistry]:
+def _real_assignment_authority(
+    tmp_path: Path,
+) -> tuple[AuthorityEngine, RepositoryRegistry]:
     repository_root = tmp_path / "repository"
     repository_root.mkdir()
     authority_state = HiveStateStore(tmp_path / "authority-state")
     principals = PrincipalRegistry(authority_state)
     for principal in (
-        Principal("godbee-main", "gottbiene", None, "profile", "global", None, "active", DIGEST, 1),
+        Principal(
+            "godbee-main",
+            "gottbiene",
+            None,
+            "profile",
+            "global",
+            None,
+            "active",
+            DIGEST,
+            1,
+        ),
         Principal(
             "queen-codex-master",
             "koenigin",
@@ -301,7 +313,9 @@ def _admission() -> AdmissionRecord:
             "standard",
             "gpt-primary",
             1,
-            AccountPoolBindingV1("account-one", "dynamic-pool", "openai", "openai_chatgpt"),
+            AccountPoolBindingV1(
+                "account-one", "dynamic-pool", "openai", "openai_chatgpt"
+            ),
         ),
         lease_context=LeaseBinding("claimed", "lease-one"),
         priority=AdmissionPriority("DP1", "selection"),
@@ -395,7 +409,9 @@ def test_dispatcher_persists_rehydrates_full_unit_binds_once_and_calls_one_bound
         calls += 1
         return original(**kwargs)
 
-    monkeypatch.setattr(dispatcher_module, "plan_queen_assignment_from_selection", counted_planner)
+    monkeypatch.setattr(
+        dispatcher_module, "plan_queen_assignment_from_selection", counted_planner
+    )
 
     result = dispatcher.dispatch(
         queen_id="queen-codex-master",
@@ -414,9 +430,7 @@ def test_dispatcher_persists_rehydrates_full_unit_binds_once_and_calls_one_bound
     assert calls == 1
     assert bridge.calls == 1
     assert bridge.readers == [reader]
-    assert bridge.scope_digest_requests == [
-        ("codex-master", "write", ("src/task.py",))
-    ]
+    assert bridge.scope_digest_requests == [("codex-master", "write", ("src/task.py",))]
     assert len(port.calls) == 1
     aggregate = dispatcher.rehydrate("dispatch-one")
     assert aggregate.generation == 3
@@ -434,7 +448,10 @@ def test_dispatcher_persists_rehydrates_full_unit_binds_once_and_calls_one_bound
         "bound",
         "bridge_returned",
     )
-    assert HiveWorkDispatcher(control, execution_port=port).rehydrate("dispatch-one") == aggregate
+    assert (
+        HiveWorkDispatcher(control, execution_port=port).rehydrate("dispatch-one")
+        == aggregate
+    )
     assert len(control.load_task9()["pool_dispatches"]) == 1
 
 
@@ -446,7 +463,9 @@ def test_dispatcher_callback_rejects_an_id_only_foreign_executing_admission_afte
     control = HiveControlPlaneStore(HiveStateStore(tmp_path / "state"))
     control.initialize_task9(now=NOW)
     port = RecordingPoolExecutionPort()
-    bridge = RecordingServerBridge(replace(_admission(), admission_id="admission-foreign"))
+    bridge = RecordingServerBridge(
+        replace(_admission(), admission_id="admission-foreign")
+    )
 
     result = HiveWorkDispatcher(control, execution_port=port).dispatch(
         queen_id="queen-codex-master",
@@ -461,7 +480,9 @@ def test_dispatcher_callback_rejects_an_id_only_foreign_executing_admission_afte
         now=NOW,
     )
 
-    aggregate = HiveWorkDispatcher(control, execution_port=port).rehydrate("dispatch-one")
+    aggregate = HiveWorkDispatcher(control, execution_port=port).rehydrate(
+        "dispatch-one"
+    )
     assert aggregate.base_admission_id == "admission-one"
     assert result == {"allowed": False, "reason_code": "pool_execution_unavailable"}
     assert port.calls == []
@@ -475,7 +496,9 @@ def test_dispatcher_callback_accepts_the_canonical_server_retry_admission_id(
     control = HiveControlPlaneStore(HiveStateStore(tmp_path / "state"))
     control.initialize_task9(now=NOW)
     port = RecordingPoolExecutionPort()
-    bridge = RecordingServerBridge(replace(_admission(), admission_id="admission-one-attempt-2"))
+    bridge = RecordingServerBridge(
+        replace(_admission(), admission_id="admission-one-attempt-2")
+    )
 
     result = HiveWorkDispatcher(control, execution_port=port).dispatch(
         queen_id="queen-codex-master",
@@ -491,7 +514,9 @@ def test_dispatcher_callback_accepts_the_canonical_server_retry_admission_id(
     )
 
     assert result == {"status": "test_double_executed"}
-    assert [record.admission_id for record, _lease in port.calls] == ["admission-one-attempt-2"]
+    assert [record.admission_id for record, _lease in port.calls] == [
+        "admission-one-attempt-2"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -528,14 +553,20 @@ def test_dispatcher_requires_a_bridge_base_admission_id_before_persisting(
     control.initialize_task9(now=NOW)
 
     class MissingBaseIdBridge:
-        def scope_digest(self, _repo_id: str, _mode: str, _paths: tuple[str, ...]) -> str:
+        def scope_digest(
+            self, _repo_id: str, _mode: str, _paths: tuple[str, ...]
+        ) -> str:
             return DIGEST
 
         def execute(self, **_kwargs: object) -> Mapping[str, object]:
             raise AssertionError("bridge must not execute")
 
-    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="invalid_hive_execution_bridge"):
-        HiveWorkDispatcher(control, execution_port=RecordingPoolExecutionPort()).dispatch(
+    with pytest.raises(
+        dispatcher_module.HiveWorkDispatcherError, match="invalid_hive_execution_bridge"
+    ):
+        HiveWorkDispatcher(
+            control, execution_port=RecordingPoolExecutionPort()
+        ).dispatch(
             queen_id="queen-codex-master",
             workpackage=_workpackage(),
             intent=_intent(),
@@ -574,11 +605,16 @@ def test_dispatcher_rehydrate_rejects_a_persisted_base_admission_id_substitution
     )
     tampered = control.load_task9()
     tampered_records = list(tampered["pool_dispatches"])
-    tampered_records[0] = {**tampered_records[0], "base_admission_id": "admission-foreign"}
+    tampered_records[0] = {
+        **tampered_records[0],
+        "base_admission_id": "admission-foreign",
+    }
     tampered["pool_dispatches"] = tampered_records
     control.replace_task9(tampered, expected_revision=tampered["revision"], now=NOW)
 
-    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="hive_work_digest_mismatch"):
+    with pytest.raises(
+        dispatcher_module.HiveWorkDispatcherError, match="hive_work_digest_mismatch"
+    ):
         dispatcher.rehydrate("dispatch-one")
 
 
@@ -596,7 +632,11 @@ def test_dispatcher_callback_accepts_real_assignment_admission_and_rejects_diges
     control.initialize_task9(now=NOW)
     port = RecordingPoolExecutionPort()
     dispatcher = HiveWorkDispatcher(control, execution_port=port)
-    fresh_lease = {"state": "held", "held_by_this_server": True, "lease_id": "lease-one"}
+    fresh_lease = {
+        "state": "held",
+        "held_by_this_server": True,
+        "lease_id": "lease-one",
+    }
 
     class GenuineAdmissionBridge:
         def scope_digest(self, repo_id: str, mode: str, paths: tuple[str, ...]) -> str:
@@ -642,7 +682,9 @@ def test_dispatcher_callback_accepts_real_assignment_admission_and_rejects_diges
     assert len(port.calls) == 1
 
 
-def test_dispatcher_without_product_port_is_unavailable_and_never_calls_a_port(tmp_path: Path) -> None:
+def test_dispatcher_without_product_port_is_unavailable_and_never_calls_a_port(
+    tmp_path: Path,
+) -> None:
     control = HiveControlPlaneStore(HiveStateStore(tmp_path / "state"))
     control.initialize_task9(now=NOW)
     dispatcher = HiveWorkDispatcher(control)
@@ -716,9 +758,15 @@ def test_dispatcher_callback_rejects_unbound_and_foreign_admissions_without_a_po
         lambda record: replace(record, grant_id="grant-foreign"),
         lambda record: replace(record, grant_digest=REQUEST_DIGEST),
         lambda record: replace(record, work_item_version=8),
-        lambda record: replace(record, scope=ScopeBinding("write", ("src/other.py",), DIGEST)),
-        lambda record: replace(record, resource=replace(record.resource, agent_id="agent-two")),
-        lambda record: replace(record, resource=replace(record.resource, model_id="gpt-secondary")),
+        lambda record: replace(
+            record, scope=ScopeBinding("write", ("src/other.py",), DIGEST)
+        ),
+        lambda record: replace(
+            record, resource=replace(record.resource, agent_id="agent-two")
+        ),
+        lambda record: replace(
+            record, resource=replace(record.resource, model_id="gpt-secondary")
+        ),
         lambda record: replace(
             record,
             resource=replace(
@@ -739,7 +787,9 @@ def test_dispatcher_callback_requires_every_bound_admission_identity(
     dispatcher = HiveWorkDispatcher(control, execution_port=port)
 
     class TamperingBridge:
-        def scope_digest(self, _repo_id: str, _mode: str, _paths: tuple[str, ...]) -> str:
+        def scope_digest(
+            self, _repo_id: str, _mode: str, _paths: tuple[str, ...]
+        ) -> str:
             return DIGEST
 
         def base_admission_id(self) -> str:
@@ -797,7 +847,9 @@ def test_dispatcher_callback_requires_a_current_executing_admission(
     dispatcher = HiveWorkDispatcher(control, execution_port=port)
 
     class TamperingBridge:
-        def scope_digest(self, _repo_id: str, _mode: str, _paths: tuple[str, ...]) -> str:
+        def scope_digest(
+            self, _repo_id: str, _mode: str, _paths: tuple[str, ...]
+        ) -> str:
             return DIGEST
 
         def base_admission_id(self) -> str:
@@ -838,7 +890,9 @@ def test_dispatcher_callback_rejects_a_mismatched_fresh_lease(tmp_path: Path) ->
     dispatcher = HiveWorkDispatcher(control, execution_port=port)
 
     class LeaseDriftBridge:
-        def scope_digest(self, _repo_id: str, _mode: str, _paths: tuple[str, ...]) -> str:
+        def scope_digest(
+            self, _repo_id: str, _mode: str, _paths: tuple[str, ...]
+        ) -> str:
             return DIGEST
 
         def base_admission_id(self) -> str:
@@ -850,7 +904,11 @@ def test_dispatcher_callback_rejects_a_mismatched_fresh_lease(tmp_path: Path) ->
             assert callable(hive_assignment_callback)
             return hive_assignment_callback(
                 _admission(),
-                {"state": "held", "held_by_this_server": True, "lease_id": "lease-foreign"},
+                {
+                    "state": "held",
+                    "held_by_this_server": True,
+                    "lease_id": "lease-foreign",
+                },
             )
 
     result = dispatcher.dispatch(
@@ -881,7 +939,9 @@ def test_dispatcher_persists_exact_d69_binding_before_bridge_and_rehydrates_afte
     original = dispatcher_module.plan_queen_assignment_from_selection
 
     class FailingBridge:
-        def scope_digest(self, _repo_id: str, _mode: str, _paths: tuple[str, ...]) -> str:
+        def scope_digest(
+            self, _repo_id: str, _mode: str, _paths: tuple[str, ...]
+        ) -> str:
             return DIGEST
 
         def base_admission_id(self) -> str:
@@ -895,7 +955,9 @@ def test_dispatcher_persists_exact_d69_binding_before_bridge_and_rehydrates_afte
         calls += 1
         return original(**kwargs)
 
-    monkeypatch.setattr(dispatcher_module, "plan_queen_assignment_from_selection", counted_planner)
+    monkeypatch.setattr(
+        dispatcher_module, "plan_queen_assignment_from_selection", counted_planner
+    )
 
     with pytest.raises(RuntimeError, match="bridge unavailable"):
         dispatcher.dispatch(
@@ -911,7 +973,9 @@ def test_dispatcher_persists_exact_d69_binding_before_bridge_and_rehydrates_afte
             now=NOW,
         )
 
-    aggregate = HiveWorkDispatcher(control, execution_port=port).rehydrate("dispatch-one")
+    aggregate = HiveWorkDispatcher(control, execution_port=port).rehydrate(
+        "dispatch-one"
+    )
     assert calls == 1
     assert aggregate.state == "bound"
     assert aggregate.bound_account_pool_binding == AccountPoolBindingV1(
@@ -919,7 +983,9 @@ def test_dispatcher_persists_exact_d69_binding_before_bridge_and_rehydrates_afte
     )
     assert aggregate.bound_dynamic_pool_digest.startswith("sha256:")
     assert port.calls == []
-    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="duplicate_hive_work_dispatch"):
+    with pytest.raises(
+        dispatcher_module.HiveWorkDispatcherError, match="duplicate_hive_work_dispatch"
+    ):
         dispatcher.dispatch(
             queen_id="queen-codex-master",
             workpackage=_workpackage(),

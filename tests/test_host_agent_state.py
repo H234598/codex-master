@@ -110,18 +110,17 @@ def test_terminal_semantic_receipt_rebinds_to_later_lease_without_new_effect(
     )
     later = lease(lease_id="lease-two", attempt=2, registry_generation=8)
 
-    rebound = HostAgentState.for_test(
-        tmp_path, host_ref="worker-one"
-    ).recover(later)
+    rebound = HostAgentState.for_test(tmp_path, host_ref="worker-one").recover(later)
 
     assert rebound is not None
     assert rebound.lease_id == later.lease_id
     assert rebound.attempt == later.attempt
     assert rebound.result == saved.result
     assert rebound.result_digest == saved.result_digest
-    assert HostAgentState.for_test(
-        tmp_path, host_ref="worker-one"
-    ).recover(later) == rebound
+    assert (
+        HostAgentState.for_test(tmp_path, host_ref="worker-one").recover(later)
+        == rebound
+    )
     with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
         state.recover(
             lease(
@@ -152,7 +151,9 @@ def test_remote_rebind_refuses_changed_envelope_fence(
 ) -> None:
     state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
     old = lease(
-        kind="ollama.instance", action="apply", arguments={"plan_ref": "plan-one"},
+        kind="ollama.instance",
+        action="apply",
+        arguments={"plan_ref": "plan-one"},
         arguments_digest=digest({"plan_ref": "plan-one"}),
         deadline=datetime(2020, 1, 1, tzinfo=UTC),
     )
@@ -163,13 +164,20 @@ def test_remote_rebind_refuses_changed_envelope_fence(
         registry_generation=old.registry_generation,
         lease_epoch=old.lease_epoch,
         resource_generation=values.get("resource_generation", old.resource_generation),  # type: ignore[arg-type]
-        plan_precondition_digest=values.get("plan_precondition_digest", old.plan_precondition_digest),  # type: ignore[arg-type]
+        plan_precondition_digest=values.get(
+            "plan_precondition_digest", old.plan_precondition_digest
+        ),  # type: ignore[arg-type]
     )
     with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
-        state.accept(lease(
-            kind="ollama.instance", action="apply", arguments={"plan_ref": "plan-one"},
-            arguments_digest=digest({"plan_ref": "plan-one"}), **values,
-        ))
+        state.accept(
+            lease(
+                kind="ollama.instance",
+                action="apply",
+                arguments={"plan_ref": "plan-one"},
+                arguments_digest=digest({"plan_ref": "plan-one"}),
+                **values,
+            )
+        )
 
 
 @pytest.mark.parametrize("changed", ("resource_generation", "plan_precondition_digest"))
@@ -178,7 +186,9 @@ def test_remote_terminal_rebind_refuses_changed_envelope_fence(
 ) -> None:
     state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
     old = lease(
-        kind="ollama.instance", action="apply", arguments={"plan_ref": "plan-one"},
+        kind="ollama.instance",
+        action="apply",
+        arguments={"plan_ref": "plan-one"},
         arguments_digest=digest({"plan_ref": "plan-one"}),
     )
     state.accept(old)
@@ -194,14 +204,18 @@ def test_remote_terminal_rebind_refuses_changed_envelope_fence(
         registry_generation=old.registry_generation,
         lease_epoch=old.lease_epoch,
         resource_generation=values.get("resource_generation", old.resource_generation),  # type: ignore[arg-type]
-        plan_precondition_digest=values.get("plan_precondition_digest", old.plan_precondition_digest),  # type: ignore[arg-type]
+        plan_precondition_digest=values.get(
+            "plan_precondition_digest", old.plan_precondition_digest
+        ),  # type: ignore[arg-type]
     )
     with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
         state.recover(
             lease(
-                kind="ollama.instance", action="apply",
+                kind="ollama.instance",
+                action="apply",
                 arguments={"plan_ref": "plan-one"},
-                arguments_digest=digest({"plan_ref": "plan-one"}), **values,
+                arguments_digest=digest({"plan_ref": "plan-one"}),
+                **values,
             )
         )
 
@@ -217,14 +231,19 @@ def test_v3_remote_state_is_refused_while_v1_host_probe_replays(tmp_path: Path) 
         result=result(probe),
     )
     remote = lease(
-        operation_id="operation-remote", kind="ollama.instance", action="apply",
-        arguments={"plan_ref": "plan-one"}, arguments_digest=digest({"plan_ref": "plan-one"}),
+        operation_id="operation-remote",
+        kind="ollama.instance",
+        action="apply",
+        arguments={"plan_ref": "plan-one"},
+        arguments_digest=digest({"plan_ref": "plan-one"}),
     )
     state.accept(remote)
     with state._state.locked():  # noqa: SLF001 - production-format V3 fixture
         document = state._read_locked()  # noqa: SLF001
         document["schema_version"] = 3
-        document["receipts"][probe.operation_id]["fence"] = document["receipts"][probe.operation_id]["fence"][:10]
+        document["receipts"][probe.operation_id]["fence"] = document["receipts"][
+            probe.operation_id
+        ]["fence"][:10]
         legacy = document["accepted"][remote.operation_id]
         legacy["fence"] = legacy["fence"][:10]
         legacy["lease"]["schema_version"] = 1
@@ -291,9 +310,7 @@ def test_live_process_claim_is_bounded_by_lease_deadline(tmp_path: Path) -> None
     process.start()
     try:
         assert ready.wait(2)
-        receipt = HostAgentState.for_test(
-            tmp_path, host_ref="worker-one"
-        ).recover(item)
+        receipt = HostAgentState.for_test(tmp_path, host_ref="worker-one").recover(item)
         assert receipt is not None and receipt.state == "unknown"
         assert process.is_alive()
     finally:
@@ -324,9 +341,7 @@ def test_claim_deadline_ignores_utc_jumps_and_uses_persisted_monotonic(
 
     utc -= timedelta(days=60)
     monotonic = 121.0
-    receipt = HostAgentState.for_test(
-        tmp_path, host_ref="worker-one"
-    ).recover(item)
+    receipt = HostAgentState.for_test(tmp_path, host_ref="worker-one").recover(item)
     assert receipt is not None and receipt.state == "unknown"
 
 
@@ -469,9 +484,7 @@ def test_state_rejects_duplicate_keys_and_incoherent_records(tmp_path: Path) -> 
 def test_accepted_records_are_bounded_and_expired_unclaimed_work_is_reclaimed(
     tmp_path: Path,
 ) -> None:
-    state = HostAgentState.for_test(
-        tmp_path, host_ref="worker-one", max_accepted=2
-    )
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one", max_accepted=2)
     state.accept(lease(operation_id="one", lease_id="lease-one"))
     state.accept(lease(operation_id="two", lease_id="lease-two"))
     with pytest.raises(HostAgentStateError, match="host.accepted_limit"):

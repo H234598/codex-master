@@ -61,7 +61,9 @@ class PilotProvisionerError(ValueError):
 
 def _canonical_bytes(payload: Mapping[str, object]) -> bytes:
     try:
-        value = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        value = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
     except (TypeError, ValueError, RecursionError) as exc:
         raise PilotProvisionerError("pilot_config_invalid") from exc
     return (value + "\n").encode("utf-8")
@@ -133,7 +135,11 @@ def _input_digest(raw: bytes) -> str:
 
 
 def _validate_absolute_path(path: object, *, code: str) -> Path:
-    if not isinstance(path, Path) or not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts[1:]):
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts[1:])
+    ):
         raise PilotProvisionerError(code)
     return path
 
@@ -158,7 +164,9 @@ def _validate_directory_chain(path: Path) -> None:
 
 
 def _open_repository_root(repository_root: Path) -> tuple[int, tuple[int, int]]:
-    repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
+    repository_root = _validate_absolute_path(
+        repository_root, code="pilot_repository_untrusted"
+    )
     _validate_directory_chain(repository_root)
     try:
         initial = repository_root.lstat()
@@ -199,7 +207,9 @@ def _read_regular(root_descriptor: int, name: str) -> tuple[bytes, tuple[int, in
     try:
         initial = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
         _validate_public_file(initial)
-        descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_descriptor)
+        descriptor = os.open(
+            name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_descriptor
+        )
     except PilotProvisionerError:
         raise
     except OSError as exc:
@@ -270,7 +280,9 @@ def _replace_config_atomically(
     temporary = f".{_CONFIG_NAME}.{secrets.token_hex(16)}"
     descriptor: int | None = None
     try:
-        _verify_repository_root_binding(repository_root, root_descriptor, expected_root_identity)
+        _verify_repository_root_binding(
+            repository_root, root_descriptor, expected_root_identity
+        )
         current_raw, current_identity = _read_regular(root_descriptor, _CONFIG_NAME)
         catalog_raw, _catalog_identity = _read_regular(root_descriptor, _CATALOG_NAME)
         if (
@@ -305,13 +317,22 @@ def _replace_config_atomically(
             raise PilotProvisionerError("pilot_config_drift")
         if _input_digest(catalog_raw) != expected_catalog_digest:
             raise PilotProvisionerError("pilot_catalog_drift")
-        _verify_repository_root_binding(repository_root, root_descriptor, expected_root_identity)
-        os.replace(temporary, _CONFIG_NAME, src_dir_fd=root_descriptor, dst_dir_fd=root_descriptor)
+        _verify_repository_root_binding(
+            repository_root, root_descriptor, expected_root_identity
+        )
+        os.replace(
+            temporary,
+            _CONFIG_NAME,
+            src_dir_fd=root_descriptor,
+            dst_dir_fd=root_descriptor,
+        )
         temporary = ""
         replaced = os.stat(_CONFIG_NAME, dir_fd=root_descriptor, follow_symlinks=False)
         _validate_public_file(replaced)
         os.fsync(root_descriptor)
-        _verify_repository_root_binding(repository_root, root_descriptor, expected_root_identity)
+        _verify_repository_root_binding(
+            repository_root, root_descriptor, expected_root_identity
+        )
     except PilotProvisionerError:
         raise
     except OSError as exc:
@@ -325,7 +346,21 @@ def _replace_config_atomically(
 
 
 @contextlib.contextmanager
-def _opened_inputs(repository_root: Path) -> Iterator[tuple[int, tuple[int, int], AgentClassCatalogSnapshot, HiveConfig, tuple[int, int], str, str, HiveConfig, bytes]]:
+def _opened_inputs(
+    repository_root: Path,
+) -> Iterator[
+    tuple[
+        int,
+        tuple[int, int],
+        AgentClassCatalogSnapshot,
+        HiveConfig,
+        tuple[int, int],
+        str,
+        str,
+        HiveConfig,
+        bytes,
+    ]
+]:
     root_descriptor, root_identity = _open_repository_root(repository_root)
     try:
         catalog_raw, _ = _read_regular(root_descriptor, _CATALOG_NAME)
@@ -370,12 +405,9 @@ def _is_target(config: HiveConfig, target: HiveConfig) -> bool:
 
 def _has_canonical_repository_binding(config: HiveConfig) -> bool:
     expected = _pilot_payload()["repositories"]
-    return (
-        len(config.repositories) == len(expected)
-        and all(
-            isinstance(repository, Mapping) and dict(repository) == required
-            for repository, required in zip(config.repositories, expected, strict=True)
-        )
+    return len(config.repositories) == len(expected) and all(
+        isinstance(repository, Mapping) and dict(repository) == required
+        for repository, required in zip(config.repositories, expected, strict=True)
     )
 
 
@@ -393,7 +425,11 @@ def _assert_canonical_repository(
         raise PilotProvisionerError("pilot_repository_invalid")
     if not _has_canonical_repository_binding(target):
         raise PilotProvisionerError("pilot_repository_invalid")
-    if current is not None and current.mode == "enforced" and not _has_canonical_repository_binding(current):
+    if (
+        current is not None
+        and current.mode == "enforced"
+        and not _has_canonical_repository_binding(current)
+    ):
         raise PilotProvisionerError("pilot_repository_invalid")
 
 
@@ -415,14 +451,17 @@ def _read_journal_locked(store: HiveStateStore, target: HiveConfig) -> str | Non
     if (
         set(payload) != {"schema_version", "phase", "target_config_digest"}
         or payload.get("schema_version") != 1
-        or payload.get("phase") not in {"prepared", "committed", "killed", "rolled_back"}
+        or payload.get("phase")
+        not in {"prepared", "committed", "killed", "rolled_back"}
         or payload.get("target_config_digest") != target.digest
     ):
         raise PilotProvisionerError("pilot_journal_invalid")
     return str(payload["phase"])
 
 
-def _write_journal_locked(store: HiveStateStore, phase: str, target: HiveConfig) -> None:
+def _write_journal_locked(
+    store: HiveStateStore, phase: str, target: HiveConfig
+) -> None:
     try:
         store.replace_json_locked(_JOURNAL, _journal_payload(phase, target))
     except HiveStateError as exc:
@@ -509,12 +548,24 @@ def _open_read_only_state(state_root: Path) -> HiveStateStore:
         raise PilotProvisionerError("pilot_state_unavailable") from exc
 
 
-def plan_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapping[str, object]:
+def plan_pilot_provisioning(
+    *, repository_root: Path, state_root: Path
+) -> Mapping[str, object]:
     """Validate the authorised target without creating any state."""
 
     _validate_absolute_path(state_root, code="pilot_state_unavailable")
     _validate_state_parent(state_root)
-    with _opened_inputs(repository_root) as (_fd, _root_identity, _snapshot, current, _identity_value, _config_digest_value, _catalog_digest_value, target, _bytes):
+    with _opened_inputs(repository_root) as (
+        _fd,
+        _root_identity,
+        _snapshot,
+        current,
+        _identity_value,
+        _config_digest_value,
+        _catalog_digest_value,
+        target,
+        _bytes,
+    ):
         _assert_canonical_repository(repository_root, target, current)
         if not _is_shadow_baseline(current):
             raise PilotProvisionerError("pilot_config_drift")
@@ -529,10 +580,14 @@ def plan_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mappi
     }
 
 
-def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapping[str, object]:
+def apply_pilot_provisioning(
+    *, repository_root: Path, state_root: Path
+) -> Mapping[str, object]:
     """Prepare exact principal state and atomically expose the closed pilot config."""
 
-    repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
+    repository_root = _validate_absolute_path(
+        repository_root, code="pilot_repository_untrusted"
+    )
     state_root = _validate_absolute_path(state_root, code="pilot_state_unavailable")
     with _opened_inputs(repository_root) as (
         _root_fd,
@@ -564,7 +619,9 @@ def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapp
             if phase is None:
                 if not _is_shadow_baseline(current):
                     raise PilotProvisionerError("pilot_config_drift")
-                _materialize_target(target, snapshot, repository_root, state_root, materialize=True)
+                _materialize_target(
+                    target, snapshot, repository_root, state_root, materialize=True
+                )
                 _write_journal_locked(store, "prepared", target)
                 _assert_canonical_repository(repository_root, target, current)
                 _replace_config_atomically(
@@ -576,12 +633,16 @@ def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapp
                     catalog_input_digest,
                     target_bytes,
                 )
-                _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
+                _materialize_target(
+                    target, snapshot, repository_root, state_root, materialize=False
+                )
                 _write_journal_locked(store, "committed", target)
                 applied = True
             elif phase == "prepared":
                 if _is_shadow_baseline(current):
-                    _materialize_target(target, snapshot, repository_root, state_root, materialize=True)
+                    _materialize_target(
+                        target, snapshot, repository_root, state_root, materialize=True
+                    )
                     _assert_canonical_repository(repository_root, target, current)
                     _replace_config_atomically(
                         repository_root,
@@ -594,16 +655,22 @@ def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapp
                     )
                 elif not _is_target(current, target):
                     raise PilotProvisionerError("pilot_config_drift")
-                _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
+                _materialize_target(
+                    target, snapshot, repository_root, state_root, materialize=False
+                )
                 _write_journal_locked(store, "committed", target)
                 applied = True
             elif phase == "committed":
                 if not _is_target(current, target):
                     raise PilotProvisionerError("pilot_config_drift")
-                _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
+                _materialize_target(
+                    target, snapshot, repository_root, state_root, materialize=False
+                )
                 applied = False
             elif phase == "rolled_back" and _is_shadow_baseline(current):
-                _materialize_target(target, snapshot, repository_root, state_root, materialize=True)
+                _materialize_target(
+                    target, snapshot, repository_root, state_root, materialize=True
+                )
                 _write_journal_locked(store, "prepared", target)
                 _assert_canonical_repository(repository_root, target, current)
                 _replace_config_atomically(
@@ -615,7 +682,9 @@ def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapp
                     catalog_input_digest,
                     target_bytes,
                 )
-                _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
+                _materialize_target(
+                    target, snapshot, repository_root, state_root, materialize=False
+                )
                 _write_journal_locked(store, "committed", target)
                 applied = True
             else:
@@ -630,12 +699,26 @@ def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapp
     }
 
 
-def verify_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapping[str, object]:
+def verify_pilot_provisioning(
+    *, repository_root: Path, state_root: Path
+) -> Mapping[str, object]:
     """Verify config/state parity through the existing runtime assembler only."""
 
-    repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
+    repository_root = _validate_absolute_path(
+        repository_root, code="pilot_repository_untrusted"
+    )
     state_root = _validate_absolute_path(state_root, code="pilot_state_unavailable")
-    with _opened_inputs(repository_root) as (_fd, _root_identity, snapshot, current, _identity_value, _config_digest_value, _catalog_digest_value, target, _bytes):
+    with _opened_inputs(repository_root) as (
+        _fd,
+        _root_identity,
+        snapshot,
+        current,
+        _identity_value,
+        _config_digest_value,
+        _catalog_digest_value,
+        target,
+        _bytes,
+    ):
         _assert_canonical_repository(repository_root, target, current)
         if not _is_target(current, target):
             raise PilotProvisionerError("pilot_config_drift")
@@ -644,7 +727,12 @@ def verify_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Map
             if _read_journal_locked(store, target) != "committed":
                 raise PilotProvisionerError("pilot_journal_invalid")
             _materialize_target(
-                target, snapshot, repository_root, state_root, materialize=False, read_only=True
+                target,
+                snapshot,
+                repository_root,
+                state_root,
+                materialize=False,
+                read_only=True,
             )
     evidence = read_hive_runtime_evidence(
         catalog_path=repository_root / _CATALOG_NAME,
@@ -664,10 +752,14 @@ def verify_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Map
     }
 
 
-def kill_switch_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapping[str, object]:
+def kill_switch_pilot_provisioning(
+    *, repository_root: Path, state_root: Path
+) -> Mapping[str, object]:
     """Atomically return to the known Shadow config before any cleanup."""
 
-    repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
+    repository_root = _validate_absolute_path(
+        repository_root, code="pilot_repository_untrusted"
+    )
     state_root = _validate_absolute_path(state_root, code="pilot_state_unavailable")
     shadow_bytes = _canonical_bytes(_shadow_payload())
     with _opened_inputs(repository_root) as (
@@ -724,10 +816,14 @@ def kill_switch_pilot_provisioning(*, repository_root: Path, state_root: Path) -
     }
 
 
-def rollback_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapping[str, object]:
+def rollback_pilot_provisioning(
+    *, repository_root: Path, state_root: Path
+) -> Mapping[str, object]:
     """Keep Shadow first, then remove only the validated initial principal file."""
 
-    repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
+    repository_root = _validate_absolute_path(
+        repository_root, code="pilot_repository_untrusted"
+    )
     state_root = _validate_absolute_path(state_root, code="pilot_state_unavailable")
     shadow_bytes = _canonical_bytes(_shadow_payload())
     with _opened_inputs(repository_root) as (
@@ -762,7 +858,9 @@ def rollback_pilot_provisioning(*, repository_root: Path, state_root: Path) -> M
             if not (_is_target(current, target) or _is_shadow_baseline(current)):
                 raise PilotProvisionerError("pilot_config_drift")
             if _is_target(current, target):
-                _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
+                _materialize_target(
+                    target, snapshot, repository_root, state_root, materialize=False
+                )
                 _assert_canonical_repository(repository_root, target, current)
                 _replace_config_atomically(
                     repository_root,
@@ -775,13 +873,17 @@ def rollback_pilot_provisioning(*, repository_root: Path, state_root: Path) -> M
                 )
             elif phase != "rolled_back":
                 try:
-                    _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
+                    _materialize_target(
+                        target, snapshot, repository_root, state_root, materialize=False
+                    )
                 except PilotProvisionerError:
                     try:
                         store.read_private_bytes(_PRINCIPALS, max_bytes=4 * 1024 * 1024)
                     except HiveStateError as exc:
                         if str(exc) != "state_not_found":
-                            raise PilotProvisionerError("pilot_principal_state_invalid") from exc
+                            raise PilotProvisionerError(
+                                "pilot_principal_state_invalid"
+                            ) from exc
                     else:
                         raise
             try:
@@ -833,7 +935,12 @@ def main(arguments: list[str] | None = None) -> int:
             state_root=args.state_root,
         )
     except PilotProvisionerError as exc:
-        print(json.dumps({"ok": False, "reason_code": str(exc), "raw_output": "not_returned"}, sort_keys=True))
+        print(
+            json.dumps(
+                {"ok": False, "reason_code": str(exc), "raw_output": "not_returned"},
+                sort_keys=True,
+            )
+        )
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0

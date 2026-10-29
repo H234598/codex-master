@@ -46,7 +46,9 @@ OLD_PROVIDER_CREDENTIAL = "old-provider-secret"
 FIXED_BINDING_SALT = bytes(range(32))
 
 
-def v2_gemini_snapshot(*, generation: int = 2, enabled: bool = False) -> FleetSnapshotV2:
+def v2_gemini_snapshot(
+    *, generation: int = 2, enabled: bool = False
+) -> FleetSnapshotV2:
     accounts = tuple(
         FleetAccountV2(
             account_id,
@@ -66,8 +68,12 @@ def v2_gemini_snapshot(*, generation: int = 2, enabled: bool = False) -> FleetSn
         )
     )
     members = (
-        FleetSeriesMember("00000000-0000-4000-8000-000000000001", 1, "gemini-project-1", enabled),
-        FleetSeriesMember("00000000-0000-4000-8000-000000000002", 2, "gemini-project-2", enabled),
+        FleetSeriesMember(
+            "00000000-0000-4000-8000-000000000001", 1, "gemini-project-1", enabled
+        ),
+        FleetSeriesMember(
+            "00000000-0000-4000-8000-000000000002", 2, "gemini-project-2", enabled
+        ),
     )
     return FleetSnapshotV2(
         2,
@@ -132,7 +138,10 @@ def test_v2_configured_gemini_without_binding_is_denied(
     snapshot = v2_gemini_snapshot(enabled=True)
     configured = replace(
         snapshot,
-        accounts=tuple(replace(account, secret_state=SecretState.CONFIGURED) for account in snapshot.accounts),
+        accounts=tuple(
+            replace(account, secret_state=SecretState.CONFIGURED)
+            for account in snapshot.accounts
+        ),
     )
     service.commit_snapshot(configured, expected_generation=1)
 
@@ -180,7 +189,9 @@ def test_existing_binding_salt_wrong_mode_fails_closed_after_sidecar_write(
 
     assert salt_path.read_bytes() == salt
     assert stat.S_IMODE(salt_path.stat().st_mode) == 0o644
-    assert (service._paths.secrets / "gemini-project-2.secret").read_text() == "second-key"
+    assert (
+        service._paths.secrets / "gemini-project-2.secret"
+    ).read_text() == "second-key"
     after = service.load()
     assert after.generation == before.generation
     assert v2_account(after, "gemini-project-2").credential_binding_id == (
@@ -253,7 +264,9 @@ def test_duplicate_binding_restores_target_sidecar_and_registry(
     with pytest.raises(FleetValidationError, match="duplicate_credential_binding"):
         service.set_secret("gemini-project-2", "same-key", expected_generation=4)
 
-    assert (service._paths.secrets / "gemini-project-2.secret").read_text() == "old-second-key"
+    assert (
+        service._paths.secrets / "gemini-project-2.secret"
+    ).read_text() == "old-second-key"
     after = service.load()
     assert after.generation == before.generation
     assert v2_account(after, "gemini-project-2").credential_binding_id == (
@@ -275,12 +288,17 @@ def test_binding_hmac_fixed_vector_uses_private_domain_and_salt(
     service.commit_snapshot(v2_gemini_snapshot(), expected_generation=1)
 
     service.set_secret("gemini-project-1", "fixed-secret", expected_generation=2)
-    expected = "hmac-sha256:" + hmac.new(
-        FIXED_BINDING_SALT,
-        b"codex-master:gemini-credential-binding:v1\0fixed-secret",
-        hashlib.sha256,
-    ).hexdigest()
-    assert v2_account(service.load(), "gemini-project-1").credential_binding_id == expected
+    expected = (
+        "hmac-sha256:"
+        + hmac.new(
+            FIXED_BINDING_SALT,
+            b"codex-master:gemini-credential-binding:v1\0fixed-secret",
+            hashlib.sha256,
+        ).hexdigest()
+    )
+    assert (
+        v2_account(service.load(), "gemini-project-1").credential_binding_id == expected
+    )
 
 
 def test_public_v2_account_api_redacts_binding_salt_and_secret(
@@ -335,8 +353,14 @@ def test_account_and_series_api_is_generation_bound_and_secret_free(
     service = server.current_fleet_service()
     current = service.load()
     series = FleetSeries(
-        "d", "Gemini D", 2, RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-        "gemini-3-flash-preview", "gemini-project-1", True,
+        "d",
+        "Gemini D",
+        2,
+        RunnerKind.GEMINI_CLI,
+        Provider.GEMINI_API,
+        "gemini-3-flash-preview",
+        "gemini-project-1",
+        True,
     )
     service.commit_snapshot(
         FleetSnapshot(1, current.generation + 1, current.accounts, (series,)),
@@ -344,16 +368,18 @@ def test_account_and_series_api_is_generation_bound_and_secret_free(
     )
     listed = server.fleet_series_list()
     assert listed["generation"] == 4
-    assert listed["series"] == [{
-        "prefix": "d",
-        "display_name": "Gemini D",
-        "count": 2,
-        "runner": "gemini_cli",
-        "provider": "gemini_api",
-        "model": "gemini-3-flash-preview",
-        "account_id": "gemini-project-1",
-        "enabled": True,
-    }]
+    assert listed["series"] == [
+        {
+            "prefix": "d",
+            "display_name": "Gemini D",
+            "count": 2,
+            "runner": "gemini_cli",
+            "provider": "gemini_api",
+            "model": "gemini-3-flash-preview",
+            "account_id": "gemini-project-1",
+            "enabled": True,
+        }
+    ]
 
     disabled = server.fleet_account_disable(
         account_id="gemini-project-1",
@@ -363,7 +389,9 @@ def test_account_and_series_api_is_generation_bound_and_secret_free(
     assert disabled["account"]["enabled"] is False
 
     with pytest.raises(server.AgentError, match="generation_conflict"):
-        server.fleet_account_disable(account_id="gemini-project-1", expected_generation=4)
+        server.fleet_account_disable(
+            account_id="gemini-project-1", expected_generation=4
+        )
 
 
 def test_account_upsert_rejects_provider_change_for_bound_series(
@@ -373,16 +401,30 @@ def test_account_upsert_rejects_provider_change_for_bound_series(
     monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
     account = FleetAccount(
-        "shared", "Shared", Provider.GEMINI_API, AuthKind.API_KEY,
-        SecretState.CONFIGURED, LimitState.READY, True,
-        None, "2026-08-03T12:00:00Z", None,
+        "shared",
+        "Shared",
+        Provider.GEMINI_API,
+        AuthKind.API_KEY,
+        SecretState.CONFIGURED,
+        LimitState.READY,
+        True,
+        None,
+        "2026-08-03T12:00:00Z",
+        None,
     )
     series = FleetSeries(
-        "d", "D", 1, RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-        "model", "shared", True,
+        "d",
+        "D",
+        1,
+        RunnerKind.GEMINI_CLI,
+        Provider.GEMINI_API,
+        "model",
+        "shared",
+        True,
     )
     server.current_fleet_service().commit_snapshot(
-        FleetSnapshot(1, 2, (account,), (series,)), expected_generation=1,
+        FleetSnapshot(1, 2, (account,), (series,)),
+        expected_generation=1,
     )
 
     with pytest.raises(server.AgentError, match="account_in_use"):
@@ -456,7 +498,9 @@ def test_account_tool_catalog_has_no_secret_default_or_private_fields() -> None:
     assert secret_schema["additionalProperties"] is False
     provider_schema = by_name["fleet_provider_models"]["inputSchema"]
     assert provider_schema["properties"]["provider"]["enum"] == [
-        "ollama_local", "huggingface_inference", "gemini_api",
+        "ollama_local",
+        "huggingface_inference",
+        "gemini_api",
     ]
     probe_schema = by_name["fleet_account_probe"]["inputSchema"]
     assert probe_schema["required"] == ["account_id", "expected_generation"]
@@ -475,10 +519,22 @@ def test_fleet_account_probe_cli_threads_optional_model(
         return {"raw_output": "not_returned"}
 
     monkeypatch.setattr(server, "call_validated_tool", fake_call)
-    assert server.main_cli([
-        "fleet", "account", "probe", "--account-id", "gemini-ready",
-        "--expected-generation", "3", "--model", "gemini-2.5-flash-lite",
-    ]) == 0
+    assert (
+        server.main_cli(
+            [
+                "fleet",
+                "account",
+                "probe",
+                "--account-id",
+                "gemini-ready",
+                "--expected-generation",
+                "3",
+                "--model",
+                "gemini-2.5-flash-lite",
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     assert captured == {
         "name": "fleet_account_probe",
@@ -509,7 +565,9 @@ def test_provider_models_is_bounded_and_keeps_hf_secret_private(
     monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
     captured: dict[str, object] = {}
 
-    def fake_probe(provider: Provider, *, secret: str | None = None) -> ProviderModelsResult:
+    def fake_probe(
+        provider: Provider, *, secret: str | None = None
+    ) -> ProviderModelsResult:
         captured["provider"] = provider
         captured["secret"] = secret
         return ProviderModelsResult(
@@ -542,7 +600,10 @@ def test_provider_models_is_bounded_and_keeps_hf_secret_private(
         account_id="hf-main",
     )
     assert huggingface["models"] == [{"id": "good/model", "agentic": True}]
-    assert captured == {"provider": Provider.HUGGINGFACE_INFERENCE, "secret": HF_MAIN_CREDENTIAL}
+    assert captured == {
+        "provider": Provider.HUGGINGFACE_INFERENCE,
+        "secret": HF_MAIN_CREDENTIAL,
+    }
     assert HF_MAIN_CREDENTIAL not in json.dumps(huggingface)
 
 
@@ -577,18 +638,22 @@ def test_gemini_provider_models_uses_configured_account_without_secret_output(
     )
     captured: dict[str, object] = {}
 
-    def fake_probe(provider: Provider, *, secret: str | None = None) -> ProviderModelsResult:
+    def fake_probe(
+        provider: Provider, *, secret: str | None = None
+    ) -> ProviderModelsResult:
         captured.update({"provider": provider, "secret": secret})
         return ProviderModelsResult(
             provider,
             True,
-            ({
-                "id": "gemini-2.5-flash-lite",
-                "supported_generation_methods": ["generateContent"],
-                "supports_generate_content": True,
-                "agentic": True,
-                "readiness_worker": True,
-            },),
+            (
+                {
+                    "id": "gemini-2.5-flash-lite",
+                    "supported_generation_methods": ["generateContent"],
+                    "supports_generate_content": True,
+                    "agentic": True,
+                    "readiness_worker": True,
+                },
+            ),
             None,
         )
 
@@ -596,7 +661,10 @@ def test_gemini_provider_models_uses_configured_account_without_secret_output(
     result = server.fleet_provider_models(provider="gemini_api")
 
     assert result["models"][0]["id"] == "gemini-2.5-flash-lite"
-    assert captured == {"provider": Provider.GEMINI_API, "secret": GEMINI_READY_CREDENTIAL}
+    assert captured == {
+        "provider": Provider.GEMINI_API,
+        "secret": GEMINI_READY_CREDENTIAL,
+    }
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
@@ -657,7 +725,9 @@ def test_gemini_account_probe_reports_missing_secret_without_invalidating_accoun
         expected_generation=1,
     )
 
-    result = server.fleet_account_probe(account_id="gemini-missing", expected_generation=2)
+    result = server.fleet_account_probe(
+        account_id="gemini-missing", expected_generation=2
+    )
 
     assert result == {
         "probed": True,
@@ -690,7 +760,11 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         secret=GEMINI_READY_CREDENTIAL,
         expected_generation=2,
     )
-    monkeypatch.setattr(server.shutil, "which", lambda _name: pytest.fail("CLI lookup is not part of account probe"))
+    monkeypatch.setattr(
+        server.shutil,
+        "which",
+        lambda _name: pytest.fail("CLI lookup is not part of account probe"),
+    )
     captured: dict[str, object] = {}
     service = server.current_fleet_service()
     probe_account = Mock(wraps=service.probe_account)
@@ -730,187 +804,190 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
-@pytest.mark.parametrize((
-    "error_kind",
-    "error_retryable",
-    "diagnostic_code",
-    "expected_observed",
-    "provided_output_shape",
-    "expected_output_shape",
-    "provided_stdout_shape",
-    "expected_stdout_shape",
-    "provided_stdout_event_class",
-    "provided_stdout_error_seen",
-    "expected_stdout_event_class",
-    "expected_stdout_error_seen",
-    "expected_process",
-    "expected_observed_process",
-    "expected_ready",
-    "expected_reason",
-    "expected_event_status",
-    "model_name",
-), [
+@pytest.mark.parametrize(
     (
-        "provider_unavailable",
-        False,
-        "gemini_probe_process_timeout",
-        "gemini_probe_process_timeout",
-        "gemini_probe_output_stdout_stderr",
-        "gemini_probe_output_stdout_stderr",
-        "gemini_probe_stdout_jsonl_incomplete",
-        "gemini_probe_stdout_jsonl_incomplete",
-        "gemini_probe_stdout_event_init",
-        True,
-        "gemini_probe_stdout_event_init",
-        True,
-        "gemini_probe_timeout_output_unclassified",
-        "gemini_probe_timeout_output_unclassified",
-        False,
-        "provider_unavailable",
-        "failed",
-        None,
+        "error_kind",
+        "error_retryable",
+        "diagnostic_code",
+        "expected_observed",
+        "provided_output_shape",
+        "expected_output_shape",
+        "provided_stdout_shape",
+        "expected_stdout_shape",
+        "provided_stdout_event_class",
+        "provided_stdout_error_seen",
+        "expected_stdout_event_class",
+        "expected_stdout_error_seen",
+        "expected_process",
+        "expected_observed_process",
+        "expected_ready",
+        "expected_reason",
+        "expected_event_status",
+        "model_name",
     ),
-    (
-        "provider_unavailable",
-        False,
-        "gemini_probe_process_timeout",
-        "gemini_probe_process_timeout",
-        "gemini_probe_output_stdout_stderr",
-        "gemini_probe_output_stdout_stderr",
-        "gemini_probe_stdout_jsonl_incomplete",
-        "gemini_probe_stdout_jsonl_incomplete",
-        "mystery_event_class",
-        False,
-        None,
-        None,
-        "gemini_probe_timeout_output_unclassified",
-        "gemini_probe_timeout_output_unclassified",
-        False,
-        "provider_unavailable",
-        "failed",
-        None,
-    ),
-    (
-        "runner_failed",
-        False,
-        "gemini_probe_generate_content_http_4xx_contract_rejected",
-        "gemini_probe_generate_content_http_4xx_contract_rejected",
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        False,
-        "runner_failed",
-        "failed",
-        None,
-    ),
-    (
-        "provider_unavailable",
-        False,
-        "mystery_probe_code",
-        None,
-        "mystery_output_shape",
-        None,
-        "gemini_probe_stdout_terminal_jsonl",
-        None,
-        None,
-        None,
-        None,
-        None,
-        "not_a_phase",
-        None,
-        False,
-        "provider_unavailable",
-        "failed",
-        None,
-    ),
-    (
-        "account_limited",
-        True,
-        "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        "gemini_probe_normal_exit",
-        "gemini_probe_normal_exit",
-        True,
-        "ready",
-        "completed",
-        "gemini-9.9-future-preview",
-    ),
-    (
-        "provider_unavailable",
-        False,
-        "gemini_probe_generate_content_http_5xx_provider_unavailable",
-        "gemini_probe_generate_content_http_5xx_provider_unavailable",
-        "mystery_output_shape",
-        None,
-        "gemini_probe_stdout_terminal_jsonl",
-        None,
-        None,
-        None,
-        None,
-        None,
-        "not_a_phase",
-        None,
-        False,
-        "provider_unavailable",
-        "failed",
-        None,
-    ),
-    (
-        "auth_or_billing_denied",
-        False,
-        "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        "gemini_probe_normal_exit",
-        "gemini_probe_normal_exit",
-        False,
-        "auth_or_billing_denied",
-        "failed",
-        None,
-    ),
-    (
-        "provider_unavailable",
-        False,
-        None,
-        None,
-        "gemini_probe_output_stdout_terminal",
-        None,
-        "gemini_probe_stdout_terminal_jsonl",
-        None,
-        None,
-        None,
-        None,
-        None,
-        "gemini_probe_normal_exit",
-        "gemini_probe_normal_exit",
-        True,
-        "ready",
-        "completed",
-        "gemini-2.5-flash",
-    ),
-])
+    [
+        (
+            "provider_unavailable",
+            False,
+            "gemini_probe_process_timeout",
+            "gemini_probe_process_timeout",
+            "gemini_probe_output_stdout_stderr",
+            "gemini_probe_output_stdout_stderr",
+            "gemini_probe_stdout_jsonl_incomplete",
+            "gemini_probe_stdout_jsonl_incomplete",
+            "gemini_probe_stdout_event_init",
+            True,
+            "gemini_probe_stdout_event_init",
+            True,
+            "gemini_probe_timeout_output_unclassified",
+            "gemini_probe_timeout_output_unclassified",
+            False,
+            "provider_unavailable",
+            "failed",
+            None,
+        ),
+        (
+            "provider_unavailable",
+            False,
+            "gemini_probe_process_timeout",
+            "gemini_probe_process_timeout",
+            "gemini_probe_output_stdout_stderr",
+            "gemini_probe_output_stdout_stderr",
+            "gemini_probe_stdout_jsonl_incomplete",
+            "gemini_probe_stdout_jsonl_incomplete",
+            "mystery_event_class",
+            False,
+            None,
+            None,
+            "gemini_probe_timeout_output_unclassified",
+            "gemini_probe_timeout_output_unclassified",
+            False,
+            "provider_unavailable",
+            "failed",
+            None,
+        ),
+        (
+            "runner_failed",
+            False,
+            "gemini_probe_generate_content_http_4xx_contract_rejected",
+            "gemini_probe_generate_content_http_4xx_contract_rejected",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            "runner_failed",
+            "failed",
+            None,
+        ),
+        (
+            "provider_unavailable",
+            False,
+            "mystery_probe_code",
+            None,
+            "mystery_output_shape",
+            None,
+            "gemini_probe_stdout_terminal_jsonl",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "not_a_phase",
+            None,
+            False,
+            "provider_unavailable",
+            "failed",
+            None,
+        ),
+        (
+            "account_limited",
+            True,
+            "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "gemini_probe_normal_exit",
+            "gemini_probe_normal_exit",
+            True,
+            "ready",
+            "completed",
+            "gemini-9.9-future-preview",
+        ),
+        (
+            "provider_unavailable",
+            False,
+            "gemini_probe_generate_content_http_5xx_provider_unavailable",
+            "gemini_probe_generate_content_http_5xx_provider_unavailable",
+            "mystery_output_shape",
+            None,
+            "gemini_probe_stdout_terminal_jsonl",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "not_a_phase",
+            None,
+            False,
+            "provider_unavailable",
+            "failed",
+            None,
+        ),
+        (
+            "auth_or_billing_denied",
+            False,
+            "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "gemini_probe_normal_exit",
+            "gemini_probe_normal_exit",
+            False,
+            "auth_or_billing_denied",
+            "failed",
+            None,
+        ),
+        (
+            "provider_unavailable",
+            False,
+            None,
+            None,
+            "gemini_probe_output_stdout_terminal",
+            None,
+            "gemini_probe_stdout_terminal_jsonl",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "gemini_probe_normal_exit",
+            "gemini_probe_normal_exit",
+            True,
+            "ready",
+            "completed",
+            "gemini-2.5-flash",
+        ),
+    ],
+)
 def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -948,7 +1025,11 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         secret=GEMINI_READY_CREDENTIAL,
         expected_generation=2,
     )
-    monkeypatch.setattr(server.shutil, "which", lambda _name: pytest.fail("CLI lookup is not part of account probe"))
+    monkeypatch.setattr(
+        server.shutil,
+        "which",
+        lambda _name: pytest.fail("CLI lookup is not part of account probe"),
+    )
 
     def fake_probe(secret: str, *, model: str | None = None) -> ProbeResult:
         if not expected_ready or error_kind == "account_limited":
@@ -975,7 +1056,9 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
                 process_stdout_shape=provided_stdout_shape,
                 process_stdout_event_class=provided_stdout_event_class,
                 process_stdout_error_seen=provided_stdout_error_seen,
-                endpoint_role="generate_content" if error_kind == "runner_failed" else None,
+                endpoint_role="generate_content"
+                if error_kind == "runner_failed"
+                else None,
                 http_class="4xx" if error_kind == "runner_failed" else None,
             )
 
@@ -993,7 +1076,9 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         )
 
     monkeypatch.setattr(server, "probe_gemini_rest", fake_probe)
-    result = server.fleet_account_probe(account_id="gemini-ready", expected_generation=3)
+    result = server.fleet_account_probe(
+        account_id="gemini-ready", expected_generation=3
+    )
 
     assert result["probed"] is True
     assert result["ready"] is expected_ready
@@ -1028,7 +1113,11 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     if model_name is not None:
         assert result.get("model") == model_name
 
-    events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    events = (
+        (server.STATE_ROOT / "fleet" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     assert events, "missing account_probe event"
     event = json.loads(events[-1])
     assert isinstance(event, dict)
@@ -1071,7 +1160,14 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert account.secret_state is SecretState.CONFIGURED
         assert account.limit_state is LimitState.UNKNOWN
         assert account.limit_reason == expected_reason
-    forbidden_telemetry = {"body", "raw_body", "headers", "url", "secret", "status_code"}
+    forbidden_telemetry = {
+        "body",
+        "raw_body",
+        "headers",
+        "url",
+        "secret",
+        "status_code",
+    }
     assert forbidden_telemetry.isdisjoint(result)
     assert forbidden_telemetry.isdisjoint(event)
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
@@ -1121,7 +1217,11 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         process_stdout_error_seen=True,
         model="gemini-2.5-flash",
     )
-    events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    events = (
+        (server.STATE_ROOT / "fleet" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     service_event = json.loads(events[-1])
     assert service_event["event_type"] == "account_probe"
     assert service_event["status"] == "failed"
@@ -1319,12 +1419,22 @@ def test_selector_policy_falls_back_to_one_published_fleet_series(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     series = FleetSeries(
-        "d", "D", 2, RunnerKind.CODEX_CLI, Provider.OLLAMA_LOCAL,
-        "local-model", None, True,
+        "d",
+        "D",
+        2,
+        RunnerKind.CODEX_CLI,
+        Provider.OLLAMA_LOCAL,
+        "local-model",
+        None,
+        True,
     )
-    inventory = server.build_inventory(FleetSnapshot(1, 1, (), (series,)), tmp_path / "pool")
+    inventory = server.build_inventory(
+        FleetSnapshot(1, 1, (), (series,)), tmp_path / "pool"
+    )
     monkeypatch.setattr(server, "published_agent_inventory", lambda: (inventory, True))
     monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
-    monkeypatch.setattr(server, "SELECTOR_POLICY_FILE", tmp_path / "selector-policy.json")
+    monkeypatch.setattr(
+        server, "SELECTOR_POLICY_FILE", tmp_path / "selector-policy.json"
+    )
     assert server.selector_policy_series() == ("d",)
     assert server.agent_ids("both") == ["d1", "d2"]

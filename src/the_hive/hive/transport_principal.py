@@ -12,7 +12,9 @@ from the_hive.hive.principals import PrincipalError, PrincipalRegistry
 from the_hive.hive.types import HiveValidationError, validate_identifier
 
 
-_ALLOWED_CAPABILITIES = frozenset({"hive.resource.trend.read", "hive.resource.absolute.read"})
+_ALLOWED_CAPABILITIES = frozenset(
+    {"hive.resource.trend.read", "hive.resource.absolute.read"}
+)
 _ALLOWED_CLASSES = frozenset({"teamleiterin", "koenigin", "queen"})
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _RESOURCE_SCOPE = (".codex-master/resource-status",)
@@ -45,7 +47,11 @@ def _digest(value: object) -> str:
 
 
 def _utc(value: object) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta():
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta()
+    ):
         _deny()
     return value.astimezone(timezone.utc)
 
@@ -71,7 +77,11 @@ class VerifiedTransportClaims:
         _identifier(self.execution_binding_id, "binding")
         _digest(self.config_digest)
         _digest(self.transport_digest)
-        if isinstance(self.principal_version, bool) or not isinstance(self.principal_version, int) or self.principal_version < 1:
+        if (
+            isinstance(self.principal_version, bool)
+            or not isinstance(self.principal_version, int)
+            or self.principal_version < 1
+        ):
             _deny()
         issued_at = _utc(self.issued_at_utc)
         expires_at = _utc(self.expires_at_utc)
@@ -103,7 +113,11 @@ class AttestedPrincipalV1:
         _identifier(self.repo_id, "repo")
         if self.scope != _RESOURCE_SCOPE:
             _deny()
-        if isinstance(self.principal_version, bool) or not isinstance(self.principal_version, int) or self.principal_version < 1:
+        if (
+            isinstance(self.principal_version, bool)
+            or not isinstance(self.principal_version, int)
+            or self.principal_version < 1
+        ):
             _deny()
         _digest(self.config_digest)
         _identifier(self.execution_binding_id, "binding")

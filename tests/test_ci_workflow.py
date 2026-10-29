@@ -33,11 +33,22 @@ def workflow_step_run(name: str) -> str:
 def test_ruff_gate_is_pinned_and_non_mutating() -> None:
     workflow = workflow_text()
 
-    assert "ruff==0.16.3" in project_metadata()["project"]["optional-dependencies"]["test"]
-    assert '".[test,test-index]"' in workflow.split("      - name: Install test dependencies\n", 1)[1].split("\n      - name:", 1)[0]
-    assert workflow.index("      - name: Install test dependencies") < workflow.index("      - name: Lint Python sources")
+    assert (
+        "ruff==0.16.3" in project_metadata()["project"]["optional-dependencies"]["test"]
+    )
+    assert (
+        '".[test,test-index]"'
+        in workflow.split("      - name: Install test dependencies\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+    )
+    assert workflow.index("      - name: Install test dependencies") < workflow.index(
+        "      - name: Lint Python sources"
+    )
     assert "ruff check --select E4,E7,E9,F --output-format=github ." in workflow
-    assert not re.search(r"^\s*run:\s*ruff\s+check\b.*\s--fix(?:\s|$)", workflow, re.MULTILINE)
+    assert not re.search(
+        r"^\s*run:\s*ruff\s+check\b.*\s--fix(?:\s|$)", workflow, re.MULTILINE
+    )
 
 
 def test_ci_installs_agent_api_crypto_dependencies_before_collection() -> None:
@@ -47,7 +58,9 @@ def test_ci_installs_agent_api_crypto_dependencies_before_collection() -> None:
     dependency_step = dependency_step.split("\n      - name:", 1)[0]
     assert "PyJWT[crypto]>=2.9,<3" in project_metadata()["project"]["dependencies"]
     assert '".[test,test-index]"' in dependency_step
-    assert workflow.index("      - name: Install test dependencies") < workflow.index("      - name: Run remaining unit tests")
+    assert workflow.index("      - name: Install test dependencies") < workflow.index(
+        "      - name: Run remaining unit tests"
+    )
 
 
 def test_plugin_manifest_gate_requires_the_hive_identity_without_a_legacy_alias() -> (
@@ -87,7 +100,10 @@ def test_manpage_gate_builds_and_renders_repository_source() -> None:
     workflow = workflow_text()
 
     assert "groff-base" in workflow_step_run("Install Linux dependencies")
-    assert './scripts/the-hive-manpage build --output-dir "${RUNNER_TEMP}/the-hive-man"' in workflow
+    assert (
+        './scripts/the-hive-manpage build --output-dir "${RUNNER_TEMP}/the-hive-man"'
+        in workflow
+    )
     assert "groff -man -Tutf8 man/man1/the-hive-mcp.1 >/dev/null" in workflow
 
 
@@ -134,14 +150,30 @@ def test_agent_pool_installer_gate_reports_the_runtime_lifecycle_boundary(
     )
     subprocess.run(
         [
-            "git", "-C", str(checkout), "-c", "user.name=CI workflow test",
-            "-c", "user.email=ci-workflow-test@example.invalid", "commit",
-            "--no-gpg-sign", "--allow-empty", "--quiet", "-m", "test fixture",
+            "git",
+            "-C",
+            str(checkout),
+            "-c",
+            "user.name=CI workflow test",
+            "-c",
+            "user.email=ci-workflow-test@example.invalid",
+            "commit",
+            "--no-gpg-sign",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "test fixture",
         ],
         check=True,
     )
     completed = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", workflow_step_run("Check agent pool installer")],
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            workflow_step_run("Check agent pool installer"),
+        ],
         cwd=checkout,
         env={
             **os.environ,
@@ -167,15 +199,51 @@ def test_agent_pool_installer_gate_reports_the_runtime_lifecycle_boundary(
 @pytest.mark.parametrize(
     ("exit_code", "payload", "stderr", "mutate"),
     (
-        (0, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "", False),
-        (2, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "", False),
+        (
+            0,
+            {
+                "status": "runtime_lifecycle_cutover_required",
+                "raw_output": "not_returned",
+            },
+            "",
+            False,
+        ),
+        (
+            2,
+            {
+                "status": "runtime_lifecycle_cutover_required",
+                "raw_output": "not_returned",
+            },
+            "",
+            False,
+        ),
         (1, {"status": "installed", "raw_output": "not_returned"}, "", False),
-        (1, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "unexpected stderr", False),
-        (1, {"status": "runtime_lifecycle_cutover_required", "raw_output": "not_returned"}, "", True),
+        (
+            1,
+            {
+                "status": "runtime_lifecycle_cutover_required",
+                "raw_output": "not_returned",
+            },
+            "unexpected stderr",
+            False,
+        ),
+        (
+            1,
+            {
+                "status": "runtime_lifecycle_cutover_required",
+                "raw_output": "not_returned",
+            },
+            "",
+            True,
+        ),
     ),
 )
 def test_agent_pool_ci_gate_rejects_wrong_exit_payload_stderr_or_mutation(
-    tmp_path: Path, exit_code: int, payload: dict[str, str], stderr: str, mutate: bool,
+    tmp_path: Path,
+    exit_code: int,
+    payload: dict[str, str],
+    stderr: str,
+    mutate: bool,
 ) -> None:
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -193,7 +261,13 @@ def test_agent_pool_ci_gate_rejects_wrong_exit_payload_stderr_or_mutation(
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
     completed = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", workflow_step_run("Check agent pool installer")],
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            workflow_step_run("Check agent pool installer"),
+        ],
         cwd=tmp_path,
         env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
         capture_output=True,

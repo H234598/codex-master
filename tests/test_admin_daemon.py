@@ -201,8 +201,13 @@ def test_readiness_cannot_race_a_partially_bound_transport(
     daemon.stop()
 
 
-def test_admin_assembly_primitives_are_sparse_local_and_close_in_reverse_order() -> None:
-    assert str(admin_assembly.AdminAssemblyError()) == "control.admin_configuration_invalid"
+def test_admin_assembly_primitives_are_sparse_local_and_close_in_reverse_order() -> (
+    None
+):
+    assert (
+        str(admin_assembly.AdminAssemblyError())
+        == "control.admin_configuration_invalid"
+    )
     assert not hasattr(admin_assembly, "_LocalOnlyOllamaBroker")
     assert hasattr(admin_assembly, "AgentQueueRemoteOllamaOperationPort")
     assert hasattr(admin_assembly, "HostRegistryOllamaLeaseSource")
@@ -840,7 +845,10 @@ def test_default_jwks_opener_disables_redirects_and_preserves_timeout(
     assert admin_daemon._open_without_redirects(request, timeout=5.0) is response
     assert opened == [(request, 5.0)]
     assert type(handlers[0]) is admin_daemon._NoRedirectHandler
-    assert handlers[0].redirect_request(request, None, 302, "redirect", {}, "https://bad") is None
+    assert (
+        handlers[0].redirect_request(request, None, 302, "redirect", {}, "https://bad")
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1814,7 +1822,9 @@ def test_empty_inventory_preserves_existing_invalid_document(tmp_path: Path) -> 
     inventory.chmod(0o600)
     admin_assembly._empty_inventory(inventory)
     assert inventory.read_bytes() == original
-    with pytest.raises(GoogleAccountInventoryError, match="credential.inventory_schema_invalid"):
+    with pytest.raises(
+        GoogleAccountInventoryError, match="credential.inventory_schema_invalid"
+    ):
         GoogleAccountInventoryLoader._for_test_path(inventory).load()
 
 
@@ -1865,16 +1875,20 @@ def test_product_assembly_materializes_agent_bindings_before_start(
         admin_assembly.AdminDaemon,
         "__init__",
         lambda self, service, **_kwargs: events.append(
-            "daemon-after-" + service._host_registry.agent_binding("worker-one").host_ref
+            "daemon-after-"
+            + service._host_registry.agent_binding("worker-one").host_ref
         ),
     )
 
     runtime = assemble_admin_runtime()
     try:
         assert events == ["daemon-after-worker-one"]
-        assert runtime.service._host_registry.resolve_agent_spki(
-            "sha256:" + "a" * 64
-        ).host_ref == "worker-one"
+        assert (
+            runtime.service._host_registry.resolve_agent_spki(
+                "sha256:" + "a" * 64
+            ).host_ref
+            == "worker-one"
+        )
     finally:
         runtime.close()
 

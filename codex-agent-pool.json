@@ -9,18 +9,14 @@
       "count": 5,
       "template": "a1",
       "codex_usage_account": "BW_Nufker",
-      "authenticated": [
-        "a1"
-      ]
+      "authenticated": ["a1"]
     },
     {
       "prefix": "b",
       "count": 3,
       "template": "b1",
       "codex_usage_account": "BW_Work",
-      "authenticated": [
-        "b1"
-      ]
+      "authenticated": ["b1"]
     },
     {
       "prefix": "c",
@@ -34,28 +30,16 @@
       "count": 1,
       "template": "u1",
       "codex_usage_account": "Birthe_Privat",
-      "authenticated": [
-        "u1"
-      ]
+      "authenticated": ["u1"]
     }
   ],
   "aliases": {
     "a": "a1",
     "b": "b1",
-    "both": [
-      "a1",
-      "b1"
-    ]
+    "both": ["a1", "b1"]
   },
-  "shared_assets": [
-    "skills",
-    "plugins"
-  ],
-  "runtime_dirs": [
-    "sessions",
-    "logs",
-    "tmp"
-  ],
+  "shared_assets": ["skills", "plugins"],
+  "runtime_dirs": ["sessions", "logs", "tmp"],
   "auth": {
     "policy": "preserve_existing_only",
     "copy": []

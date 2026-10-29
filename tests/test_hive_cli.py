@@ -17,13 +17,17 @@ def parser():
 
 
 def test_reset_anchor_cli_dry_run_is_bounded_and_execute_is_gated() -> None:
-    dry_run_args = parser().parse_args(["reset-anchor-run", "--dry-run", "--anchor-key", ANCHOR_KEY])
+    dry_run_args = parser().parse_args(
+        ["reset-anchor-run", "--dry-run", "--anchor-key", ANCHOR_KEY]
+    )
     dry_run = run_hive_cli(dry_run_args)
     assert dry_run["mode"] == "dry_run"
     assert dry_run["mutation_performed"] is False
     assert dry_run["reason_code"] == "anchor_due"
 
-    execute_args = parser().parse_args(["reset-anchor-run", "--execute", "--anchor-key", ANCHOR_KEY])
+    execute_args = parser().parse_args(
+        ["reset-anchor-run", "--execute", "--anchor-key", ANCHOR_KEY]
+    )
     executed = run_hive_cli(execute_args)
     assert executed["allowed"] is False
     assert executed["reason_code"] == "selection_proactive_anchor_safety_gate"
@@ -52,7 +56,11 @@ def test_cli_status_and_doctor_accept_the_same_canonical_runtime_evidence() -> N
         authority="fail_closed",
         state="not_configured",
         pilot="blocked",
-        reason_codes=("repository_not_configured", "principal_not_configured", "state_not_configured"),
+        reason_codes=(
+            "repository_not_configured",
+            "principal_not_configured",
+            "state_not_configured",
+        ),
         mutation_performed=False,
     )
     status = run_hive_cli({"hive_command": "status"}, runtime_evidence=evidence)
@@ -92,12 +100,21 @@ def test_fleet_test_cli_uses_injected_shared_service(tmp_path) -> None:
         test_service=evidence_service,
     )
     plan = run_hive_cli(
-        parser().parse_args(["fleet", "test", "plan", "--changed-path", "src/example.py"]),
+        parser().parse_args(
+            ["fleet", "test", "plan", "--changed-path", "src/example.py"]
+        ),
         test_service=evidence_service,
     )
     run = run_hive_cli(
         parser().parse_args(
-            ["fleet", "test", "run", test_id, "--index-digest", index_status["index_digest"]]
+            [
+                "fleet",
+                "test",
+                "run",
+                test_id,
+                "--index-digest",
+                index_status["index_digest"],
+            ]
         ),
         test_service=evidence_service,
     )

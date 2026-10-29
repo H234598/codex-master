@@ -129,9 +129,7 @@ def test_ollama_instance_plan_preserves_typed_cpu_and_model_arguments() -> None:
         "cpu_weight": 40,
     }
 
-    request = AdminRequestV1(
-        "ollama.instance.plan", arguments, 3, "request-one", None
-    )
+    request = AdminRequestV1("ollama.instance.plan", arguments, 3, "request-one", None)
 
     assert request.arguments["selected_model_refs"] == (
         "llama-small",

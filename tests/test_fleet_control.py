@@ -17,24 +17,39 @@ from the_hive.fleet_control import (
 def _accounts() -> dict[str, object]:
     return {
         "generation": 4,
-        "accounts": [{
-            "account_id": "gemini-project-1", "label": "Project 1",
-            "provider": "gemini_api", "auth_kind": "api_key",
-            "secret_state": "configured", "limit_state": "ready", "enabled": True,
-            "secret": "must not be copied", "home": "/home/private",
-        }],
+        "accounts": [
+            {
+                "account_id": "gemini-project-1",
+                "label": "Project 1",
+                "provider": "gemini_api",
+                "auth_kind": "api_key",
+                "secret_state": "configured",
+                "limit_state": "ready",
+                "enabled": True,
+                "secret": "must not be copied",
+                "home": "/home/private",
+            }
+        ],
     }
 
 
 def _series(count: int = 26) -> dict[str, object]:
     return {
         "generation": 4,
-        "series": [{
-            "prefix": chr(ord("a") + index), "display_name": f"Series {index}",
-            "count": 1, "runner": "gemini_cli", "provider": "gemini_api",
-            "model": "gemini-3-flash-preview", "account_id": "gemini-project-1",
-            "enabled": True, "runner_path": "/home/private/gemini",
-        } for index in range(count)],
+        "series": [
+            {
+                "prefix": chr(ord("a") + index),
+                "display_name": f"Series {index}",
+                "count": 1,
+                "runner": "gemini_cli",
+                "provider": "gemini_api",
+                "model": "gemini-3-flash-preview",
+                "account_id": "gemini-project-1",
+                "enabled": True,
+                "runner_path": "/home/private/gemini",
+            }
+            for index in range(count)
+        ],
     }
 
 
@@ -61,16 +76,25 @@ def test_page_parser_rejects_generation_mismatch_without_private_payload() -> No
     assert state.series == ()
 
 
-@pytest.mark.parametrize(("provider", "auth_kind"), [
-    ("gemini_api", "api_key"),
-    ("openai_api", "api_key"),
-    ("openai_chatgpt", "chatgpt_session"),
-    ("huggingface_inference", "api_key"),
-])
-def test_account_builder_enforces_provider_auth_contract(provider: str, auth_kind: str) -> None:
+@pytest.mark.parametrize(
+    ("provider", "auth_kind"),
+    [
+        ("gemini_api", "api_key"),
+        ("openai_api", "api_key"),
+        ("openai_chatgpt", "chatgpt_session"),
+        ("huggingface_inference", "api_key"),
+    ],
+)
+def test_account_builder_enforces_provider_auth_contract(
+    provider: str, auth_kind: str
+) -> None:
     result = account_upsert_args(
-        account_id="project-1", label="Project", provider=provider,
-        auth_kind=auth_kind, enabled=True, expected_generation=4,
+        account_id="project-1",
+        label="Project",
+        provider=provider,
+        auth_kind=auth_kind,
+        enabled=True,
+        expected_generation=4,
     )
     assert result["provider"] == provider
     assert result["expected_generation"] == 4
@@ -79,35 +103,63 @@ def test_account_builder_enforces_provider_auth_contract(provider: str, auth_kin
 def test_account_builder_rejects_ollama_account_and_mismatched_auth() -> None:
     with pytest.raises(FleetControlError):
         account_upsert_args(
-            account_id="local", label="Local", provider="ollama_local",
-            auth_kind="none", enabled=True, expected_generation=1,
+            account_id="local",
+            label="Local",
+            provider="ollama_local",
+            auth_kind="none",
+            enabled=True,
+            expected_generation=1,
         )
     with pytest.raises(FleetControlError):
         account_upsert_args(
-            account_id="project", label="Project", provider="gemini_api",
-            auth_kind="chatgpt_session", enabled=True, expected_generation=1,
+            account_id="project",
+            label="Project",
+            provider="gemini_api",
+            auth_kind="chatgpt_session",
+            enabled=True,
+            expected_generation=1,
         )
 
 
-def test_secret_builder_is_bounded_but_keeps_secret_only_for_immediate_dispatch() -> None:
+def test_secret_builder_is_bounded_but_keeps_secret_only_for_immediate_dispatch() -> (
+    None
+):
     synthetic_secret = "syn" + "thetic"
-    args = account_secret_args(account_id="project-1", secret=synthetic_secret, expected_generation=4)
-    assert args == {"account_id": "project-1", "secret": "synthetic", "expected_generation": 4}
+    args = account_secret_args(
+        account_id="project-1", secret=synthetic_secret, expected_generation=4
+    )
+    assert args == {
+        "account_id": "project-1",
+        "secret": "synthetic",
+        "expected_generation": 4,
+    }
 
 
 def test_series_builder_enforces_provider_runner_account_contract() -> None:
     args = series_plan_args(
-        prefix="d", count=100, runner="gemini_cli", provider="gemini_api",
-        model="gemini-3-flash-preview", account_id="project-1", enabled=True,
-        expected_generation=4, confirmed_remove_ids=[],
+        prefix="d",
+        count=100,
+        runner="gemini_cli",
+        provider="gemini_api",
+        model="gemini-3-flash-preview",
+        account_id="project-1",
+        enabled=True,
+        expected_generation=4,
+        confirmed_remove_ids=[],
     )
     assert args["prefix"] == "d"
     assert args["count"] == 100
     with pytest.raises(FleetControlError):
         series_apply_args(
-            prefix="d", count=1, runner="codex_cli", provider="gemini_api",
-            model="model", account_id=None, enabled=True,
-            expected_generation=4, confirmed_remove_ids=[],
+            prefix="d",
+            count=1,
+            runner="codex_cli",
+            provider="gemini_api",
+            model="model",
+            account_id=None,
+            enabled=True,
+            expected_generation=4,
+            confirmed_remove_ids=[],
         )
 
 
@@ -152,9 +204,7 @@ def _ollama_instances_payload() -> dict[str, object]:
 
 
 def test_ollama_page_keeps_models_and_instances_separate() -> None:
-    state = parse_ollama_page(
-        _ollama_models_payload(), _ollama_instances_payload()
-    )
+    state = parse_ollama_page(_ollama_models_payload(), _ollama_instances_payload())
 
     assert state.models[0].model_ref == "llama-small"
     assert state.models[0].capabilities == ("chat", "tools")

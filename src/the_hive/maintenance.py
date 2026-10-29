@@ -124,7 +124,10 @@ def _validate_tar_archive_fd(descriptor: int, expected: list[dict[str, Any]]) ->
                     if name in seen:
                         raise MaintenanceError("archive_member_duplicate")
                     for parent in PurePosixPath(name).parents:
-                        if parent.as_posix() in seen and seen[parent.as_posix()] == "symlink":
+                        if (
+                            parent.as_posix() in seen
+                            and seen[parent.as_posix()] == "symlink"
+                        ):
                             raise MaintenanceError("archive_member_through_symlink")
                     entry = expected_by_path.get(name)
                     if entry is None:
@@ -136,7 +139,11 @@ def _validate_tar_archive_fd(descriptor: int, expected: list[dict[str, Any]]) ->
                     elif member.issym():
                         kind = "symlink"
                         target = member.linkname
-                        if not target or PurePosixPath(target).is_absolute() or "\\" in target:
+                        if (
+                            not target
+                            or PurePosixPath(target).is_absolute()
+                            or "\\" in target
+                        ):
                             raise MaintenanceError("archive_symlink_target_invalid")
                         stack = list(PurePosixPath(name).parent.parts)
                         for part in PurePosixPath(target).parts:
@@ -144,7 +151,9 @@ def _validate_tar_archive_fd(descriptor: int, expected: list[dict[str, Any]]) ->
                                 continue
                             if part == "..":
                                 if not stack:
-                                    raise MaintenanceError("archive_symlink_target_escape")
+                                    raise MaintenanceError(
+                                        "archive_symlink_target_escape"
+                                    )
                                 stack.pop()
                             else:
                                 stack.append(part)
@@ -197,11 +206,13 @@ def _snapshot_archive_tar(
             not stat.S_ISREG(opened.st_mode)
             or opened.st_uid != os.geteuid()
             or opened.st_nlink != 1
-            or (opened.st_dev, opened.st_ino)
-            != (before.st_dev, before.st_ino)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
         ):
             raise MaintenanceError("archive_data_invalid")
-        if shutil.disk_usage(receipt.archive.parent).free < opened.st_size + 4 * 1024 * 1024:
+        if (
+            shutil.disk_usage(receipt.archive.parent).free
+            < opened.st_size + 4 * 1024 * 1024
+        ):
             raise MaintenanceError("restore_space_unavailable")
         snapshot = tempfile.TemporaryFile(mode="w+b", dir=receipt.archive.parent)
         while True:
@@ -274,7 +285,12 @@ def _validate_git_config_at(
         raise MaintenanceError("archive_git_config_invalid") from exc
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_size > 1024 * 1024:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_size > 1024 * 1024
+        ):
             raise MaintenanceError("archive_git_config_invalid")
         environment = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -282,7 +298,15 @@ def _validate_git_config_at(
             "GIT_CONFIG_GLOBAL": os.devnull,
         }
         completed = subprocess.run(
-            ["git", "config", "--no-includes", "--null", "--list", "--file", f"/proc/self/fd/{fd}"],
+            [
+                "git",
+                "config",
+                "--no-includes",
+                "--null",
+                "--list",
+                "--file",
+                f"/proc/self/fd/{fd}",
+            ],
             pass_fds=_maintenance_pass_fds(lock_fd, (fd,)),
             env=environment,
             stdout=subprocess.PIPE,
@@ -300,7 +324,8 @@ def _validate_git_config_at(
             if (
                 key_text.startswith("include.")
                 or key_text.startswith("includeif.")
-                or key_text in {
+                or key_text
+                in {
                     "core.fsmonitor",
                     "core.worktree",
                     "core.attributesfile",
@@ -308,7 +333,10 @@ def _validate_git_config_at(
                     "core.hookspath",
                     "core.sshcommand",
                 }
-                or (key_text.startswith("filter.") and suffix in {"clean", "smudge", "process"})
+                or (
+                    key_text.startswith("filter.")
+                    and suffix in {"clean", "smudge", "process"}
+                )
                 or (key_text.startswith("diff.") and suffix in {"textconv", "external"})
             ):
                 raise MaintenanceError("archive_git_config_unsafe")
@@ -328,7 +356,11 @@ def _write_at(directory_fd: int, name: str, value: str, *, create: bool) -> None
         raise MaintenanceError("archive_metadata_write_failed") from exc
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+        ):
             raise MaintenanceError("archive_metadata_target_invalid")
         data = value.encode("utf-8")
         offset = 0
@@ -337,6 +369,8 @@ def _write_at(directory_fd: int, name: str, value: str, *, create: bool) -> None
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
 def _mount_id(fd: int) -> int:
     return LocalFleetHomeV2Filesystem.mount_id(fd)
 
@@ -369,7 +403,9 @@ def _xattrs(fd: int) -> dict[str, str]:
         raise MaintenanceError("extended_attribute_unavailable") from exc
 
 
-def _xattrs_at(directory_fd: int, name: str, expected: os.stat_result) -> dict[str, str]:
+def _xattrs_at(
+    directory_fd: int, name: str, expected: os.stat_result
+) -> dict[str, str]:
     path = f"/proc/self/fd/{directory_fd}/{name}"
     try:
         before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -454,15 +490,17 @@ def _tree_manifest(
             if name in {".", ".."}:
                 raise MaintenanceError("source_path_invalid")
             relative = f"{prefix}/{name}" if prefix else name
-            if not prefix and (
-                (skip_git and name == ".git") or name in skip_names
-            ):
+            if not prefix and ((skip_git and name == ".git") or name in skip_names):
                 continue
             try:
                 info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as exc:
                 raise MaintenanceError("source_changed") from exc
-            if info.st_dev != root_device or info.st_uid != owner_uid or info.st_gid != owner_gid:
+            if (
+                info.st_dev != root_device
+                or info.st_uid != owner_uid
+                or info.st_gid != owner_gid
+            ):
                 raise MaintenanceError("foreign_or_cross_mount_entry")
             entry: dict[str, Any] = {
                 "path": relative,
@@ -544,11 +582,17 @@ def _git_layout(source: Path, binding: WorktreeBinding | None) -> tuple[Path, st
         if not text.startswith("gitdir: ") or not text.endswith("\n"):
             raise MaintenanceError("linked_worktree_metadata_invalid")
         raw_gitdir = Path(text[8:].strip())
-        gitdir = (raw_gitdir if raw_gitdir.is_absolute() else source / raw_gitdir).resolve(strict=True)
+        gitdir = (
+            raw_gitdir if raw_gitdir.is_absolute() else source / raw_gitdir
+        ).resolve(strict=True)
         common_text = (gitdir / "commondir").read_text(encoding="utf-8").strip()
         raw_common = Path(common_text)
-        common = (raw_common if raw_common.is_absolute() else gitdir / raw_common).resolve(strict=True)
-        expected_common = binding.git_common_directory if binding is not None else common
+        common = (
+            raw_common if raw_common.is_absolute() else gitdir / raw_common
+        ).resolve(strict=True)
+        expected_common = (
+            binding.git_common_directory if binding is not None else common
+        )
         if common != expected_common or gitdir.parent != common / "worktrees":
             raise MaintenanceError("linked_worktree_metadata_invalid")
         relative = gitdir.relative_to(common).as_posix()
@@ -605,7 +649,9 @@ def _tar_create(
 
 
 def _write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    fd = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode
+    )
     try:
         view = memoryview(data)
         while view:
@@ -619,7 +665,12 @@ def _write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 
 def _json_bytes(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    return (
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def _read_archive_manifest(
@@ -633,16 +684,29 @@ def _read_archive_manifest(
             not stat.S_ISDIR(info.st_mode)
             or info.st_uid != os.geteuid()
             or stat.S_IMODE(info.st_mode) != 0o700
-            or (receipt.archive_device is not None and info.st_dev != receipt.archive_device)
-            or (receipt.archive_inode is not None and info.st_ino != receipt.archive_inode)
+            or (
+                receipt.archive_device is not None
+                and info.st_dev != receipt.archive_device
+            )
+            or (
+                receipt.archive_inode is not None
+                and info.st_ino != receipt.archive_inode
+            )
         ):
             raise MaintenanceError("archive_identity_invalid")
         manifest_path = receipt.archive / "manifest.json"
         manifest_info = manifest_path.lstat()
-        if not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_uid != os.geteuid() or manifest_info.st_nlink != 1:
+        if (
+            not stat.S_ISREG(manifest_info.st_mode)
+            or manifest_info.st_uid != os.geteuid()
+            or manifest_info.st_nlink != 1
+        ):
             raise MaintenanceError("archive_manifest_invalid")
         raw = manifest_path.read_bytes()
-        if len(raw) > _MAX_MANIFEST_BYTES or hashlib.sha256(raw).hexdigest() != receipt.manifest_sha256:
+        if (
+            len(raw) > _MAX_MANIFEST_BYTES
+            or hashlib.sha256(raw).hexdigest() != receipt.manifest_sha256
+        ):
             raise MaintenanceError("archive_manifest_digest_mismatch")
         manifest = json.loads(raw)
         if not isinstance(manifest, dict) or manifest.get("format") != 1:
@@ -669,7 +733,9 @@ def _read_archive_manifest(
         common_entries = manifest.get("common_entries")
         if not isinstance(source_entries, list) or not isinstance(common_entries, list):
             raise MaintenanceError("archive_manifest_invalid")
-        if any(not isinstance(entry, dict) for entry in (*source_entries, *common_entries)):
+        if any(
+            not isinstance(entry, dict) for entry in (*source_entries, *common_entries)
+        ):
             raise MaintenanceError("archive_manifest_invalid")
         if any(entry.get("path") == ".git" for entry in source_entries):
             raise MaintenanceError("archive_manifest_git_metadata_invalid")
@@ -681,7 +747,9 @@ def _read_archive_manifest(
         ):
             raise MaintenanceError("archive_gitdir_invalid")
         for name in ("worktree.tar", "git-common.tar"):
-            expected_entries = source_entries if name == "worktree.tar" else common_entries
+            expected_entries = (
+                source_entries if name == "worktree.tar" else common_entries
+            )
             tar_file = _snapshot_archive_tar(
                 receipt, name, manifest.get("archives", {}).get(name), expected_entries
             )
@@ -703,7 +771,11 @@ def _open_tree(path: Path) -> tuple[int, os.stat_result, int]:
         mount = _mount_id(fd)
     except OSError as exc:
         raise MaintenanceError("source_unavailable") from exc
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_gid != os.getegid():
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_gid != os.getegid()
+    ):
         os.close(fd)
         raise MaintenanceError("foreign_source_owner")
     return fd, info, mount
@@ -748,11 +820,7 @@ def _run_tar_extract(
     lock_fd: int | None = None,
     archive_fd: int | None = None,
 ) -> None:
-    archive_path = (
-        str(archive)
-        if archive_fd is None
-        else f"/proc/self/fd/{archive_fd}"
-    )
+    archive_path = str(archive) if archive_fd is None else f"/proc/self/fd/{archive_fd}"
     command = [
         "tar",
         "--extract",
@@ -773,7 +841,9 @@ def _run_tar_extract(
             command,
             pass_fds=_maintenance_pass_fds(
                 lock_fd,
-                (destination_fd,) if archive_fd is None else (destination_fd, archive_fd),
+                (destination_fd,)
+                if archive_fd is None
+                else (destination_fd, archive_fd),
             ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -816,9 +886,7 @@ def _git_status(
     pass_fd: int | None = None,
     lock_fd: int | None = None,
 ) -> tuple[str, str, str]:
-    inherited = _maintenance_pass_fds(
-        lock_fd, () if pass_fd is None else (pass_fd,)
-    )
+    inherited = _maintenance_pass_fds(lock_fd, () if pass_fd is None else (pass_fd,))
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -840,7 +908,15 @@ def _git_status(
     )
     try:
         status = subprocess.run(
-            ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=all", "--ignored=matching"],
+            [
+                "git",
+                "-C",
+                str(path),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
             check=True,
             text=True,
             stdout=subprocess.PIPE,
@@ -858,7 +934,15 @@ def _git_status(
             env=environment,
         ).stdout.strip()
         index = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-path", "index"],
+            [
+                "git",
+                "-C",
+                str(path),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index",
+            ],
             check=True,
             text=True,
             stdout=subprocess.PIPE,
@@ -872,7 +956,9 @@ def _git_status(
         raise MaintenanceError(f"git_restore_verification_failed:{detail}") from exc
 
 
-def _remove_private_tree(parent_fd: int, name: str, expected_fd: int | None = None) -> None:
+def _remove_private_tree(
+    parent_fd: int, name: str, expected_fd: int | None = None
+) -> None:
     if not shutil.rmtree.avoids_symlink_attacks:
         raise MaintenanceError("safe_staging_cleanup_unavailable")
     child_fd = -1
@@ -881,7 +967,11 @@ def _remove_private_tree(parent_fd: int, name: str, expected_fd: int | None = No
             info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             return
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
             raise MaintenanceError("staging_identity_invalid")
         child_fd = os.open(name, _TREE_FLAGS, dir_fd=parent_fd)
         opened = os.fstat(child_fd)
@@ -928,8 +1018,10 @@ def _archive_candidate(
         raise MaintenanceError("archive_path_invalid")
     if (
         candidate.archive_root is None
-        or candidate.archive_root.resolve(strict=False) != archive_root.resolve(strict=False)
-        or policy.archive_root.resolve(strict=False) != archive_root.resolve(strict=False)
+        or candidate.archive_root.resolve(strict=False)
+        != archive_root.resolve(strict=False)
+        or policy.archive_root.resolve(strict=False)
+        != archive_root.resolve(strict=False)
     ):
         raise MaintenanceError("archive_path_unbound")
     source = candidate.source.resolve(strict=True)
@@ -937,9 +1029,13 @@ def _archive_candidate(
     source_identity = (source_info.st_dev, source_info.st_ino, _source_mount)
     try:
         policy_source = policy.source_root.resolve(strict=True)
-        allowed_roots = tuple(root.resolve(strict=True) for root in policy.allowed_source_roots)
+        allowed_roots = tuple(
+            root.resolve(strict=True) for root in policy.allowed_source_roots
+        )
         current_entries = _tree_manifest(source, skip_git=True)
-        current_manifest_digest = hashlib.sha256(_json_bytes(current_entries)).hexdigest()
+        current_manifest_digest = hashlib.sha256(
+            _json_bytes(current_entries)
+        ).hexdigest()
         allocated_now = _allocated_bytes(source)
     except (OSError, MaintenanceError) as exc:
         os.close(source_fd)
@@ -1039,9 +1135,7 @@ def _archive_candidate(
                 raise MaintenanceError("archive_root_untrusted")
             fcntl.flock(root_fd, fcntl.LOCK_EX)
             if claim is not None:
-                lifecycle._bind_maintenance_archive_lock(
-                    claim, archive_root, root_fd
-                )
+                lifecycle._bind_maintenance_archive_lock(claim, archive_root, root_fd)
             if shutil.disk_usage(root_parent).free < required_bytes:
                 raise MaintenanceError("archive_space_unavailable")
             stage_name = f".stage-{secrets.token_hex(12)}"
@@ -1081,9 +1175,15 @@ def _archive_candidate(
                     raise MaintenanceError("git_common_changed_during_archive")
                 source_now = os.fstat(source_fd)
                 common_now = os.fstat(common_fd)
-                if (source_now.st_dev, source_now.st_ino) != (source_info.st_dev, source_info.st_ino):
+                if (source_now.st_dev, source_now.st_ino) != (
+                    source_info.st_dev,
+                    source_info.st_ino,
+                ):
                     raise MaintenanceError("source_identity_changed")
-                if (common_now.st_dev, common_now.st_ino) != (common_info.st_dev, common_info.st_ino):
+                if (common_now.st_dev, common_now.st_ino) != (
+                    common_info.st_dev,
+                    common_info.st_ino,
+                ):
                     raise MaintenanceError("git_common_identity_changed")
                 manifest = {
                     "format": 1,
@@ -1113,7 +1213,9 @@ def _archive_candidate(
                 _write_bytes(stage_path / "manifest.json", manifest_bytes)
                 _write_bytes(
                     stage_path / "receipt.json",
-                    _json_bytes({"manifest_sha256": manifest_digest, "entry_count": count}),
+                    _json_bytes(
+                        {"manifest_sha256": manifest_digest, "entry_count": count}
+                    ),
                 )
                 os.fsync(stage_fd)
                 stage_identity = os.fstat(stage_fd)
@@ -1129,12 +1231,16 @@ def _archive_candidate(
             verify_name = f".verify-{secrets.token_hex(12)}"
             verify_path = archive_root / verify_name
             try:
-                _restore_archive_unlocked(temporary_receipt, verify_path, lock_fd=root_fd)
+                _restore_archive_unlocked(
+                    temporary_receipt, verify_path, lock_fd=root_fd
+                )
                 _remove_private_tree(root_fd, verify_name)
             except Exception:
                 raise
             final_name = f"archive-{source_info.st_dev:x}-{source_info.st_ino:x}-{secrets.token_hex(8)}"
-            LocalFleetHomeV2Filesystem().rename_noreplace_at(root_fd, stage_name, final_name)
+            LocalFleetHomeV2Filesystem().rename_noreplace_at(
+                root_fd, stage_name, final_name
+            )
             stage_published = True
             LocalFleetHomeV2Filesystem.fsync_directory(root_fd)
             final_info = os.stat(final_name, dir_fd=root_fd, follow_symlinks=False)
@@ -1196,7 +1302,9 @@ def archive_temporary_candidate(
         producer = next(
             (
                 item
-                for item in lifecycle.temporary_producers(candidate.binding, claim=claim)
+                for item in lifecycle.temporary_producers(
+                    candidate.binding, claim=claim
+                )
                 if item.get("path") == str(source)
             ),
             None,
@@ -1224,8 +1332,12 @@ def archive_temporary_candidate(
         raise MaintenanceError("temporary_candidate_stale_or_active")
     project_fd = common_fd = -1
     try:
-        project_fd, project_info, project_mount = _open_tree(policy.source_root.resolve(strict=True))
-        common_fd, common_info, common_mount = _open_tree(candidate.binding.git_common_directory)
+        project_fd, project_info, project_mount = _open_tree(
+            policy.source_root.resolve(strict=True)
+        )
+        common_fd, common_info, common_mount = _open_tree(
+            candidate.binding.git_common_directory
+        )
         available = shutil.disk_usage(archive_root.parent).free
     except (OSError, MaintenanceError) as exc:
         if common_fd >= 0:
@@ -1274,13 +1386,20 @@ def archive_temporary_candidate(
                     raise MaintenanceError("archive_root_untrusted")
                 fcntl.flock(root_fd, fcntl.LOCK_EX)
                 if claim is not None:
-                    lifecycle._bind_maintenance_archive_lock(claim, archive_root, root_fd)
+                    lifecycle._bind_maintenance_archive_lock(
+                        claim, archive_root, root_fd
+                    )
                 if _tree_manifest(source) != current_entries:
                     raise MaintenanceError("source_changed_during_archive")
                 os.mkdir(stage_name, 0o700, dir_fd=root_fd)
                 stage_fd = os.open(stage_name, _TREE_FLAGS, dir_fd=root_fd)
                 stage_path = archive_root / stage_name
-                _run_tar_create(source_fd, stage_path / "temporary.tar", exclude_git=False, lock_fd=root_fd)
+                _run_tar_create(
+                    source_fd,
+                    stage_path / "temporary.tar",
+                    exclude_git=False,
+                    lock_fd=root_fd,
+                )
                 if _tree_manifest(source) != current_entries:
                     raise MaintenanceError("source_changed_during_archive")
                 source_now = source.stat(follow_symlinks=False)
@@ -1302,7 +1421,9 @@ def archive_temporary_candidate(
                     "producer_ended_at": producer["ended_at"],
                     "source_mode": stat.S_IMODE(source_info.st_mode),
                     "source_entries": current_entries,
-                    "archives": {"temporary.tar": _digest_file(stage_path / "temporary.tar")},
+                    "archives": {
+                        "temporary.tar": _digest_file(stage_path / "temporary.tar")
+                    },
                 }
                 manifest_bytes = _json_bytes(manifest)
                 if len(manifest_bytes) > _MAX_MANIFEST_BYTES:
@@ -1310,14 +1431,25 @@ def archive_temporary_candidate(
                 manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
                 count = len(current_entries)
                 _write_bytes(stage_path / "manifest.json", manifest_bytes)
-                _write_bytes(stage_path / "receipt.json", _json_bytes({"manifest_sha256": manifest_digest, "entry_count": count}))
+                _write_bytes(
+                    stage_path / "receipt.json",
+                    _json_bytes(
+                        {"manifest_sha256": manifest_digest, "entry_count": count}
+                    ),
+                )
                 os.fsync(stage_fd)
                 stage_info = os.fstat(stage_fd)
                 temporary_receipt = ArchiveReceipt(
-                    stage_path, manifest_digest, count, stage_info.st_dev, stage_info.st_ino
+                    stage_path,
+                    manifest_digest,
+                    count,
+                    stage_info.st_dev,
+                    stage_info.st_ino,
                 )
                 verify_path = archive_root / f".verify-{secrets.token_hex(12)}"
-                _restore_archive_unlocked(temporary_receipt, verify_path, lock_fd=root_fd)
+                _restore_archive_unlocked(
+                    temporary_receipt, verify_path, lock_fd=root_fd
+                )
                 verify_fd = os.open(verify_path, _TREE_FLAGS)
                 try:
                     _remove_private_tree(root_fd, verify_path.name, verify_fd)
@@ -1329,7 +1461,9 @@ def archive_temporary_candidate(
                     fresh_producer = next(
                         (
                             item
-                            for item in lifecycle.temporary_producers(candidate.binding, claim=claim)
+                            for item in lifecycle.temporary_producers(
+                                candidate.binding, claim=claim
+                            )
                             if item.get("path") == str(source)
                         ),
                         None,
@@ -1347,16 +1481,24 @@ def archive_temporary_candidate(
                     or fresh_entries != current_entries
                     or fresh_producer is None
                     or fresh_producer.get("ended_at") != producer.get("ended_at")
-                    or any(use.binding == candidate.binding for use in fresh_snapshot.active_uses)
+                    or any(
+                        use.binding == candidate.binding
+                        for use in fresh_snapshot.active_uses
+                    )
                     or any(
                         active.candidate == candidate.binding
-                        and (claim is None or active.claim_id != getattr(claim, "claim_id", None))
+                        and (
+                            claim is None
+                            or active.claim_id != getattr(claim, "claim_id", None)
+                        )
                         for active in fresh_snapshot.maintenance_claims
                     )
                 ):
                     raise MaintenanceError("temporary_source_changed_before_publish")
                 final_name = f"temporary-{source_info.st_dev:x}-{source_info.st_ino:x}-{secrets.token_hex(8)}"
-                LocalFleetHomeV2Filesystem().rename_noreplace_at(root_fd, stage_name, final_name)
+                LocalFleetHomeV2Filesystem().rename_noreplace_at(
+                    root_fd, stage_name, final_name
+                )
                 published = True
                 LocalFleetHomeV2Filesystem.fsync_directory(root_fd)
                 final_info = os.stat(final_name, dir_fd=root_fd, follow_symlinks=False)
@@ -1412,7 +1554,10 @@ def _recover_maintenance_claim_under_archive_lock(
     now: int,
 ) -> object:
     """Fence a dead archive writer only after its archive-root lock is exclusive."""
-    if not isinstance(lifecycle, WorktreeLifecycleStore) or type(binding) is not WorktreeBinding:
+    if (
+        not isinstance(lifecycle, WorktreeLifecycleStore)
+        or type(binding) is not WorktreeBinding
+    ):
         raise MaintenanceError("maintenance_recovery_arguments_invalid")
     lock_fd = -1
     try:
@@ -1461,7 +1606,10 @@ def recover_temporary_source_after_hold(
     try:
         operation = lifecycle.maintenance_operation_for_recovery(claim)
         binding = getattr(claim, "candidate", None)
-        if type(binding) is not WorktreeBinding or operation.get("operation_kind") != "temporary":
+        if (
+            type(binding) is not WorktreeBinding
+            or operation.get("operation_kind") != "temporary"
+        ):
             raise MaintenanceError("maintenance_recovery_not_temporary")
         lock_path, expected_device, expected_inode, expected_mount = (
             lifecycle._maintenance_archive_lock_for_recovery(binding)
@@ -1476,10 +1624,10 @@ def recover_temporary_source_after_hold(
         raise MaintenanceError("maintenance_recovery_unavailable") from exc
     try:
         lock_info = os.fstat(lock_fd)
-        if (
-            (lock_info.st_dev, lock_info.st_ino) != (expected_device, expected_inode)
-            or _mount_id(lock_fd) != expected_mount
-        ):
+        if (lock_info.st_dev, lock_info.st_ino) != (
+            expected_device,
+            expected_inode,
+        ) or _mount_id(lock_fd) != expected_mount:
             raise MaintenanceError("maintenance_archive_lock_changed")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         if lifecycle._maintenance_archive_lock_for_recovery(binding) != (
@@ -1490,10 +1638,9 @@ def recover_temporary_source_after_hold(
         ):
             raise MaintenanceError("maintenance_archive_lock_changed")
         archive_info = archive.lstat()
-        if (
-            archive_info.st_dev != operation.get("archive_device")
-            or archive_info.st_ino != operation.get("archive_inode")
-        ):
+        if archive_info.st_dev != operation.get(
+            "archive_device"
+        ) or archive_info.st_ino != operation.get("archive_inode"):
             raise MaintenanceError("maintenance_archive_identity_changed")
         receipt = ArchiveReceipt(
             archive=archive,
@@ -1508,8 +1655,10 @@ def recover_temporary_source_after_hold(
             or manifest.get("source") != operation.get("temporary_source_path")
             or manifest.get("source_device") != operation.get("temporary_source_device")
             or manifest.get("source_inode") != operation.get("temporary_source_inode")
-            or manifest.get("source_mount_id") != operation.get("temporary_source_mount_id")
-            or manifest.get("producer_lease_id") != operation.get("temporary_producer_lease_id")
+            or manifest.get("source_mount_id")
+            != operation.get("temporary_source_mount_id")
+            or manifest.get("producer_lease_id")
+            != operation.get("temporary_producer_lease_id")
         ):
             raise MaintenanceError("maintenance_receipt_binding_mismatch")
         receipt = ArchiveReceipt(
@@ -1531,7 +1680,9 @@ def recover_temporary_source_after_hold(
             except FileNotFoundError:
                 source_fd = -1
             try:
-                quarantine_root_fd = os.open(".hive-quarantine", _TREE_FLAGS, dir_fd=parent_fd)
+                quarantine_root_fd = os.open(
+                    ".hive-quarantine", _TREE_FLAGS, dir_fd=parent_fd
+                )
             except FileNotFoundError:
                 quarantine_root_fd = -1
             if quarantine_root_fd >= 0:
@@ -1539,8 +1690,10 @@ def recover_temporary_source_after_hold(
                 if (
                     quarantine_root_info.st_uid != os.geteuid()
                     or stat.S_IMODE(quarantine_root_info.st_mode) != 0o700
-                    or quarantine_root_info.st_dev != operation.get("temporary_source_device")
-                    or _mount_id(quarantine_root_fd) != operation.get("temporary_source_mount_id")
+                    or quarantine_root_info.st_dev
+                    != operation.get("temporary_source_device")
+                    or _mount_id(quarantine_root_fd)
+                    != operation.get("temporary_source_mount_id")
                 ):
                     raise MaintenanceError("maintenance_quarantine_identity_changed")
             try:
@@ -1554,13 +1707,14 @@ def recover_temporary_source_after_hold(
                 raise MaintenanceError("maintenance_source_restore_ambiguous")
             if source_fd >= 0:
                 info = os.fstat(source_fd)
-                if (
-                    (info.st_dev, info.st_ino)
-                    != (operation.get("temporary_source_device"), operation.get("temporary_source_inode"))
-                    or _mount_id(source_fd) != operation.get("temporary_source_mount_id")
-                ):
+                if (info.st_dev, info.st_ino) != (
+                    operation.get("temporary_source_device"),
+                    operation.get("temporary_source_inode"),
+                ) or _mount_id(source_fd) != operation.get("temporary_source_mount_id"):
                     raise MaintenanceError("maintenance_source_restore_mismatch")
-                _verify_manifest_tree(source, manifest["source_entries"], skip_git=False)
+                _verify_manifest_tree(
+                    source, manifest["source_entries"], skip_git=False
+                )
             else:
                 if quarantine_root_fd < 0 or quarantine_fd < 0:
                     raise MaintenanceError("maintenance_source_restore_unavailable")
@@ -1581,9 +1735,14 @@ def recover_temporary_source_after_hold(
                         operation.get("temporary_source_device"),
                         operation.get("temporary_source_inode"),
                     ):
-                        raise MaintenanceError("maintenance_quarantine_identity_changed")
+                        raise MaintenanceError(
+                            "maintenance_quarantine_identity_changed"
+                        )
                     _verify_manifest_tree(
-                        source.parent / ".hive-quarantine" / claim.claim_id / moved_name,
+                        source.parent
+                        / ".hive-quarantine"
+                        / claim.claim_id
+                        / moved_name,
                         manifest["source_entries"],
                         skip_git=False,
                     )
@@ -1623,12 +1782,20 @@ def _restore_archive_unlocked(
     archive: ArchiveReceipt, destination: Path, *, lock_fd: int | None = None
 ) -> Path:
     """Snapshot and verify archive members before restoring from those same bytes."""
-    if not isinstance(archive, ArchiveReceipt) or not isinstance(destination, Path) or not destination.is_absolute():
+    if (
+        not isinstance(archive, ArchiveReceipt)
+        or not isinstance(destination, Path)
+        or not destination.is_absolute()
+    ):
         raise MaintenanceError("restore_arguments_invalid")
     verified_tar_files: dict[str, Any] = {}
     try:
-        manifest = _read_archive_manifest(archive, verified_tar_files=verified_tar_files)
-        if archive.entry_count != len(manifest.get("source_entries", [])) + len(manifest.get("common_entries", [])):
+        manifest = _read_archive_manifest(
+            archive, verified_tar_files=verified_tar_files
+        )
+        if archive.entry_count != len(manifest.get("source_entries", [])) + len(
+            manifest.get("common_entries", [])
+        ):
             raise MaintenanceError("archive_entry_count_mismatch")
         if manifest.get("kind") == "temporary_tree":
             return _restore_temporary_archive_unlocked(
@@ -1659,7 +1826,9 @@ def _restore_archive_payload_unlocked(
     lock_fd: int | None,
 ) -> Path:
     """Restore a validated linked-worktree bundle from private tar snapshots."""
-    if archive.entry_count != len(manifest.get("source_entries", [])) + len(manifest.get("common_entries", [])):
+    if archive.entry_count != len(manifest.get("source_entries", [])) + len(
+        manifest.get("common_entries", [])
+    ):
         raise MaintenanceError("archive_entry_count_mismatch")
     parent = destination.parent.resolve(strict=True)
     _validate_private_parent_chain(parent)
@@ -1710,8 +1879,12 @@ def _restore_archive_payload_unlocked(
                 lock_fd=lock_fd,
                 archive_fd=verified_tar_files["git-common.tar"].fileno(),
             )
-            _verify_manifest_tree(payload_path, manifest["source_entries"], skip_git=True)
-            _verify_manifest_tree(common_path, manifest["common_entries"], skip_git=False)
+            _verify_manifest_tree(
+                payload_path, manifest["source_entries"], skip_git=True
+            )
+            _verify_manifest_tree(
+                common_path, manifest["common_entries"], skip_git=False
+            )
             gitdir_fd = _open_directory_beneath(common_fd, manifest["gitdir"])
             _validate_git_config_at(common_fd, "config", lock_fd=lock_fd)
             _validate_git_config_at(gitdir_fd, "config", lock_fd=lock_fd)
@@ -1760,10 +1933,15 @@ def _restore_archive_payload_unlocked(
         _verify_root_metadata(payload_fd, source_root_entry)
         _verify_root_metadata(common_fd, common_root_entry)
         stage_identity = os.fstat(stage_fd)
-        LocalFleetHomeV2Filesystem().rename_noreplace_at(parent_fd, stage_name, destination.name)
+        LocalFleetHomeV2Filesystem().rename_noreplace_at(
+            parent_fd, stage_name, destination.name
+        )
         LocalFleetHomeV2Filesystem.fsync_directory(parent_fd)
         published = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (published.st_dev, published.st_ino) != (stage_identity.st_dev, stage_identity.st_ino):
+        if (published.st_dev, published.st_ino) != (
+            stage_identity.st_dev,
+            stage_identity.st_ino,
+        ):
             raise MaintenanceError("restore_publication_mismatch")
         return destination / worktree_name
     finally:
@@ -1790,9 +1968,11 @@ def _restore_temporary_archive_unlocked(
     parent = destination.parent.resolve(strict=True)
     _validate_private_parent_chain(parent)
     entries = manifest["source_entries"]
-    if shutil.disk_usage(parent).free < sum(
-        entry.get("size", 0) for entry in entries if entry.get("kind") == "file"
-    ) + 4 * 1024 * 1024:
+    if (
+        shutil.disk_usage(parent).free
+        < sum(entry.get("size", 0) for entry in entries if entry.get("kind") == "file")
+        + 4 * 1024 * 1024
+    ):
         raise MaintenanceError("restore_space_unavailable")
     parent_fd = os.open(parent, _TREE_FLAGS)
     stage_name = f".restore-{secrets.token_hex(12)}"
@@ -1821,11 +2001,16 @@ def _restore_temporary_archive_unlocked(
         _verify_root_metadata(stage_fd, root)
         os.fsync(stage_fd)
         stage_identity = os.fstat(stage_fd)
-        LocalFleetHomeV2Filesystem().rename_noreplace_at(parent_fd, stage_name, destination.name)
+        LocalFleetHomeV2Filesystem().rename_noreplace_at(
+            parent_fd, stage_name, destination.name
+        )
         published = True
         LocalFleetHomeV2Filesystem.fsync_directory(parent_fd)
         final = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (final.st_dev, final.st_ino) != (stage_identity.st_dev, stage_identity.st_ino):
+        if (final.st_dev, final.st_ino) != (
+            stage_identity.st_dev,
+            stage_identity.st_ino,
+        ):
             raise MaintenanceError("restore_publication_mismatch")
         return destination
     finally:
@@ -1878,11 +2063,15 @@ def scan_candidates(
                 snapshot = lifecycle.snapshot()
                 if any(use.binding == binding for use in snapshot.active_uses):
                     reasons.append("worktree_in_use")
-                if any(claim.candidate == binding for claim in snapshot.maintenance_claims):
+                if any(
+                    claim.candidate == binding for claim in snapshot.maintenance_claims
+                ):
                     reasons.append("maintenance_claim_active")
                 _git_layout(canonical, binding)
                 entries = _tree_manifest(canonical, skip_git=True)
-                source_manifest_digest = hashlib.sha256(_json_bytes(entries)).hexdigest()
+                source_manifest_digest = hashlib.sha256(
+                    _json_bytes(entries)
+                ).hexdigest()
                 allocated = _allocated_bytes(canonical)
                 common = binding.git_common_directory
                 _tree_manifest(common)
@@ -1895,7 +2084,10 @@ def scan_candidates(
                         reasons.append("runtime_end_time_in_future")
                     elif age >= policy.inactive_seconds:
                         reasons.append("inactive_30_days")
-                    elif allocated >= policy.large_bytes and age >= policy.large_inactive_seconds:
+                    elif (
+                        allocated >= policy.large_bytes
+                        and age >= policy.large_inactive_seconds
+                    ):
                         reasons.append("large_inactive_7_days")
                     else:
                         reasons.append("below_inactivity_threshold")
@@ -1950,7 +2142,10 @@ def scan_candidates(
                                 temp_info.st_ino,
                                 temp_mount,
                             )
-                            reasons = ("temporary_producer_7_days", "eligible_for_archive_review")
+                            reasons = (
+                                "temporary_producer_7_days",
+                                "eligible_for_archive_review",
+                            )
                             result.append(
                                 MaintenanceCandidate(
                                     source=temp_path,
@@ -2036,7 +2231,8 @@ def _quarantine_and_remove_claimed_temporary_source(
         or operation.get("temporary_source_device") != manifest.get("source_device")
         or operation.get("temporary_source_inode") != manifest.get("source_inode")
         or operation.get("temporary_source_mount_id") != manifest.get("source_mount_id")
-        or operation.get("temporary_producer_lease_id") != manifest.get("producer_lease_id")
+        or operation.get("temporary_producer_lease_id")
+        != manifest.get("producer_lease_id")
         or operation.get("archive_path") != str(receipt.archive)
         or operation.get("archive_manifest_sha256") != receipt.manifest_sha256
     ):
@@ -2107,7 +2303,8 @@ def _quarantine_and_remove_claimed_temporary_source(
         source_moved = False
         returned = filesystem.identity_at(parent_fd, source_name)
         if (returned.device, returned.inode) != (
-            manifest.get("source_device"), manifest.get("source_inode")
+            manifest.get("source_device"),
+            manifest.get("source_inode"),
         ):
             os.close(quarantine_fd)
             quarantine_fd = -1
@@ -2163,10 +2360,10 @@ def _quarantine_and_remove_claimed_temporary_source(
         source_fd = -1
         lifecycle.advance_maintenance_phase(claim, phase="quarantined")
         moved = filesystem.identity_at(quarantine_fd, "temporary")
-        if (
-            (moved.device, moved.inode) != (source_info.st_dev, source_info.st_ino)
-            or moved.uid != os.geteuid()
-        ):
+        if (moved.device, moved.inode) != (
+            source_info.st_dev,
+            source_info.st_ino,
+        ) or moved.uid != os.geteuid():
             raise MaintenanceError("quarantine_identity_changed")
         _assert_no_open_tree_references((quarantine_path,))
         _verify_manifest_tree(quarantine_path, entries, skip_git=False)
@@ -2200,7 +2397,9 @@ def _quarantine_and_remove_claimed_temporary_source(
                 os.close(descriptor)
 
 
-def _private_quarantine_fd(parent_fd: int, name: str, expected_device: int, expected_mount: int) -> int:
+def _private_quarantine_fd(
+    parent_fd: int, name: str, expected_device: int, expected_mount: int
+) -> int:
     try:
         os.mkdir(name, 0o700, dir_fd=parent_fd)
     except FileExistsError:
@@ -2230,7 +2429,9 @@ def _remove_quarantined_contents(directory_fd: int, device: int, mount: int) -> 
     filesystem = LocalFleetHomeV2Filesystem()
     names = os.listdir(directory_fd)
     grab_name = f".hive-remove-{secrets.token_hex(12)}"
-    grab_fd = filesystem.mkdir_private_at(directory_fd, grab_name, os.geteuid(), os.getegid())
+    grab_fd = filesystem.mkdir_private_at(
+        directory_fd, grab_name, os.geteuid(), os.getegid()
+    )
     try:
         for name in names:
             before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -2244,7 +2445,9 @@ def _remove_quarantined_contents(directory_fd: int, device: int, mount: int) -> 
                 moved.st_mode,
             ):
                 try:
-                    filesystem.rename_noreplace_between_at(grab_fd, name, directory_fd, name)
+                    filesystem.rename_noreplace_between_at(
+                        grab_fd, name, directory_fd, name
+                    )
                 except Exception:
                     pass
                 raise MaintenanceError("quarantine_entry_changed")
@@ -2252,11 +2455,10 @@ def _remove_quarantined_contents(directory_fd: int, device: int, mount: int) -> 
                 child_fd = os.open(name, _TREE_FLAGS, dir_fd=grab_fd)
                 try:
                     child_info = os.fstat(child_fd)
-                    if (
-                        (child_info.st_dev, child_info.st_ino)
-                        != (moved.st_dev, moved.st_ino)
-                        or _mount_id(child_fd) != mount
-                    ):
+                    if (child_info.st_dev, child_info.st_ino) != (
+                        moved.st_dev,
+                        moved.st_ino,
+                    ) or _mount_id(child_fd) != mount:
                         raise MaintenanceError("quarantine_entry_changed")
                     _remove_quarantined_contents(child_fd, device, mount)
                 finally:
@@ -2313,10 +2515,10 @@ def _remove_quarantined_tree_at(
     root_fd = os.open(grave_name, _TREE_FLAGS, dir_fd=parent_fd)
     try:
         root_info = os.fstat(root_fd)
-        if (
-            (root_info.st_dev, root_info.st_ino) != (expected_device, expected_inode)
-            or _mount_id(root_fd) != expected_mount
-        ):
+        if (root_info.st_dev, root_info.st_ino) != (
+            expected_device,
+            expected_inode,
+        ) or _mount_id(root_fd) != expected_mount:
             raise MaintenanceError("quarantine_identity_changed")
         _remove_quarantined_contents(root_fd, expected_device, expected_mount)
     finally:
@@ -2341,11 +2543,10 @@ def _tree_inode_identities(root: Path) -> set[tuple[int, int]]:
                 child_fd = os.open(name, _TREE_FLAGS, dir_fd=directory_fd)
                 try:
                     child_info = os.fstat(child_fd)
-                    if (
-                        (child_info.st_dev, child_info.st_ino)
-                        != (info.st_dev, info.st_ino)
-                        or _mount_id(child_fd) != root_mount
-                    ):
+                    if (child_info.st_dev, child_info.st_ino) != (
+                        info.st_dev,
+                        info.st_ino,
+                    ) or _mount_id(child_fd) != root_mount:
                         raise MaintenanceError("maintenance_reference_tree_changed")
                     walk(child_fd)
                 finally:
@@ -2382,11 +2583,15 @@ def _assert_no_open_tree_references(roots: tuple[Path, ...]) -> None:
         except ProcessLookupError:
             return False
         except PermissionError as exc:
-            raise MaintenanceError("maintenance_reference_inventory_unavailable") from exc
+            raise MaintenanceError(
+                "maintenance_reference_inventory_unavailable"
+            ) from exc
         except OSError as exc:
             if exc.errno == errno.ENOENT:
                 return False
-            raise MaintenanceError("maintenance_reference_inventory_unavailable") from exc
+            raise MaintenanceError(
+                "maintenance_reference_inventory_unavailable"
+            ) from exc
         return (info.st_dev, info.st_ino) in identities
 
     for pid in pids:
@@ -2419,11 +2624,15 @@ def _assert_no_open_tree_references(roots: tuple[Path, ...]) -> None:
         except ProcessLookupError:
             continue
         except PermissionError as exc:
-            raise MaintenanceError("maintenance_reference_inventory_unavailable") from exc
+            raise MaintenanceError(
+                "maintenance_reference_inventory_unavailable"
+            ) from exc
         except OSError as exc:
             if exc.errno == errno.ENOENT:
                 continue
-            raise MaintenanceError("maintenance_reference_inventory_unavailable") from exc
+            raise MaintenanceError(
+                "maintenance_reference_inventory_unavailable"
+            ) from exc
 
 
 def _expected_subtree_manifest(
@@ -2491,7 +2700,9 @@ def _quarantine_and_remove_claimed_source(
         or operation.get("archive_inode") != receipt.archive_inode
     ):
         raise MaintenanceError("maintenance_receipt_binding_mismatch")
-    source_parent_fd = common_parent_fd = common_fd = source_quarantine_fd = common_quarantine_fd = -1
+    source_parent_fd = common_parent_fd = common_fd = source_quarantine_fd = (
+        common_quarantine_fd
+    ) = -1
     filesystem = LocalFleetHomeV2Filesystem()
     try:
         source_parent_fd = os.open(source.parent, _TREE_FLAGS)
@@ -2513,7 +2724,10 @@ def _quarantine_and_remove_claimed_source(
             source_parent_fd, ".hive-quarantine", binding.device, binding.mount_id
         )
         common_quarantine_root_fd = _private_quarantine_fd(
-            common_parent_fd, ".hive-quarantine", common_parent_info.st_dev, common_mount
+            common_parent_fd,
+            ".hive-quarantine",
+            common_parent_info.st_dev,
+            common_mount,
         )
         try:
             claim_id = getattr(claim, "claim_id")
@@ -2521,7 +2735,10 @@ def _quarantine_and_remove_claimed_source(
                 source_quarantine_root_fd, claim_id, binding.device, binding.mount_id
             )
             common_quarantine_fd = _private_quarantine_fd(
-                common_quarantine_root_fd, claim_id, common_parent_info.st_dev, common_mount
+                common_quarantine_root_fd,
+                claim_id,
+                common_parent_info.st_dev,
+                common_mount,
             )
         finally:
             os.close(source_quarantine_root_fd)
@@ -2542,17 +2759,16 @@ def _quarantine_and_remove_claimed_source(
         ):
             raise MaintenanceError("quarantine_source_identity_changed")
         _assert_no_open_tree_references((source, gitdir))
-        _assert_receipt_tree_matches(
-            source, gitdir, manifest, gitdir_relative
-        )
+        _assert_receipt_tree_matches(source, gitdir, manifest, gitdir_relative)
         lifecycle.advance_maintenance_phase(claim, phase="quarantine_started")
         current_source = filesystem.identity_at(source_parent_fd, source_name)
         current_gitdir = filesystem.identity_at(common_parent_fd, gitdir_name)
-        if (
-            (current_source.device, current_source.inode)
-            != (source_identity.device, source_identity.inode)
-            or (current_gitdir.device, current_gitdir.inode)
-            != (gitdir_identity.device, gitdir_identity.inode)
+        if (current_source.device, current_source.inode) != (
+            source_identity.device,
+            source_identity.inode,
+        ) or (current_gitdir.device, current_gitdir.inode) != (
+            gitdir_identity.device,
+            gitdir_identity.inode,
         ):
             raise MaintenanceError("quarantine_source_identity_changed")
         filesystem.rename_noreplace_between_at(
@@ -2568,16 +2784,15 @@ def _quarantine_and_remove_claimed_source(
         lifecycle.advance_maintenance_phase(claim, phase="quarantined")
         moved_source = filesystem.identity_at(source_quarantine_fd, "worktree")
         moved_gitdir = filesystem.identity_at(common_quarantine_fd, "gitdir")
-        if (
-            (moved_source.device, moved_source.inode)
-            != (binding.device, binding.inode)
-            or (moved_gitdir.device, moved_gitdir.inode)
-            != (gitdir_identity.device, gitdir_identity.inode)
+        if (moved_source.device, moved_source.inode) != (
+            binding.device,
+            binding.inode,
+        ) or (moved_gitdir.device, moved_gitdir.inode) != (
+            gitdir_identity.device,
+            gitdir_identity.inode,
         ):
             raise MaintenanceError("quarantine_identity_changed")
-        quarantined_source = (
-            source.parent / ".hive-quarantine" / claim_id / "worktree"
-        )
+        quarantined_source = source.parent / ".hive-quarantine" / claim_id / "worktree"
         quarantined_gitdir = (
             common / "worktrees" / ".hive-quarantine" / claim_id / "gitdir"
         )

@@ -48,7 +48,11 @@ def _ensure_private_directory(path: Path) -> None:
         current = path.lstat()
     except OSError as exc:
         raise HiveStateError("state_directory_unavailable") from exc
-    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode) or current.st_mode & 0o077:
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or current.st_mode & 0o077
+    ):
         raise HiveStateError("state_directory_untrusted")
     if stat.S_IMODE(current.st_mode) != 0o700:
         try:
@@ -71,11 +75,9 @@ def _validate_existing_private_directory(
     if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
         raise HiveStateError("state_directory_untrusted")
     trusted = (
-        current.st_uid == os.geteuid()
-        and stat.S_IMODE(current.st_mode) == 0o700
+        current.st_uid == os.geteuid() and stat.S_IMODE(current.st_mode) == 0o700
         if shared_gid is None
-        else current.st_gid == shared_gid
-        and stat.S_IMODE(current.st_mode) == 0o2770
+        else current.st_gid == shared_gid and stat.S_IMODE(current.st_mode) == 0o2770
     )
     if not trusted:
         raise HiveStateError("state_directory_untrusted")
@@ -96,7 +98,9 @@ class HiveStateStore:
         if type(read_only) is not bool:
             raise HiveStateError("invalid_state_mode")
         if shared_gid is not None and (
-            isinstance(shared_gid, bool) or not isinstance(shared_gid, int) or shared_gid < 0
+            isinstance(shared_gid, bool)
+            or not isinstance(shared_gid, int)
+            or shared_gid < 0
         ):
             raise HiveStateError("invalid_state_group")
         self._root = root
@@ -115,12 +119,16 @@ class HiveStateStore:
         finally:
             os.close(descriptor)
 
-    def read_json(self, relative: PurePosixPath, *, max_bytes: int) -> Mapping[str, object]:
+    def read_json(
+        self, relative: PurePosixPath, *, max_bytes: int
+    ) -> Mapping[str, object]:
         self._validate_limit(max_bytes)
         with self._lock():
             return self.read_json_locked(relative, max_bytes=max_bytes)
 
-    def read_json_locked(self, relative: PurePosixPath, *, max_bytes: int) -> Mapping[str, object]:
+    def read_json_locked(
+        self, relative: PurePosixPath, *, max_bytes: int
+    ) -> Mapping[str, object]:
         """Read while the caller already owns :meth:`locked`."""
 
         path = self._path(relative)
@@ -134,7 +142,9 @@ class HiveStateStore:
             raise HiveStateError("invalid_state_document")
         return dict(payload)
 
-    def replace_json(self, relative: PurePosixPath, payload: Mapping[str, object]) -> None:
+    def replace_json(
+        self, relative: PurePosixPath, payload: Mapping[str, object]
+    ) -> None:
         self._ensure_writable()
         if not isinstance(payload, Mapping):
             raise HiveStateError("invalid_state_document")
@@ -155,7 +165,9 @@ class HiveStateStore:
         path = self._path(relative)
         if not isinstance(payload, Mapping):
             raise HiveStateError("invalid_state_document")
-        self._atomic_replace(path, encoded if encoded is not None else self._encode(payload))
+        self._atomic_replace(
+            path, encoded if encoded is not None else self._encode(payload)
+        )
 
     def read_private_bytes(self, relative: PurePosixPath, *, max_bytes: int) -> bytes:
         """Read one private regular file through the store's existing lock."""
@@ -201,7 +213,10 @@ class HiveStateStore:
         path = self._path(relative)
         if not isinstance(payload, Mapping):
             raise HiveStateError("invalid_state_document")
-        if isinstance(max_records, bool) or not 1 <= max_records <= MAX_HIVE_JSONL_RECORDS:
+        if (
+            isinstance(max_records, bool)
+            or not 1 <= max_records <= MAX_HIVE_JSONL_RECORDS
+        ):
             raise HiveStateError("invalid_state_limit")
         self._validate_limit(max_bytes)
         encoded_line = self._encode(payload).rstrip(b"\n")
@@ -283,7 +298,9 @@ class HiveStateStore:
 
         relative = _validate_relative(relative)
         parts = relative.parts
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
             descriptor = os.dup(self._held_root_descriptor())
         except OSError as exc:
@@ -321,7 +338,9 @@ class HiveStateStore:
             os.close(descriptor)
 
     def _open_private_root(self) -> int:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
             descriptor = os.open(self._root, flags)
         except OSError as exc:
@@ -474,10 +493,16 @@ class HiveStateStore:
     def _identity(info: os.stat_result) -> tuple[int, int]:
         return info.st_dev, info.st_ino
 
-    def _read_private_bytes_locked(self, relative: PurePosixPath, *, max_bytes: int) -> bytes:
+    def _read_private_bytes_locked(
+        self, relative: PurePosixPath, *, max_bytes: int
+    ) -> bytes:
         with self._private_parent(relative) as (parent_descriptor, name):
             try:
-                descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_descriptor)
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_descriptor,
+                )
             except FileNotFoundError:
                 raise HiveStateError("state_not_found") from None
             except OSError as exc:
@@ -512,11 +537,15 @@ class HiveStateStore:
             finally:
                 os.close(descriptor)
 
-    def _replace_private_bytes_locked(self, relative: PurePosixPath, payload: bytes) -> None:
+    def _replace_private_bytes_locked(
+        self, relative: PurePosixPath, payload: bytes
+    ) -> None:
         self._ensure_writable()
         with self._private_parent(relative) as (parent_descriptor, name):
             try:
-                existing = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                existing = os.stat(
+                    name, dir_fd=parent_descriptor, follow_symlinks=False
+                )
             except FileNotFoundError:
                 existing = None
             except OSError as exc:
@@ -543,7 +572,9 @@ class HiveStateStore:
                 descriptor = None
 
                 try:
-                    current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                    current = os.stat(
+                        name, dir_fd=parent_descriptor, follow_symlinks=False
+                    )
                 except FileNotFoundError:
                     current = None
                 if existing is None:
@@ -554,7 +585,12 @@ class HiveStateStore:
                         raise HiveStateError("state_file_untrusted")
                     self._validate_private_file(current, MAX_HIVE_STATE_BYTES)
 
-                os.replace(temporary, name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
+                os.replace(
+                    temporary,
+                    name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
                 temporary = ""
                 self._validate_private_file(
                     os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False),
@@ -595,14 +631,19 @@ class HiveStateStore:
 
     @classmethod
     def _validate_jsonl_limits(cls, max_records: int, max_bytes: int) -> None:
-        if isinstance(max_records, bool) or not 1 <= max_records <= MAX_HIVE_JSONL_RECORDS:
+        if (
+            isinstance(max_records, bool)
+            or not 1 <= max_records <= MAX_HIVE_JSONL_RECORDS
+        ):
             raise HiveStateError("invalid_state_limit")
         cls._validate_limit(max_bytes)
 
     @staticmethod
     def _encode(payload: Mapping[str, object]) -> bytes:
         try:
-            encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            encoded = json.dumps(
+                payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
         except (TypeError, ValueError, RecursionError) as exc:
             raise HiveStateError("invalid_state_document") from exc
         result = (encoded + "\n").encode("utf-8")
@@ -618,7 +659,11 @@ class HiveStateStore:
             return False
         except OSError as exc:
             raise HiveStateError("state_unavailable") from exc
-        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+        ):
             raise HiveStateError("state_file_untrusted")
         return True
 
@@ -633,8 +678,16 @@ class HiveStateStore:
             info = os.fstat(descriptor)
             if self._read_only:
                 self._validate_private_file(info, max_bytes)
-            elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes:
-                raise HiveStateError("state_file_untrusted" if info.st_size <= max_bytes else "state_oversize")
+            elif (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size > max_bytes
+            ):
+                raise HiveStateError(
+                    "state_file_untrusted"
+                    if info.st_size <= max_bytes
+                    else "state_oversize"
+                )
             raw = os.read(descriptor, max_bytes + 1)
             if len(raw) > max_bytes:
                 raise HiveStateError("state_oversize")
@@ -664,7 +717,9 @@ class HiveStateStore:
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
             temporary = None
-            parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            parent_descriptor = os.open(
+                parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
             try:
                 os.fsync(parent_descriptor)
             finally:
@@ -714,7 +769,9 @@ class HiveStateStore:
             self._verify_bound_root_descriptor(root_descriptor)
             lock_descriptor = self._open_lock_descriptor(root_descriptor)
             try:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_SH if self._read_only else fcntl.LOCK_EX)
+                fcntl.flock(
+                    lock_descriptor, fcntl.LOCK_SH if self._read_only else fcntl.LOCK_EX
+                )
             except OSError as exc:
                 raise HiveStateError("state_lock_unavailable") from exc
             self._verify_bound_root_descriptor(root_descriptor)

@@ -57,14 +57,29 @@ def peer(**changes):
 def closure(*entries):
     if not entries:
         entries = (
-            ImportClosureEntry("codex_master/__init__.py", "c" * 64, identity(mode=0o100600, ino=11, nlink=1)),
-            ImportClosureEntry("codex_master/fleet_home_broker_identity.py", "d" * 64, identity(mode=0o100600, ino=12, nlink=1)),
+            ImportClosureEntry(
+                "codex_master/__init__.py",
+                "c" * 64,
+                identity(mode=0o100600, ino=11, nlink=1),
+            ),
+            ImportClosureEntry(
+                "codex_master/fleet_home_broker_identity.py",
+                "d" * 64,
+                identity(mode=0o100600, ino=12, nlink=1),
+            ),
         )
     return ImportClosureManifestV1("1.0.0", identity(), tuple(entries))
 
 
 def test_public_contract_types_are_frozen_and_slotted():
-    for klass in (ObjectIdentity, BrokerManifestV1, PeerCgroupEvidence, BrokerCapabilityModel, ImportClosureEntry, ImportClosureManifestV1):
+    for klass in (
+        ObjectIdentity,
+        BrokerManifestV1,
+        PeerCgroupEvidence,
+        BrokerCapabilityModel,
+        ImportClosureEntry,
+        ImportClosureManifestV1,
+    ):
         assert dataclasses.is_dataclass(klass)
         assert klass.__dataclass_params__.frozen
         assert hasattr(klass, "__slots__")
@@ -82,23 +97,52 @@ def test_manifest_and_peer_bind_only_the_exact_principal():
     assert principal.fencing_epoch == 4
 
 
-@pytest.mark.parametrize("altered_manifest,altered_peer", [(manifest(mcs_pair="c0,c2"), peer()), (manifest(), peer(mcs_pair="c0,c2"))])
+@pytest.mark.parametrize(
+    "altered_manifest,altered_peer",
+    [(manifest(mcs_pair="c0,c2"), peer()), (manifest(), peer(mcs_pair="c0,c2"))],
+)
 def test_manifest_and_peer_mcs_mismatch_is_rejected(altered_manifest, altered_peer):
     with pytest.raises(BrokerIdentityError) as error:
         principal_for_attested_peer(altered_manifest, altered_peer)
-    assert error.value.code in {BrokerIdentityCode.WRONG_PRINCIPAL, BrokerIdentityCode.STALE_PEER, BrokerIdentityCode.STALE_GENERATION, BrokerIdentityCode.FENCED}
+    assert error.value.code in {
+        BrokerIdentityCode.WRONG_PRINCIPAL,
+        BrokerIdentityCode.STALE_PEER,
+        BrokerIdentityCode.STALE_GENERATION,
+        BrokerIdentityCode.FENCED,
+    }
 
 
 def test_manifest_and_peer_validators_require_exact_types_and_boundaries():
-    assert validate_broker_manifest(manifest(manifest_generation=1, policy_generation=1, fencing_epoch=0))
-    assert validate_broker_manifest(manifest(manifest_generation=MAX_CHPB_GENERATION, policy_generation=MAX_CHPB_GENERATION, fencing_epoch=MAX_CHPB_GENERATION))
+    assert validate_broker_manifest(
+        manifest(manifest_generation=1, policy_generation=1, fencing_epoch=0)
+    )
+    assert validate_broker_manifest(
+        manifest(
+            manifest_generation=MAX_CHPB_GENERATION,
+            policy_generation=MAX_CHPB_GENERATION,
+            fencing_epoch=MAX_CHPB_GENERATION,
+        )
+    )
     assert validate_peer_cgroup_evidence(peer(pid=1, unit_generation=1))
-    assert validate_peer_cgroup_evidence(peer(pid=MAX_CHPB_GENERATION, unit_generation=MAX_CHPB_GENERATION))
-    for value in (object(), dataclasses.replace(manifest(), manifest_generation=True), dataclasses.replace(peer(), unit_generation=False)):
-        validator = validate_broker_manifest if isinstance(value, BrokerManifestV1) else validate_peer_cgroup_evidence
+    assert validate_peer_cgroup_evidence(
+        peer(pid=MAX_CHPB_GENERATION, unit_generation=MAX_CHPB_GENERATION)
+    )
+    for value in (
+        object(),
+        dataclasses.replace(manifest(), manifest_generation=True),
+        dataclasses.replace(peer(), unit_generation=False),
+    ):
+        validator = (
+            validate_broker_manifest
+            if isinstance(value, BrokerManifestV1)
+            else validate_peer_cgroup_evidence
+        )
         with pytest.raises(BrokerIdentityError) as error:
             validator(value)
-        assert error.value.code in {BrokerIdentityCode.INVALID_TYPE, BrokerIdentityCode.INVALID_FIELD}
+        assert error.value.code in {
+            BrokerIdentityCode.INVALID_TYPE,
+            BrokerIdentityCode.INVALID_FIELD,
+        }
 
 
 @pytest.mark.parametrize(
@@ -115,7 +159,11 @@ def test_manifest_and_peer_validators_require_exact_types_and_boundaries():
     ],
 )
 def test_manifest_and_peer_reject_invalid_fields(altered):
-    validator = validate_broker_manifest if isinstance(altered, BrokerManifestV1) else validate_peer_cgroup_evidence
+    validator = (
+        validate_broker_manifest
+        if isinstance(altered, BrokerManifestV1)
+        else validate_peer_cgroup_evidence
+    )
     with pytest.raises(BrokerIdentityError):
         validator(altered)
 
@@ -133,32 +181,90 @@ def test_capability_model_is_exactly_root_with_three_empty_sets():
     ):
         with pytest.raises(BrokerIdentityError) as error:
             validate_empty_capability_model(model)
-        assert error.value.code in {BrokerIdentityCode.INVALID_TYPE, BrokerIdentityCode.INVALID_CAPABILITY_MODEL}
+        assert error.value.code in {
+            BrokerIdentityCode.INVALID_TYPE,
+            BrokerIdentityCode.INVALID_CAPABILITY_MODEL,
+        }
 
 
 def test_import_closure_requires_sorted_root_owned_regular_single_link_entries():
     value = validate_import_closure_manifest(closure())
     assert value.entries[0].relative_path < value.entries[1].relative_path
+
+
 @pytest.mark.parametrize(
     "candidate",
     [
-        closure(ImportClosureEntry("z.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)), ImportClosureEntry("a.py", "b" * 64, identity(mode=0o100600, ino=12, nlink=1))),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=2))),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o40700, ino=11, nlink=2))),
-        closure(ImportClosureEntry("../a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("./a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a//b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("/a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a\\\\b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a\x00b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a.py", "A" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)), ImportClosureEntry("a.py", "b" * 64, identity(mode=0o100600, ino=12, nlink=1))),
+        closure(
+            ImportClosureEntry(
+                "z.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            ),
+            ImportClosureEntry(
+                "a.py", "b" * 64, identity(mode=0o100600, ino=12, nlink=1)
+            ),
+        ),
+        closure(
+            ImportClosureEntry(
+                "a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=2)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "a.py", "a" * 64, identity(mode=0o40700, ino=11, nlink=2)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "../a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "./a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "a//b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "/a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "a\\\\b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "a\x00b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "a.py", "A" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            )
+        ),
+        closure(
+            ImportClosureEntry(
+                "a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)
+            ),
+            ImportClosureEntry(
+                "a.py", "b" * 64, identity(mode=0o100600, ino=12, nlink=1)
+            ),
+        ),
     ],
 )
 def test_import_closure_rejects_malformed_entries(candidate):
     with pytest.raises(BrokerIdentityError) as error:
         validate_import_closure_manifest(candidate)
-    assert error.value.code in {BrokerIdentityCode.INVALID_FIELD, BrokerIdentityCode.INVALID_IMPORT_CLOSURE}
+    assert error.value.code in {
+        BrokerIdentityCode.INVALID_FIELD,
+        BrokerIdentityCode.INVALID_IMPORT_CLOSURE,
+    }
 
 
 def test_import_closure_rejects_explicit_empty_relative_path():
@@ -189,7 +295,11 @@ def test_import_closure_rejects_non_root_or_writable_identity():
     for candidate in (
         ImportClosureManifestV1("1.0.0", identity(uid=1), closure().entries),
         ImportClosureManifestV1("1.0.0", identity(mode=0o40720), closure().entries),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o100620, ino=11, nlink=1))),
+        closure(
+            ImportClosureEntry(
+                "a.py", "a" * 64, identity(mode=0o100620, ino=11, nlink=1)
+            )
+        ),
     ):
         with pytest.raises(BrokerIdentityError):
             validate_import_closure_manifest(candidate)
@@ -198,10 +308,31 @@ def test_import_closure_rejects_non_root_or_writable_identity():
 def test_identity_production_imports_are_stdlib_or_pb1_only():
     source = Path("src/the_hive/fleet_home_broker_identity_contract.py").read_text()
     tree = ast.parse(source)
-    allowed = {"dataclasses", "enum", "re", "typing", "the_hive.fleet_home_broker_protocol"}
+    allowed = {
+        "dataclasses",
+        "enum",
+        "re",
+        "typing",
+        "the_hive.fleet_home_broker_protocol",
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             assert all(alias.name in allowed for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            assert node.module in allowed or (node.level == 1 and node.module == "fleet_home_broker_protocol")
-    assert all(token not in source.lower() for token in ("fleet_home_recovery", "server", "socket", "sqlite", "subprocess", "systemd", "selinux", "os.", "time."))
+            assert node.module in allowed or (
+                node.level == 1 and node.module == "fleet_home_broker_protocol"
+            )
+    assert all(
+        token not in source.lower()
+        for token in (
+            "fleet_home_recovery",
+            "server",
+            "socket",
+            "sqlite",
+            "subprocess",
+            "systemd",
+            "selinux",
+            "os.",
+            "time.",
+        )
+    )

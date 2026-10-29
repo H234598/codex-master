@@ -117,7 +117,13 @@ def _authority(
     monkeypatch: pytest.MonkeyPatch,
     *,
     action: str = "binding_manifest",
-) -> tuple[authority.GoogleInventoryDeploymentQuiescenceAuthorityV1, _Clock, _Port, _Port, _Port]:
+) -> tuple[
+    authority.GoogleInventoryDeploymentQuiescenceAuthorityV1,
+    _Clock,
+    _Port,
+    _Port,
+    _Port,
+]:
     layout = _layout(tmp_path, monkeypatch)
     plan, principal, target = _ports(action=action)
     clock = _Clock()
@@ -221,7 +227,9 @@ def test_plan_digest_action_target_generation_and_fingerprint_drift_fail_closed(
     receipt = instance.issue("plan-reference-1")
     plan.value = replace(plan.value, plan_digest="sha256:" + "2" * 64)
 
-    with pytest.raises(authority.AuthorityUnavailable, match="receipt_plan_digest_stale"):
+    with pytest.raises(
+        authority.AuthorityUnavailable, match="receipt_plan_digest_stale"
+    ):
         instance.resolve(receipt.receipt_reference)
 
 
@@ -264,7 +272,9 @@ def test_expiry_is_at_most_sixty_seconds_and_rejects_long_or_expired_plans(
 ) -> None:
     instance, _clock, _plan, _principal, _target = _authority(tmp_path, monkeypatch)
     receipt = instance.issue("plan-reference-1")
-    assert receipt.expires_boottime_ns - receipt.issued_boottime_ns == 60 * 1_000_000_000
+    assert (
+        receipt.expires_boottime_ns - receipt.issued_boottime_ns == 60 * 1_000_000_000
+    )
 
     bad_plan, principal, target = _ports(expires=_UTC + 301 * 1_000_000_000)
     bad = authority.GoogleInventoryDeploymentQuiescenceAuthorityV1(
@@ -527,8 +537,7 @@ def test_unreadable_known_claimed_record_is_indeterminate_and_not_remintable(
     receipt = instance.issue("plan-reference-1")
     instance.claim(receipt.receipt_reference)
     record = (
-        instance._layout.state_directory
-        / f"{receipt.receipt_reference}-claimed.json"
+        instance._layout.state_directory / f"{receipt.receipt_reference}-claimed.json"
     )
     record.write_text("{", encoding="utf-8")
     record.chmod(0o600)
@@ -547,9 +556,7 @@ def test_issue_rejects_a_false_action_target_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     instance, _clock, plan, _principal, _target = _authority(tmp_path, monkeypatch)
-    plan.value = replace(
-        plan.value, target_class="inventory-desktop-clients-v1"
-    )
+    plan.value = replace(plan.value, target_class="inventory-desktop-clients-v1")
 
     with pytest.raises(authority.AuthorityUnavailable, match="action_target"):
         instance.issue("plan-reference-1")
@@ -729,8 +736,7 @@ def test_missing_renameat2_is_fail_closed_without_replace_or_rename_fallback(
     instance, _clock, _plan, _principal, _target = _authority(tmp_path, monkeypatch)
     receipt = instance.issue("plan-reference-1")
     record = (
-        instance._layout.state_directory
-        / f"{receipt.receipt_reference}-issued.json"
+        instance._layout.state_directory / f"{receipt.receipt_reference}-issued.json"
     )
     original_record = record.read_bytes()
 
@@ -789,7 +795,9 @@ def test_consume_rechecks_expiry_after_acquiring_the_store_lock(
         return lockfd
 
     monkeypatch.setattr(authority, "_open_lock", acquire_lock_then_expire_receipt)
-    with pytest.raises(authority.AuthorityIndeterminate, match="consume_reattest_failed"):
+    with pytest.raises(
+        authority.AuthorityIndeterminate, match="consume_reattest_failed"
+    ):
         instance.consume(receipt.receipt_reference, continuity)
 
     assert instance._read_store()[receipt.receipt_reference].state == "INDETERMINATE"
@@ -813,7 +821,9 @@ def test_consume_rechecks_expiry_after_port_reattest_before_transition(
         return value
 
     monkeypatch.setattr(plan, "read", advance_during_consume)
-    with pytest.raises(authority.AuthorityIndeterminate, match="consume_reattest_failed"):
+    with pytest.raises(
+        authority.AuthorityIndeterminate, match="consume_reattest_failed"
+    ):
         instance.consume(receipt.receipt_reference, continuity)
 
     assert instance._read_store()[receipt.receipt_reference].state == "INDETERMINATE"
@@ -932,7 +942,9 @@ def test_record_mode_and_linkcount_are_rechecked_before_read(
 ) -> None:
     instance, _clock, _plan, _principal, _target = _authority(tmp_path, monkeypatch)
     receipt = instance.issue("plan-reference-1")
-    record = instance._layout.state_directory / f"{receipt.receipt_reference}-issued.json"
+    record = (
+        instance._layout.state_directory / f"{receipt.receipt_reference}-issued.json"
+    )
     record.chmod(0o644)
     with pytest.raises(authority.AuthorityUnavailable, match="store_file_invariant"):
         instance.resolve(receipt.receipt_reference)

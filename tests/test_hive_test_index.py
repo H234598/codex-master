@@ -71,10 +71,26 @@ def test_index_round_trips_as_canonical_json() -> None:
     [
         (lambda value: value.update(schema_version=True), "test.index_invalid"),
         (lambda value: value.update(extra=True), "test.index_invalid"),
-        (lambda value: value["functions"][0].update(path="../escape.py"), "test.index_invalid"),
-        (lambda value: value["functions"][0].update(test_ids=[]), "test.function_unindexed"),
-        (lambda value: value["tests"][0].update(assertion_digest="sha256:" + "x" * 64), "test.assertion_missing"),
-        (lambda value: value["tests"][0].update(covers=["python:src/missing.py:run"]), "test.index_invalid"),
+        (
+            lambda value: value["functions"][0].update(path="../escape.py"),
+            "test.index_invalid",
+        ),
+        (
+            lambda value: value["functions"][0].update(test_ids=[]),
+            "test.function_unindexed",
+        ),
+        (
+            lambda value: value["tests"][0].update(
+                assertion_digest="sha256:" + "x" * 64
+            ),
+            "test.assertion_missing",
+        ),
+        (
+            lambda value: value["tests"][0].update(
+                covers=["python:src/missing.py:run"]
+            ),
+            "test.index_invalid",
+        ),
     ],
 )
 def test_index_rejects_noncanonical_or_unbound_records(mutate, reason: str) -> None:

@@ -1858,9 +1858,7 @@ def _d321_evidence_bound_to_fresh_manager(
     expires_at_utc: object = "2026-08-23T12:05:00Z",
 ) -> object:
     snapshot = manager._snapshot_for_internal_use()
-    authority_generation = (
-        snapshot.generation if generation is None else generation
-    )
+    authority_generation = snapshot.generation if generation is None else generation
     content_fingerprint = (
         snapshot.content_fingerprint if fingerprint is None else fingerprint
     )
@@ -1916,25 +1914,34 @@ def test_d321_digest_preimages_have_exact_gold_bytes_and_sha256() -> None:
     evidence = _d321_evidence_for_test()
 
     assert consumer_preimage == _D321_CONSUMER_PREIMAGE
-    assert manager_module._d321_consumer_binding_digest(
-        inventory_authority_generation=7,
-        inventory_content_fingerprint=_D321_FINGERPRINT,
-        account_ref="synthetic-account-A",
-        project_ref="hive-synthetic-project-A",
-        project_id="synthetic-project-A",
-        key_id="synthetic-key-A",
-    ) == _D321_CONSUMER_DIGEST
+    assert (
+        manager_module._d321_consumer_binding_digest(
+            inventory_authority_generation=7,
+            inventory_content_fingerprint=_D321_FINGERPRINT,
+            account_ref="synthetic-account-A",
+            project_ref="hive-synthetic-project-A",
+            project_id="synthetic-project-A",
+            key_id="synthetic-key-A",
+        )
+        == _D321_CONSUMER_DIGEST
+    )
     assert group_preimage == _D321_GROUP_PREIMAGE
-    assert manager_module._d321_billing_group_digest(
-        billing_account_id="synthetic-billing-A"
-    ) == _D321_GROUP_DIGEST
+    assert (
+        manager_module._d321_billing_group_digest(
+            billing_account_id="synthetic-billing-A"
+        )
+        == _D321_GROUP_DIGEST
+    )
     assert inventory_preimage == _D321_INVENTORY_PREIMAGE
-    assert manager_module._d321_inventory_binding_digest(
-        inventory_authority_generation=7,
-        inventory_content_fingerprint=_D321_FINGERPRINT,
-        consumer_binding_digest=_D321_CONSUMER_DIGEST,
-        billing_group_digest=_D321_GROUP_DIGEST,
-    ) == _D321_INVENTORY_DIGEST
+    assert (
+        manager_module._d321_inventory_binding_digest(
+            inventory_authority_generation=7,
+            inventory_content_fingerprint=_D321_FINGERPRINT,
+            consumer_binding_digest=_D321_CONSUMER_DIGEST,
+            billing_group_digest=_D321_GROUP_DIGEST,
+        )
+        == _D321_INVENTORY_DIGEST
+    )
     assert evidence._evidence_preimage() == _D321_EVIDENCE_PREIMAGE
     assert evidence.evidence_digest == _D321_EVIDENCE_DIGEST
 
@@ -1942,9 +1949,7 @@ def test_d321_digest_preimages_have_exact_gold_bytes_and_sha256() -> None:
 def test_d321_evidence_codec_accepts_only_exact_canonical_13_field_value() -> None:
     evidence = _d321_evidence_for_test()
     raw = evidence._canonical_json_bytes()
-    decoded = manager_module._BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(
-        raw
-    )
+    decoded = manager_module._BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(raw)
 
     assert raw == _D321_EVIDENCE_BYTES
     assert decoded._canonical_json_bytes() == raw
@@ -2060,12 +2065,15 @@ def test_d321_manager_reattests_only_current_ready_snapshot_and_binding(
     manager.reload()
     evidence = _d321_evidence_bound_to_fresh_manager(manager)
 
-    assert manager._reattest_billing_group_quota_evidence(
-        evidence,
-        account_ref="synthetic-account-01",
-        project_ref="the-hive-1",
-        key_id="000654",
-    ) is evidence
+    assert (
+        manager._reattest_billing_group_quota_evidence(
+            evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+        is evidence
+    )
 
     for stale_evidence, account_ref, project_ref, key_id in (
         (
@@ -2139,8 +2147,9 @@ def test_d321_manager_reattest_rejects_future_or_expired_evidence_and_no_issue_p
     )
 
 
-def test_d321_pair_decoder_rejects_unknown_and_missing_before_map_materialization(
-) -> None:
+def test_d321_pair_decoder_rejects_unknown_and_missing_before_map_materialization() -> (
+    None
+):
     expected_fields = frozenset({"first", "second"})
 
     assert manager_module._d321_pairs_to_flat_object(
@@ -2205,7 +2214,9 @@ def test_d321_each_binding_raw_component_changes_its_digest() -> None:
 
     assert manager_module._d321_billing_group_digest(
         billing_account_id="synthetic-billing-B"
-    ) != manager_module._d321_billing_group_digest(billing_account_id="synthetic-billing-A")
+    ) != manager_module._d321_billing_group_digest(
+        billing_account_id="synthetic-billing-A"
+    )
 
 
 def test_d321_codec_rejects_tampered_value_without_recomputed_evidence_digest() -> None:
@@ -2220,8 +2231,10 @@ def test_d321_codec_rejects_tampered_value_without_recomputed_evidence_digest() 
 
 @pytest.mark.parametrize("token", (b"NaN", b"Infinity", b"-Infinity"))
 def test_d321_codec_rejects_json_nonfinite_tokens(token: bytes) -> None:
-    raw = _d321_evidence_for_test()._canonical_json_bytes().replace(
-        b'"schema_version":1', b'"schema_version":' + token
+    raw = (
+        _d321_evidence_for_test()
+        ._canonical_json_bytes()
+        .replace(b'"schema_version":1', b'"schema_version":' + token)
     )
 
     with pytest.raises(GoogleAccountInventoryError):
@@ -2419,8 +2432,7 @@ def _d327_json_bytes(payload: object) -> bytes:
     ).encode("utf-8")
 
 
-def test_d327_configured_quota_codec_is_canonical_private_and_non_authorizing(
-) -> None:
+def test_d327_configured_quota_codec_is_canonical_private_and_non_authorizing() -> None:
     raw_project_id = "synthetic-private-synthetic-project-marker"
     evidence = _d327_evidence_for_test(
         project_id=raw_project_id,
@@ -2481,8 +2493,7 @@ def test_d327_configured_quota_digest_preimage_binds_every_contract_field() -> N
     }
     for field, value in replacements.items():
         assert (
-            _d327_evidence_for_test(**{field: value}).evidence_digest
-            != baseline_digest
+            _d327_evidence_for_test(**{field: value}).evidence_digest != baseline_digest
         )
 
     assert (
@@ -2516,13 +2527,13 @@ def test_d327_configured_quota_codec_rejects_duplicate_and_noncanonical_json(
         manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(raw)
 
 
-def test_d327_configured_quota_codec_rejects_duplicate_dimension_before_digest(
-) -> None:
+def test_d327_configured_quota_codec_rejects_duplicate_dimension_before_digest() -> (
+    None
+):
     raw = _d327_evidence_for_test()._canonical_json_bytes()
     duplicate_dimensions = raw.replace(
         b'"dimensions":{"model":"gemini-test","region":"global"}',
-        b'"dimensions":{"model":"gemini-test","model":"duplicate",'
-        b'"region":"global"}',
+        b'"dimensions":{"model":"gemini-test","model":"duplicate","region":"global"}',
     )
     assert duplicate_dimensions != raw
 
@@ -2532,8 +2543,9 @@ def test_d327_configured_quota_codec_rejects_duplicate_dimension_before_digest(
         )
 
 
-def test_d327_configured_quota_codec_rejects_missing_unknown_and_tampered_fields(
-) -> None:
+def test_d327_configured_quota_codec_rejects_missing_unknown_and_tampered_fields() -> (
+    None
+):
     payload = json.loads(_d327_evidence_for_test()._canonical_json_bytes())
     variants = []
     missing = dict(payload)
@@ -2664,12 +2676,15 @@ def test_d327_manager_reattest_requires_current_ready_snapshot_and_binding(
     manager.reload()
     evidence = _d327_evidence_bound_to_fresh_manager(manager)
 
-    assert manager._reattest_configured_quota_evidence(
-        evidence,
-        account_ref="synthetic-account-01",
-        project_ref="the-hive-1",
-        key_id="000654",
-    ) is evidence
+    assert (
+        manager._reattest_configured_quota_evidence(
+            evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+        is evidence
+    )
 
     for stale_evidence, account_ref, project_ref, key_id in (
         (
@@ -2708,17 +2723,17 @@ def test_d327_manager_reattest_rejects_future_expired_blocked_and_closed_state(
     manager.reload()
     for evidence in (
         _d327_evidence_bound_to_fresh_manager(
-                manager,
-                observed_at_utc="2026-08-23T12:01:00Z",
-                expires_at_utc="2026-08-23T12:01:01Z",
-                refresh_interval="1s",
-            ),
+            manager,
+            observed_at_utc="2026-08-23T12:01:00Z",
+            expires_at_utc="2026-08-23T12:01:01Z",
+            refresh_interval="1s",
+        ),
         _d327_evidence_bound_to_fresh_manager(
-                manager,
-                observed_at_utc="2026-08-23T11:50:00Z",
-                expires_at_utc="2026-08-23T11:59:00Z",
-                refresh_interval="540s",
-            ),
+            manager,
+            observed_at_utc="2026-08-23T11:50:00Z",
+            expires_at_utc="2026-08-23T11:59:00Z",
+            refresh_interval="540s",
+        ),
     ):
         with pytest.raises(GoogleAccountInventoryError):
             manager._reattest_configured_quota_evidence(
@@ -2812,8 +2827,9 @@ def _d328_source_preimage_for_test(
     )
 
 
-def test_d328_source_preimage_has_exact_fields_sorted_dimensions_and_bound_digest(
-) -> None:
+def test_d328_source_preimage_has_exact_fields_sorted_dimensions_and_bound_digest() -> (
+    None
+):
     first = _d328_source_preimage_for_test(
         dimensions={"region": "global", "model": "gemini-test"}
     )
@@ -2837,9 +2853,7 @@ def test_d328_source_preimage_has_exact_fields_sorted_dimensions_and_bound_diges
     }
     assert payload["kind"] == "gemini_configured_quota_source_preimage.v1"
     assert payload["source_kind"] == "cloud_quotas_v1"
-    assert first.index(b'"model":"gemini-test"') < first.index(
-        b'"region":"global"'
-    )
+    assert first.index(b'"model":"gemini-test"') < first.index(b'"region":"global"')
 
 
 @pytest.mark.parametrize(
@@ -3063,9 +3077,9 @@ def test_d328_decoder_accepts_only_structural_digest_until_manager_reattests(
     payload["source_resource_digest"] = "sha256:" + "0" * 64
     preimage = dict(payload)
     del preimage["evidence_digest"]
-    payload["evidence_digest"] = "sha256:" + hashlib.sha256(
-        _d327_json_bytes(preimage)
-    ).hexdigest()
+    payload["evidence_digest"] = (
+        "sha256:" + hashlib.sha256(_d327_json_bytes(preimage)).hexdigest()
+    )
     decoded = manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
         _d327_json_bytes(payload)
     )
@@ -3105,9 +3119,9 @@ def test_d328_decoder_rejects_resealed_contract_bound_violations(
     payload[field] = value
     preimage = dict(payload)
     del preimage["evidence_digest"]
-    payload["evidence_digest"] = "sha256:" + hashlib.sha256(
-        _d327_json_bytes(preimage)
-    ).hexdigest()
+    payload["evidence_digest"] = (
+        "sha256:" + hashlib.sha256(_d327_json_bytes(preimage)).hexdigest()
+    )
 
     with pytest.raises(GoogleAccountInventoryError):
         manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
@@ -3179,9 +3193,12 @@ def test_d329_d327_validate_dimensions_sorts_and_rejects_unbounded_entries() -> 
 def test_d329_d327_validate_payload_fields_requires_the_exact_field_set() -> None:
     payload = {"field": "value"}
 
-    assert manager_module._d327_validate_payload_fields(
-        payload, expected_fields=frozenset({"field"})
-    ) is payload
+    assert (
+        manager_module._d327_validate_payload_fields(
+            payload, expected_fields=frozenset({"field"})
+        )
+        is payload
+    )
     with pytest.raises(GoogleAccountInventoryError):
         manager_module._d327_validate_payload_fields(
             {"other": "value"}, expected_fields=frozenset({"field"})
@@ -3239,8 +3256,7 @@ def test_d329_d327_validate_evidence_payload_accepts_exact_bounded_ttl_edges(
 
 def test_d329_d327_timestamp_seconds_parses_canonical_utc_and_rejects_offset() -> None:
     assert (
-        manager_module._d327_timestamp_seconds("2026-09-23T12:00:00Z")
-        == 1_790_164_800
+        manager_module._d327_timestamp_seconds("2026-09-23T12:00:00Z") == 1_790_164_800
     )
     with pytest.raises(GoogleAccountInventoryError):
         manager_module._d327_timestamp_seconds("2026-09-23T12:00:00+00:00")
@@ -3402,8 +3418,9 @@ def test_d329_configured_quota_evidence_v1_evidence_preimage_excludes_digest() -
     assert "evidence_digest" not in json.loads(evidence._evidence_preimage())
 
 
-def test_d329_configured_quota_evidence_v1_canonical_json_bytes_includes_digest(
-) -> None:
+def test_d329_configured_quota_evidence_v1_canonical_json_bytes_includes_digest() -> (
+    None
+):
     evidence = _d327_evidence_for_test()
 
     assert json.loads(evidence._canonical_json_bytes())["evidence_digest"] == (
@@ -3411,8 +3428,9 @@ def test_d329_configured_quota_evidence_v1_canonical_json_bytes_includes_digest(
     )
 
 
-def test_d329_configured_quota_evidence_v1_from_canonical_json_bytes_round_trips(
-) -> None:
+def test_d329_configured_quota_evidence_v1_from_canonical_json_bytes_round_trips() -> (
+    None
+):
     raw = _d327_evidence_for_test()._canonical_json_bytes()
 
     decoded = manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(raw)

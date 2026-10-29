@@ -323,10 +323,20 @@ def _g_home_identity(value: object) -> GMigrationHomeIdentity:
     )
 
 
-def _g_alias(value: object, migration_id: str, expected_generation: int) -> GMigrationAlias:
+def _g_alias(
+    value: object, migration_id: str, expected_generation: int
+) -> GMigrationAlias:
     raw = _g_exact_fields(
         value,
-        frozenset({"old_agent_id", "current_agent_id", "member_id", "expected_generation", "migration_id"}),
+        frozenset(
+            {
+                "old_agent_id",
+                "current_agent_id",
+                "member_id",
+                "expected_generation",
+                "migration_id",
+            }
+        ),
     )
     alias = GMigrationAlias(
         _g_agent_id(raw["old_agent_id"]),
@@ -499,7 +509,10 @@ def _g_validate_journal(journal: object) -> GMigrationJournal:
         _g_integer(authoritative, minimum=1, maximum=2**63 - 1)
         if authoritative != target_generation:
             _g_fail()
-    if type(journal.blocking_error_codes) is not tuple or len(journal.blocking_error_codes) > 32:
+    if (
+        type(journal.blocking_error_codes) is not tuple
+        or len(journal.blocking_error_codes) > 32
+    ):
         _g_fail()
     errors = tuple(
         _g_text(code, minimum=1, maximum=64)
@@ -580,24 +593,26 @@ def normalize_g_migration_journal(value: object) -> GMigrationJournal:
             _g_fail()
         raw = _g_exact_fields(
             value,
-            frozenset({
-                "schema_version",
-                "migration_id",
-                "manifest_version",
-                "expected_registry_generation",
-                "source_projection_digest",
-                "source_snapshot_digest",
-                "plan_digest",
-                "candidate_digest",
-                "binding_evidence_digest",
-                "allocations",
-                "source_ids",
-                "home_identities",
-                "aliases",
-                "phase",
-                "authoritative_generation",
-                "blocking_error_codes",
-            }),
+            frozenset(
+                {
+                    "schema_version",
+                    "migration_id",
+                    "manifest_version",
+                    "expected_registry_generation",
+                    "source_projection_digest",
+                    "source_snapshot_digest",
+                    "plan_digest",
+                    "candidate_digest",
+                    "binding_evidence_digest",
+                    "allocations",
+                    "source_ids",
+                    "home_identities",
+                    "aliases",
+                    "phase",
+                    "authoritative_generation",
+                    "blocking_error_codes",
+                }
+            ),
         )
         if (
             type(raw["allocations"]) is not list
@@ -611,7 +626,9 @@ def normalize_g_migration_journal(value: object) -> GMigrationJournal:
             _g_integer(raw["schema_version"], minimum=1, maximum=1),
             _g_text(raw["migration_id"], minimum=32, maximum=32),
             _g_integer(raw["manifest_version"], minimum=1, maximum=1),
-            _g_integer(raw["expected_registry_generation"], minimum=1, maximum=2**63 - 2),
+            _g_integer(
+                raw["expected_registry_generation"], minimum=1, maximum=2**63 - 2
+            ),
             _g_digest(raw["source_projection_digest"]),
             _g_digest(raw["source_snapshot_digest"]),
             _g_digest(raw["plan_digest"]),
@@ -624,17 +641,25 @@ def normalize_g_migration_journal(value: object) -> GMigrationJournal:
                 _g_alias(
                     item,
                     _g_text(raw["migration_id"], minimum=32, maximum=32),
-                    _g_integer(raw["expected_registry_generation"], minimum=1, maximum=2**63 - 2) + 1,
+                    _g_integer(
+                        raw["expected_registry_generation"],
+                        minimum=1,
+                        maximum=2**63 - 2,
+                    )
+                    + 1,
                 )
                 for item in raw["aliases"]
             ),
-            GMigrationPhase(raw["phase"])
-            if type(raw["phase"]) is str
-            else _g_fail(),
+            GMigrationPhase(raw["phase"]) if type(raw["phase"]) is str else _g_fail(),
             None
             if raw["authoritative_generation"] is None
-            else _g_integer(raw["authoritative_generation"], minimum=1, maximum=2**63 - 1),
-            tuple(_g_text(code, minimum=1, maximum=64) for code in raw["blocking_error_codes"]),
+            else _g_integer(
+                raw["authoritative_generation"], minimum=1, maximum=2**63 - 1
+            ),
+            tuple(
+                _g_text(code, minimum=1, maximum=64)
+                for code in raw["blocking_error_codes"]
+            ),
         )
         return _g_validate_journal(journal)
     except GMigrationRecoveryError:
@@ -656,9 +681,13 @@ def g_migration_journal_document(journal: GMigrationJournal) -> dict[str, object
             "plan_digest": journal.plan_digest,
             "candidate_digest": journal.candidate_digest,
             "binding_evidence_digest": journal.binding_evidence_digest,
-            "allocations": [_g_allocation_document(item) for item in journal.allocations],
+            "allocations": [
+                _g_allocation_document(item) for item in journal.allocations
+            ],
             "source_ids": list(journal.source_ids),
-            "home_identities": [_g_home_document(item) for item in journal.home_identities],
+            "home_identities": [
+                _g_home_document(item) for item in journal.home_identities
+            ],
             "aliases": [_g_alias_output(item) for item in journal.aliases],
             "phase": journal.phase.value,
             "authoritative_generation": journal.authoritative_generation,
@@ -674,30 +703,53 @@ def g_migration_journal_document(journal: GMigrationJournal) -> dict[str, object
 
 def g_migration_alias_view(journal: GMigrationJournal) -> Mapping[str, str]:
     journal = _g_validate_journal(journal)
-    return MappingProxyType({alias.old_agent_id: alias.current_agent_id for alias in journal.aliases})
+    return MappingProxyType(
+        {alias.old_agent_id: alias.current_agent_id for alias in journal.aliases}
+    )
 
 
-ROOT_FIELDS = frozenset({
-    "schema_version", "journal_id", "operation", "pool_root_digest",
-    "expected_generation", "planned_generation", "authoritative_generation",
-    "phase", "entries", "blocking_error_codes",
-})
-ENTRY_FIELDS = frozenset({
-    "kind", "agent_id", "hidden_name", "old_descriptor_fingerprint",
-    "new_descriptor_fingerprint", "old_materialization_fingerprint",
-    "new_materialization_fingerprint", "source_identity", "target_identity",
-    "manifest", "phase", "result_code",
-})
+ROOT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "journal_id",
+        "operation",
+        "pool_root_digest",
+        "expected_generation",
+        "planned_generation",
+        "authoritative_generation",
+        "phase",
+        "entries",
+        "blocking_error_codes",
+    }
+)
+ENTRY_FIELDS = frozenset(
+    {
+        "kind",
+        "agent_id",
+        "hidden_name",
+        "old_descriptor_fingerprint",
+        "new_descriptor_fingerprint",
+        "old_materialization_fingerprint",
+        "new_materialization_fingerprint",
+        "source_identity",
+        "target_identity",
+        "manifest",
+        "phase",
+        "result_code",
+    }
+)
 IDENTITY_FIELDS = frozenset({"dev", "ino", "mode", "uid", "gid", "nlink"})
 ARTIFACT_FIELDS = frozenset({"relative_path", "mode", "sha256"})
-RESULT_CODES = frozenset({
-    "fleet_create_rollback_diverged",
-    "fleet_update_rollback_diverged",
-    "fleet_tombstone_rollback_diverged",
-    "fleet_registry_delete_reservation_diverged",
-    "fleet_recovery_incomplete",
-    "fleet_registry_commit_diverged",
-})
+RESULT_CODES = frozenset(
+    {
+        "fleet_create_rollback_diverged",
+        "fleet_update_rollback_diverged",
+        "fleet_tombstone_rollback_diverged",
+        "fleet_registry_delete_reservation_diverged",
+        "fleet_recovery_incomplete",
+        "fleet_registry_commit_diverged",
+    }
+)
 
 
 def _fail() -> None:
@@ -718,7 +770,11 @@ def _exact_fields(value: object, fields: frozenset[str]) -> Mapping[str, object]
 
 
 def _integer(value: object, *, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
         _fail()
     return value
 
@@ -818,7 +874,11 @@ def _entry(value: object) -> RecoveryEntry:
 def normalize_recovery_document(value: object) -> FleetRecoveryJournal:
     try:
         raw_payload = json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError):
         _fail()
@@ -840,7 +900,10 @@ def normalize_recovery_document(value: object) -> FleetRecoveryJournal:
         or len(entries_raw) > MAX_RECOVERY_ENTRIES
         or not isinstance(errors_raw, list)
         or len(errors_raw) > len(RESULT_CODES)
-        or any(not isinstance(error, str) or error not in RESULT_CODES for error in errors_raw)
+        or any(
+            not isinstance(error, str) or error not in RESULT_CODES
+            for error in errors_raw
+        )
         or errors_raw != sorted(set(errors_raw))
     ):
         _fail()
@@ -905,7 +968,11 @@ def _recovery_document(journal: FleetRecoveryJournal) -> dict[str, object]:
                 "source_identity": identity_document(entry.source_identity),
                 "target_identity": identity_document(entry.target_identity),
                 "manifest": [
-                    {"relative_path": item.relative_path, "mode": item.mode, "sha256": item.sha256}
+                    {
+                        "relative_path": item.relative_path,
+                        "mode": item.mode,
+                        "sha256": item.sha256,
+                    }
                     for item in entry.manifest
                 ],
                 "phase": entry.phase.value,
@@ -929,7 +996,11 @@ def recovery_document(journal: FleetRecoveryJournal) -> dict[str, object]:
 
 def _fingerprint(payload: object) -> str:
     encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -937,41 +1008,49 @@ def _fingerprint(payload: object) -> str:
 def descriptor_fingerprint(descriptor: AgentDescriptor | None) -> str | None:
     if descriptor is None:
         return None
-    return _fingerprint({
-        "agent_id": descriptor.agent_id,
-        "series_prefix": descriptor.series_prefix,
-        "ordinal": descriptor.ordinal,
-        "label": descriptor.label,
-        "runner": descriptor.runner.value,
-        "provider": descriptor.provider.value,
-        "model": descriptor.model,
-        "account_id": descriptor.account_id,
-        "skill_profile": descriptor.skill_profile,
-        "task_profile": descriptor.task_profile,
-        "home": str(descriptor.home),
-        "session": descriptor.session,
-        "enabled": descriptor.enabled,
-    })
+    return _fingerprint(
+        {
+            "agent_id": descriptor.agent_id,
+            "series_prefix": descriptor.series_prefix,
+            "ordinal": descriptor.ordinal,
+            "label": descriptor.label,
+            "runner": descriptor.runner.value,
+            "provider": descriptor.provider.value,
+            "model": descriptor.model,
+            "account_id": descriptor.account_id,
+            "skill_profile": descriptor.skill_profile,
+            "task_profile": descriptor.task_profile,
+            "home": str(descriptor.home),
+            "session": descriptor.session,
+            "enabled": descriptor.enabled,
+        }
+    )
 
 
 def materialization_fingerprint(
     descriptor: AgentDescriptor,
     manifest: tuple[ArtifactDigest, ...],
 ) -> str:
-    return _fingerprint({
-        "agent_id": descriptor.agent_id,
-        "series_prefix": descriptor.series_prefix,
-        "ordinal": descriptor.ordinal,
-        "runner": descriptor.runner.value,
-        "provider": descriptor.provider.value,
-        "model": descriptor.model,
-        "skill_profile": descriptor.skill_profile,
-        "task_profile": descriptor.task_profile,
-        "manifest": [
-            {"relative_path": item.relative_path, "mode": item.mode, "sha256": item.sha256}
-            for item in manifest
-        ],
-    })
+    return _fingerprint(
+        {
+            "agent_id": descriptor.agent_id,
+            "series_prefix": descriptor.series_prefix,
+            "ordinal": descriptor.ordinal,
+            "runner": descriptor.runner.value,
+            "provider": descriptor.provider.value,
+            "model": descriptor.model,
+            "skill_profile": descriptor.skill_profile,
+            "task_profile": descriptor.task_profile,
+            "manifest": [
+                {
+                    "relative_path": item.relative_path,
+                    "mode": item.mode,
+                    "sha256": item.sha256,
+                }
+                for item in manifest
+            ],
+        }
+    )
 
 
 def classify_descriptor(
@@ -1038,29 +1117,45 @@ def plan_reconciliation(
             and entry.target_identity is None
             and state in {DescriptorState.ABSENT, DescriptorState.OLD}
         ):
-            actions.append(RecoveryAction(
-                RecoveryActionKind.VERIFY_UNCHANGED,
+            actions.append(
+                RecoveryAction(
+                    RecoveryActionKind.VERIFY_UNCHANGED,
+                    index,
+                    entry.agent_id,
+                    state,
+                )
+            )
+            continue
+        actions.append(
+            RecoveryAction(
+                _ACTION_MATRIX[entry.kind][state],
                 index,
                 entry.agent_id,
                 state,
-            ))
-            continue
-        actions.append(RecoveryAction(
-            _ACTION_MATRIX[entry.kind][state],
-            index,
-            entry.agent_id,
-            state,
-        ))
+            )
+        )
     return RecoveryPlan(tuple(actions), has_third)
 
 
 _TRANSITIONS = {
-    RecoveryPhase.PREPARED: frozenset({RecoveryPhase.MATERIALIZING, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.MATERIALIZING: frozenset({RecoveryPhase.CAS_PENDING, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.CAS_PENDING: frozenset({RecoveryPhase.RECONCILING, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.RECONCILING: frozenset({RecoveryPhase.VERIFIED, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.VERIFIED: frozenset({RecoveryPhase.PUBLISHED, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.PUBLISHED: frozenset({RecoveryPhase.COMPLETE, RecoveryPhase.DEGRADED}),
+    RecoveryPhase.PREPARED: frozenset(
+        {RecoveryPhase.MATERIALIZING, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.MATERIALIZING: frozenset(
+        {RecoveryPhase.CAS_PENDING, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.CAS_PENDING: frozenset(
+        {RecoveryPhase.RECONCILING, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.RECONCILING: frozenset(
+        {RecoveryPhase.VERIFIED, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.VERIFIED: frozenset(
+        {RecoveryPhase.PUBLISHED, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.PUBLISHED: frozenset(
+        {RecoveryPhase.COMPLETE, RecoveryPhase.DEGRADED}
+    ),
     RecoveryPhase.COMPLETE: frozenset(),
     RecoveryPhase.DEGRADED: frozenset({RecoveryPhase.RECONCILING}),
 }
@@ -1078,17 +1173,28 @@ def advance_recovery_phase(
     generation = journal.authoritative_generation
     if authoritative_generation is not None:
         generation = _integer(authoritative_generation, minimum=1, maximum=2**63 - 1)
-    if target in {
-        RecoveryPhase.RECONCILING,
-        RecoveryPhase.VERIFIED,
-        RecoveryPhase.PUBLISHED,
-        RecoveryPhase.COMPLETE,
-    } and generation is None:
+    if (
+        target
+        in {
+            RecoveryPhase.RECONCILING,
+            RecoveryPhase.VERIFIED,
+            RecoveryPhase.PUBLISHED,
+            RecoveryPhase.COMPLETE,
+        }
+        and generation is None
+    ):
         _fail()
-    if any(not isinstance(code, str) or code not in RESULT_CODES for code in blocking_error_codes):
+    if any(
+        not isinstance(code, str) or code not in RESULT_CODES
+        for code in blocking_error_codes
+    ):
         _fail()
     normalized_errors = tuple(sorted(set(blocking_error_codes)))
-    if target in {RecoveryPhase.VERIFIED, RecoveryPhase.PUBLISHED, RecoveryPhase.COMPLETE} and normalized_errors:
+    if (
+        target
+        in {RecoveryPhase.VERIFIED, RecoveryPhase.PUBLISHED, RecoveryPhase.COMPLETE}
+        and normalized_errors
+    ):
         _fail()
     return replace(
         journal,

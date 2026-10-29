@@ -39,9 +39,7 @@ ABI = {
     "agent_unit_template": "the-hive-agent@.service",
     "launcher_path": "/usr/libexec/the-hive-agent-launcher",
 }
-FIXTURES = {
-    role: f"{role}-bundle\n".encode("ascii") for role in ROLES
-}
+FIXTURES = {role: f"{role}-bundle\n".encode("ascii") for role in ROLES}
 
 
 def _payloads(fixtures: dict[str, bytes] = FIXTURES):
@@ -86,9 +84,12 @@ def _document() -> dict[str, object]:
 
 
 def _document_bytes(document: dict[str, object]) -> bytes:
-    return json.dumps(
-        document, ensure_ascii=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8") + b"\n"
+    return (
+        json.dumps(
+            document, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def test_public_models_are_exact_frozen_slots_and_have_fixed_fields() -> None:
@@ -164,7 +165,9 @@ def test_payload_digest_rejects_wrong_exact_types_roles_and_sha256(
         ("launcher_path", {"path": "/usr/libexec/the-hive-agent-launcher"}),
     ],
 )
-def test_spec_rejects_wrong_exact_types_and_abi_values(field: str, value: object) -> None:
+def test_spec_rejects_wrong_exact_types_and_abi_values(
+    field: str, value: object
+) -> None:
     values = {
         "schema_version": 2,
         "payload_version": "0.10.5",
@@ -176,7 +179,10 @@ def test_spec_rejects_wrong_exact_types_and_abi_values(field: str, value: object
         ControlReleaseSpecV2(**values)
 
 
-@pytest.mark.parametrize("payloads", [list(_payloads()), {"payloads": _payloads()}, "payloads", iter(_payloads())])
+@pytest.mark.parametrize(
+    "payloads",
+    [list(_payloads()), {"payloads": _payloads()}, "payloads", iter(_payloads())],
+)
 def test_spec_rejects_collection_substitutes(payloads: object) -> None:
     with pytest.raises(ValueError):
         _spec(payloads=payloads)
@@ -217,7 +223,9 @@ def test_decoder_rejects_wrong_trailing_linefeed(raw: bytes) -> None:
         decode_control_release_v2(raw, expected_payload_version="0.10.5")
 
 
-@pytest.mark.parametrize("raw", ["bytes", bytearray(GOLDEN_BYTES), memoryview(GOLDEN_BYTES), None])
+@pytest.mark.parametrize(
+    "raw", ["bytes", bytearray(GOLDEN_BYTES), memoryview(GOLDEN_BYTES), None]
+)
 def test_decoder_requires_exact_bytes_input(raw: object) -> None:
     with pytest.raises(ValueError):
         decode_control_release_v2(raw, expected_payload_version="0.10.5")
@@ -249,8 +257,12 @@ def test_decoder_rejects_noncanonical_json_bytes(raw: bytes) -> None:
     "raw",
     [
         b"{\xff}\n",
-        GOLDEN_BYTES.replace(b'"payload_version":"0.10.5"', b'"payload_version":NaN', 1),
-        GOLDEN_BYTES.replace(b'"payload_version":"0.10.5"', b'"payload_version":Infinity', 1),
+        GOLDEN_BYTES.replace(
+            b'"payload_version":"0.10.5"', b'"payload_version":NaN', 1
+        ),
+        GOLDEN_BYTES.replace(
+            b'"payload_version":"0.10.5"', b'"payload_version":Infinity', 1
+        ),
         GOLDEN_BYTES.replace(
             b'"schema_version":2,', b'"schema_version":2,"schema_version":2,', 1
         ),
@@ -363,7 +375,9 @@ def test_copy_deepcopy_pickle_and_mutation_cannot_change_immutable_graph() -> No
         clones[0].payloads[0].role = "root_helpers"
 
 
-def test_in_memory_bundle_bytes_drive_deterministic_selected_role_digest_and_spec() -> None:
+def test_in_memory_bundle_bytes_drive_deterministic_selected_role_digest_and_spec() -> (
+    None
+):
     same = _spec()
     assert same == _spec()
     assert encode_control_release_v2(same) == encode_control_release_v2(SPEC)
@@ -372,9 +386,9 @@ def test_in_memory_bundle_bytes_drive_deterministic_selected_role_digest_and_spe
     changed_fixtures["selinux_policy"] += b"x"
     changed = _spec(changed_fixtures)
     assert changed.payloads[2].sha256 != SPEC.payloads[2].sha256
-    assert tuple(item.sha256 for item in changed.payloads[:2] + changed.payloads[3:]) == tuple(
-        item.sha256 for item in SPEC.payloads[:2] + SPEC.payloads[3:]
-    )
+    assert tuple(
+        item.sha256 for item in changed.payloads[:2] + changed.payloads[3:]
+    ) == tuple(item.sha256 for item in SPEC.payloads[:2] + SPEC.payloads[3:])
     assert encode_control_release_v2(changed) != GOLDEN_BYTES
 
 
@@ -384,16 +398,21 @@ def test_project_version_is_test_only_build_input() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     assert document["project"]["version"] == "0.10.5"
-    assert _spec(payload_version=document["project"]["version"]).payload_version == "0.10.5"
+    assert (
+        _spec(payload_version=document["project"]["version"]).payload_version
+        == "0.10.5"
+    )
 
 
 def test_production_module_imports_only_pure_stdlib_and_has_no_io_surface() -> None:
-    module_path = Path(__import__("the_hive.fleet_control_release_v2").fleet_control_release_v2.__file__)
+    module_path = Path(
+        __import__(
+            "the_hive.fleet_control_release_v2"
+        ).fleet_control_release_v2.__file__
+    )
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
     imported = {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     } | {
         alias.name.split(".")[0]
         for node in ast.walk(tree)

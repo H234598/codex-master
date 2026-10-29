@@ -37,8 +37,12 @@ def admission(name: str = "one", **changes: object):
         "grant_id": f"grant-{name}",
         "grant_digest": "sha256:grant-digest",
         "work_item_version": 4,
-        "scope": ScopeBinding("write", ("src/codex_master/admission.py",), "sha256:scope-digest"),
-        "resource": ResourceBinding("a1", "hmac:account-a", "standard", "gpt-primary", 5_000_000),
+        "scope": ScopeBinding(
+            "write", ("src/codex_master/admission.py",), "sha256:scope-digest"
+        ),
+        "resource": ResourceBinding(
+            "a1", "hmac:account-a", "standard", "gpt-primary", 5_000_000
+        ),
         "lease_context": LeaseBinding("claimed", "lease-private"),
         "priority": AdmissionPriority("DP1", "sp1a_budget"),
         "now": NOW,
@@ -52,7 +56,9 @@ def test_create_binds_work_scope_resource_and_bounded_ttl() -> None:
 
     assert record.state is AdmissionState.PLANNED
     assert record.revision == 0
-    assert record.expires_at_utc == NOW + timedelta(seconds=DEFAULT_RESERVATION_TTL_SECONDS)
+    assert record.expires_at_utc == NOW + timedelta(
+        seconds=DEFAULT_RESERVATION_TTL_SECONDS
+    )
     public = record.public()
     assert public["resource"] == {
         "agent_id": "a1",
@@ -110,7 +116,9 @@ def test_store_applies_scope_overlap_and_separate_capacity_gates() -> None:
 
     different_model = admission(
         "different-model",
-        resource=ResourceBinding("a4", "hmac:account-a", "standard", "gpt-secondary", 1),
+        resource=ResourceBinding(
+            "a4", "hmac:account-a", "standard", "gpt-secondary", 1
+        ),
         scope=ScopeBinding("write", ("src/codex_master",), "sha256:different-model"),
     )
     with pytest.raises(AdmissionError, match="scope_conflict"):
@@ -123,7 +131,9 @@ def test_store_applies_scope_overlap_and_separate_capacity_gates() -> None:
         account_limited.reserve(
             admission(
                 "account-two",
-                resource=ResourceBinding("a2", "hmac:account-a", "standard", "gpt-secondary", 1),
+                resource=ResourceBinding(
+                    "a2", "hmac:account-a", "standard", "gpt-secondary", 1
+                ),
             ),
             now=NOW,
         )
@@ -134,7 +144,9 @@ def test_dispatch_priority_uses_the_plan_enum() -> None:
         AdmissionPriority("P1", "selection")
 
 
-def test_file_store_persists_revisions_and_rejects_corrupt_or_symlink_state(tmp_path) -> None:
+def test_file_store_persists_revisions_and_rejects_corrupt_or_symlink_state(
+    tmp_path,
+) -> None:
     state_path = tmp_path / "admissions.json"
     lock_path = tmp_path / "admission.lock"
     first = FileAdmissionStore(state_path, lock_path)
@@ -162,19 +174,25 @@ def test_file_store_bounds_state_read_after_metadata_check(tmp_path) -> None:
     state_path.write_text("{}", encoding="utf-8")
     store = FileAdmissionStore(state_path, lock_path)
 
-    with patch.object(Path, "open", return_value=io.BytesIO(b"x" * (MAX_ADMISSION_STATE_BYTES + 1))):
+    with patch.object(
+        Path, "open", return_value=io.BytesIO(b"x" * (MAX_ADMISSION_STATE_BYTES + 1))
+    ):
         with pytest.raises(AdmissionError, match="admission_state_too_large"):
             store.get("missing")
 
 
-def test_file_store_persists_every_lifecycle_transition_across_instances(tmp_path) -> None:
+def test_file_store_persists_every_lifecycle_transition_across_instances(
+    tmp_path,
+) -> None:
     state_path = tmp_path / "admissions.json"
     lock_path = tmp_path / "admission.lock"
     first = FileAdmissionStore(state_path, lock_path)
     reserved = first.reserve(admission("lifecycle"), now=NOW)
 
     second = FileAdmissionStore(state_path, lock_path)
-    revalidating = second.begin_revalidation(reserved.admission_id, expected_revision=reserved.revision, now=NOW)
+    revalidating = second.begin_revalidation(
+        reserved.admission_id, expected_revision=reserved.revision, now=NOW
+    )
     assert first.get(reserved.admission_id).state is AdmissionState.REVALIDATING
 
     admitted = second.complete_revalidation(
@@ -195,7 +213,10 @@ def test_file_store_persists_every_lifecycle_transition_across_instances(tmp_pat
         expected_revision=executing.revision,
         now=NOW,
     )
-    assert FileAdmissionStore(state_path, lock_path).get(reserved.admission_id) == finalized
+    assert (
+        FileAdmissionStore(state_path, lock_path).get(reserved.admission_id)
+        == finalized
+    )
 
 
 def test_file_store_prunes_expired_records_across_instances(tmp_path) -> None:
@@ -204,22 +225,35 @@ def test_file_store_prunes_expired_records_across_instances(tmp_path) -> None:
     first = FileAdmissionStore(state_path, lock_path)
     record = first.reserve(admission("expiring", ttl_seconds=1), now=NOW)
     second = FileAdmissionStore(state_path, lock_path)
-    assert second.prune_expired(now=NOW + timedelta(seconds=1)) == (record.admission_id,)
+    assert second.prune_expired(now=NOW + timedelta(seconds=1)) == (
+        record.admission_id,
+    )
     assert second.get(record.admission_id).state is AdmissionState.EXPIRED
 
 
 def test_revalidation_execution_and_finalization_are_versioned_and_idempotent() -> None:
     store = AdmissionStore()
     reserved = store.reserve(admission(), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=1, now=NOW)
-    admitted = store.complete_revalidation(
-        reserved.admission_id, expected_revision=revalidating.revision, valid=True, now=NOW
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=1, now=NOW
     )
-    executing = store.begin_execution(reserved.admission_id, expected_revision=admitted.revision, now=NOW)
-    finalized = store.finalize(reserved.admission_id, expected_revision=executing.revision, now=NOW)
+    admitted = store.complete_revalidation(
+        reserved.admission_id,
+        expected_revision=revalidating.revision,
+        valid=True,
+        now=NOW,
+    )
+    executing = store.begin_execution(
+        reserved.admission_id, expected_revision=admitted.revision, now=NOW
+    )
+    finalized = store.finalize(
+        reserved.admission_id, expected_revision=executing.revision, now=NOW
+    )
     assert finalized.state is AdmissionState.FINALIZED
     assert finalized.revision == 5
-    assert store.finalize(reserved.admission_id, expected_revision=0, now=NOW) == finalized
+    assert (
+        store.finalize(reserved.admission_id, expected_revision=0, now=NOW) == finalized
+    )
 
 
 def test_expiry_and_compensation_are_explicit_terminal_paths() -> None:
@@ -227,31 +261,55 @@ def test_expiry_and_compensation_are_explicit_terminal_paths() -> None:
     record = admission(ttl_seconds=1)
     reserved = store.reserve(record, now=NOW)
     expired = store.expire(now=NOW + timedelta(seconds=1))
-    assert expired == (reserved.advance(AdmissionState.EXPIRED, now=NOW + timedelta(seconds=1)),)
-    compensated = store.compensate(reserved.admission_id, expected_revision=2, now=NOW + timedelta(seconds=1))
+    assert expired == (
+        reserved.advance(AdmissionState.EXPIRED, now=NOW + timedelta(seconds=1)),
+    )
+    compensated = store.compensate(
+        reserved.admission_id, expected_revision=2, now=NOW + timedelta(seconds=1)
+    )
     assert compensated.state is AdmissionState.COMPENSATED
 
-    denied_record = admission("denied", resource=ResourceBinding("a2", "hmac:account-b", "standard", "gpt-primary", 1))
+    denied_record = admission(
+        "denied",
+        resource=ResourceBinding("a2", "hmac:account-b", "standard", "gpt-primary", 1),
+    )
     denied_reserved = store.reserve(denied_record, now=NOW)
     denied_revalidating = store.begin_revalidation(
         denied_reserved.admission_id, expected_revision=1, now=NOW
     )
     denied = store.complete_revalidation(
-        denied_reserved.admission_id, expected_revision=denied_revalidating.revision, valid=False, now=NOW
+        denied_reserved.admission_id,
+        expected_revision=denied_revalidating.revision,
+        valid=False,
+        now=NOW,
     )
     assert denied.state is AdmissionState.DENIED
-    assert store.compensate(denied.admission_id, expected_revision=3, now=NOW).state is AdmissionState.COMPENSATED
+    assert (
+        store.compensate(denied.admission_id, expected_revision=3, now=NOW).state
+        is AdmissionState.COMPENSATED
+    )
 
 
-def test_execution_failure_requires_compensation_and_crash_recovery_can_finalize() -> None:
+def test_execution_failure_requires_compensation_and_crash_recovery_can_finalize() -> (
+    None
+):
     store = AdmissionStore()
     reserved = store.reserve(admission(), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=1, now=NOW)
-    admitted = store.complete_revalidation(
-        reserved.admission_id, expected_revision=revalidating.revision, valid=True, now=NOW
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=1, now=NOW
     )
-    failed = store.mark_execution_failed(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
-    compensating = store.begin_compensation(failed.admission_id, expected_revision=failed.revision, now=NOW)
+    admitted = store.complete_revalidation(
+        reserved.admission_id,
+        expected_revision=revalidating.revision,
+        valid=True,
+        now=NOW,
+    )
+    failed = store.mark_execution_failed(
+        admitted.admission_id, expected_revision=admitted.revision, now=NOW
+    )
+    compensating = store.begin_compensation(
+        failed.admission_id, expected_revision=failed.revision, now=NOW
+    )
     assert compensating.state is AdmissionState.COMPENSATING
     failed_final = store.finish_compensation(
         compensating.admission_id, expected_revision=compensating.revision, now=NOW
@@ -264,31 +322,72 @@ def test_execution_failure_requires_compensation_and_crash_recovery_can_finalize
         recovered_reserved.admission_id, expected_revision=1, now=NOW
     )
     recovered_admitted = recovered_store.complete_revalidation(
-        recovered_reserved.admission_id, expected_revision=recovered_revalidating.revision, valid=True, now=NOW
+        recovered_reserved.admission_id,
+        expected_revision=recovered_revalidating.revision,
+        valid=True,
+        now=NOW,
     )
     recovered_executing = recovered_store.begin_execution(
-        recovered_admitted.admission_id, expected_revision=recovered_admitted.revision, now=NOW
+        recovered_admitted.admission_id,
+        expected_revision=recovered_admitted.revision,
+        now=NOW,
     )
     recovered = recovered_store.recover_after_crash(
-        recovered_executing.admission_id, expected_revision=recovered_executing.revision, now=NOW
+        recovered_executing.admission_id,
+        expected_revision=recovered_executing.revision,
+        now=NOW,
     )
-    assert recovered_store.finalize(recovered.admission_id, expected_revision=recovered.revision, now=NOW).state is AdmissionState.FINALIZED
+    assert (
+        recovered_store.finalize(
+            recovered.admission_id, expected_revision=recovered.revision, now=NOW
+        ).state
+        is AdmissionState.FINALIZED
+    )
 
 
 def test_paused_admission_holds_scope_until_revalidation_or_expiry() -> None:
     store = AdmissionStore()
     reserved = store.reserve(admission("paused"), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=reserved.revision, now=NOW)
-    admitted = store.complete_revalidation(
-        reserved.admission_id, expected_revision=revalidating.revision, valid=True, now=NOW
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=reserved.revision, now=NOW
     )
-    executing = store.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
-    paused = store.transition(executing.admission_id, AdmissionState.PAUSED, expected_revision=executing.revision, now=NOW)
+    admitted = store.complete_revalidation(
+        reserved.admission_id,
+        expected_revision=revalidating.revision,
+        valid=True,
+        now=NOW,
+    )
+    executing = store.begin_execution(
+        admitted.admission_id, expected_revision=admitted.revision, now=NOW
+    )
+    paused = store.transition(
+        executing.admission_id,
+        AdmissionState.PAUSED,
+        expected_revision=executing.revision,
+        now=NOW,
+    )
     assert paused.active is True
-    resumed = store.transition(paused.admission_id, AdmissionState.EXECUTING, expected_revision=paused.revision, now=NOW)
+    resumed = store.transition(
+        paused.admission_id,
+        AdmissionState.EXECUTING,
+        expected_revision=paused.revision,
+        now=NOW,
+    )
     assert resumed.state is AdmissionState.EXECUTING
-    paused_again = store.transition(resumed.admission_id, AdmissionState.PAUSED, expected_revision=resumed.revision, now=NOW)
-    assert store.expire(now=NOW + timedelta(seconds=DEFAULT_RESERVATION_TTL_SECONDS)) == (paused_again.advance(AdmissionState.EXPIRED, now=NOW + timedelta(seconds=DEFAULT_RESERVATION_TTL_SECONDS)),)
+    paused_again = store.transition(
+        resumed.admission_id,
+        AdmissionState.PAUSED,
+        expected_revision=resumed.revision,
+        now=NOW,
+    )
+    assert store.expire(
+        now=NOW + timedelta(seconds=DEFAULT_RESERVATION_TTL_SECONDS)
+    ) == (
+        paused_again.advance(
+            AdmissionState.EXPIRED,
+            now=NOW + timedelta(seconds=DEFAULT_RESERVATION_TTL_SECONDS),
+        ),
+    )
 
 
 def test_cancel_transitions_a_reserved_admission_with_its_expected_revision() -> None:
@@ -309,7 +408,9 @@ def test_cancel_transitions_a_reserved_admission_with_its_expected_revision() ->
     assert store.get(reserved.admission_id) == cancelled
 
 
-def test_file_records_snapshot_reloads_the_complete_immutable_record_set(tmp_path) -> None:
+def test_file_records_snapshot_reloads_the_complete_immutable_record_set(
+    tmp_path,
+) -> None:
     state_path = tmp_path / "admissions.json"
     lock_path = tmp_path / "admission.lock"
     writer = FileAdmissionStore(state_path, lock_path)

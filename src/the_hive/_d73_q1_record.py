@@ -247,9 +247,15 @@ def _validate_manifest_grammar(
     manifest = _exact_object(
         value,
         {
-            "schema_version", "commit", "generation", "r2_base",
-            "historical_lineage", "successor_witness", "release",
-            "directories", "files",
+            "schema_version",
+            "commit",
+            "generation",
+            "r2_base",
+            "historical_lineage",
+            "successor_witness",
+            "release",
+            "directories",
+            "files",
         },
     )
     if _bounded_int(manifest["schema_version"], 2, 2) != 2:
@@ -277,10 +283,18 @@ def _validate_manifest_grammar(
     release = _exact_object(
         manifest["release"],
         {
-            "stable_launchers", "hook_abi_source", "hook_abi",
-            "hook_abi_companion", "hook_abi_core", "hook_entrypoints",
-            "plugin_bundle", "root_install_plan", "python_tree",
-            "monitor_entrypoint", "h4_units", "bind_sources",
+            "stable_launchers",
+            "hook_abi_source",
+            "hook_abi",
+            "hook_abi_companion",
+            "hook_abi_core",
+            "hook_entrypoints",
+            "plugin_bundle",
+            "root_install_plan",
+            "python_tree",
+            "monitor_entrypoint",
+            "h4_units",
+            "bind_sources",
         },
     )
     array_keys = {"stable_launchers", "hook_entrypoints", "h4_units", "bind_sources"}
@@ -452,9 +466,7 @@ def _encode_record(
     selinux_context_bytes = _selinux_context(selinux_context)
     polkit_action_bytes = _polkit_action(polkit_action)
     manifest_bytes = _bytes(manifest)
-    _parse_manifest(
-        manifest_bytes, commit=commit_bytes, generation=generation_bytes
-    )
+    _parse_manifest(manifest_bytes, commit=commit_bytes, generation=generation_bytes)
     leaf_bytes = _leaf(
         expected_uid=expected_uid_value,
         generation=generation_bytes,
@@ -634,14 +646,17 @@ def _decode_record_bytes(raw: object, descriptor: object) -> _DecodedRecord:
     descriptor_digest = record[204:236]
     binder = record[236:268]
     generation_digest = record[268:300]
-    if any(len(value) != 32 for value in (
-        leaf_digest,
-        manifest_digest,
-        tuple_digest,
-        descriptor_digest,
-        binder,
-        generation_digest,
-    )):
+    if any(
+        len(value) != 32
+        for value in (
+            leaf_digest,
+            manifest_digest,
+            tuple_digest,
+            descriptor_digest,
+            binder,
+            generation_digest,
+        )
+    ):
         raise _Reject()
     leaf_start = _HEADER_LENGTH
     tuple_start = leaf_start + leaf_length
@@ -780,6 +795,7 @@ class D73Q1Capability:
     def __deepcopy__(self, memo: object) -> None:
         del memo
         raise _Reject()
+
 
 _CAPABILITY_REGISTRY: dict[int, weakref.ReferenceType[D73Q1Capability]] = {}
 _ISSUED_DESCRIPTOR_IDENTITIES: set[tuple[int, int]] = set()

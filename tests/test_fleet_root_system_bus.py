@@ -517,9 +517,7 @@ class RecordingRunnerOperations:
         self.error = error
         self.calls: list[tuple[DynamicTeamleadRunnerPlan, object]] = []
 
-    def execute(
-        self, plan: DynamicTeamleadRunnerPlan, *, permit: object
-    ) -> None:
+    def execute(self, plan: DynamicTeamleadRunnerPlan, *, permit: object) -> None:
         self.calls.append((plan, permit))
         if self.error is not None:
             raise self.error
@@ -531,9 +529,7 @@ class BlockingRunnerOperations(RecordingRunnerOperations):
         self.entered = Event()
         self.release = Event()
 
-    def execute(
-        self, plan: DynamicTeamleadRunnerPlan, *, permit: object
-    ) -> None:
+    def execute(self, plan: DynamicTeamleadRunnerPlan, *, permit: object) -> None:
         self.calls.append((plan, permit))
         self.entered.set()
         assert self.release.wait(5)
@@ -1013,10 +1009,7 @@ def test_executor_exposes_root_binding_evidence_with_exact_identity_references(
     assert evidence.snapshot_identity is context.snapshot
     assert evidence.snapshot_identity is consumer._context.snapshot
     assert evidence.release_identity is service._release
-    assert not {
-        field.name
-        for field in dataclasses.fields(evidence)
-    } & {
+    assert not {field.name for field in dataclasses.fields(evidence)} & {
         "permit",
         "receipt",
         "fd",
@@ -1083,9 +1076,7 @@ def test_executor_rejects_other_bound_identity_before_operation(
             "snapshot_identity": consumer._context.snapshot,
             "release_identity": consumer._bound_service._release,
         }
-        values[identity + "_identity"] = getattr(
-            other_evidence, identity + "_identity"
-        )
+        values[identity + "_identity"] = getattr(other_evidence, identity + "_identity")
         for name, value in values.items():
             object.__setattr__(forged, name, value)
         object.__setattr__(executor, "_binding_evidence", forged)
@@ -1281,9 +1272,7 @@ def test_executor_rejects_canonical_binding_mismatch_before_operation(
             service, "_release", replace(service._release, release_id="0.11.1")
         )
     elif mismatch == "identity":
-        object.__setattr__(
-            context.identity, "executable_fingerprint", "e" * 64
-        )
+        object.__setattr__(context.identity, "executable_fingerprint", "e" * 64)
     elif mismatch == "principal":
         object.__setattr__(context.expected_principal, "cgroup_ino", 11)
     elif mismatch == "snapshot":
@@ -1432,7 +1421,13 @@ def test_trusted_consumer_r2a_drift_or_start_failure_ends_same_ownership_and_clo
     initial = r2a_evidence()
     if failure == "drift":
         r2a_operations = R2AOperations(
-            (initial, replace(initial, enforcing=broker_system.BrokerFedoraEnforcingEvidence(False)))
+            (
+                initial,
+                replace(
+                    initial,
+                    enforcing=broker_system.BrokerFedoraEnforcingEvidence(False),
+                ),
+            )
         )
     else:
         r2a_operations = R2AOperations(start_error=RuntimeError("start failed"))
@@ -1583,7 +1578,9 @@ def test_trusted_handoff_forge_or_replay_never_reaches_r2a(
     attestation, issued, ownership = issue(host, service)
     forged_attestation = object.__new__(RootSystemBusPeerAttestation)
     for field in dataclasses.fields(attestation):
-        object.__setattr__(forged_attestation, field.name, getattr(attestation, field.name))
+        object.__setattr__(
+            forged_attestation, field.name, getattr(attestation, field.name)
+        )
     with pytest.raises(RootSystemBusError) as caught:
         service._handoff(forged_attestation, ownership, issued)
     assert caught.value.code == "handoff_invalid"
@@ -3327,9 +3324,10 @@ def test_root_control_composes_issued_start_and_calls_builder_then_start_once(
         }
         assert len(issued) == len(built) == len(started) == 1
         assert started[0] is built[0]
-        assert issued[0] is consumer._runner_records[
-            id(issued[0].executor._permit)
-        ].composition
+        assert (
+            issued[0]
+            is consumer._runner_records[id(issued[0].executor._permit)].composition
+        )
         assert store.load_calls == 0
         assert store.commit_calls == 0
         assert exchange.exchange_calls == 0
@@ -3361,9 +3359,7 @@ def test_root_control_rejects_transfer_before_and_after_original_burn(
         _trusted_service(private_bus, operations=consumer_operations)
     )
     service._handle_start(":1.1")
-    context, registry, broker, _store, _exchange = composition_inputs(
-        consumer, service
-    )
+    context, registry, broker, _store, _exchange = composition_inputs(consumer, service)
     runner_operations = RecordingRunnerOperations()
     control = _RootDynamicTeamleadStartControl(
         consumer,
@@ -3504,8 +3500,7 @@ def test_control1_source_and_registration_surface_remain_p1_identical() -> None:
     service = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "HomeBrokerControlService"
+        if isinstance(node, ast.ClassDef) and node.name == "HomeBrokerControlService"
     )
     service_source = ast.get_source_segment(source, service)
     assert service_source is not None
@@ -3515,10 +3510,12 @@ def test_control1_source_and_registration_surface_remain_p1_identical() -> None:
     control1_lines = "".join(
         line
         for line in source.splitlines(keepends=True)
-        if line.startswith(("BUS_NAME =", "BUS_PATH =", "BUS_INTERFACE =", "BUS_METHOD ="))
+        if line.startswith(
+            ("BUS_NAME =", "BUS_PATH =", "BUS_INTERFACE =", "BUS_METHOD =")
+        )
     )
     assert hashlib.sha256(control1_lines.encode("utf-8")).hexdigest() == (
-            "b7358a8a065184fb0803e1f96ba84822b54ef196c12736224e197a7a13b21b74"
+        "b7358a8a065184fb0803e1f96ba84822b54ef196c12736224e197a7a13b21b74"
     )
 
     method_decorators = [
@@ -3695,7 +3692,9 @@ def test_root_control_rejects_lifecycle_and_identity_gates_before_issuance(
         service._host._host_generation += 1
     elif mutation == "ownership":
         ownership = object.__new__(RootRuntimeActivityOwnership)
-        object.__setattr__(ownership, "host_generation", original_ownership.host_generation)
+        object.__setattr__(
+            ownership, "host_generation", original_ownership.host_generation
+        )
         object.__setattr__(ownership, "begin_epoch", original_ownership.begin_epoch)
         object.__setattr__(active, "ownership", ownership)
     elif mutation == "cross_release":
@@ -3772,7 +3771,10 @@ def test_second_start_composition_issuance_fails_for_same_active_record(
         )
 
 
-@pytest.mark.parametrize("mismatch", ("context", "snapshot", "broker_context", "broker_release", "operations"))
+@pytest.mark.parametrize(
+    "mismatch",
+    ("context", "snapshot", "broker_context", "broker_release", "operations"),
+)
 def test_composition_issuance_rejects_identity_or_operations_mismatch(
     runner_authority,
     mismatch: str,

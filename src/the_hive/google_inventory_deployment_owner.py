@@ -24,10 +24,7 @@ from .google_inventory_deployment_quiescence_authority import (
 
 _MAX_REQUEST_BYTES: Final[int] = 16 * 1024
 _MEMFD_REQUIRED_SEALS: Final[int] = (
-    fcntl.F_SEAL_WRITE
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_SEAL
+    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
 )
 
 

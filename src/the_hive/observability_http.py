@@ -29,7 +29,12 @@ class TimedMetricsReader:
         ttl_seconds: float = 5,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not callable(source) or not callable(clock) or not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+        if (
+            not callable(source)
+            or not callable(clock)
+            or not math.isfinite(ttl_seconds)
+            or ttl_seconds <= 0
+        ):
             raise ValueError("invalid_metrics_reader")
         self._source = source
         self._ttl_seconds = ttl_seconds
@@ -65,7 +70,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         except Exception:
             self._reply(503, b"metrics unavailable\n", "text/plain; charset=utf-8")
             return
-        self._reply(200, payload, "application/openmetrics-text; version=1.0.0; charset=utf-8")
+        self._reply(
+            200, payload, "application/openmetrics-text; version=1.0.0; charset=utf-8"
+        )
 
     def _reply(self, status: int, payload: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -83,7 +90,9 @@ class MetricsHttpServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], metrics_reader: Callable[[], str]) -> None:
+    def __init__(
+        self, address: tuple[str, int], metrics_reader: Callable[[], str]
+    ) -> None:
         if not callable(metrics_reader):
             raise ValueError("invalid_metrics_reader")
         try:

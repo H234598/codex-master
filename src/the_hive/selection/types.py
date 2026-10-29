@@ -47,4 +47,11 @@ def validate_selection_time(value: datetime) -> datetime:
         raise SelectionValidationError("invalid_selection_time") from exc
 
 
-__all__ = ["SelectionClock", "SelectionPriority", "SelectionValidationError", "SystemClock", "TaskComplexity", "validate_selection_time"]
+__all__ = [
+    "SelectionClock",
+    "SelectionPriority",
+    "SelectionValidationError",
+    "SystemClock",
+    "TaskComplexity",
+    "validate_selection_time",
+]

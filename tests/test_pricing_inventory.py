@@ -35,7 +35,9 @@ def _write_codex_home(codex: Path, *, tiers: list[str]) -> Path:
         json.dumps(_catalog(tiers=tiers)), encoding="utf-8"
     )
     config = codex / "config.toml"
-    config.write_text('model = "gpt-5.6-sol"\nservice_tier = "auto"\n', encoding="utf-8")
+    config.write_text(
+        'model = "gpt-5.6-sol"\nservice_tier = "auto"\n', encoding="utf-8"
+    )
     return config
 
 
@@ -52,14 +54,18 @@ def _stub_external_sources(
 ) -> None:
     api_models = [MODEL] if api_models is None else api_models
 
-    def fake_fetch(url: str, *, headers: dict[str, str] | None = None) -> tuple[str, str]:
+    def fake_fetch(
+        url: str, *, headers: dict[str, str] | None = None
+    ) -> tuple[str, str]:
         del headers
         if url == pricing_inventory.PRICING_URL:
             return "utf-8", pricing
         if url == pricing_inventory.MODELS_URL:
             return "utf-8", models
         if url == "https://api.openai.com/v1/models":
-            return "utf-8", json.dumps({"data": [{"id": model} for model in api_models]})
+            return "utf-8", json.dumps(
+                {"data": [{"id": model} for model in api_models]}
+            )
         raise AssertionError(f"unexpected external URL: {url}")
 
     monkeypatch.setattr(pricing_inventory, "_fetch", fake_fetch)
@@ -179,9 +185,8 @@ def test_update_preserves_unrelated_custom_model_catalog(
 
     pricing_inventory.update(tmp_path / "inventory")
 
-    assert (
-        f'model_catalog_json = "{custom_catalog}"'
-        in config.read_text(encoding="utf-8")
+    assert f'model_catalog_json = "{custom_catalog}"' in config.read_text(
+        encoding="utf-8"
     )
 
 
@@ -191,7 +196,9 @@ def test_update_does_not_promote_model_without_documented_flex_evidence(
     home = tmp_path / "home"
     config = _write_home(home, tiers=["priority", "flex"])
     monkeypatch.setenv("HOME", str(home))
-    _stub_external_sources(monkeypatch, pricing="<article>gpt-5.6-sol standard pricing</article>")
+    _stub_external_sources(
+        monkeypatch, pricing="<article>gpt-5.6-sol standard pricing</article>"
+    )
 
     root = tmp_path / "inventory"
     pricing_inventory.update(root)
@@ -205,7 +212,9 @@ def test_home_service_tier_uses_standard_when_transport_is_unknown(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "config.toml"
-    config.write_text('model = "gpt-5.6-sol"\nservice_tier = "flex"\n', encoding="utf-8")
+    config.write_text(
+        'model = "gpt-5.6-sol"\nservice_tier = "flex"\n', encoding="utf-8"
+    )
     tier, reason = pricing_inventory._home_service_tier(config, [], {"gpt-5.6-sol"})
     assert tier == "default"
     assert reason == "standard_service_tier"
@@ -216,7 +225,8 @@ def test_home_service_tier_preserves_explicit_flex_for_api_auth(tmp_path: Path) 
     config.write_text('service_tier = "flex"\n', encoding="utf-8")
     (tmp_path / "auth.json").write_text('{"auth_mode":"api"}\n', encoding="utf-8")
     assert pricing_inventory._home_service_tier(config, [], set()) == (
-        "flex", "explicit_api_flex_service_tier"
+        "flex",
+        "explicit_api_flex_service_tier",
     )
 
 
@@ -357,9 +367,10 @@ def test_run_retries_once_with_an_injectable_short_pause(
 
     monkeypatch.setattr(pricing_inventory, "update", fail_once)
 
-    assert pricing_inventory.run(
-        tmp_path, pause=pauses.append, retry_delay_seconds=0.01
-    ) == generation
+    assert (
+        pricing_inventory.run(tmp_path, pause=pauses.append, retry_delay_seconds=0.01)
+        == generation
+    )
     assert calls == [tmp_path, tmp_path]
     assert pauses == [0.01]
     health = json.loads((tmp_path / "health.json").read_text(encoding="utf-8"))
@@ -380,7 +391,9 @@ def test_final_failure_preserves_existing_generation_catalog_and_home_config(
     root.mkdir()
     valid_generation = root / "20260926T220000Z"
     valid_generation.mkdir()
-    (valid_generation / "inventory.json").write_text("old inventory\n", encoding="utf-8")
+    (valid_generation / "inventory.json").write_text(
+        "old inventory\n", encoding="utf-8"
+    )
     (root / "current").write_text(valid_generation.name + "\n", encoding="utf-8")
     stable_catalog = root / "effective-codex-model-catalog.json"
     stable_catalog.write_text("old catalog\n", encoding="utf-8")
@@ -400,7 +413,9 @@ def test_final_failure_preserves_existing_generation_catalog_and_home_config(
     monkeypatch.setattr(pricing_inventory.os, "replace", record_replace)
     update_configs = pricing_inventory._update_codex_configs
 
-    def change_then_fail(*args: object, **kwargs: object) -> tuple[list[str], list[dict[str, str]]]:
+    def change_then_fail(
+        *args: object, **kwargs: object
+    ) -> tuple[list[str], list[dict[str, str]]]:
         update_configs(*args, **kwargs)
         raise OSError("do not retain the partial catalog or configuration")
 
@@ -419,7 +434,9 @@ def test_final_failure_preserves_existing_generation_catalog_and_home_config(
     ]
     assert len(config_replacements) == 2
     assert len(set(config_replacements)) == 2
-    assert all(source.name.startswith(f".{config.name}.") for source in config_replacements)
+    assert all(
+        source.name.startswith(f".{config.name}.") for source in config_replacements
+    )
 
 
 def test_recovery_rolls_back_crashed_catalog_and_config_transaction_twice_without_secrets(
@@ -444,7 +461,9 @@ def test_recovery_rolls_back_crashed_catalog_and_config_transaction_twice_withou
     root.mkdir()
     previous_generation = root / "20260926T220000Z"
     previous_generation.mkdir()
-    (previous_generation / "inventory.json").write_text("old inventory\n", encoding="utf-8")
+    (previous_generation / "inventory.json").write_text(
+        "old inventory\n", encoding="utf-8"
+    )
     (root / "current").write_text(previous_generation.name + "\n", encoding="utf-8")
     stable_catalog = root / "effective-codex-model-catalog.json"
     stable_catalog.write_text("old catalog\n", encoding="utf-8")
@@ -456,7 +475,9 @@ def test_recovery_rolls_back_crashed_catalog_and_config_transaction_twice_withou
     }
     apply_updates = pricing_inventory._update_codex_configs
 
-    def crash_after_config(*args: object, **kwargs: object) -> tuple[list[str], list[dict[str, str]]]:
+    def crash_after_config(
+        *args: object, **kwargs: object
+    ) -> tuple[list[str], list[dict[str, str]]]:
         apply_updates(*args, **kwargs)
         raise SimulatedPowerLoss()
 
@@ -482,7 +503,9 @@ def test_recovery_rolls_back_crashed_catalog_and_config_transaction_twice_withou
             raise OSError("injected recovery backup cleanup failure")
         durable_unlink(path)
 
-    monkeypatch.setattr(pricing_inventory, "_durable_unlink", fail_recovery_backup_cleanup)
+    monkeypatch.setattr(
+        pricing_inventory, "_durable_unlink", fail_recovery_backup_cleanup
+    )
     with pytest.raises(OSError, match="injected recovery backup cleanup failure"):
         pricing_inventory._recover_transaction(root)
 
@@ -526,7 +549,9 @@ def test_recovery_removes_new_current_and_generation_after_crash_then_repeats(
     root.mkdir()
     previous_generation = root / "20260926T220000Z"
     previous_generation.mkdir()
-    (previous_generation / "inventory.json").write_text("old inventory\n", encoding="utf-8")
+    (previous_generation / "inventory.json").write_text(
+        "old inventory\n", encoding="utf-8"
+    )
     (root / "current").write_text(previous_generation.name + "\n", encoding="utf-8")
     stable_catalog = root / "effective-codex-model-catalog.json"
     stable_catalog.write_text("old catalog\n", encoding="utf-8")
@@ -542,12 +567,16 @@ def test_recovery_removes_new_current_and_generation_after_crash_then_repeats(
         write_current(path, generation)
         raise SimulatedPowerLoss()
 
-    monkeypatch.setattr(pricing_inventory, "_write_current_generation", crash_after_current)
+    monkeypatch.setattr(
+        pricing_inventory, "_write_current_generation", crash_after_current
+    )
 
     with pytest.raises(SimulatedPowerLoss):
         pricing_inventory.update(root)
 
-    assert (root / "current").read_text(encoding="utf-8") != before["current"].decode("utf-8")
+    assert (root / "current").read_text(encoding="utf-8") != before["current"].decode(
+        "utf-8"
+    )
     monkeypatch.setattr(pricing_inventory, "_write_current_generation", write_current)
     pricing_inventory._recover_transaction(root)
     pricing_inventory._recover_transaction(root)
@@ -620,14 +649,18 @@ def test_catalog_path_validation_requires_normalized_non_sensitive_absolute_path
     assert pricing_inventory._is_valid_local_catalog_path(ordinary_secret_component)
     assert not pricing_inventory._is_valid_local_catalog_path(control_character)
 
-    with pytest.raises(ValueError, match="invalid managed configuration field") as failure:
+    with pytest.raises(
+        ValueError, match="invalid managed configuration field"
+    ) as failure:
         pricing_inventory._parse_managed_config_field(
             f'model_catalog_json = "{query_with_secret}"'
         )
     assert query_with_secret not in str(failure.value)
 
 
-def test_catalog_path_validation_allows_ordinary_credential_words(tmp_path: Path) -> None:
+def test_catalog_path_validation_allows_ordinary_credential_words(
+    tmp_path: Path,
+) -> None:
     root = tmp_path.resolve()
 
     for component in ("author", "authentication", "secret-catalog", "credential"):
@@ -642,7 +675,9 @@ def test_catalog_path_validation_allows_ordinary_credential_words(tmp_path: Path
     )
 
 
-def test_catalog_path_validation_rejects_existing_parent_symlink(tmp_path: Path) -> None:
+def test_catalog_path_validation_rejects_existing_parent_symlink(
+    tmp_path: Path,
+) -> None:
     root = tmp_path.resolve()
     real_parent = root / "real-parent"
     real_parent.mkdir()
@@ -677,9 +712,12 @@ def test_malicious_managed_config_lines_are_skipped_from_journal_and_inventory(
     ):
         with pytest.raises(ValueError, match="invalid managed configuration field"):
             pricing_inventory._config_rollback_state(malicious_line)
-    assert pricing_inventory._plan_codex_config_updates(
-        Path("relative-catalog.json"), [], {MODEL}
-    ) == []
+    assert (
+        pricing_inventory._plan_codex_config_updates(
+            Path("relative-catalog.json"), [], {MODEL}
+        )
+        == []
+    )
     plans = pricing_inventory._plan_codex_config_updates(
         root / "effective-codex-model-catalog.json", [], {MODEL}
     )
@@ -690,14 +728,20 @@ def test_malicious_managed_config_lines_are_skipped_from_journal_and_inventory(
 
     update_configs = pricing_inventory._update_codex_configs
 
-    def crash_after_actual_journal(*args: object, **kwargs: object) -> tuple[list[str], list[dict[str, str]]]:
+    def crash_after_actual_journal(
+        *args: object, **kwargs: object
+    ) -> tuple[list[str], list[dict[str, str]]]:
         raise SimulatedPowerLoss()
 
-    monkeypatch.setattr(pricing_inventory, "_update_codex_configs", crash_after_actual_journal)
+    monkeypatch.setattr(
+        pricing_inventory, "_update_codex_configs", crash_after_actual_journal
+    )
     with pytest.raises(SimulatedPowerLoss):
         pricing_inventory.update(root)
 
-    journal = (root / pricing_inventory.TRANSACTION_FILE_NAME).read_text(encoding="utf-8")
+    journal = (root / pricing_inventory.TRANSACTION_FILE_NAME).read_text(
+        encoding="utf-8"
+    )
     assert unsafe_catalog not in journal
     assert "api_key=secret" not in journal
     assert "journal-secret-token" not in journal
@@ -765,7 +809,9 @@ def test_committed_transaction_keeps_backup_journal_for_retry_then_second_update
     second_published = pricing_inventory.update(root)
 
     assert second_published.is_dir()
-    assert (root / "current").read_text(encoding="utf-8") == second_published.name + "\n"
+    assert (root / "current").read_text(
+        encoding="utf-8"
+    ) == second_published.name + "\n"
     assert not backup.exists()
     assert not journal.exists()
 
@@ -800,7 +846,11 @@ def test_generation_rename_fsync_failure_cleans_registered_unpublished_target(
         fsync_directory(directory)
 
     monkeypatch.setattr(Path, "rename", record_generation_rename)
-    monkeypatch.setattr(pricing_inventory, "_fsync_directory", fail_first_root_sync_after_generation_rename)
+    monkeypatch.setattr(
+        pricing_inventory,
+        "_fsync_directory",
+        fail_first_root_sync_after_generation_rename,
+    )
 
     with pytest.raises(OSError, match="injected root fsync failure"):
         pricing_inventory.update(root)
@@ -829,7 +879,9 @@ def test_current_generation_is_private_crash_atomic_and_directory_synced(
 
     def record_replace(source: os.PathLike[str], target: os.PathLike[str]) -> None:
         source_path = Path(source)
-        replacements.append((source_path, Path(target), stat.S_IMODE(source_path.stat().st_mode)))
+        replacements.append(
+            (source_path, Path(target), stat.S_IMODE(source_path.stat().st_mode))
+        )
         replace(source, target)
 
     def record_fsync(descriptor: int) -> None:
@@ -903,12 +955,14 @@ def test_update_syncs_generation_files_and_directories_before_current_publicatio
     )
     root_sync = next(
         index
-        for index, (event, path) in enumerate(events[generation_rename + 1:], generation_rename + 1)
+        for index, (event, path) in enumerate(
+            events[generation_rename + 1 :], generation_rename + 1
+        )
         if event == "fsync" and path == root
     )
     current_publication = next(
         index
-        for index, (event, path) in enumerate(events[root_sync + 1:], root_sync + 1)
+        for index, (event, path) in enumerate(events[root_sync + 1 :], root_sync + 1)
         if event == "replace" and path == root / "current"
     )
 
@@ -960,32 +1014,45 @@ def test_update_durably_moves_stable_catalog_before_config_or_current_publicatio
         and path.name.startswith(".effective-codex-model-catalog.json.")
     )
     catalog_rename = events.index(("catalog-rename", stable_catalog))
-    journal_publication = events.index((
-        "replace", root / pricing_inventory.TRANSACTION_FILE_NAME
-    ))
+    journal_publication = events.index(
+        ("replace", root / pricing_inventory.TRANSACTION_FILE_NAME)
+    )
     target_directory_sync = next(
         index
-        for index, (event, path) in enumerate(events[catalog_rename + 1:], catalog_rename + 1)
+        for index, (event, path) in enumerate(
+            events[catalog_rename + 1 :], catalog_rename + 1
+        )
         if event == "fsync" and path == root
     )
     source_directory_sync = next(
         index
-        for index, (event, path) in enumerate(events[target_directory_sync + 1:], target_directory_sync + 1)
+        for index, (event, path) in enumerate(
+            events[target_directory_sync + 1 :], target_directory_sync + 1
+        )
         if event == "fsync" and path == staging
     )
     config_publication = next(
         index
-        for index, (event, path) in enumerate(events[source_directory_sync + 1:], source_directory_sync + 1)
+        for index, (event, path) in enumerate(
+            events[source_directory_sync + 1 :], source_directory_sync + 1
+        )
         if event == "replace" and path == config
     )
     current_publication = next(
         index
-        for index, (event, path) in enumerate(events[config_publication + 1:], config_publication + 1)
+        for index, (event, path) in enumerate(
+            events[config_publication + 1 :], config_publication + 1
+        )
         if event == "replace" and path == root / "current"
     )
 
     assert journal_publication < catalog_rename
-    assert catalog_file_sync < catalog_rename < target_directory_sync < source_directory_sync
+    assert (
+        catalog_file_sync
+        < catalog_rename
+        < target_directory_sync
+        < source_directory_sync
+    )
     assert source_directory_sync < config_publication < current_publication
 
 
@@ -1003,7 +1070,9 @@ def test_retention_never_deletes_current_generation_when_clock_moves_backwards(
     root.mkdir()
     frozen_now = datetime(2026, 1, 1, tzinfo=UTC)
     for offset in range(1, 51):
-        (root / (frozen_now + timedelta(days=offset)).strftime("%Y%m%dT%H%M%SZ")).mkdir()
+        (
+            root / (frozen_now + timedelta(days=offset)).strftime("%Y%m%dT%H%M%SZ")
+        ).mkdir()
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -1015,7 +1084,16 @@ def test_retention_never_deletes_current_generation_when_clock_moves_backwards(
     assert published.name == "20260101T000000Z"
     assert published.is_dir()
     assert (root / "current").read_text(encoding="utf-8") == f"{published.name}\n"
-    assert len([path for path in root.iterdir() if path.is_dir() and path.name.startswith("20")]) == 50
+    assert (
+        len(
+            [
+                path
+                for path in root.iterdir()
+                if path.is_dir() and path.name.startswith("20")
+            ]
+        )
+        == 50
+    )
 
 
 def test_retention_after_committed_transaction_never_recovers_to_deleted_previous_current(
@@ -1038,9 +1116,12 @@ def test_retention_after_committed_transaction_never_recovers_to_deleted_previou
     (previous / "inventory.json").write_text("old inventory\n", encoding="utf-8")
     (root / "current").write_text(previous.name + "\n", encoding="utf-8")
     for offset in range(50):
-        (root / (datetime(2027, 1, 1, tzinfo=UTC) + timedelta(days=offset)).strftime(
-            "%Y%m%dT%H%M%SZ"
-        )).mkdir()
+        (
+            root
+            / (datetime(2027, 1, 1, tzinfo=UTC) + timedelta(days=offset)).strftime(
+                "%Y%m%dT%H%M%SZ"
+            )
+        ).mkdir()
     home = tmp_path / "home"
     _write_home(home, tiers=["priority"])
     monkeypatch.setenv("HOME", str(home))
@@ -1056,7 +1137,9 @@ def test_retention_after_committed_transaction_never_recovers_to_deleted_previou
         remove_directory(directory)
 
     monkeypatch.setattr(
-        pricing_inventory, "_durable_remove_generated_directory", crash_when_retention_reaches_previous
+        pricing_inventory,
+        "_durable_remove_generated_directory",
+        crash_when_retention_reaches_previous,
     )
     with pytest.raises(SimulatedPowerLoss):
         pricing_inventory.update(root)
@@ -1083,7 +1166,9 @@ def test_parallel_run_reports_stable_lock_code_without_changing_artifacts(
     root.mkdir()
     generation = root / "20260926T220000Z"
     generation.mkdir()
-    (generation / "inventory.json").write_text("last valid inventory\n", encoding="utf-8")
+    (generation / "inventory.json").write_text(
+        "last valid inventory\n", encoding="utf-8"
+    )
     (root / "current").write_text(f"{generation.name}\n", encoding="utf-8")
     calls: list[Path] = []
 
@@ -1124,9 +1209,13 @@ def test_health_state_is_private_atomic_and_never_serializes_exception_text(
         replace(source, target)
 
     monkeypatch.setattr(pricing_inventory.os, "replace", record_replace)
-    monkeypatch.setattr(pricing_inventory, "update", lambda _root: (_ for _ in ()).throw(
-        RuntimeError("response body with secret-token")
-    ))
+    monkeypatch.setattr(
+        pricing_inventory,
+        "update",
+        lambda _root: (_ for _ in ()).throw(
+            RuntimeError("response body with secret-token")
+        ),
+    )
 
     with pytest.raises(pricing_inventory.InventoryRunFailure) as failure:
         pricing_inventory.run(tmp_path, pause=lambda _seconds: None)
@@ -1152,7 +1241,9 @@ def test_health_state_is_private_atomic_and_never_serializes_exception_text(
     assert not list(tmp_path.glob(".health.json.*.tmp"))
 
 
-def test_successful_health_state_preserves_the_previous_error_history(tmp_path: Path) -> None:
+def test_successful_health_state_preserves_the_previous_error_history(
+    tmp_path: Path,
+) -> None:
     pricing_inventory._write_health_state(
         tmp_path, status="alert", attempts=2, error_code="inventory_failed"
     )
@@ -1169,16 +1260,20 @@ def test_successful_health_state_preserves_the_previous_error_history(tmp_path: 
     assert isinstance(health["last_error_at"], str)
 
 
-def test_health_history_accepts_only_canonical_non_sensitive_values(tmp_path: Path) -> None:
+def test_health_history_accepts_only_canonical_non_sensitive_values(
+    tmp_path: Path,
+) -> None:
     health_path = tmp_path / "health.json"
     health_path.write_text(
-        json.dumps({
-            "last_successful_generation": "20260927T220000Z",
-            "last_successful_at": "2026-09-27T22:00:00+00:00",
-            "last_error_at": "2026-09-27T22:01:00+00:00",
-            "last_error_code": "io_error",
-            "exception": "Bearer secret-token leaked here",
-        }),
+        json.dumps(
+            {
+                "last_successful_generation": "20260927T220000Z",
+                "last_successful_at": "2026-09-27T22:00:00+00:00",
+                "last_error_at": "2026-09-27T22:01:00+00:00",
+                "last_error_code": "io_error",
+                "exception": "Bearer secret-token leaked here",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -1190,12 +1285,14 @@ def test_health_history_accepts_only_canonical_non_sensitive_values(tmp_path: Pa
     }
 
     health_path.write_text(
-        json.dumps({
-            "last_successful_generation": "20261340T250000Z",
-            "last_successful_at": "yesterday with secret-token",
-            "last_error_at": "RuntimeError: secret-token",
-            "last_error_code": "RuntimeError: secret-token",
-        }),
+        json.dumps(
+            {
+                "last_successful_generation": "20261340T250000Z",
+                "last_successful_at": "yesterday with secret-token",
+                "last_error_at": "RuntimeError: secret-token",
+                "last_error_code": "RuntimeError: secret-token",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -1204,7 +1301,10 @@ def test_health_history_accepts_only_canonical_non_sensitive_values(tmp_path: Pa
 
 def test_pricing_units_use_the_canonical_the_hive_state_path() -> None:
     repository = Path(__file__).resolve().parents[1]
-    assert pricing_inventory.PRICING_URL == "https://developers.openai.com/api/docs/pricing"
+    assert (
+        pricing_inventory.PRICING_URL
+        == "https://developers.openai.com/api/docs/pricing"
+    )
     service = (repository / "systemd/user/the-hive-openai-pricing.service").read_text(
         encoding="utf-8"
     )

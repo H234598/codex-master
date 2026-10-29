@@ -169,15 +169,18 @@ def _successful_probe_receipt(lease: AgentLeaseV1) -> AgentReceiptV1:
         DeterministicKernel()
     )
     result = AgentResultV1("host.probe", "collect", evidence.public())
-    result_digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            serialize_agent_result(result),
-            ensure_ascii=True,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    result_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                serialize_agent_result(result),
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     return AgentReceiptV1(
         lease.operation_id,
         lease.lease_id,
@@ -901,9 +904,7 @@ def test_persisted_attempt_exhaustion_split_reconciles_after_reconstruction(
     admin_document_path.chmod(0o600)
     registry_document = tmp_path / "admin-hosts" / "hosts.json"
     registry_before = registry_document.read_bytes()
-    clock.advance(
-        seconds=int((planned.expires_at - clock.now).total_seconds()) + 1
-    )
+    clock.advance(seconds=int((planned.expires_at - clock.now).total_seconds()) + 1)
     assert clock.now > planned.expires_at
 
     admin_operations.plan(
@@ -1014,9 +1015,9 @@ def test_receipt_after_operation_deadline_is_rejected_before_registry_mutation(
         next(
             record["operation_id"]
             for record in json.loads(
-                (
-                    tmp_path / "agent-operations" / "operations.json"
-                ).read_text(encoding="utf-8")
+                (tmp_path / "agent-operations" / "operations.json").read_text(
+                    encoding="utf-8"
+                )
             )["operations"]
         )
     ).deadline
@@ -1094,17 +1095,16 @@ def test_pruned_split_batch_retries_without_starving_later_or_other_host(
         record["operation_id"] for record in operation_document["operations"]
     ]
     clock.now = max(
-        agent_operations.get(operation_id).deadline
-        for operation_id in operation_ids
+        agent_operations.get(operation_id).deadline for operation_id in operation_ids
     )
     agent_operations.expire_leases()
-    persisted_operations = json.loads(
-        operation_path.read_text(encoding="utf-8")
-    )["operations"]
+    persisted_operations = json.loads(operation_path.read_text(encoding="utf-8"))[
+        "operations"
+    ]
     assert all(record["state"] == "unknown" for record in persisted_operations)
-    clock.now = max(plan.expires_at for plan in (*first_plans, second_plan)) + timedelta(
-        seconds=1
-    )
+    clock.now = max(
+        plan.expires_at for plan in (*first_plans, second_plan)
+    ) + timedelta(seconds=1)
     admin_operations.plan(
         kind="google.provision",
         generation=1,
@@ -1164,7 +1164,10 @@ def test_pruned_split_batch_retries_without_starving_later_or_other_host(
         first_client.poll(first_poll)
     assert all(admin_operations.get(plan.id).state == "planned" for plan in first_plans)
     assert isinstance(first_client.poll(first_poll), AgentNoWorkV1)
-    assert sum(admin_operations.get(plan.id).state == "failed" for plan in first_plans) == 8
+    assert (
+        sum(admin_operations.get(plan.id).state == "failed" for plan in first_plans)
+        == 8
+    )
     assert isinstance(first_client.poll(first_poll), AgentNoWorkV1)
     assert all(admin_operations.get(plan.id).state == "failed" for plan in first_plans)
     assert admin_operations.get(second_plan.id).state == "planned"
@@ -1233,9 +1236,7 @@ def test_queued_agent_deadline_terminalizes_without_lease_in_production_poll(
         idempotency_key="queued-production-agent-deadline",
     )
     operation_document = json.loads(
-        (tmp_path / "agent-operations" / "operations.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "agent-operations" / "operations.json").read_text(encoding="utf-8")
     )
     agent_operation_id = operation_document["operations"][0]["operation_id"]
     operation_deadline = agent_operations.get(agent_operation_id).deadline
@@ -1274,9 +1275,9 @@ def test_queued_agent_deadline_terminalizes_without_lease_in_production_poll(
     assert terminal_agent.lease_id is None
     assert terminal_agent.reason_codes == ("host.lease_expired",)
     lifecycle = json.loads(
-        (
-            tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-        ).read_text(encoding="utf-8")
+        (tmp_path / "admin-operations" / "host-probe-lifecycle.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert lifecycle["schema_version"] == 1
     assert lifecycle["owners"][0]["acknowledged"] is True
@@ -1336,9 +1337,7 @@ def test_expired_restart_reconciled_steps_converge_through_lifecycle_owner(
             reason_code=step_reason,
         )
     operation_document = json.loads(
-        (tmp_path / "agent-operations" / "operations.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "agent-operations" / "operations.json").read_text(encoding="utf-8")
     )
     agent_operation_id = operation_document["operations"][0]["operation_id"]
     clock.now = agent_operations.get(agent_operation_id).deadline
@@ -1399,7 +1398,9 @@ def test_expired_restart_reconciled_steps_converge_through_lifecycle_owner(
         owner_probe=dead_owner,
     )
     agent_operations = AgentOperationStore(tmp_path, clock=clock)
-    assert isinstance(client_for(admin_operations, agent_operations).poll(poll), AgentNoWorkV1)
+    assert isinstance(
+        client_for(admin_operations, agent_operations).poll(poll), AgentNoWorkV1
+    )
     assert admin_operations.get(planned.id) == terminal
     assert agent_operations.get(agent_operation_id) == persisted_agent
     assert registry_path.read_bytes() == registry_before

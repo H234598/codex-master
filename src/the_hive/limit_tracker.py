@@ -730,7 +730,9 @@ def _validate_pointer(pointer: dict[str, Any]) -> None:
         raise _InvalidEvidence("invalid previous pointer")
 
 
-def _validate_binding_shape(binding: dict[str, Any], *, generation: str) -> dict[str, Any]:
+def _validate_binding_shape(
+    binding: dict[str, Any], *, generation: str
+) -> dict[str, Any]:
     if (
         set(binding) != _BINDING_FIELDS
         or type(binding.get("binding_schema_version")) is not int
@@ -748,8 +750,7 @@ def _validate_binding_shape(binding: dict[str, Any], *, generation: str) -> dict
         or usage.get("usage_binding_schema_version") != 2
         or not _is_hex(usage.get("active_manifest_sha256"), 64)
         or not _is_hex(usage.get("payload_sha256"), 64)
-        or usage.get("source_manifest_sha256")
-        != _PRODUCER_SOURCE_MANIFEST_SHA256
+        or usage.get("source_manifest_sha256") != _PRODUCER_SOURCE_MANIFEST_SHA256
         or release_id != _PRODUCER_RELEASE_ID
         or not isinstance(usage.get("payload_size_bytes"), int)
         or isinstance(usage.get("payload_size_bytes"), bool)
@@ -758,9 +759,7 @@ def _validate_binding_shape(binding: dict[str, Any], *, generation: str) -> dict
         or not _is_hex(binding.get("pool_authority_sha256"), 64)
         or not isinstance(binding.get("pool_authority_size_bytes"), int)
         or isinstance(binding.get("pool_authority_size_bytes"), bool)
-        or not 1
-        <= binding["pool_authority_size_bytes"]
-        <= _MAX_POOL_AUTHORITY_BYTES
+        or not 1 <= binding["pool_authority_size_bytes"] <= _MAX_POOL_AUTHORITY_BYTES
         or binding.get("source_inputs_filename") != "source-inputs-v2.json"
         or not _is_hex(binding.get("source_inputs_sha256"), 64)
         or not isinstance(binding.get("source_inputs_size_bytes"), int)
@@ -849,8 +848,7 @@ def _validate_generation_sidecars(
         raise _InvalidEvidence("generation sidecar crossbinding drift")
     if current_account_ids is not None and (
         now >= authority.expires_at
-        or {entry.account_id for entry in authority.authorities}
-        != current_account_ids
+        or {entry.account_id for entry in authority.authorities} != current_account_ids
     ):
         raise _InvalidEvidence("current authority is stale or mismatched")
     return [source_inputs_proof, authority_proof]

@@ -9,13 +9,18 @@ from the_hive.queen_runtime import QueenRuntimeError, QueenRuntimeHomeManager
 
 
 def manager(tmp_path: Path) -> QueenRuntimeHomeManager:
-    return QueenRuntimeHomeManager(root=tmp_path / "Queens", state_root=tmp_path / "state")
+    return QueenRuntimeHomeManager(
+        root=tmp_path / "Queens", state_root=tmp_path / "state"
+    )
 
 
 def materialize(value: QueenRuntimeHomeManager, generation: int = 1):
     return value.materialize(
-        principal_id="queen-codex-master", repository_id="codex-master",
-        lease_id="lease-1", fence="fence-1", generation=generation,
+        principal_id="queen-codex-master",
+        repository_id="codex-master",
+        lease_id="lease-1",
+        fence="fence-1",
+        generation=generation,
     )
 
 
@@ -39,14 +44,24 @@ def test_cleanup_never_removes_a_home_with_changed_binding(tmp_path: Path) -> No
     changed["fence"] = "other-fence"
     metadata.write_text(json.dumps(changed), encoding="utf-8")
     result = value.release(runtime)
-    assert result == {"released": False, "quarantined": True, "reason": "queen_runtime_metadata_mismatch"}
+    assert result == {
+        "released": False,
+        "quarantined": True,
+        "reason": "queen_runtime_metadata_mismatch",
+    }
     assert runtime.path.exists()
 
 
 def test_invalid_binding_and_corrupt_registry_fail_closed(tmp_path: Path) -> None:
     value = manager(tmp_path)
     with pytest.raises(QueenRuntimeError, match="invalid_queen_runtime_binding"):
-        value.materialize(principal_id="../bad", repository_id="repo", lease_id="lease", fence="fence", generation=1)
+        value.materialize(
+            principal_id="../bad",
+            repository_id="repo",
+            lease_id="lease",
+            fence="fence",
+            generation=1,
+        )
     value.state_root.mkdir(mode=0o700)
     (value.state_root / "queen-runtime-homes.json").write_text("[]", encoding="utf-8")
     with pytest.raises(QueenRuntimeError, match="queen_runtime_registry_invalid"):

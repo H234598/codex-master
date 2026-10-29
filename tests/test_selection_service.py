@@ -49,7 +49,9 @@ def plan(name: str = "one"):
         grant_digest="sha256:grant",
         work_item_version=1,
         scope=ScopeBinding("write", ("src",), "sha256:scope"),
-        resource=ResourceBinding(f"agent-{name}", f"account-{name}", "standard", "gpt-primary", 1),
+        resource=ResourceBinding(
+            f"agent-{name}", f"account-{name}", "standard", "gpt-primary", 1
+        ),
         lease_context=LeaseBinding("available"),
         priority=AdmissionPriority("DP1", "selection"),
         now=datetime.now(timezone.utc),
@@ -80,7 +82,9 @@ class Runtime:
 
 def test_preview_uses_the_same_non_mutating_selection_core() -> None:
     service = SelectionService(AdmissionStore(), Runtime())
-    preview = service.preview(SelectionRequest((candidate(),), SelectionPolicy(sp3=True), NOW))
+    preview = service.preview(
+        SelectionRequest((candidate(),), SelectionPolicy(sp3=True), NOW)
+    )
     assert preview.selected is not None
     assert preview.selected.agent_id == "a1"
 
@@ -107,7 +111,12 @@ def test_execution_revalidates_before_runtime_and_retries_with_fixed_backoff() -
     assert result["attempt"] == 3
     assert sleeps == [0.05, 0.1]
     assert [event[0] for event in runtime.events] == [
-        "revalidate", "execute", "revalidate", "execute", "revalidate", "execute"
+        "revalidate",
+        "execute",
+        "revalidate",
+        "execute",
+        "revalidate",
+        "execute",
     ]
     assert result["admission"]["state"] == AdmissionState.FINALIZED.value
 
@@ -130,14 +139,26 @@ def test_denial_never_executes_and_failure_compensates() -> None:
 def test_reconcile_recovers_completed_execution_without_second_runtime_call() -> None:
     store = AdmissionStore()
     reserved = store.reserve(plan("recover"), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=1, now=NOW)
-    admitted = store.complete_revalidation(
-        reserved.admission_id, expected_revision=revalidating.revision, valid=True, now=NOW
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=1, now=NOW
     )
-    executing = store.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
+    admitted = store.complete_revalidation(
+        reserved.admission_id,
+        expected_revision=revalidating.revision,
+        valid=True,
+        now=NOW,
+    )
+    executing = store.begin_execution(
+        admitted.admission_id, expected_revision=admitted.revision, now=NOW
+    )
     runtime = Runtime(completed=True)
     service = SelectionService(store, runtime)
 
     result = service.reconcile_incomplete()
-    assert result == {"recovered": 1, "compensated": 0, "unresolved": 0, "raw_output": "not_returned"}
+    assert result == {
+        "recovered": 1,
+        "compensated": 0,
+        "unresolved": 0,
+        "raw_output": "not_returned",
+    }
     assert store.get(executing.admission_id).state is AdmissionState.FINALIZED

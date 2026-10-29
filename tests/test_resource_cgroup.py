@@ -58,7 +58,9 @@ class FakeCgroupAdapter:
             raise CgroupPreflightError("cgroup_preflight_failed")
         return self.documents[path]
 
-    def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None:
+    def read_optional_cpu_topology_bytes(
+        self, path: Path, *, max_bytes: int
+    ) -> bytes | None:
         self.events.append(f"read-optional:{path}")
         if max_bytes != 4096:
             raise CgroupPreflightError("cgroup_preflight_failed")
@@ -108,7 +110,9 @@ class FakeCgroupAdapter:
             raise CgroupPreflightError("cgroup_preflight_failed")
         return 4242
 
-    def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None:
+    def verify_tmux_membership_and_inheritance(
+        self, scope: PreparedAgentScope, tmux_pid: int
+    ) -> None:
         self.events.append("verify_tmux")
         if tmux_pid != 4242 or self.fail_at == "verify_tmux":
             raise CgroupPreflightError("cgroup_preflight_failed")
@@ -145,7 +149,9 @@ def _preflight(
     )
 
 
-def _topology(*, efficiency_cpus: tuple[int, ...] = tuple(range(4, 12))) -> CpuTopologyV1:
+def _topology(
+    *, efficiency_cpus: tuple[int, ...] = tuple(range(4, 12))
+) -> CpuTopologyV1:
     return CpuTopologyV1(
         physical_cores=tuple((cpu,) for cpu in range(12)),
         efficiency_cpus=efficiency_cpus,
@@ -158,13 +164,19 @@ def _profile() -> CgroupProfileV1:
     )
 
 
-def _topology_documents(*, present: bytes = b"0-11\n", malformed: bool = False) -> dict[Path, bytes]:
+def _topology_documents(
+    *, present: bytes = b"0-11\n", malformed: bool = False
+) -> dict[Path, bytes]:
     documents = {Path("/sys/devices/system/cpu/present"): present}
     for cpu in range(12):
         prefix = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
         documents[prefix / "physical_package_id"] = b"0\n"
-        documents[prefix / "core_id"] = (b"bad\n" if malformed and cpu == 0 else f"{cpu}\n".encode())
-        documents[prefix / "core_type"] = b"efficiency\n" if cpu >= 4 else b"performance\n"
+        documents[prefix / "core_id"] = (
+            b"bad\n" if malformed and cpu == 0 else f"{cpu}\n".encode()
+        )
+        documents[prefix / "core_type"] = (
+            b"efficiency\n" if cpu >= 4 else b"performance\n"
+        )
     return documents
 
 
@@ -233,7 +245,9 @@ def _nonhybrid_topology_documents() -> dict[Path, bytes]:
     return documents
 
 
-def test_preflight_requires_unified_v2_and_cpu_cpuset_memory_pids_io_delegation() -> None:
+def test_preflight_requires_unified_v2_and_cpu_cpuset_memory_pids_io_delegation() -> (
+    None
+):
     invalid = (
         {"unified_v2": False},
         {"controllers": frozenset({"cpu", "memory", "pids", "io"})},
@@ -244,12 +258,17 @@ def test_preflight_requires_unified_v2_and_cpu_cpuset_memory_pids_io_delegation(
             _preflight(**arguments)
 
 
-def test_resource_cgroup_is_the_only_sys_cpu_topology_cpuset_and_cgroup_parser_owner() -> None:
+def test_resource_cgroup_is_the_only_sys_cpu_topology_cpuset_and_cgroup_parser_owner() -> (
+    None
+):
     adapter = FakeCgroupAdapter(documents=_topology_documents())
     topology = parse_cpu_topology(adapter)
 
     assert topology.efficiency_cpus == tuple(range(4, 12))
-    assert all(event.split(":", 1)[-1].startswith("/sys/devices/system/cpu/") for event in adapter.events)
+    assert all(
+        event.split(":", 1)[-1].startswith("/sys/devices/system/cpu/")
+        for event in adapter.events
+    )
 
 
 @pytest.mark.parametrize(
@@ -265,8 +284,7 @@ def test_resource_cgroup_is_the_only_sys_cpu_topology_cpuset_and_cgroup_parser_o
     ),
 )
 def test_systemd_user_cgroup_adapter_disallows_instance_method_shadowing(
-    method_name: str,
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    method_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     runner = _approved_provider_runner(monkeypatch, tmp_path)
     adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=runner)
@@ -334,7 +352,9 @@ def test_approved_runtime_provider_constructs_exact_adapter_internally(
     assert result.profile.cpuset_expression == "4-11"
     assert type(result.adapter) is resource_cgroup.SystemdUserCgroupAdapter
     assert result.adapter._runner is runner
-    parameters = inspect.signature(resource_cgroup.build_approved_cgroup_runtime).parameters
+    parameters = inspect.signature(
+        resource_cgroup.build_approved_cgroup_runtime
+    ).parameters
     assert "adapter" not in parameters
     assert "adapter_factory" not in parameters
 
@@ -394,7 +414,9 @@ def test_approved_monitor_runtime_binds_exact_self_service_parent_without_user_b
         monitor_self_cgroup=True,
     )
 
-    assert result.adapter._target_slice_control_group_path == "user.slice/the-hive.slice"
+    assert (
+        result.adapter._target_slice_control_group_path == "user.slice/the-hive.slice"
+    )
     assert runner.calls == []
 
 
@@ -459,16 +481,31 @@ def test_approved_runtime_provider_rejects_parent_mask_missing_approved_cpu(
         )
 
 
-def test_topology_uses_nonhybrid_route_only_when_every_core_type_leaf_is_cleanly_missing() -> None:
+def test_topology_uses_nonhybrid_route_only_when_every_core_type_leaf_is_cleanly_missing() -> (
+    None
+):
     documents = _nonhybrid_topology_documents()
     topology = parse_cpu_topology(FakeCgroupAdapter(documents=documents))
 
     assert topology == CpuTopologyV1(
-        physical_cores=((0, 1), (2, 3), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)),
+        physical_cores=(
+            (0, 1),
+            (2, 3),
+            (4,),
+            (5,),
+            (6,),
+            (7,),
+            (8,),
+            (9,),
+            (10,),
+            (11,),
+        ),
         efficiency_cpus=(),
     )
 
-    documents[Path("/sys/devices/system/cpu/cpu0/topology/core_type")] = b"performance\n"
+    documents[Path("/sys/devices/system/cpu/cpu0/topology/core_type")] = (
+        b"performance\n"
+    )
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         parse_cpu_topology(FakeCgroupAdapter(documents=documents))
 
@@ -500,7 +537,9 @@ def test_topology_missing_core_type_does_not_hide_unreadable_malformed_or_symlin
             return super().read_optional_cpu_topology_bytes(path, max_bytes=max_bytes)
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        parse_cpu_topology(_UnreadableCoreTypeAdapter(documents=_nonhybrid_topology_documents()))
+        parse_cpu_topology(
+            _UnreadableCoreTypeAdapter(documents=_nonhybrid_topology_documents())
+        )
 
     cgroup_root = tmp_path / "cgroup"
     cpu_root = tmp_path / "cpu"
@@ -546,7 +585,9 @@ def test_topology_rejects_core_type_enoent_after_bound_parent_and_optional_non_l
 
     real_open = resource_cgroup.os.open
 
-    def _race_open(path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+    def _race_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
         if path == "core_type" and dir_fd is not None:
             raise FileNotFoundError("core_type vanished after parent bind")
         if dir_fd is None:
@@ -577,11 +618,14 @@ def test_optional_core_type_rejects_extreme_decimal_cpu_path_with_canonical_erro
     assert captured.value.args == ("cgroup_preflight_failed",)
 
 
-def test_preflight_rejects_missing_subtree_controller_or_effective_parent_cpuset() -> None:
+def test_preflight_rejects_missing_subtree_controller_or_effective_parent_cpuset() -> (
+    None
+):
     profile = _profile()
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         require_cgroup_preflight(
-            FakeCgroupAdapter(preflight=_preflight(parent_cpuset=tuple(range(4, 11)))), profile
+            FakeCgroupAdapter(preflight=_preflight(parent_cpuset=tuple(range(4, 11)))),
+            profile,
         )
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         _preflight(parent_cpuset=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10))
@@ -589,9 +633,13 @@ def test_preflight_rejects_missing_subtree_controller_or_effective_parent_cpuset
 
 def test_topology_rejects_malformed_oversize_and_inconsistent_cpu_records() -> None:
     malformed = FakeCgroupAdapter(documents=_topology_documents(malformed=True))
-    oversized = FakeCgroupAdapter(documents=_topology_documents(present=b"0-999999999999999999\n"))
+    oversized = FakeCgroupAdapter(
+        documents=_topology_documents(present=b"0-999999999999999999\n")
+    )
     inconsistent = _topology_documents()
-    inconsistent[Path("/sys/devices/system/cpu/cpu4/topology/core_type")] = b"performance\n"
+    inconsistent[Path("/sys/devices/system/cpu/cpu4/topology/core_type")] = (
+        b"performance\n"
+    )
     inconsistent[Path("/sys/devices/system/cpu/cpu5/topology/core_id")] = b"4\n"
     for adapter in (malformed, oversized, FakeCgroupAdapter(documents=inconsistent)):
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
@@ -623,20 +671,28 @@ def test_read_hive_io_pressure_rejects_malformed_pressure_payload() -> None:
     )
     for payload in payloads:
         adapter = FakeCgroupAdapter(
-            documents={Path("/sys/fs/cgroup/user.slice/the-hive.slice/io.pressure"): payload}
+            documents={
+                Path("/sys/fs/cgroup/user.slice/the-hive.slice/io.pressure"): payload
+            }
         )
         assert read_hive_io_pressure(adapter=adapter) is None
 
 
-def test_read_hive_io_pressure_uses_control_group_from_target_slice_systemd_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    target_control_group = "/user.slice/user-1000.slice/user@1000.service/codex.slice/the-hive.slice"
+def test_read_hive_io_pressure_uses_control_group_from_target_slice_systemd_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target_control_group = (
+        "/user.slice/user-1000.slice/user@1000.service/codex.slice/the-hive.slice"
+    )
     payload = (
         b"some avg10=12.34 avg60=11.11 avg300=10.00 total=7\n"
         b"full avg10=34.56 avg60=7.89 avg300=6.78 total=8\n"
     )
     runner = _FakeSystemdRunner(target_slice_control_group=target_control_group)
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    pressure_file = tmp_path / "cgroup" / target_control_group.lstrip("/") / "io.pressure"
+    pressure_file = (
+        tmp_path / "cgroup" / target_control_group.lstrip("/") / "io.pressure"
+    )
     pressure_file.parent.mkdir(parents=True)
     pressure_file.write_bytes(payload)
 
@@ -669,11 +725,15 @@ def test_hive_io_pressure_evidence_rejects_invalid_pressure_values(
         )
 
 
-def test_profile_rejects_unapproved_empty_duplicate_hybrid_or_outside_parent_cpu_set() -> None:
+def test_profile_rejects_unapproved_empty_duplicate_hybrid_or_outside_parent_cpu_set() -> (
+    None
+):
     topology = _topology()
     for approved in ((), (4, 4, 5, 6, 7, 8, 9, 10, 11), tuple(range(3, 12))):
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-            derive_cgroup_profile(topology, approved_cpuset=approved, mem_total_bytes=16 * GIB)
+            derive_cgroup_profile(
+                topology, approved_cpuset=approved, mem_total_bytes=16 * GIB
+            )
 
     profile = _profile()
     outside = _preflight(parent_cpuset=tuple(range(4, 11)))
@@ -712,16 +772,18 @@ def test_profile_computes_i5_generic_and_memory_bounds_or_fails_closed() -> None
         (_topology(), tuple(range(4, 12)), 1 << 63),
     ):
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-            derive_cgroup_profile(topology, approved_cpuset=approved, mem_total_bytes=memory)
+            derive_cgroup_profile(
+                topology, approved_cpuset=approved, mem_total_bytes=memory
+            )
 
 
 def test_profile_rejects_two_physical_core_hybrid_before_efficiency_branch() -> None:
-    two_core_hybrid = CpuTopologyV1(
-        physical_cores=((0,), (1,)), efficiency_cpus=(1,)
-    )
+    two_core_hybrid = CpuTopologyV1(physical_cores=((0,), (1,)), efficiency_cpus=(1,))
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        derive_cgroup_profile(two_core_hybrid, approved_cpuset=(1,), mem_total_bytes=16 * GIB)
+        derive_cgroup_profile(
+            two_core_hybrid, approved_cpuset=(1,), mem_total_bytes=16 * GIB
+        )
 
 
 @pytest.mark.parametrize("allowed", ["", "0-", "3-1", "0,0", "all", "4-99"])
@@ -741,12 +803,16 @@ def test_ollama_cpu_profile_maps_exact_systemd_properties() -> None:
 
 
 @pytest.mark.parametrize("quota,weight", [(0, 50), (10001, 50), (200, 0), (200, 10001)])
-def test_ollama_cpu_profile_rejects_out_of_range_cpu_limits(quota: int, weight: int) -> None:
+def test_ollama_cpu_profile_rejects_out_of_range_cpu_limits(
+    quota: int, weight: int
+) -> None:
     with pytest.raises(ResourceCgroupError, match="resource.cgroup_profile_invalid"):
         OllamaCpuProfile.parse("4-7", quota, weight, available_cpus=set(range(12)))
 
 
-def test_scope_runner_uses_held_scope_before_tmux_and_readbacks_every_required_property() -> None:
+def test_scope_runner_uses_held_scope_before_tmux_and_readbacks_every_required_property() -> (
+    None
+):
     adapter = FakeCgroupAdapter()
     scope = start_verified_scope(
         adapter,
@@ -756,11 +822,20 @@ def test_scope_runner_uses_held_scope_before_tmux_and_readbacks_every_required_p
     )
 
     assert scope.unit_name == "the-hive-test.scope"
-    assert adapter.events == ["inspect", "start", "verify_scope", "release", "confirm", "verify_tmux"]
+    assert adapter.events == [
+        "inspect",
+        "start",
+        "verify_scope",
+        "release",
+        "confirm",
+        "verify_tmux",
+    ]
     assert adapter.cleaned == []
 
 
-def test_scope_runner_dispatches_command_between_gate_ready_and_elf_attestation() -> None:
+def test_scope_runner_dispatches_command_between_gate_ready_and_elf_attestation() -> (
+    None
+):
     adapter = FakeCgroupAdapter()
 
     scope = start_verified_scope(
@@ -785,7 +860,9 @@ def test_scope_runner_dispatches_command_between_gate_ready_and_elf_attestation(
     ]
 
 
-def test_scope_runner_cleans_when_gate_attestation_fails_after_command_dispatch() -> None:
+def test_scope_runner_cleans_when_gate_attestation_fails_after_command_dispatch() -> (
+    None
+):
     adapter = FakeCgroupAdapter(fail_at="confirm")
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
@@ -820,7 +897,9 @@ def test_scope_runner_never_uses_shell_sudo_taskset_or_move_existing_pid() -> No
     assert adapter.events == []
 
 
-def test_scope_failure_before_publication_cleans_only_new_scope_and_never_touches_existing_pid() -> None:
+def test_scope_failure_before_publication_cleans_only_new_scope_and_never_touches_existing_pid() -> (
+    None
+):
     adapter = FakeCgroupAdapter(fail_at="verify_scope")
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         start_verified_scope(
@@ -833,7 +912,9 @@ def test_scope_failure_before_publication_cleans_only_new_scope_and_never_touche
     assert [scope.unit_name for scope in adapter.cleaned] == ["the-hive-test.scope"]
 
 
-def test_scope_runner_checks_tmux_pid_cgroup_and_child_inheritance_before_success() -> None:
+def test_scope_runner_checks_tmux_pid_cgroup_and_child_inheritance_before_success() -> (
+    None
+):
     adapter = FakeCgroupAdapter(fail_at="verify_tmux")
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         start_verified_scope(
@@ -842,10 +923,20 @@ def test_scope_runner_checks_tmux_pid_cgroup_and_child_inheritance_before_succes
             socket_name="scope_socket-1",
             session_name="scope-session.1",
         )
-    assert adapter.events == ["inspect", "start", "verify_scope", "release", "confirm", "verify_tmux", "cleanup"]
+    assert adapter.events == [
+        "inspect",
+        "start",
+        "verify_scope",
+        "release",
+        "confirm",
+        "verify_tmux",
+        "cleanup",
+    ]
 
 
-def test_io_weight_is_not_reported_as_proven_physical_isolation_without_evidence() -> None:
+def test_io_weight_is_not_reported_as_proven_physical_isolation_without_evidence() -> (
+    None
+):
     preflight = require_cgroup_preflight(FakeCgroupAdapter(), _profile())
     assert preflight.io_physical_isolation_proven is False
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
@@ -951,7 +1042,9 @@ def test_scope_gate_generates_internal_challenge_and_executes_only_fixed_tmux_ar
     monkeypatch.setattr(socket, "socket", lambda family, kind: control_socket)
     import secrets
 
-    monkeypatch.setattr(secrets, "token_hex", lambda size: challenge if size == 32 else "")
+    monkeypatch.setattr(
+        secrets, "token_hex", lambda size: challenge if size == 32 else ""
+    )
 
     try:
         with pytest.raises(_GateExecveCalled):
@@ -989,7 +1082,9 @@ def test_scope_gate_generates_internal_challenge_and_executes_only_fixed_tmux_ar
     }
 
 
-def test_scope_gate_rejects_wrong_or_replayed_challenge_without_exec(tmp_path: Path) -> None:
+def test_scope_gate_rejects_wrong_or_replayed_challenge_without_exec(
+    tmp_path: Path,
+) -> None:
     control = "the-hive-resource-" + "e" * 32
     runner = tmp_path / "runner"
     runner.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
@@ -1099,7 +1194,9 @@ def test_scope_gate_retains_verified_runner_fd_for_tmux_pane_after_source_replac
         os.close(runner_fd)
         runner_fd = -1
         runner.rename(original)
-        runner.write_text("#!/bin/sh\nprintf '%s\\n' RUNNER_FD_REPLACED\n", encoding="ascii")
+        runner.write_text(
+            "#!/bin/sh\nprintf '%s\\n' RUNNER_FD_REPLACED\n", encoding="ascii"
+        )
         runner.chmod(0o700)
         subprocess.run(
             [
@@ -1121,7 +1218,15 @@ def test_scope_gate_retains_verified_runner_fd_for_tmux_pane_after_source_replac
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             captured = subprocess.run(
-                ["/usr/bin/tmux", "-L", socket_name, "capture-pane", "-p", "-t", session_name],
+                [
+                    "/usr/bin/tmux",
+                    "-L",
+                    socket_name,
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    session_name,
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -1158,7 +1263,9 @@ def test_scope_gate_retains_verified_runner_fd_for_tmux_pane_after_source_replac
     os.environ.get("THE_HIVE_TMUX_IT") != "1", reason="tmux_it_disabled"
 )
 @pytest.mark.parametrize("mode", ("timeout", "identity_mismatch"))
-def test_scope_gate_cleans_new_session_when_pane_exec_evidence_fails(mode: str, tmp_path: Path) -> None:
+def test_scope_gate_cleans_new_session_when_pane_exec_evidence_fails(
+    mode: str, tmp_path: Path
+) -> None:
     runner = tmp_path / "runner"
     shutil.copyfile(sys.executable, runner)
     runner.chmod(0o700)
@@ -1196,13 +1303,16 @@ def test_scope_gate_cleans_new_session_when_pane_exec_evidence_fails(mode: str, 
         connection.sendall(challenge)
         connection.shutdown(socket.SHUT_WR)
         deadline = time.monotonic() + 3
-        while subprocess.run(
-            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        ).returncode != 0:
+        while (
+            subprocess.run(
+                ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+            != 0
+        ):
             if time.monotonic() >= deadline:
                 pytest.fail("scope gate did not create the tmux session")
             time.sleep(0.02)
@@ -1228,13 +1338,16 @@ def test_scope_gate_cleans_new_session_when_pane_exec_evidence_fails(mode: str, 
         assert process.wait(timeout=7) == 64
         assert process.stdout.read() == b""
         assert process.stderr.read() == b""
-        assert subprocess.run(
-            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        ).returncode != 0
+        assert (
+            subprocess.run(
+                ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+            != 0
+        )
     finally:
         if connection is not None:
             connection.close()
@@ -1254,7 +1367,9 @@ def test_scope_gate_cleans_new_session_when_pane_exec_evidence_fails(mode: str, 
 
 
 @pytest.mark.parametrize("source_state", ("missing", "identity_mismatch", "symlink"))
-def test_scope_gate_rejects_missing_or_replaced_runner_fd(source_state: str, tmp_path: Path) -> None:
+def test_scope_gate_rejects_missing_or_replaced_runner_fd(
+    source_state: str, tmp_path: Path
+) -> None:
     runner = tmp_path / "runner"
     runner.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
     runner.chmod(0o700)
@@ -1279,7 +1394,9 @@ def test_scope_gate_rejects_missing_or_replaced_runner_fd(source_state: str, tmp
                 str(os.getpid()),
                 str(runner_fd),
                 str(expected.st_dev),
-                str(expected.st_ino + (1 if source_state == "identity_mismatch" else 0)),
+                str(
+                    expected.st_ino + (1 if source_state == "identity_mismatch" else 0)
+                ),
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -1355,7 +1472,11 @@ class _FakeScopeControl:
 
 
 def _scope_control_releases() -> list[bytes]:
-    return [payload for control in _FakeScopeControl.instances for payload in control.releases]
+    return [
+        payload
+        for control in _FakeScopeControl.instances
+        for payload in control.releases
+    ]
 
 
 def _scope_control_name() -> str:
@@ -1372,7 +1493,9 @@ def test_scope_control_rejects_wrong_peer_pid_and_closes_without_release() -> No
         assert control.peer_pid() == os.getpid()
 
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-            control.read_challenge(expected_gate_pid=os.getpid() + 1, timeout_seconds=0.1)
+            control.read_challenge(
+                expected_gate_pid=os.getpid() + 1, timeout_seconds=0.1
+            )
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
             control.release_once(b"c" * 64 + b"\n", timeout_seconds=0.1)
     finally:
@@ -1399,7 +1522,10 @@ def test_scope_control_times_out_without_challenge_and_releases_once_only() -> N
         client.connect(b"\0" + _scope_control_name().encode())
         control.accept(timeout_seconds=0.1)
         client.sendall(challenge)
-        assert control.read_challenge(expected_gate_pid=os.getpid(), timeout_seconds=0.1) == "c" * 64
+        assert (
+            control.read_challenge(expected_gate_pid=os.getpid(), timeout_seconds=0.1)
+            == "c" * 64
+        )
         control.release_once(challenge, timeout_seconds=0.1)
         assert client.recv(65) == challenge
         client.sendall(b"ready\n")
@@ -1440,7 +1566,9 @@ class _FakeSystemdRunner:
         self.gate = _FakeHeldGate()
         self.unit_name = ""
 
-    def _result(self, *, returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> object:
+    def _result(
+        self, *, returncode: int, stdout: bytes = b"", stderr: bytes = b""
+    ) -> object:
         return resource_cgroup.CommandResultV1(
             returncode=returncode,
             stdout=stdout,
@@ -1461,13 +1589,25 @@ class _FakeSystemdRunner:
         self.calls.append(argv)
         if self.timeout:
             raise TimeoutError("bounded")
-        if argv[0] == "/usr/bin/systemctl" and argv[3] == "show" and "--property=LoadState" in argv:
+        if (
+            argv[0] == "/usr/bin/systemctl"
+            and argv[3] == "show"
+            and "--property=LoadState" in argv
+        ):
             return self._result(
                 returncode=0,
                 stdout=self.show_stdout
-                or (b"LoadState=loaded\n" if self.collision else b"LoadState=not-found\n"),
+                or (
+                    b"LoadState=loaded\n"
+                    if self.collision
+                    else b"LoadState=not-found\n"
+                ),
             )
-        if argv[0] == "/usr/bin/systemctl" and argv[3] == "show" and argv[4] == "the-hive.slice":
+        if (
+            argv[0] == "/usr/bin/systemctl"
+            and argv[3] == "show"
+            and argv[4] == "the-hive.slice"
+        ):
             if self.target_slice_missing:
                 return self._result(returncode=4)
             if self.target_slice_stdout is not None:
@@ -1479,7 +1619,10 @@ class _FakeSystemdRunner:
         if argv[0] == "/usr/bin/systemctl" and argv[3] == "show":
             if self.show_stdout is not None:
                 return self._result(returncode=0, stdout=self.show_stdout)
-            control_group = self.control_group or f"{self.target_slice_control_group}/{self.unit_name}"
+            control_group = (
+                self.control_group
+                or f"{self.target_slice_control_group}/{self.unit_name}"
+            )
             values = {
                 "ControlGroup": control_group,
                 "MainPID": "4241",
@@ -1490,7 +1633,9 @@ class _FakeSystemdRunner:
                 for argument in argv
                 if argument.startswith("--property=")
             )
-            assert properties and all(property_name in values for property_name in properties)
+            assert properties and all(
+                property_name in values for property_name in properties
+            )
             return self._result(
                 returncode=0,
                 stdout="".join(
@@ -1518,7 +1663,11 @@ class _FakeSystemdRunner:
         assert max_stdout_bytes == 65
         assert max_stderr_bytes > 0
         self.started.append(argv)
-        self.unit_name = next(argument.split("=", 1)[1] for argument in argv if argument.startswith("--unit="))
+        self.unit_name = next(
+            argument.split("=", 1)[1]
+            for argument in argv
+            if argument.startswith("--unit=")
+        )
         return self.gate
 
 
@@ -1561,7 +1710,9 @@ def _write_cgroup_documents(
     parent = target.parent
     for directory in (root,):
         (directory / "cgroup.controllers").write_bytes(b"cpu cpuset memory pids io\n")
-        (directory / "cgroup.subtree_control").write_bytes(b"cpu cpuset memory pids io\n")
+        (directory / "cgroup.subtree_control").write_bytes(
+            b"cpu cpuset memory pids io\n"
+        )
         (directory / "cpuset.cpus.effective").write_bytes(b"0-11\n")
     (parent / "cgroup.controllers").write_bytes(slice_controllers)
     (parent / "cgroup.subtree_control").write_bytes(slice_subtree)
@@ -1598,7 +1749,9 @@ def _systemd_adapter(
         slice_subtree=slice_subtree,
     )
     monkeypatch.setattr(resource_cgroup, "CGROUP_ROOT", root)
-    monkeypatch.setattr(resource_cgroup.secrets, "token_hex", lambda size: "d" * (size * 2))
+    monkeypatch.setattr(
+        resource_cgroup.secrets, "token_hex", lambda size: "d" * (size * 2)
+    )
     _FakeScopeControl.instances.clear()
     monkeypatch.setattr(resource_cgroup, "_ScopeControl", _FakeScopeControl)
     return resource_cgroup.SystemdUserCgroupAdapter(runner=runner)
@@ -1609,7 +1762,9 @@ def test_systemd_v259_scope_uses_pid_bound_control_without_pipe_and_one_gate_rel
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
+    monkeypatch.setattr(
+        resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path)
+    )
 
     scope = start_verified_scope(
         adapter,
@@ -1692,7 +1847,9 @@ def test_systemd_adapter_accepts_kernel_tmux_children_space_format(
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
+    monkeypatch.setattr(
+        resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path)
+    )
 
     scope = start_verified_scope(
         adapter,
@@ -1724,7 +1881,9 @@ def test_systemd_user_scope_without_main_pid_uses_authenticated_gate_peer_pid(
 ) -> None:
     runner = _FakeSystemdRunner(scope_main_pid_omitted=True)
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
+    monkeypatch.setattr(
+        resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path)
+    )
 
     scope = start_verified_scope(
         adapter,
@@ -1747,11 +1906,13 @@ def test_systemd_v259_scope_accepts_cgroup_v2_default_io_weight_format(
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
-    scope_name = "the-hive-resource-" + "d" * 32 + ".scope"
-    (tmp_path / "cgroup" / "user.slice" / "the-hive.slice" / scope_name / "io.weight").write_bytes(
-        b"default 50\n"
+    monkeypatch.setattr(
+        resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path)
     )
+    scope_name = "the-hive-resource-" + "d" * 32 + ".scope"
+    (
+        tmp_path / "cgroup" / "user.slice" / "the-hive.slice" / scope_name / "io.weight"
+    ).write_bytes(b"default 50\n")
 
     scope = start_verified_scope(
         adapter,
@@ -1791,7 +1952,9 @@ def test_systemd_adapter_binds_preflight_and_new_scope_to_the_hive_slice(
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
+    monkeypatch.setattr(
+        resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path)
+    )
 
     start_verified_scope(
         adapter,
@@ -1821,7 +1984,11 @@ def test_controller_parser_rejects_duplicate_controller_tokens() -> None:
 
 
 def test_integration_precondition_classifier_is_not_generic_preflight_skip() -> None:
-    classifier = getattr(resource_cgroup.SystemdUserCgroupAdapter, "integration_precondition_reason", None)
+    classifier = getattr(
+        resource_cgroup.SystemdUserCgroupAdapter,
+        "integration_precondition_reason",
+        None,
+    )
 
     assert classifier is not None, "missing bounded opt-in precondition classifier"
 
@@ -1831,7 +1998,14 @@ def test_systemd_adapter_denies_missing_wrong_or_non_delegated_target_slice_befo
 ) -> None:
     cases = (
         (_FakeSystemdRunner(target_slice_missing=True), b"cpu cpuset memory pids io\n"),
-        (_FakeSystemdRunner(control_group="/user.slice/other.slice/the-hive-resource-" + "d" * 32 + ".scope"), b"cpu cpuset memory pids io\n"),
+        (
+            _FakeSystemdRunner(
+                control_group="/user.slice/other.slice/the-hive-resource-"
+                + "d" * 32
+                + ".scope"
+            ),
+            b"cpu cpuset memory pids io\n",
+        ),
         (_FakeSystemdRunner(), b"cpu cpuset memory pids\n"),
     )
     for number, (runner, controllers) in enumerate(cases):
@@ -1887,7 +2061,9 @@ def test_systemd_adapter_allows_parent_controller_supersets(
         slice_controllers=b"cpu cpuset memory pids io hugetlb\n",
         slice_subtree=b"cpu cpuset memory pids io hugetlb\n",
     )
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
+    monkeypatch.setattr(
+        resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path)
+    )
 
     scope = start_verified_scope(
         adapter,
@@ -1935,7 +2111,9 @@ def test_integration_precondition_classifier_skips_only_clean_absence_and_fails_
 ) -> None:
     _provide_user_bus_socket_fact(monkeypatch)
     missing_runner = _FakeSystemdRunner(target_slice_missing=True)
-    missing_adapter = _systemd_adapter(monkeypatch, tmp_path / "missing", missing_runner)
+    missing_adapter = _systemd_adapter(
+        monkeypatch, tmp_path / "missing", missing_runner
+    )
     assert missing_adapter.integration_precondition_reason() == "requires_target_slice"
 
     no_delegation = _FakeSystemdRunner()
@@ -1945,7 +2123,10 @@ def test_integration_precondition_classifier_skips_only_clean_absence_and_fails_
         no_delegation,
         slice_controllers=b"cpu cpuset memory pids\n",
     )
-    assert absent_adapter.integration_precondition_reason() == "requires_delegated_controllers"
+    assert (
+        absent_adapter.integration_precondition_reason()
+        == "requires_delegated_controllers"
+    )
 
     malformed_runner = _FakeSystemdRunner()
     malformed_adapter = _systemd_adapter(

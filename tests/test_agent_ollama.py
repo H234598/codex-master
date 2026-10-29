@@ -46,14 +46,10 @@ class ControlledRuntime:
         self.started.append(request)
         return FakeProcess()
 
-    def resolve_scope(
-        self, request: object, process: object
-    ) -> tuple[int, str, int]:
+    def resolve_scope(self, request: object, process: object) -> tuple[int, str, int]:
         return 4343, "/user.slice/ollama.scope", 901
 
-    def process_running(
-        self, process: object, pid: int, start_ticks: int
-    ) -> bool:
+    def process_running(self, process: object, pid: int, start_ticks: int) -> bool:
         return self.process_up
 
     def scope_process_matches(
@@ -69,8 +65,13 @@ class ControlledRuntime:
         return True
 
     def classify_running_identity(
-        self, unit_name: str, pid: int, control_group: str,
-        start_ticks: int, port: int, executable: object,
+        self,
+        unit_name: str,
+        pid: int,
+        control_group: str,
+        start_ticks: int,
+        port: int,
+        executable: object,
     ) -> str:
         return self.identity_status or ("exact" if self.process_up else "absent")
 
@@ -166,9 +167,9 @@ def test_production_adapter_uses_public_runtime_plan_apply_probe_stop(
         "loopback_endpoint_reachable": True,
         "available_model_ids": ["model-id"],
     }
-    assert executor.stop(
-        {"instance_ref": "instance-one", "generation": 1}
-    ) == {"stopped": True}
+    assert executor.stop({"instance_ref": "instance-one", "generation": 1}) == {
+        "stopped": True
+    }
     assert len(runtime.stopped) == 1
 
 
@@ -201,9 +202,9 @@ def test_apply_revalidates_original_path_evidence_at_actual_consumer(
             store, state_root=tmp_path / "state", runtime=runtime
         )
     )
-    plan_ref = executor.plan(
-        {"instance_ref": "instance-one", "generation": 1}
-    )["plan_ref"]
+    plan_ref = executor.plan({"instance_ref": "instance-one", "generation": 1})[
+        "plan_ref"
+    ]
     executable.rename(tmp_path / "old-ollama")
     executable.write_bytes(b"#!/bin/sh\nexit 0\n")
     executable.chmod(0o700)
@@ -319,9 +320,7 @@ def test_adapter_restart_recovers_plan_and_running_ownership(tmp_path: Path) -> 
             store, state_root=state_root, runtime=runtime
         )
     )
-    plan_ref = first.plan(
-        {"instance_ref": "instance-one", "generation": 1}
-    )["plan_ref"]
+    plan_ref = first.plan({"instance_ref": "instance-one", "generation": 1})["plan_ref"]
     second = AgentOllamaExecutor(
         agent_ollama.ProductionAgentOllamaAdapter(
             store, state_root=state_root, runtime=runtime
@@ -333,12 +332,12 @@ def test_adapter_restart_recovers_plan_and_running_ownership(tmp_path: Path) -> 
             store, state_root=state_root, runtime=runtime
         )
     )
-    assert third.probe(
-        {"instance_ref": "instance-one", "generation": 1}
-    )["ready"] is True
-    assert third.stop(
-        {"instance_ref": "instance-one", "generation": 1}
-    ) == {"stopped": True}
+    assert (
+        third.probe({"instance_ref": "instance-one", "generation": 1})["ready"] is True
+    )
+    assert third.stop({"instance_ref": "instance-one", "generation": 1}) == {
+        "stopped": True
+    }
 
 
 def test_plan_journal_has_exact_limit_and_deterministic_expiry(
@@ -409,9 +408,9 @@ def test_new_registry_generation_expires_old_plans(tmp_path: Path) -> None:
     adapter = agent_ollama.ProductionAgentOllamaAdapter(
         store, state_root=tmp_path / "state", runtime=ControlledRuntime()
     )
-    old_ref = adapter.plan(
-        {"instance_ref": "instance-one", "generation": 1}
-    )["plan_ref"]
+    old_ref = adapter.plan({"instance_ref": "instance-one", "generation": 1})[
+        "plan_ref"
+    ]
     snapshot = store.load()
     store.replace(
         models=snapshot.models,
@@ -445,9 +444,9 @@ def test_hard_crash_after_start_recovers_durable_intent_without_second_start(
     adapter = agent_ollama.ProductionAgentOllamaAdapter(
         store, state_root=state_root, runtime=runtime
     )
-    plan_ref = adapter.plan(
-        {"instance_ref": "instance-one", "generation": 1}
-    )["plan_ref"]
+    plan_ref = adapter.plan({"instance_ref": "instance-one", "generation": 1})[
+        "plan_ref"
+    ]
     crashed: list[BaseException] = []
 
     def apply_and_crash() -> None:
@@ -495,19 +494,18 @@ def test_running_reconcile_handles_absence_conflict_advance_and_rollback(
         instances=snapshot.instances,
         expected_generation=1,
     )
-    adapter.validate_running_precondition(
-        "instance-one", 1, digest, 7
+    adapter.validate_running_precondition("instance-one", 1, digest, 7)
+    assert (
+        executor.probe({"instance_ref": "instance-one", "generation": 2}, **fences)[
+            "ready"
+        ]
+        is True
     )
-    assert executor.probe(
-        {"instance_ref": "instance-one", "generation": 2}, **fences
-    )["ready"] is True
     with pytest.raises(
         agent_ollama.AgentOllamaNoEffectError,
         match="provider.generation_stale",
     ):
-        executor.probe(
-            {"instance_ref": "instance-one", "generation": 1}, **fences
-        )
+        executor.probe({"instance_ref": "instance-one", "generation": 1}, **fences)
     with pytest.raises(
         agent_ollama.AgentOllamaNoEffectError,
         match="provider.generation_stale",
@@ -521,9 +519,7 @@ def test_running_reconcile_handles_absence_conflict_advance_and_rollback(
     assert runtime.stopped == []
     runtime.identity_status = "conflict"
     with pytest.raises(Exception, match="provider.instance_identity_conflict"):
-        executor.stop(
-            {"instance_ref": "instance-one", "generation": 2}, **fences
-        )
+        executor.stop({"instance_ref": "instance-one", "generation": 2}, **fences)
     runtime.identity_status = "absent"
     assert executor.stop(
         {"instance_ref": "instance-one", "generation": 2}, **fences
@@ -548,9 +544,7 @@ def test_concurrent_stops_perform_at_most_one_runtime_effect(tmp_path: Path) -> 
     first = agent_ollama.ProductionAgentOllamaAdapter(
         store, state_root=state_root, runtime=runtime
     )
-    plan_ref = first.plan(
-        {"instance_ref": "instance-one", "generation": 1}
-    )["plan_ref"]
+    plan_ref = first.plan({"instance_ref": "instance-one", "generation": 1})["plan_ref"]
     first.apply({"plan_ref": plan_ref})
     second = agent_ollama.ProductionAgentOllamaAdapter(
         store, state_root=state_root, runtime=runtime
@@ -585,9 +579,7 @@ def test_cross_process_stops_perform_at_most_one_runtime_effect(tmp_path: Path) 
     setup = agent_ollama.ProductionAgentOllamaAdapter(
         store, state_root=state_root, runtime=setup_runtime
     )
-    plan_ref = setup.plan(
-        {"instance_ref": "instance-one", "generation": 1}
-    )["plan_ref"]
+    plan_ref = setup.plan({"instance_ref": "instance-one", "generation": 1})["plan_ref"]
     setup.apply({"plan_ref": plan_ref})
     context = multiprocessing.get_context("fork")
     count = context.Value("i", 0)

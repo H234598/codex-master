@@ -12,9 +12,7 @@ from the_hive.hive.indexed_tests import TestIndexError, TestIndexV1
 
 
 _DEPENDENCY_POLICY = b"python-ast-v2:names,attributes,imports,module-bindings,static-calls,python-entrypoints"
-_PYTHON_ENTRYPOINT_HEADERS = frozenset(
-    {"#!/usr/bin/env python3", "#!/usr/bin/python3"}
-)
+_PYTHON_ENTRYPOINT_HEADERS = frozenset({"#!/usr/bin/env python3", "#!/usr/bin/python3"})
 _COOLDOWN_RANK = {
     "deterministic": 0,
     "integration": 1,
@@ -33,7 +31,12 @@ def _repo_path(value: str) -> str:
     if not isinstance(value, str):
         raise TestIndexError("test.index_invalid")
     path = PurePosixPath(value)
-    if path.is_absolute() or path.as_posix() != value or ".." in path.parts or "." in path.parts:
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or ".." in path.parts
+        or "." in path.parts
+    ):
         raise TestIndexError("test.index_invalid")
     return value
 
@@ -63,8 +66,14 @@ class _FunctionVisitor(ast.NodeVisitor):
         self._visit_function(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        decorators = {getattr(item, "id", getattr(item, "attr", "")) for item in node.decorator_list}
-        if (self.type_only_stack and self.type_only_stack[-1]) or decorators & {"overload", "abstractmethod"}:
+        decorators = {
+            getattr(item, "id", getattr(item, "attr", ""))
+            for item in node.decorator_list
+        }
+        if (self.type_only_stack and self.type_only_stack[-1]) or decorators & {
+            "overload",
+            "abstractmethod",
+        }:
             return
         qualified = ".".join((*self.stack, node.name))
         self.functions.append((qualified, node))
@@ -120,21 +129,24 @@ def _assertion_nodes(node: ast.AST) -> tuple[ast.AST, ...]:
 
 def _dependency_digest(node: ast.AST, module: ast.Module) -> str:
     names = {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
-    rows = {
-        f"name:{name}" for name in names
-    } | {
-        f"attribute:{child.attr}" for child in ast.walk(node) if isinstance(child, ast.Attribute)
+    rows = {f"name:{name}" for name in names} | {
+        f"attribute:{child.attr}"
+        for child in ast.walk(node)
+        if isinstance(child, ast.Attribute)
     }
     for statement in module.body:
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             bound = {
-                alias.asname or alias.name.split(".")[0]
-                for alias in statement.names
+                alias.asname or alias.name.split(".")[0] for alias in statement.names
             }
             if names & bound:
                 rows.add("import:" + ast.dump(statement, include_attributes=False))
         elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            targets = statement.targets if isinstance(statement, ast.Assign) else (statement.target,)
+            targets = (
+                statement.targets
+                if isinstance(statement, ast.Assign)
+                else (statement.target,)
+            )
             bound = {
                 child.id
                 for target in targets
@@ -214,7 +226,10 @@ class PythonTestIndexBuilder:
             if not assertions:
                 raise TestIndexError("test.assertion_missing")
             strictest = max(
-                (function_by_id[function_id]["cooldown_class"] for function_id in covers[test_id]),
+                (
+                    function_by_id[function_id]["cooldown_class"]
+                    for function_id in covers[test_id]
+                ),
                 key=_COOLDOWN_RANK.__getitem__,
             )
             metadata = test_meta.get(test_id, {})
@@ -226,7 +241,10 @@ class PythonTestIndexBuilder:
                     "node_id": node_id,
                     "test_digest": _ast_digest(node),
                     "assertion_digest": _digest(
-                        "\n".join(ast.dump(item, include_attributes=False) for item in assertions)
+                        "\n".join(
+                            ast.dump(item, include_attributes=False)
+                            for item in assertions
+                        )
                     ),
                     "covers": sorted(covers[test_id]),
                     "kind": metadata.get("kind", "unit"),
@@ -237,7 +255,8 @@ class PythonTestIndexBuilder:
                 }
             )
         source_rows = "\n".join(
-            f"{entry['function_id']}:{entry['source_digest']}" for entry in function_entries
+            f"{entry['function_id']}:{entry['source_digest']}"
+            for entry in function_entries
         )
         test_rows = "\n".join(
             f"{entry['test_id']}:{entry['test_digest']}:{entry['assertion_digest']}"
@@ -261,7 +280,9 @@ class PythonTestIndexBuilder:
     def _inventory_functions(
         self, paths: Sequence[str]
     ) -> dict[str, tuple[str, str, ast.FunctionDef | ast.AsyncFunctionDef, ast.Module]]:
-        inventory: dict[str, tuple[str, str, ast.FunctionDef | ast.AsyncFunctionDef, ast.Module]] = {}
+        inventory: dict[
+            str, tuple[str, str, ast.FunctionDef | ast.AsyncFunctionDef, ast.Module]
+        ] = {}
         for path in self._normalized_paths(paths):
             module = self._parse(path)
             visitor = _FunctionVisitor()
@@ -278,7 +299,9 @@ class PythonTestIndexBuilder:
     def _inventory_tests(
         self, paths: Sequence[str]
     ) -> dict[str, tuple[str, str, ast.FunctionDef | ast.AsyncFunctionDef]]:
-        inventory: dict[str, tuple[str, str, ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        inventory: dict[
+            str, tuple[str, str, ast.FunctionDef | ast.AsyncFunctionDef]
+        ] = {}
         for path in self._normalized_paths(paths):
             visitor = _TestVisitor()
             visitor.visit(self._parse(path))

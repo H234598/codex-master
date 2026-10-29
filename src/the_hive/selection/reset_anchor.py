@@ -15,7 +15,17 @@ class AnchorError(ValueError):
 
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_STATES = frozenset({"grace", "due", "reserved", "attempted", "pending_confirmation", "anchored", "cooldown"})
+_STATES = frozenset(
+    {
+        "grace",
+        "due",
+        "reserved",
+        "attempted",
+        "pending_confirmation",
+        "anchored",
+        "cooldown",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,25 +46,43 @@ class ProactiveAnchorSafetyStatus:
     fixed_internal_task_verified: bool
 
     def __post_init__(self) -> None:
-        if any(not isinstance(value, bool) for value in (
-            self.allowlisted, self.cooldown_clear, self.attempts_available,
-            self.kill_switch_active, self.execute_enabled, self.hard_sandbox_verified,
-            self.token_budget_verified, self.runtime_limit_verified, self.no_tools_verified,
-            self.empty_workspace_verified, self.no_repository_data_verified,
-            self.fixed_internal_task_verified,
-        )):
+        if any(
+            not isinstance(value, bool)
+            for value in (
+                self.allowlisted,
+                self.cooldown_clear,
+                self.attempts_available,
+                self.kill_switch_active,
+                self.execute_enabled,
+                self.hard_sandbox_verified,
+                self.token_budget_verified,
+                self.runtime_limit_verified,
+                self.no_tools_verified,
+                self.empty_workspace_verified,
+                self.no_repository_data_verified,
+                self.fixed_internal_task_verified,
+            )
+        ):
             raise AnchorError("invalid_proactive_safety_status")
 
     @property
     def gate_ready(self) -> bool:
-        return all((
-            self.allowlisted, self.cooldown_clear, self.attempts_available,
-            not self.kill_switch_active, self.execute_enabled,
-            self.hard_sandbox_verified, self.token_budget_verified,
-            self.runtime_limit_verified, self.no_tools_verified,
-            self.empty_workspace_verified, self.no_repository_data_verified,
-            self.fixed_internal_task_verified,
-        ))
+        return all(
+            (
+                self.allowlisted,
+                self.cooldown_clear,
+                self.attempts_available,
+                not self.kill_switch_active,
+                self.execute_enabled,
+                self.hard_sandbox_verified,
+                self.token_budget_verified,
+                self.runtime_limit_verified,
+                self.no_tools_verified,
+                self.empty_workspace_verified,
+                self.no_repository_data_verified,
+                self.fixed_internal_task_verified,
+            )
+        )
 
     def public(self) -> dict[str, object]:
         return {
@@ -85,7 +113,11 @@ class ProactiveAnchorPlan:
     def __post_init__(self) -> None:
         if not _DIGEST_RE.fullmatch(self.anchor_key) or self.state != "due":
             raise AnchorError("invalid_proactive_anchor_plan")
-        if isinstance(self.attempt_number, bool) or not isinstance(self.attempt_number, int) or not 1 <= self.attempt_number <= 3:
+        if (
+            isinstance(self.attempt_number, bool)
+            or not isinstance(self.attempt_number, int)
+            or not 1 <= self.attempt_number <= 3
+        ):
             raise AnchorError("invalid_proactive_anchor_plan")
 
     def public(self) -> dict[str, object]:
@@ -107,9 +139,18 @@ class LimitObservation:
     observed_at_utc: datetime
 
     def __post_init__(self) -> None:
-        if self.semantics not in {"remaining", "consumed"} or isinstance(self.quantity_value, bool) or not isinstance(self.quantity_value, int) or not 0 <= self.quantity_value <= 100:
+        if (
+            self.semantics not in {"remaining", "consumed"}
+            or isinstance(self.quantity_value, bool)
+            or not isinstance(self.quantity_value, int)
+            or not 0 <= self.quantity_value <= 100
+        ):
             raise AnchorError("invalid_anchor_observation")
-        if self.reset_kind not in {"rolling_unanchored", "rolling_anchored", "fixed"} or self.confidence not in {"verified", "observed", "unknown"}:
+        if self.reset_kind not in {
+            "rolling_unanchored",
+            "rolling_anchored",
+            "fixed",
+        } or self.confidence not in {"verified", "observed", "unknown"}:
             raise AnchorError("invalid_anchor_observation")
         try:
             validate_utc_datetime(self.observed_at_utc)
@@ -129,9 +170,15 @@ class AnchorRecord:
     def __post_init__(self) -> None:
         if not _DIGEST_RE.fullmatch(self.anchor_key) or self.state not in _STATES:
             raise AnchorError("invalid_anchor_record")
-        if isinstance(self.attempt_count, bool) or not isinstance(self.attempt_count, int) or not 0 <= self.attempt_count <= 3:
+        if (
+            isinstance(self.attempt_count, bool)
+            or not isinstance(self.attempt_count, int)
+            or not 0 <= self.attempt_count <= 3
+        ):
             raise AnchorError("invalid_anchor_attempts")
-        if self.admission_id is not None and (not isinstance(self.admission_id, str) or not self.admission_id):
+        if self.admission_id is not None and (
+            not isinstance(self.admission_id, str) or not self.admission_id
+        ):
             raise AnchorError("invalid_anchor_admission")
         for value in (self.cooldown_until_utc, self.last_observed_at_utc):
             if value is not None:
@@ -142,8 +189,12 @@ class AnchorRecord:
 
 
 class AnchorStateMachine:
-    def transition(self, record: AnchorRecord, observation: LimitObservation, *, now: datetime) -> AnchorRecord:
-        if not isinstance(record, AnchorRecord) or not isinstance(observation, LimitObservation):
+    def transition(
+        self, record: AnchorRecord, observation: LimitObservation, *, now: datetime
+    ) -> AnchorRecord:
+        if not isinstance(record, AnchorRecord) or not isinstance(
+            observation, LimitObservation
+        ):
             raise AnchorError("invalid_anchor_transition")
         try:
             now = validate_utc_datetime(now, field="anchor_time")
@@ -151,11 +202,24 @@ class AnchorStateMachine:
             raise AnchorError("invalid_anchor_time") from exc
         if observation.observed_at_utc > now:
             raise AnchorError("future_anchor_observation")
-        if observation.semantics == "remaining" and observation.quantity_value == 100 and observation.reset_kind == "rolling_unanchored" and observation.confidence == "verified":
+        if (
+            observation.semantics == "remaining"
+            and observation.quantity_value == 100
+            and observation.reset_kind == "rolling_unanchored"
+            and observation.confidence == "verified"
+        ):
             if record.attempt_count >= 3:
-                return replace(record, state="cooldown", last_observed_at_utc=observation.observed_at_utc)
-            return replace(record, state="due", last_observed_at_utc=observation.observed_at_utc)
-        return replace(record, state="grace", last_observed_at_utc=observation.observed_at_utc)
+                return replace(
+                    record,
+                    state="cooldown",
+                    last_observed_at_utc=observation.observed_at_utc,
+                )
+            return replace(
+                record, state="due", last_observed_at_utc=observation.observed_at_utc
+            )
+        return replace(
+            record, state="grace", last_observed_at_utc=observation.observed_at_utc
+        )
 
 
 def anchor_due(record: AnchorRecord, *, now: datetime) -> bool:
@@ -163,7 +227,9 @@ def anchor_due(record: AnchorRecord, *, now: datetime) -> bool:
         now = validate_utc_datetime(now, field="anchor_time")
     except ValueError:
         return False
-    return record.state == "due" and (record.cooldown_until_utc is None or now >= record.cooldown_until_utc)
+    return record.state == "due" and (
+        record.cooldown_until_utc is None or now >= record.cooldown_until_utc
+    )
 
 
 class ResetAnchorPlanner:
@@ -190,17 +256,25 @@ class ResetAnchorPlanner:
             allowed = frozenset(allowed_anchor_keys)
         except TypeError as exc:
             raise AnchorError("invalid_anchor_allowlist") from exc
-        if len(allowed) > 256 or any(not _DIGEST_RE.fullmatch(value) for value in allowed):
+        if len(allowed) > 256 or any(
+            not _DIGEST_RE.fullmatch(value) for value in allowed
+        ):
             raise AnchorError("invalid_anchor_allowlist")
-        if not isinstance(execute_enabled, bool) or not isinstance(kill_switch_active, bool):
+        if not isinstance(execute_enabled, bool) or not isinstance(
+            kill_switch_active, bool
+        ):
             raise AnchorError("invalid_proactive_safety_status")
         self._record = record
         self._allowed = allowed
         self._execute_enabled = execute_enabled
         self._kill_switch_active = kill_switch_active
         self._safety_flags = (
-            hard_sandbox_verified, token_budget_verified, runtime_limit_verified,
-            no_tools_verified, empty_workspace_verified, no_repository_data_verified,
+            hard_sandbox_verified,
+            token_budget_verified,
+            runtime_limit_verified,
+            no_tools_verified,
+            empty_workspace_verified,
+            no_repository_data_verified,
             fixed_internal_task_verified,
         )
         if any(not isinstance(value, bool) for value in self._safety_flags):
@@ -211,7 +285,10 @@ class ResetAnchorPlanner:
             now = validate_utc_datetime(now, field="anchor_time")
         except ValueError as exc:
             raise AnchorError("invalid_anchor_time") from exc
-        cooldown_clear = self._record.cooldown_until_utc is None or now >= self._record.cooldown_until_utc
+        cooldown_clear = (
+            self._record.cooldown_until_utc is None
+            or now >= self._record.cooldown_until_utc
+        )
         return ProactiveAnchorSafetyStatus(
             self._record.anchor_key in self._allowed,
             cooldown_clear,
@@ -223,9 +300,16 @@ class ResetAnchorPlanner:
 
     def plan_due(self, *, now: datetime) -> ProactiveAnchorPlan | None:
         status = self.safety_status(now=now)
-        if not anchor_due(self._record, now=now) or not status.allowlisted or not status.cooldown_clear or not status.attempts_available:
+        if (
+            not anchor_due(self._record, now=now)
+            or not status.allowlisted
+            or not status.cooldown_clear
+            or not status.attempts_available
+        ):
             return None
-        return ProactiveAnchorPlan(self._record.anchor_key, self._record.attempt_count + 1, self._record.state)
+        return ProactiveAnchorPlan(
+            self._record.anchor_key, self._record.attempt_count + 1, self._record.state
+        )
 
     def dry_run(self, *, now: datetime) -> dict[str, object]:
         status = self.safety_status(now=now)
@@ -251,13 +335,18 @@ class ResetAnchorPlanner:
         }
 
     def execute(self, plan: ProactiveAnchorPlan) -> dict[str, object]:
-        if not isinstance(plan, ProactiveAnchorPlan) or plan.anchor_key != self._record.anchor_key:
+        if (
+            not isinstance(plan, ProactiveAnchorPlan)
+            or plan.anchor_key != self._record.anchor_key
+        ):
             raise AnchorError("invalid_proactive_anchor_plan")
         return {
             "allowed": False,
             "reason_code": "selection_proactive_anchor_safety_gate",
             "plan": plan.public(),
-            "safety": self.safety_status(now=self._record.last_observed_at_utc or datetime.now(timezone.utc)).public(),
+            "safety": self.safety_status(
+                now=self._record.last_observed_at_utc or datetime.now(timezone.utc)
+            ).public(),
             "mutation_performed": False,
             "raw_output": "not_returned",
         }

@@ -104,8 +104,7 @@ FUNCTION_TEST_MATRIX_V1: dict[str, str] = {
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "src/the_hive/dynamic_worker_coordinator.py"
+    Path(__file__).resolve().parents[1] / "src/the_hive/dynamic_worker_coordinator.py"
 )
 
 
@@ -1195,8 +1194,7 @@ def test_function_matrix_ast_imports_public_surface_and_nodes_are_exact() -> Non
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     definitions.add(
-                        "the_hive.dynamic_worker_coordinator."
-                        f"{node.name}.{child.name}"
+                        f"the_hive.dynamic_worker_coordinator.{node.name}.{child.name}"
                     )
                 elif isinstance(child, ast.AnnAssign) and isinstance(
                     child.target, ast.Name

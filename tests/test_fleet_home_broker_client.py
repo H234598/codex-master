@@ -186,7 +186,9 @@ class FakeOperations:
 
 
 class FakeAgentStartOperations:
-    def __init__(self, frame, *, stat=EXPECTED_STAT, fstat_error=None, close_error=None):
+    def __init__(
+        self, frame, *, stat=EXPECTED_STAT, fstat_error=None, close_error=None
+    ):
         self.frame = frame
         self.stat = stat
         self.fstat_error = fstat_error
@@ -1051,9 +1053,7 @@ def test_agent_start_client_rejects_envelope_binding_drift(changes):
     expected = replace(agent_start_envelope(), **changes)
 
     with pytest.raises(client.BrokerClientError):
-        client.receive_attested_agent_start(
-            agent_start_claim(), expected, operations
-        )
+        client.receive_attested_agent_start(agent_start_claim(), expected, operations)
 
     assert operations.closed == [61]
     assert operations.fstat_calls == []

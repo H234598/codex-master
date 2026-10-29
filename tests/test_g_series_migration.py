@@ -48,7 +48,10 @@ def gemini_series(prefix: str, *account_ids: str) -> FleetMigrationSeries:
         "standard",
         tuple(
             LegacyFleetSeriesMember(
-                f"v1:{prefix}:{ordinal}", ordinal, account_id, True,
+                f"v1:{prefix}:{ordinal}",
+                ordinal,
+                account_id,
+                True,
             )
             for ordinal, account_id in enumerate(account_ids, start=1)
         ),
@@ -56,7 +59,9 @@ def gemini_series(prefix: str, *account_ids: str) -> FleetMigrationSeries:
 
 
 def snapshot(*series: FleetMigrationSeries) -> FleetMigrationSnapshot:
-    account_ids = sorted({member.account_id for item in series for member in item.members})
+    account_ids = sorted(
+        {member.account_id for item in series for member in item.members}
+    )
     return FleetMigrationSnapshot(
         1,
         7,
@@ -82,7 +87,10 @@ def test_free_g_plan_keeps_only_migration_identities_and_never_uses_uuid() -> No
     assert source == before
     assert first.target_prefix == "g"
     assert first.g_relocation_target is None
-    assert [member.migration_identity for member in first.members] == ["v1:m:1", "v1:m:2"]
+    assert [member.migration_identity for member in first.members] == [
+        "v1:m:1",
+        "v1:m:2",
+    ]
     assert [member.target_ordinal for member in first.members] == [1, 2]
     assert all(not hasattr(member, "member_id") for member in first.members)
     assert "opaque-a" not in repr(first)
@@ -128,7 +136,9 @@ def test_active_duplicate_binding_wins_and_other_member_is_retired() -> None:
 
 def test_multiple_active_duplicate_bindings_fail_closed() -> None:
     source = snapshot(gemini_series("m", "gem-a"), gemini_series("n", "gem-b"))
-    with pytest.raises(GMigrationPlanError, match="multiple_active_credential_bindings"):
+    with pytest.raises(
+        GMigrationPlanError, match="multiple_active_credential_bindings"
+    ):
         plan_g_series_migration(
             source,
             credential_bindings={"gem-a": "opaque-shared", "gem-b": "opaque-shared"},
@@ -144,7 +154,9 @@ def test_non_g_members_keep_the_smallest_free_ordinals_deterministically() -> No
     )
     bindings = {"gem-z": "opaque-z", "gem-b": "opaque-b", "gem-a": "opaque-a"}
     plan = plan_g_series_migration(source, credential_bindings=bindings)
-    assert [(item.migration_identity, item.target_ordinal) for item in plan.members] == [
+    assert [
+        (item.migration_identity, item.target_ordinal) for item in plan.members
+    ] == [
         ("v1:g:1", 1),
         ("v1:n:1", 2),
         ("v1:m:1", 3),
@@ -179,16 +191,28 @@ def test_snapshot_subclass_fails_closed_at_exact_type_boundary() -> None:
 
 def test_collided_g_ordinals_are_order_independent_and_smallest_free() -> None:
     left = FleetMigrationSeries(
-        "g", "Synthetic left", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-        "synthetic-model", True, "generic", "standard",
+        "g",
+        "Synthetic left",
+        RunnerKind.GEMINI_CLI,
+        Provider.GEMINI_API,
+        "synthetic-model",
+        True,
+        "generic",
+        "standard",
         (
             LegacyFleetSeriesMember("v1:g:left:1", 1, "gem-a", True),
             LegacyFleetSeriesMember("v1:g:left:3", 3, "gem-c", True),
         ),
     )
     right = FleetMigrationSeries(
-        "g", "Synthetic right", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-        "synthetic-model", True, "generic", "standard",
+        "g",
+        "Synthetic right",
+        RunnerKind.GEMINI_CLI,
+        Provider.GEMINI_API,
+        "synthetic-model",
+        True,
+        "generic",
+        "standard",
         (
             LegacyFleetSeriesMember("v1:g:right:1", 1, "gem-b", True),
             LegacyFleetSeriesMember("v1:g:right:4", 4, "gem-d", True),
@@ -206,12 +230,26 @@ def test_collided_g_ordinals_are_order_independent_and_smallest_free() -> None:
         (left, right),
     )
     left_reversed = FleetMigrationSeries(
-        "g", "Synthetic left", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-        "synthetic-model", True, "generic", "standard", tuple(reversed(left.members)),
+        "g",
+        "Synthetic left",
+        RunnerKind.GEMINI_CLI,
+        Provider.GEMINI_API,
+        "synthetic-model",
+        True,
+        "generic",
+        "standard",
+        tuple(reversed(left.members)),
     )
     right_reversed = FleetMigrationSeries(
-        "g", "Synthetic right", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-        "synthetic-model", True, "generic", "standard", tuple(reversed(right.members)),
+        "g",
+        "Synthetic right",
+        RunnerKind.GEMINI_CLI,
+        Provider.GEMINI_API,
+        "synthetic-model",
+        True,
+        "generic",
+        "standard",
+        tuple(reversed(right.members)),
     )
     reversed_source = FleetMigrationSnapshot(
         1,
@@ -227,7 +265,9 @@ def test_collided_g_ordinals_are_order_independent_and_smallest_free() -> None:
     }
 
     first = plan_g_series_migration(forward, credential_bindings=bindings)
-    second = plan_g_series_migration(reversed_source, credential_bindings=dict(reversed(bindings.items())))
+    second = plan_g_series_migration(
+        reversed_source, credential_bindings=dict(reversed(bindings.items()))
+    )
 
     assert first == second
     assert [

@@ -56,10 +56,7 @@ def _sealed_memfd(payload: bytes) -> int:
     fd = os.memfd_create("ga-i2d-p1a-request", required_flags)
     os.write(fd, payload)
     seals = (
-        fcntl.F_SEAL_WRITE
-        | fcntl.F_SEAL_GROW
-        | fcntl.F_SEAL_SHRINK
-        | fcntl.F_SEAL_SEAL
+        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
     )
     fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
     return fd
@@ -265,9 +262,7 @@ def test_request_reader_rejects_a_partially_sealed_memfd() -> None:
 def test_request_reader_enforces_the_fixed_byte_bound(tmp_path: Path) -> None:
     exact = b"x" * owner_module._MAX_REQUEST_BYTES
     exact_fd = _regular_request_fd(tmp_path / "exact.json", exact)
-    too_large_fd = _regular_request_fd(
-        tmp_path / "too-large.json", exact + b"x"
-    )
+    too_large_fd = _regular_request_fd(tmp_path / "too-large.json", exact + b"x")
     try:
         assert owner_module.read_request_bytes_from_fd(exact_fd) == exact
         _assert_unavailable(

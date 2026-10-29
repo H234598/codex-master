@@ -42,7 +42,10 @@ def _binding(root: Path) -> WorktreeBinding:
         ("git", "commit", "--quiet", "-m", "baseline"), cwd=source, check=True
     )
     attestation = HeadlessWriteScopeStore(root / "binding-evidence-state").create(
-        "agent.test", source.resolve(strict=True), source.resolve(strict=True), base_ref=None
+        "agent.test",
+        source.resolve(strict=True),
+        source.resolve(strict=True),
+        base_ref=None,
     )
     return WorktreeBinding.from_creation_attestation(attestation)
 
@@ -326,7 +329,9 @@ def test_pre_spawn_abort_keeps_changed_or_runtime_bound_temp_protected(
     )
     producer_path = store.create_temporary_producer(lease, now=10)
     wrong_path = producer_path.with_name("different-temp-root")
-    with pytest.raises(WorktreeLifecycleError, match="temporary_producer_identity_invalid"):
+    with pytest.raises(
+        WorktreeLifecycleError, match="temporary_producer_identity_invalid"
+    ):
         store.abort_temporary_producer_before_spawn(lease, wrong_path, now=11)
     assert producer_path.is_dir()
 
@@ -357,7 +362,9 @@ def test_pre_spawn_abort_keeps_changed_or_runtime_bound_temp_protected(
     ):
         evidence = G5ScopeBindingEvidence.capture(lease, scope, now=11)
         bound_lease = store.bind_g5_runtime(lease, evidence, now=11)
-        with pytest.raises(WorktreeLifecycleError, match="pre_spawn_abort_runtime_bound"):
+        with pytest.raises(
+            WorktreeLifecycleError, match="pre_spawn_abort_runtime_bound"
+        ):
             store.abort_temporary_producer_before_spawn(
                 bound_lease, producer_path, now=12
             )
@@ -489,9 +496,7 @@ def test_parent_exit_does_not_release_use_while_bound_runtime_is_active(
         process.join()
         assert process.exitcode == 0
         assert isinstance(pending_lease, UseLease)
-        bind_evidence = RuntimeBindingEvidence.capture(
-            pending_lease, runtime, now=2
-        )
+        bind_evidence = RuntimeBindingEvidence.capture(pending_lease, runtime, now=2)
         lease = store.bind_runtime(pending_lease, bind_evidence, now=3)
         reopened = WorktreeLifecycleStore(HiveStateStore(state_root))
         assert reopened.snapshot().active_uses == (lease,)
@@ -627,7 +632,9 @@ def test_claim_exclusion_holds_in_both_deterministic_orders(tmp_path: Path) -> N
     claim_first_root = tmp_path / "claim-first"
     claim_first_root.mkdir()
     claim_first_binding = _binding(claim_first_root)
-    claim_first_store = WorktreeLifecycleStore(HiveStateStore(claim_first_root / "state"))
+    claim_first_store = WorktreeLifecycleStore(
+        HiveStateStore(claim_first_root / "state")
+    )
     _register_origin(claim_first_store, claim_first_binding, claim_first_root)
     _complete_use(claim_first_store, claim_first_binding)
     claim_first_store.claim_maintenance(claim_first_binding, now=5)
@@ -655,10 +662,14 @@ def test_claim_rejects_wrong_revision_fence_and_replay(tmp_path: Path) -> None:
     with pytest.raises(WorktreeLifecycleError, match="maintenance_claim_mismatch"):
         store.assert_claim(replace(claim, fence=claim.fence + 1))
 
-    with pytest.raises(WorktreeLifecycleError, match="maintenance_operation_incomplete"):
+    with pytest.raises(
+        WorktreeLifecycleError, match="maintenance_operation_incomplete"
+    ):
         store.finish_maintenance(claim, outcome="retained")
     store.assert_claim(claim)
-    with pytest.raises(WorktreeLifecycleError, match="maintenance_operation_incomplete"):
+    with pytest.raises(
+        WorktreeLifecycleError, match="maintenance_operation_incomplete"
+    ):
         store.finish_maintenance(claim, outcome="replayed")
 
 
@@ -687,14 +698,16 @@ def test_maintenance_phase_is_persisted_and_claim_recovers_under_new_fence(
     tree = next(iter(document["worktrees"].values()))
     assert tree["maintenance_operation"]["phase"] == "claimed"
 
-    recovered = WorktreeLifecycleStore(HiveStateStore(state_root)).recover_maintenance_claim(
-        binding, now=6
-    )
+    recovered = WorktreeLifecycleStore(
+        HiveStateStore(state_root)
+    ).recover_maintenance_claim(binding, now=6)
 
     assert recovered.claim_id == stale_claim.claim_id
     assert recovered.owner_process != stale_claim.owner_process
     assert recovered.fence == stale_claim.fence + 1
-    with pytest.raises(WorktreeLifecycleError, match="maintenance_operation_incomplete"):
+    with pytest.raises(
+        WorktreeLifecycleError, match="maintenance_operation_incomplete"
+    ):
         WorktreeLifecycleStore(HiveStateStore(state_root)).finish_maintenance(
             recovered, outcome="incorrectly-finished"
         )
@@ -814,9 +827,9 @@ def test_competing_alias_binding_cannot_create_second_physical_worktree_use(
 
     assert process.exitcode == 0
     assert result == ("blocked", "worktree_binding_alias")
-    assert WorktreeLifecycleStore(HiveStateStore(state_root)).snapshot().active_uses == (
-        original_lease,
-    )
+    assert WorktreeLifecycleStore(
+        HiveStateStore(state_root)
+    ).snapshot().active_uses == (original_lease,)
 
 
 def test_binding_rejects_unrelated_git_common_directory(tmp_path: Path) -> None:
@@ -828,9 +841,7 @@ def test_binding_rejects_unrelated_git_common_directory(tmp_path: Path) -> None:
     alias = replace(binding, git_common_directory=unrelated_common)
     store = WorktreeLifecycleStore(HiveStateStore(tmp_path / "state"))
 
-    with pytest.raises(
-        WorktreeLifecycleError, match="worktree_git_common_mismatch"
-    ):
+    with pytest.raises(WorktreeLifecycleError, match="worktree_git_common_mismatch"):
         store.begin_use(
             alias,
             principal_id="principal.test",
@@ -840,7 +851,9 @@ def test_binding_rejects_unrelated_git_common_directory(tmp_path: Path) -> None:
         )
 
 
-def test_native_reference_blocks_maintenance_for_any_project_source(tmp_path: Path) -> None:
+def test_native_reference_blocks_maintenance_for_any_project_source(
+    tmp_path: Path,
+) -> None:
     state = HiveStateStore(tmp_path / "state")
     store = WorktreeLifecycleStore(state)
     first = _binding(tmp_path)
@@ -915,8 +928,13 @@ def test_native_writer_persists_reference_before_pruning_expired_reservation(
             "NATIVE_AGENT_REGISTRY_LOCK_FILE",
             state_root / "locks" / "native-agents.lock",
         ),
-        patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
-        patch("the_hive.native_registry.retained_pin_session_ids", return_value=frozenset()),
+        patch.object(
+            server_module, "_worktree_lifecycle_store", return_value=lifecycle
+        ),
+        patch(
+            "the_hive.native_registry.retained_pin_session_ids",
+            return_value=frozenset(),
+        ),
     ):
         server_module._write_native_agent_registry(
             {
@@ -967,14 +985,21 @@ def test_native_writer_persists_reference_before_pruning_unpinned_history(
             "NATIVE_AGENT_REGISTRY_LOCK_FILE",
             state_root / "locks" / "native-agents.lock",
         ),
-        patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
-        patch("the_hive.native_registry.retained_pin_session_ids", return_value=frozenset()),
+        patch.object(
+            server_module, "_worktree_lifecycle_store", return_value=lifecycle
+        ),
+        patch(
+            "the_hive.native_registry.retained_pin_session_ids",
+            return_value=frozenset(),
+        ),
     ):
         server_module._write_native_agent_registry(
             {"schema_version": 2, "agents": agents, "sessions": [], "reservations": []},
             now=2_000,
         )
-        assert len(json.loads(native_file.read_text(encoding="utf-8"))["agents"]) == 1024
+        assert (
+            len(json.loads(native_file.read_text(encoding="utf-8"))["agents"]) == 1024
+        )
         with pytest.raises(WorktreeLifecycleError, match="native_reference_active"):
             lifecycle.claim_maintenance(binding, now=2_001)
 
@@ -998,8 +1023,12 @@ def test_native_claim_fence_race_uses_real_hive_state_and_registry_locks(
             patch.object(server_module, "LOCK_DIR", state_root / "locks"),
             patch.object(server_module, "NATIVE_AGENT_REGISTRY_FILE", native_file),
             patch.object(server_module, "NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_file),
-            patch.object(server_module, "_worktree_lifecycle_store", return_value=lifecycle),
-            patch.object(server_module, "retained_pin_session_ids", return_value=frozenset()),
+            patch.object(
+                server_module, "_worktree_lifecycle_store", return_value=lifecycle
+            ),
+            patch.object(
+                server_module, "retained_pin_session_ids", return_value=frozenset()
+            ),
         ):
             server_module._write_native_agent_registry(
                 {"schema_version": 2, "agents": [], "sessions": [], "reservations": []},

@@ -7,6 +7,7 @@ Hinweis: Nutzt diese Templates nur in interaktiven Seats (IDE/Web UI). Nicht fü
 ---
 
 ## 1) Quick Diff Review (Use when you have a small patch)
+
 Prompt (paste into the Copilot/Chat window together with the unified diff):
 
 ```
@@ -27,6 +28,7 @@ Example usage: paste the small diff, run Copilot, copy the JSON into your audit 
 ---
 
 ## 2) Security Scan Prompt (Repo snippet)
+
 Use this when sending a focused code snippet or function.
 
 ```
@@ -44,6 +46,7 @@ Focus only on the snippet provided. If the snippet references global state or se
 ---
 
 ## 3) Refactor Suggestion (Behavioral)
+
 Use this for maintainability or API redesign suggestions.
 
 ```
@@ -61,6 +64,6 @@ Keep the response compact and precise. If the change requires broad repository k
 ---
 
 ## How to store & reuse outputs
+
 - Save each structured response next to the diff or assignment as JSON with metadata: request_id, assignment_id, seat_id, timestamp, model_version. This makes caching and audit trivial.
 - Use the canonical_plan_id (hash of the assignment body) as cache key.
-

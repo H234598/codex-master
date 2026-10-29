@@ -13,8 +13,17 @@ from the_hive.admission import (
     ScopeBinding,
     create_admission,
 )
-from the_hive.admission_journal import CompletionJournal, CompletionJournalError, FileCompletionJournal
-from the_hive.admission_runtime import ADMISSION_RUNTIME_GATES, AdmissionRuntimeError, RuntimeGateDecision, ServerAdmissionRuntime
+from the_hive.admission_journal import (
+    CompletionJournal,
+    CompletionJournalError,
+    FileCompletionJournal,
+)
+from the_hive.admission_runtime import (
+    ADMISSION_RUNTIME_GATES,
+    AdmissionRuntimeError,
+    RuntimeGateDecision,
+    ServerAdmissionRuntime,
+)
 from the_hive.hive.events import HiveEventStore
 from the_hive.selection_service import SelectionService
 from the_hive.usage_snapshot import UsageEvidenceV2
@@ -30,7 +39,9 @@ def test_completion_journal_base_record_started_requires_adapter() -> None:
 
 def test_completion_journal_base_record_completed_requires_adapter() -> None:
     with pytest.raises(NotImplementedError):
-        CompletionJournal().record_completed(executing_record(), "assign", {"status": "ok"})
+        CompletionJournal().record_completed(
+            executing_record(), "assign", {"status": "ok"}
+        )
 
 
 def test_completion_journal_base_execution_completed_requires_adapter() -> None:
@@ -52,7 +63,9 @@ def admission():
         grant_digest="sha256:grant-journal",
         work_item_version=1,
         scope=ScopeBinding("write", ("src",), "sha256:scope-journal"),
-        resource=ResourceBinding("agent-journal", "account-journal", "standard", "gpt-primary", 1),
+        resource=ResourceBinding(
+            "agent-journal", "account-journal", "standard", "gpt-primary", 1
+        ),
         lease_context=LeaseBinding("available"),
         priority=AdmissionPriority("DP1", "selection"),
         now=NOW,
@@ -62,14 +75,18 @@ def admission():
 def executing_record():
     store = AdmissionStore()
     reserved = store.reserve(admission(), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=reserved.revision, now=NOW)
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=reserved.revision, now=NOW
+    )
     admitted = store.complete_revalidation(
         revalidating.admission_id,
         expected_revision=revalidating.revision,
         valid=True,
         now=NOW,
     )
-    return store.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
+    return store.begin_execution(
+        admitted.admission_id, expected_revision=admitted.revision, now=NOW
+    )
 
 
 def allow_all():
@@ -85,13 +102,17 @@ def unused_pool_authority_reader() -> UsageEvidenceV2:
     )
 
 
-def test_file_completion_journal_survives_reload_without_result_values(tmp_path: Path) -> None:
+def test_file_completion_journal_survives_reload_without_result_values(
+    tmp_path: Path,
+) -> None:
     record = executing_record()
     journal = FileCompletionJournal(tmp_path / "journal", now=lambda: NOW)
 
     journal.record_started(record, "assign")
     assert journal.status(record.admission_id)["state"] == "started"
-    journal.record_completed(record, "assign", {"status": "ok", "api_token": "must-not-persist"})
+    journal.record_completed(
+        record, "assign", {"status": "ok", "api_token": "must-not-persist"}
+    )
 
     reloaded = FileCompletionJournal(tmp_path / "journal", now=lambda: NOW)
     assert reloaded.execution_completed(record) is True
@@ -101,7 +122,9 @@ def test_file_completion_journal_survives_reload_without_result_values(tmp_path:
         "state": "completed",
         "raw_output": "not_returned",
     }
-    raw = (tmp_path / "journal" / "admission-completion.json").read_text(encoding="utf-8")
+    raw = (tmp_path / "journal" / "admission-completion.json").read_text(
+        encoding="utf-8"
+    )
     assert "must-not-persist" not in raw
     assert "api_token" not in raw
 
@@ -109,12 +132,18 @@ def test_file_completion_journal_survives_reload_without_result_values(tmp_path:
 def test_file_completion_journal_can_emit_sanitized_hive_events(tmp_path: Path) -> None:
     record = executing_record()
     events = HiveEventStore(tmp_path / "events", now=lambda: NOW)
-    journal = FileCompletionJournal(tmp_path / "journal", event_store=events, now=lambda: NOW)
+    journal = FileCompletionJournal(
+        tmp_path / "journal", event_store=events, now=lambda: NOW
+    )
 
     journal.record_started(record, "assign")
     journal.record_started(record, "assign")
-    journal.record_completed(record, "assign", {"status": "ok", "api_token": "must-not-persist"})
-    journal.record_completed(record, "assign", {"status": "ok", "api_token": "must-not-persist"})
+    journal.record_completed(
+        record, "assign", {"status": "ok", "api_token": "must-not-persist"}
+    )
+    journal.record_completed(
+        record, "assign", {"status": "ok", "api_token": "must-not-persist"}
+    )
 
     _, report_events = events.read_report_sources()
 
@@ -123,7 +152,9 @@ def test_file_completion_journal_can_emit_sanitized_hive_events(tmp_path: Path) 
     assert "must-not-persist" not in raw
 
 
-def test_file_completion_journal_is_idempotent_but_rejects_revision_or_operation_conflicts(tmp_path: Path) -> None:
+def test_file_completion_journal_is_idempotent_but_rejects_revision_or_operation_conflicts(
+    tmp_path: Path,
+) -> None:
     record = executing_record()
     journal = FileCompletionJournal(tmp_path / "journal", now=lambda: NOW)
     journal.record_started(record, "assign")
@@ -154,19 +185,24 @@ def test_completion_evidence_is_bound_to_assignment_metadata(tmp_path: Path) -> 
     assert fresh.execution_completed(changed) is False
 
 
-def test_runtime_writes_completion_before_a_fresh_process_recovers(tmp_path: Path) -> None:
+def test_runtime_writes_completion_before_a_fresh_process_recovers(
+    tmp_path: Path,
+) -> None:
     journal = FileCompletionJournal(tmp_path / "journal", now=lambda: NOW)
     executed: list[str] = []
     runtime = ServerAdmissionRuntime(
         allow_all(),
-        execute=lambda _record, operation: executed.append(operation) or {"status": "ok"},
+        execute=lambda _record, operation: executed.append(operation)
+        or {"status": "ok"},
         completion_journal=journal,
         pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
     store = AdmissionStore()
     reserved = store.reserve(admission(), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=reserved.revision, now=NOW)
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=reserved.revision, now=NOW
+    )
     assert runtime.revalidate(revalidating) is True
     admitted = store.complete_revalidation(
         revalidating.admission_id,
@@ -174,7 +210,9 @@ def test_runtime_writes_completion_before_a_fresh_process_recovers(tmp_path: Pat
         valid=True,
         now=NOW,
     )
-    executing = store.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
+    executing = store.begin_execution(
+        admitted.admission_id, expected_revision=admitted.revision, now=NOW
+    )
 
     assert runtime.execute(executing, "assign") == {"status": "ok"}
     assert executed == ["assign"]
@@ -186,7 +224,9 @@ def test_runtime_writes_completion_before_a_fresh_process_recovers(tmp_path: Pat
     assert fresh_runtime.execution_completed(executing) is True
 
 
-def test_runtime_rejects_ambiguous_completion_sources_and_journal_failure(tmp_path: Path) -> None:
+def test_runtime_rejects_ambiguous_completion_sources_and_journal_failure(
+    tmp_path: Path,
+) -> None:
     journal = FileCompletionJournal(tmp_path / "journal", now=lambda: NOW)
     with pytest.raises(AdmissionRuntimeError, match="ambiguous_completion_evidence"):
         ServerAdmissionRuntime(
@@ -210,14 +250,18 @@ def test_runtime_rejects_ambiguous_completion_sources_and_journal_failure(tmp_pa
 def test_selection_recovery_uses_persisted_completion_evidence(tmp_path: Path) -> None:
     store = AdmissionStore()
     reserved = store.reserve(admission(), now=NOW)
-    revalidating = store.begin_revalidation(reserved.admission_id, expected_revision=reserved.revision, now=NOW)
+    revalidating = store.begin_revalidation(
+        reserved.admission_id, expected_revision=reserved.revision, now=NOW
+    )
     admitted = store.complete_revalidation(
         revalidating.admission_id,
         expected_revision=revalidating.revision,
         valid=True,
         now=NOW,
     )
-    executing = store.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
+    executing = store.begin_execution(
+        admitted.admission_id, expected_revision=admitted.revision, now=NOW
+    )
     journal = FileCompletionJournal(tmp_path / "journal", now=lambda: NOW)
     journal.record_started(executing, "assign")
     journal.record_completed(executing, "assign", {"status": "ok"})
@@ -230,5 +274,10 @@ def test_selection_recovery_uses_persisted_completion_evidence(tmp_path: Path) -
 
     result = SelectionService(store, runtime, now=lambda: NOW).reconcile_incomplete()
 
-    assert result == {"recovered": 1, "compensated": 0, "unresolved": 0, "raw_output": "not_returned"}
+    assert result == {
+        "recovered": 1,
+        "compensated": 0,
+        "unresolved": 0,
+        "raw_output": "not_returned",
+    }
     assert store.get(executing.admission_id).state is AdmissionState.FINALIZED

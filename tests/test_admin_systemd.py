@@ -14,9 +14,7 @@ MASTER_SYSUSERS = ROOT / "systemd" / "sysusers.d" / "the-hive-agent-api.conf"
 MASTER_TMPFILES = ROOT / "systemd" / "tmpfiles.d" / "the-hive-agent-api.conf"
 
 
-def _directives(
-    section: str, unit: Path = UNIT
-) -> dict[str, list[str]]:
+def _directives(section: str, unit: Path = UNIT) -> dict[str, list[str]]:
     current = ""
     result: dict[str, list[str]] = {}
     for raw_line in unit.read_text(encoding="utf-8").splitlines():
@@ -37,9 +35,7 @@ def test_unit_exposes_the_admin_cli_entrypoint() -> None:
     assert document["project"]["scripts"]["the-hive-admin"] == (
         "the_hive.admin_daemon:main"
     )
-    assert _directives("Service")["ExecStart"] == [
-        "@THE_HIVE_BINDIR@/the-hive-admin"
-    ]
+    assert _directives("Service")["ExecStart"] == ["@THE_HIVE_BINDIR@/the-hive-admin"]
 
 
 def test_unit_passes_every_secret_only_as_a_systemd_credential() -> None:
@@ -159,8 +155,7 @@ def test_agent_api_unit_uses_private_tls_entrypoint_and_credentials() -> None:
     assert service["SupplementaryGroups"] == ["the-hive-agent-state"]
     assert service["ReadWritePaths"] == ["/var/lib/codex-master-agent"]
     assert service["ExecStart"] == [
-        "@THE_HIVE_BINDIR@/the-hive-agent-api "
-        "--listen-address-credential --port=9443"
+        "@THE_HIVE_BINDIR@/the-hive-agent-api --listen-address-credential --port=9443"
     ]
     assert service["TimeoutStopSec"] == ["10s"]
     assert service["LoadCredential"] == [
@@ -183,9 +178,7 @@ def test_agent_api_waits_for_admin_binding_provisioning() -> None:
     unit = _directives("Unit", AGENT_API_UNIT)
 
     assert unit["Requires"] == ["the-hive-admin.service"]
-    assert unit["After"] == [
-        "network-online.target the-hive-admin.service"
-    ]
+    assert unit["After"] == ["network-online.target the-hive-admin.service"]
 
 
 def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> None:
@@ -209,9 +202,7 @@ def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> No
     assert service["ReadWritePaths"] == [
         "/var/lib/codex-master-host-agent",
     ]
-    assert service["ExecStart"] == [
-        "@THE_HIVE_BINDIR@/the-hive-host-agent"
-    ]
+    assert service["ExecStart"] == ["@THE_HIVE_BINDIR@/the-hive-host-agent"]
     assert service["PAMName"] == ["login"]
     assert service["TimeoutStopSec"] == ["10s"]
     assert set(service["LoadCredential"]) == {
@@ -225,7 +216,9 @@ def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> No
     assert "DynamicUser" not in service
     _assert_hardening(service)
     exec_start = " ".join(service["ExecStart"]).lower()
-    assert not any(marker in exec_start for marker in ("key", "cert", "config", "secret"))
+    assert not any(
+        marker in exec_start for marker in ("key", "cert", "config", "secret")
+    )
 
 
 def test_static_accounts_and_shared_agent_state_are_deployable() -> None:
@@ -264,11 +257,11 @@ def test_wheel_contract_contains_installer_units_and_static_account_layout() -> 
         ],
         "lib/the-hive/systemd/sysusers.d": [
             "systemd/sysusers.d/the-hive-agent-api.conf",
-            "systemd/sysusers.d/the-hive-host-agent.conf"
+            "systemd/sysusers.d/the-hive-host-agent.conf",
         ],
         "lib/the-hive/systemd/tmpfiles.d": [
             "systemd/tmpfiles.d/the-hive-agent-api.conf",
-            "systemd/tmpfiles.d/the-hive-host-agent.conf"
+            "systemd/tmpfiles.d/the-hive-host-agent.conf",
         ],
         "lib/the-hive/systemd/user": [
             "systemd/user/the-hive-worktree-maintenance.service",

@@ -54,7 +54,9 @@ class HiveControlPlaneStore:
         moment = _utc_time(now)
         with self._state.locked():
             try:
-                self._state.read_json_locked(_TASK9_PATH, max_bytes=MAX_HIVE_STATE_BYTES)
+                self._state.read_json_locked(
+                    _TASK9_PATH, max_bytes=MAX_HIVE_STATE_BYTES
+                )
             except HiveStateError as exc:
                 if str(exc) != "state_not_found":
                     raise HiveStateError("control_plane_state_unavailable") from exc
@@ -94,7 +96,9 @@ class HiveControlPlaneStore:
 
     def _load_task9_locked(self) -> dict[str, object]:
         try:
-            document = self._state.read_json_locked(_TASK9_PATH, max_bytes=MAX_HIVE_STATE_BYTES)
+            document = self._state.read_json_locked(
+                _TASK9_PATH, max_bytes=MAX_HIVE_STATE_BYTES
+            )
             if _is_legacy_v1_without_pool_dispatches(document):
                 normalized = dict(document)
                 normalized["pool_dispatches"] = []
@@ -200,7 +204,11 @@ def _parse_utc_timestamp(value: object) -> datetime:
 
 def _utc_time(value: datetime) -> datetime:
     try:
-        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() != timedelta(0)
+        ):
             raise ValueError
         return validate_utc_datetime(value, field="control_plane_time")
     except (HiveValidationError, TypeError, ValueError):

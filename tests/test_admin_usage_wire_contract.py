@@ -90,16 +90,17 @@ def test_master_and_usage_reject_identical_invalid_host_probe_boundaries(
         "observed_at": "2026-08-28T10:00:00Z",
         "agent_generation": 1,
     } | override
-    digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-        ).encode("ascii")
-    ).hexdigest()
+    digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest()
+    )
     result = evidence | {"evidence_digest": digest}
 
-    with pytest.raises(
-        AdminContractError, match=r"resource\.host_response_invalid"
-    ):
+    with pytest.raises(AdminContractError, match=r"resource\.host_response_invalid"):
         public_agent_result("host.probe", result)
     with pytest.raises(ControlContractError, match=r"control\.response_invalid"):
         parse_operation_status(

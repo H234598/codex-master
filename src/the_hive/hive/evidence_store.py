@@ -33,11 +33,14 @@ class TestStatusStore:
             raise HiveStateError("invalid_state_document")
         relative = self._relative(receipt.repository_id, receipt.executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, receipt.repository_id, receipt.executor_fingerprint)
+            document = self._load_locked(
+                state, relative, receipt.repository_id, receipt.executor_fingerprint
+            )
             records = [
                 item
                 for item in document["receipts"]
-                if isinstance(item, dict) and self._evidence_id(item) != receipt.evidence_id
+                if isinstance(item, dict)
+                and self._evidence_id(item) != receipt.evidence_id
             ]
             records.append(receipt.public())
             records.sort(
@@ -59,11 +62,17 @@ class TestStatusStore:
         started_monotonic_ns: int,
         expires_monotonic_ns: int,
     ) -> None:
-        self._validate_attempt(test_id, attempt_id, started_monotonic_ns, expires_monotonic_ns)
+        self._validate_attempt(
+            test_id, attempt_id, started_monotonic_ns, expires_monotonic_ns
+        )
         relative = self._relative(repository_id, executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
-            running = [item for item in document["running"] if item["test_id"] != test_id]
+            document = self._load_locked(
+                state, relative, repository_id, executor_fingerprint
+            )
+            running = [
+                item for item in document["running"] if item["test_id"] != test_id
+            ]
             running.append(
                 {
                     "test_id": test_id,
@@ -72,7 +81,9 @@ class TestStatusStore:
                     "expires_monotonic_ns": expires_monotonic_ns,
                 }
             )
-            document["running"] = sorted(running, key=lambda item: item["test_id"])[-_MAX_RUNNING:]
+            document["running"] = sorted(running, key=lambda item: item["test_id"])[
+                -_MAX_RUNNING:
+            ]
             state.replace_json_locked(relative, document)
 
     def cancel_attempt(
@@ -84,7 +95,9 @@ class TestStatusStore:
     ) -> None:
         relative = self._relative(repository_id, executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
+            document = self._load_locked(
+                state, relative, repository_id, executor_fingerprint
+            )
             document["running"] = [
                 item
                 for item in document["running"]
@@ -102,12 +115,15 @@ class TestStatusStore:
     ) -> dict[str, object] | None:
         relative = self._relative(repository_id, executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
+            document = self._load_locked(
+                state, relative, repository_id, executor_fingerprint
+            )
         return next(
             (
                 dict(item)
                 for item in document["running"]
-                if item["test_id"] == test_id and now_monotonic_ns < item["expires_monotonic_ns"]
+                if item["test_id"] == test_id
+                and now_monotonic_ns < item["expires_monotonic_ns"]
             ),
             None,
         )
@@ -118,10 +134,14 @@ class TestStatusStore:
         executor_fingerprint: str,
         *,
         now_monotonic_ns: int,
-    ) -> tuple[dict[str, EvidenceReceiptV1], frozenset[str], dict[str, dict[str, object]]]:
+    ) -> tuple[
+        dict[str, EvidenceReceiptV1], frozenset[str], dict[str, dict[str, object]]
+    ]:
         relative = self._relative(repository_id, executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
+            document = self._load_locked(
+                state, relative, repository_id, executor_fingerprint
+            )
         latest: dict[str, EvidenceReceiptV1] = {}
         for raw in document["receipts"]:
             try:
@@ -129,7 +149,10 @@ class TestStatusStore:
             except (TypeError, ValueError):
                 continue
             previous = latest.get(receipt.test_id)
-            if previous is None or (receipt.finished_monotonic_ns, receipt.attempt_id) > (
+            if previous is None or (
+                receipt.finished_monotonic_ns,
+                receipt.attempt_id,
+            ) > (
                 previous.finished_monotonic_ns,
                 previous.attempt_id,
             ):
@@ -146,7 +169,9 @@ class TestStatusStore:
     ) -> EvidenceReceiptV1 | None:
         relative = self._relative(repository_id, executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
+            document = self._load_locked(
+                state, relative, repository_id, executor_fingerprint
+            )
         matches: list[EvidenceReceiptV1] = []
         for raw in document["receipts"]:
             try:
@@ -161,20 +186,28 @@ class TestStatusStore:
             default=None,
         )
 
-    def invalidate(self, repository_id: str, executor_fingerprint: str, evidence_id: str) -> None:
+    def invalidate(
+        self, repository_id: str, executor_fingerprint: str, evidence_id: str
+    ) -> None:
         if not isinstance(evidence_id, str) or not _DIGEST_RE.fullmatch(evidence_id):
             raise HiveStateError("invalid_state_document")
         relative = self._relative(repository_id, executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
+            document = self._load_locked(
+                state, relative, repository_id, executor_fingerprint
+            )
             revoked = sorted({*document["revoked"], evidence_id})
             document["revoked"] = revoked[-_MAX_REVOKED:]
             state.replace_json_locked(relative, document)
 
-    def is_revoked(self, repository_id: str, executor_fingerprint: str, evidence_id: str) -> bool:
+    def is_revoked(
+        self, repository_id: str, executor_fingerprint: str, evidence_id: str
+    ) -> bool:
         relative = self._relative(repository_id, executor_fingerprint)
         with self._state.locked() as state:
-            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
+            document = self._load_locked(
+                state, relative, repository_id, executor_fingerprint
+            )
         return evidence_id in document["revoked"]
 
     def status(
@@ -249,9 +282,13 @@ class TestStatusStore:
 
     @staticmethod
     def _relative(repository_id: str, executor_fingerprint: str) -> PurePosixPath:
-        if not isinstance(repository_id, str) or not _REPOSITORY_RE.fullmatch(repository_id):
+        if not isinstance(repository_id, str) or not _REPOSITORY_RE.fullmatch(
+            repository_id
+        ):
             raise HiveStateError("invalid_state_path")
-        if not isinstance(executor_fingerprint, str) or not _DIGEST_RE.fullmatch(executor_fingerprint):
+        if not isinstance(executor_fingerprint, str) or not _DIGEST_RE.fullmatch(
+            executor_fingerprint
+        ):
             raise HiveStateError("invalid_state_path")
         executor_key = hashlib.sha256(executor_fingerprint.encode("ascii")).hexdigest()
         return PurePosixPath(repository_id, executor_key + ".json")
@@ -276,7 +313,9 @@ class TestStatusStore:
         executor_fingerprint: str,
     ) -> dict[str, object]:
         try:
-            document = dict(state.read_json_locked(relative, max_bytes=_MAX_STATE_BYTES))
+            document = dict(
+                state.read_json_locked(relative, max_bytes=_MAX_STATE_BYTES)
+            )
         except HiveStateError as exc:
             if str(exc) == "state_not_found":
                 return cls._empty(repository_id, executor_fingerprint)
@@ -298,7 +337,10 @@ class TestStatusStore:
             or len(document["receipts"]) > _MAX_RECEIPTS
             or not isinstance(document["revoked"], list)
             or len(document["revoked"]) > _MAX_REVOKED
-            or any(not isinstance(value, str) or not _DIGEST_RE.fullmatch(value) for value in document["revoked"])
+            or any(
+                not isinstance(value, str) or not _DIGEST_RE.fullmatch(value)
+                for value in document["revoked"]
+            )
             or not isinstance(document["running"], list)
             or len(document["running"]) > _MAX_RUNNING
             or any(not cls._valid_attempt(item) for item in document["running"])

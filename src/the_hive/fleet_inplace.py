@@ -34,7 +34,14 @@ _SPECS = (
     (".codex-fleet-agent.json", "marker", 0o600, 64 * 1024),
 )
 _SPEC_BY_NAME = {item[0]: item for item in _SPECS}
-_PHASES = {"prepared", "materializing", "materialized", "committed", "rolling_back", "rolling_forward"}
+_PHASES = {
+    "prepared",
+    "materializing",
+    "materialized",
+    "committed",
+    "rolling_back",
+    "rolling_forward",
+}
 
 
 class InplaceError(RuntimeError):
@@ -100,7 +107,13 @@ def _directory(path: Path, code: str) -> os.stat_result:
 
 
 def _home_identity(current: os.stat_result) -> tuple[int, int, int, int, int]:
-    return current.st_dev, current.st_ino, current.st_mode, current.st_uid, current.st_gid
+    return (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_uid,
+        current.st_gid,
+    )
 
 
 def _metadata(current: os.stat_result) -> tuple[int, ...]:
@@ -116,7 +129,9 @@ def _metadata(current: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _open_home(path: Path, expected: tuple[int, int, int, int, int] | None = None) -> int:
+def _open_home(
+    path: Path, expected: tuple[int, int, int, int, int] | None = None
+) -> int:
     _directory(path, "unsafe_home")
     try:
         descriptor = os.open(path, _dir_flags())
@@ -181,7 +196,9 @@ def _read_leaf(
     ):
         _fail("unsafe_managed_leaf")
     try:
-        descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=home_fd)
+        descriptor = os.open(
+            name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=home_fd
+        )
         opened = os.fstat(descriptor)
         if _metadata(opened) != _metadata(before):
             _fail("managed_drift")
@@ -209,7 +226,9 @@ def _same_payload(state: _FileState | None, other: _FileState | None) -> bool:
     return state.mode == other.mode and state.digest == other.digest
 
 
-def _revalidate_leaf(home_fd: int, name: str, limit: int, expected: _FileState | None) -> None:
+def _revalidate_leaf(
+    home_fd: int, name: str, limit: int, expected: _FileState | None
+) -> None:
     current, _ = _read_leaf(home_fd, name, limit, missing_ok=True)
     if not _same(current, expected):
         _fail("managed_drift")
@@ -315,7 +334,11 @@ def _read_private(path: Path, limit: int, code: str) -> bytes:
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    if len(data) > limit or _metadata(opened) != _metadata(current) or _metadata(after) != _metadata(opened):
+    if (
+        len(data) > limit
+        or _metadata(opened) != _metadata(current)
+        or _metadata(after) != _metadata(opened)
+    ):
         _fail(code)
     return data
 
@@ -330,8 +353,14 @@ def _parse_state(value: object) -> _FileState | None:
     fields = {"dev", "ino", "mode", "uid", "gid", "nlink", "size", "mtime_ns", "digest"}
     if not isinstance(value, dict) or set(value) != fields:
         _fail("invalid_journal")
-    numbers = [value[key] for key in ("dev", "ino", "mode", "uid", "gid", "nlink", "size", "mtime_ns")]
-    if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in numbers):
+    numbers = [
+        value[key]
+        for key in ("dev", "ino", "mode", "uid", "gid", "nlink", "size", "mtime_ns")
+    ]
+    if any(
+        isinstance(item, bool) or not isinstance(item, int) or item < 0
+        for item in numbers
+    ):
         _fail("invalid_journal")
     digest = value["digest"]
     if (
@@ -351,9 +380,12 @@ def _journal_bytes(journal: dict[str, object]) -> bytes:
             return _state_doc(value)
         raise TypeError
 
-    payload = json.dumps(
-        journal, sort_keys=True, separators=(",", ":"), default=encode
-    ).encode() + b"\n"
+    payload = (
+        json.dumps(
+            journal, sort_keys=True, separators=(",", ":"), default=encode
+        ).encode()
+        + b"\n"
+    )
     if len(payload) > MAX_JOURNAL_BYTES:
         _fail("invalid_request")
     return payload
@@ -363,7 +395,9 @@ def _store_journal(transaction: Path, journal: dict[str, object]) -> None:
     _atomic_private(transaction / "journal.json", _journal_bytes(journal))
 
 
-def _ordered(updates: tuple[QHomeUpdate, ...]) -> list[tuple[QHomeUpdate, tuple[str, str, int, int]]]:
+def _ordered(
+    updates: tuple[QHomeUpdate, ...],
+) -> list[tuple[QHomeUpdate, tuple[str, str, int, int]]]:
     return [(update, spec) for spec in _SPECS for update in updates]
 
 
@@ -430,14 +464,18 @@ def _prepare(
 ) -> tuple[Path, dict[str, object], dict[str, Path]]:
     homes: dict[str, Path] = {}
     identities: dict[str, tuple[int, int, int, int, int]] = {}
-    snapshots: list[tuple[QHomeUpdate, tuple[str, str, int, int], _FileState | None, bytes | None]] = []
+    snapshots: list[
+        tuple[QHomeUpdate, tuple[str, str, int, int], _FileState | None, bytes | None]
+    ] = []
     for update in updates:
         home_fd = _open_home(update.home)
         identity = _home_identity(os.fstat(home_fd))
         homes[update.home_id] = update.home
         identities[update.home_id] = identity
         try:
-            for item, spec in ((candidate, spec) for candidate, spec in _ordered((update,))):
+            for item, spec in (
+                (candidate, spec) for candidate, spec in _ordered((update,))
+            ):
                 name, _attribute, _mode, limit = spec
                 old, data = _read_leaf(home_fd, name, limit, missing_ok=True)
                 snapshots.append((item, spec, old, data))
@@ -454,7 +492,10 @@ def _prepare(
         _fail("transaction_prepare_failed")
     entries: list[dict[str, object]] = []
     try:
-        lookup = {(item.home_id, spec[0]): (item, spec, old, data) for item, spec, old, data in snapshots}
+        lookup = {
+            (item.home_id, spec[0]): (item, spec, old, data)
+            for item, spec, old, data in snapshots
+        }
         for index, (update, spec) in enumerate(_ordered(updates)):
             name, attribute, mode, _limit = spec
             _item, _spec, old, old_data = lookup[(update.home_id, name)]
@@ -465,18 +506,20 @@ def _prepare(
             if old_data is not None:
                 backup = f"old-{index:02d}"
                 _atomic_private(transaction / backup, old_data)
-            entries.append({
-                "home_id": update.home_id,
-                "name": name,
-                "mode": mode,
-                "digest": _digest(desired),
-                "stage": stage,
-                "old": _state_doc(old),
-                "backup": backup,
-                "applied": False,
-                "installed": None,
-                "restored": None,
-            })
+            entries.append(
+                {
+                    "home_id": update.home_id,
+                    "name": name,
+                    "mode": mode,
+                    "digest": _digest(desired),
+                    "stage": stage,
+                    "old": _state_doc(old),
+                    "backup": backup,
+                    "applied": False,
+                    "installed": None,
+                    "restored": None,
+                }
+            )
         journal: dict[str, object] = {
             "version": 1,
             "transaction_id": transaction_id,
@@ -484,7 +527,8 @@ def _prepare(
             "new_generation": new_generation,
             "phase": "prepared",
             "homes": [
-                {"home_id": key, "identity": list(value)} for key, value in identities.items()
+                {"home_id": key, "identity": list(value)}
+                for key, value in identities.items()
             ],
             "entries": entries,
         }
@@ -497,16 +541,39 @@ def _prepare(
 
 def _parse_journal(transaction: Path, transaction_id: str) -> dict[str, object]:
     try:
-        raw = json.loads(_read_private(transaction / "journal.json", MAX_JOURNAL_BYTES, "invalid_journal"))
+        raw = json.loads(
+            _read_private(
+                transaction / "journal.json", MAX_JOURNAL_BYTES, "invalid_journal"
+            )
+        )
     except (UnicodeDecodeError, json.JSONDecodeError):
         _fail("invalid_journal")
-    root_fields = {"version", "transaction_id", "old_generation", "new_generation", "phase", "homes", "entries"}
-    if not isinstance(raw, dict) or set(raw) != root_fields or raw["version"] != 1 or raw["transaction_id"] != transaction_id:
+    root_fields = {
+        "version",
+        "transaction_id",
+        "old_generation",
+        "new_generation",
+        "phase",
+        "homes",
+        "entries",
+    }
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != root_fields
+        or raw["version"] != 1
+        or raw["transaction_id"] != transaction_id
+    ):
         _fail("invalid_journal")
     if raw["phase"] not in _PHASES:
         _fail("invalid_journal")
     generations = (raw["old_generation"], raw["new_generation"])
-    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in generations) or generations[0] == generations[1]:
+    if (
+        any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in generations
+        )
+        or generations[0] == generations[1]
+    ):
         _fail("invalid_journal")
     homes_raw = raw["homes"]
     if not isinstance(homes_raw, list) or not 1 <= len(homes_raw) <= MAX_Q_HOMES:
@@ -522,17 +589,35 @@ def _parse_journal(transaction: Path, transaction_id: str) -> dict[str, object]:
             or home_id in ids
             or not isinstance(identity, list)
             or len(identity) != 5
-            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in identity)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in identity
+            )
         ):
             _fail("invalid_journal")
         ids.append(home_id)
     entries = raw["entries"]
-    fields = {"home_id", "name", "mode", "digest", "stage", "old", "backup", "applied", "installed", "restored"}
+    fields = {
+        "home_id",
+        "name",
+        "mode",
+        "digest",
+        "stage",
+        "old",
+        "backup",
+        "applied",
+        "installed",
+        "restored",
+    }
     expected = [(home_id, spec[0]) for spec in _SPECS for home_id in ids]
     if not isinstance(entries, list) or len(entries) != len(expected):
         _fail("invalid_journal")
     for index, (entry, coordinate) in enumerate(zip(entries, expected)):
-        if not isinstance(entry, dict) or set(entry) != fields or (entry["home_id"], entry["name"]) != coordinate:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != fields
+            or (entry["home_id"], entry["name"]) != coordinate
+        ):
             _fail("invalid_journal")
         spec = _SPEC_BY_NAME[coordinate[1]]
         if (
@@ -546,10 +631,17 @@ def _parse_journal(transaction: Path, transaction_id: str) -> dict[str, object]:
         old = _parse_state(entry["old"])
         if entry["backup"] != (None if old is None else f"old-{index:02d}"):
             _fail("invalid_journal")
-        installed, restored = _parse_state(entry["installed"]), _parse_state(entry["restored"])
-        if (entry["applied"] and installed is None) or (not entry["applied"] and installed is not None):
+        installed, restored = (
+            _parse_state(entry["installed"]),
+            _parse_state(entry["restored"]),
+        )
+        if (entry["applied"] and installed is None) or (
+            not entry["applied"] and installed is not None
+        ):
             _fail("invalid_journal")
-        if installed is not None and (installed.mode != entry["mode"] or installed.digest != entry["digest"]):
+        if installed is not None and (
+            installed.mode != entry["mode"] or installed.digest != entry["digest"]
+        ):
             _fail("invalid_journal")
         if restored is not None and (old is None or not _same_payload(restored, old)):
             _fail("invalid_journal")
@@ -557,7 +649,9 @@ def _parse_journal(transaction: Path, transaction_id: str) -> dict[str, object]:
     return raw
 
 
-def _identities(journal: dict[str, object]) -> dict[str, tuple[int, int, int, int, int]]:
+def _identities(
+    journal: dict[str, object],
+) -> dict[str, tuple[int, int, int, int, int]]:
     result: dict[str, tuple[int, int, int, int, int]] = {}
     for item in journal["homes"]:  # type: ignore[union-attr]
         result[item["home_id"]] = tuple(item["identity"])
@@ -601,7 +695,12 @@ def _scan_transaction(transaction: Path, journal: dict[str, object]) -> list[str
 
 
 def _cleanup_partial(transaction: Path, entries: list[dict[str, object]]) -> None:
-    allowed = {value for entry in entries for key in ("stage", "backup") if isinstance((value := entry.get(key)), str)}
+    allowed = {
+        value
+        for entry in entries
+        for key in ("stage", "backup")
+        if isinstance((value := entry.get(key)), str)
+    }
     try:
         for child in transaction.iterdir():
             if child.name not in allowed and not _TEMP_RE.fullmatch(child.name):
@@ -638,7 +737,9 @@ def _load_aux(transaction: Path, name: str, limit: int, digest: str) -> bytes:
 
 
 def _paths_for_recovery(
-    homes: Mapping[str, Path], transaction_root: Path, identities: dict[str, tuple[int, int, int, int, int]]
+    homes: Mapping[str, Path],
+    transaction_root: Path,
+    identities: dict[str, tuple[int, int, int, int, int]],
 ) -> dict[str, Path]:
     if not isinstance(homes, Mapping) or set(homes) != set(identities):
         _fail("invalid_request")
@@ -662,7 +763,11 @@ def _paths_for_recovery(
     return result
 
 
-def _current(homes: Mapping[str, Path], identities: Mapping[str, tuple[int, int, int, int, int]], entry: dict[str, object]) -> _FileState | None:
+def _current(
+    homes: Mapping[str, Path],
+    identities: Mapping[str, tuple[int, int, int, int, int]],
+    entry: dict[str, object],
+) -> _FileState | None:
     name = entry["name"]
     home_id = entry["home_id"]
     spec = _SPEC_BY_NAME[name]
@@ -675,7 +780,11 @@ def _current(homes: Mapping[str, Path], identities: Mapping[str, tuple[int, int,
 
 
 def _materialize(
-    homes: Mapping[str, Path], identities: Mapping[str, tuple[int, int, int, int, int]], transaction: Path, journal: dict[str, object], fault: FaultHook | None
+    homes: Mapping[str, Path],
+    identities: Mapping[str, tuple[int, int, int, int, int]],
+    transaction: Path,
+    journal: dict[str, object],
+    fault: FaultHook | None,
 ) -> None:
     journal["phase"] = "materializing"
     _store_journal(transaction, journal)
@@ -701,7 +810,12 @@ def _materialize(
 
 
 def _rollback(
-    homes: Mapping[str, Path], identities: Mapping[str, tuple[int, int, int, int, int]], transaction: Path, journal: dict[str, object], *, strict: bool
+    homes: Mapping[str, Path],
+    identities: Mapping[str, tuple[int, int, int, int, int]],
+    transaction: Path,
+    journal: dict[str, object],
+    *,
+    strict: bool,
 ) -> None:
     journal["phase"] = "rolling_back"
     _store_journal(transaction, journal)
@@ -719,8 +833,14 @@ def _rollback(
         if strict:
             allowed = entry["applied"] and _same(current, installed)
         else:
-            allowed = _same(current, installed) if entry["applied"] else (
-                current is not None and current.mode == entry["mode"] and current.digest == entry["digest"]
+            allowed = (
+                _same(current, installed)
+                if entry["applied"]
+                else (
+                    current is not None
+                    and current.mode == entry["mode"]
+                    and current.digest == entry["digest"]
+                )
             )
         if not allowed or current is None:
             _fail("rollback_diverged")
@@ -743,7 +863,10 @@ def _rollback(
 
 
 def _roll_forward(
-    homes: Mapping[str, Path], identities: Mapping[str, tuple[int, int, int, int, int]], transaction: Path, journal: dict[str, object]
+    homes: Mapping[str, Path],
+    identities: Mapping[str, tuple[int, int, int, int, int]],
+    transaction: Path,
+    journal: dict[str, object],
 ) -> None:
     journal["phase"] = "rolling_forward"
     _store_journal(transaction, journal)
@@ -751,7 +874,11 @@ def _roll_forward(
         name, home_id = entry["name"], entry["home_id"]
         spec = _SPEC_BY_NAME[name]
         current = _current(homes, identities, entry)
-        if current is not None and current.mode == entry["mode"] and current.digest == entry["digest"]:
+        if (
+            current is not None
+            and current.mode == entry["mode"]
+            and current.digest == entry["digest"]
+        ):
             entry["applied"], entry["installed"] = True, current
             _store_journal(transaction, journal)
             continue
@@ -768,7 +895,11 @@ def _roll_forward(
         _store_journal(transaction, journal)
     for entry in journal["entries"]:  # type: ignore[union-attr]
         current = _current(homes, identities, entry)
-        if current is None or current.mode != entry["mode"] or current.digest != entry["digest"]:
+        if (
+            current is None
+            or current.mode != entry["mode"]
+            or current.digest != entry["digest"]
+        ):
             _fail("roll_forward_diverged")
 
 
@@ -785,8 +916,17 @@ def apply_series_update(
     """Update Q homes in place and invoke registry CAS exactly once."""
 
     try:
-        updates = _validate_apply(updates, transaction_root, transaction_id, old_generation, new_generation, registry_cas)
-        transaction, journal, homes = _prepare(updates, transaction_root, transaction_id, old_generation, new_generation)
+        updates = _validate_apply(
+            updates,
+            transaction_root,
+            transaction_id,
+            old_generation,
+            new_generation,
+            registry_cas,
+        )
+        transaction, journal, homes = _prepare(
+            updates, transaction_root, transaction_id, old_generation, new_generation
+        )
         identities = _identities(journal)
         try:
             if _fault is not None:
@@ -856,9 +996,15 @@ def recover_series_update(
         transaction = transaction_root / transaction_id
         _directory(transaction, "invalid_journal")
         journal = _parse_journal(transaction, transaction_id)
-        if authoritative_generation not in {journal["old_generation"], journal["new_generation"]}:
+        if authoritative_generation not in {
+            journal["old_generation"],
+            journal["new_generation"],
+        }:
             _fail("generation_ambiguous")
-        if journal["phase"] == "committed" and authoritative_generation == journal["old_generation"]:
+        if (
+            journal["phase"] == "committed"
+            and authoritative_generation == journal["old_generation"]
+        ):
             _fail("recovery_diverged")
         identities = _identities(journal)
         paths = _paths_for_recovery(homes, transaction_root, identities)

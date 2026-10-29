@@ -27,11 +27,7 @@
     "longDescription": "Adds the-hive-mcp plus fleet-management skills and an App Bridge manifest for starting, assigning, auditing, and safely inspecting a scalable sleeping Agentinnen fleet. Masterjet remains a separately named component; the tool surface is data-sparse by default.",
     "developerName": "teladi",
     "category": "Developer Tools",
-    "capabilities": [
-      "Interactive",
-      "Read",
-      "Write"
-    ],
+    "capabilities": ["Interactive", "Read", "Write"],
     "defaultPrompt": [
       "Use The Hive to start Agentin A1 and Agentin B1",
       "Assign a read-only Exploriererin task with the-hive-mcp",

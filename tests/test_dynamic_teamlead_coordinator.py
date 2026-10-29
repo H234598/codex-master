@@ -943,9 +943,7 @@ def test_noncanonical_request_id_is_rejected_before_broker() -> None:
 
 
 def test_launch_plan_return_uses_exact_keyword_contract() -> None:
-    path = (
-        Path(__file__).parents[1] / "src/the_hive/dynamic_teamlead_coordinator.py"
-    )
+    path = Path(__file__).parents[1] / "src/the_hive/dynamic_teamlead_coordinator.py"
     tree = ast.parse(path.read_text())
     coordinators = [
         node
@@ -976,9 +974,7 @@ def test_launch_plan_return_uses_exact_keyword_contract() -> None:
 
 
 def test_coordinator_imports_are_allowlisted() -> None:
-    path = (
-        Path(__file__).parents[1] / "src/the_hive/dynamic_teamlead_coordinator.py"
-    )
+    path = Path(__file__).parents[1] / "src/the_hive/dynamic_teamlead_coordinator.py"
     tree = ast.parse(path.read_text())
     allowed_from = {
         "dataclasses": {"dataclass", "replace"},

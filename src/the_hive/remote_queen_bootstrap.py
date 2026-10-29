@@ -265,8 +265,7 @@ def _plan_dict(
             for item in rollback_objects
         ],
         "steps": [
-            {"object_id": item.object_id, "action": item.action}
-            for item in steps
+            {"object_id": item.object_id, "action": item.action} for item in steps
         ],
     }
     if plan_digest is not None:
@@ -319,9 +318,11 @@ def build_remote_queen_bootstrap_plan(
     object_states: tuple[ManagedObjectStateV1, ...],
     queen_binding: QueenBindingV1,
 ) -> RemoteQueenBootstrapPlanV1:
-    if not isinstance(ssh_target, SshTargetV1) or not isinstance(
-        host_facts, HostFactsV1
-    ) or not isinstance(desired_generation, ManifestGenerationV1):
+    if (
+        not isinstance(ssh_target, SshTargetV1)
+        or not isinstance(host_facts, HostFactsV1)
+        or not isinstance(desired_generation, ManifestGenerationV1)
+    ):
         raise _inconsistent_plan()
     if not isinstance(queen_binding, QueenBindingV1):
         raise _inconsistent_plan()
@@ -449,7 +450,9 @@ def _is_host(host: str) -> bool:
 def parse_ssh_target(value: str) -> SshTargetV1:
     if not isinstance(value, str) or not value or value.startswith("-"):
         raise _invalid_ssh_target()
-    if any(char.isspace() or unicodedata.category(char).startswith("C") for char in value):
+    if any(
+        char.isspace() or unicodedata.category(char).startswith("C") for char in value
+    ):
         raise _invalid_ssh_target()
     if any(token in value for token in ("://", "?", "#", ",")):
         raise _invalid_ssh_target()

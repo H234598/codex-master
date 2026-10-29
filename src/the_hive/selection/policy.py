@@ -49,25 +49,39 @@ def generate_candidates(request: object, snapshot: object) -> tuple[Candidate, .
     return values
 
 
-def evaluate_eligibility(candidate: Candidate, *, now: datetime | None = None) -> EligibilityResult:
+def evaluate_eligibility(
+    candidate: Candidate, *, now: datetime | None = None
+) -> EligibilityResult:
     del now
     reason = eligibility_reason(candidate)
     return EligibilityResult(reason is None, () if reason is None else (reason,))
 
 
-def priority_key(candidate: Candidate, state: FairnessLedger, *, now: datetime) -> SelectionPriorityKey:
+def priority_key(
+    candidate: Candidate, state: FairnessLedger, *, now: datetime
+) -> SelectionPriorityKey:
     if not isinstance(state, FairnessLedger):
         raise ValueError("invalid_fairness_state")
     fairness = state.normalized_service(candidate.account_key, now)
     last_selected = state.last_selected_epoch(candidate.account_key)
-    return SelectionPriorityKey(0, fairness, last_selected, candidate.rotation_distance, candidate.agent_id)
+    return SelectionPriorityKey(
+        0, fairness, last_selected, candidate.rotation_distance, candidate.agent_id
+    )
 
 
 def select_candidate(
-    candidates: tuple[Candidate, ...], *, policy: SelectionPolicy, now: datetime, ledger: FairnessLedger | None = None
+    candidates: tuple[Candidate, ...],
+    *,
+    policy: SelectionPolicy,
+    now: datetime,
+    ledger: FairnessLedger | None = None,
 ) -> SelectionDecision:
     preview = preview_selection(candidates, policy=policy, now=now, ledger=ledger)
-    return SelectionDecision(preview.selected, preview.eligible_count, tuple(reason for _agent, reason in preview.exclusions))
+    return SelectionDecision(
+        preview.selected,
+        preview.eligible_count,
+        tuple(reason for _agent, reason in preview.exclusions),
+    )
 
 
 __all__ = [

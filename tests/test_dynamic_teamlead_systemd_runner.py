@@ -83,7 +83,9 @@ def forged_release(schema_version: int) -> ControlReleaseSpecV2:
     return value
 
 
-def assert_no_manager_call(operation, *, candidate_plan=None, candidate_permit=None) -> None:
+def assert_no_manager_call(
+    operation, *, candidate_plan=None, candidate_permit=None
+) -> None:
     manager = operation.systemd
     with pytest.raises(ValueError) as caught:
         operation.execute(
@@ -116,7 +118,11 @@ def test_boundary_mcs_pairs_map_to_unique_reversible_instances(
     mcs_pair: str, expected_instance: str
 ) -> None:
     module = runner_module()
-    context = trusted_context(expected_principal=replace(trusted_context().expected_principal, mcs_pair=mcs_pair))
+    context = trusted_context(
+        expected_principal=replace(
+            trusted_context().expected_principal, mcs_pair=mcs_pair
+        )
+    )
     candidate = runner_plan(context)
     manager = RecordingManager()
     operation = module.RootSystemdDynamicTeamleadRunnerOperations(V2_RELEASE, manager)
@@ -213,7 +219,9 @@ def test_independent_plan_binding_drift_is_rejected_before_manager_call(
             ),
         )
     elif mutation == "identity_agent":
-        candidate = replace(candidate, identity=replace(candidate.identity, agent_id=alternate_agent))
+        candidate = replace(
+            candidate, identity=replace(candidate.identity, agent_id=alternate_agent)
+        )
     elif mutation == "identity_manifest":
         candidate = replace(
             candidate,
@@ -223,11 +231,15 @@ def test_independent_plan_binding_drift_is_rejected_before_manager_call(
             ),
         )
     elif mutation == "identity_mcs":
-        candidate = replace(candidate, identity=replace(candidate.identity, mcs_pair="c2,c3"))
+        candidate = replace(
+            candidate, identity=replace(candidate.identity, mcs_pair="c2,c3")
+        )
     elif mutation == "identity_fencing":
         candidate = replace(
             candidate,
-            identity=replace(candidate.identity, fencing_epoch=candidate.identity.fencing_epoch + 1),
+            identity=replace(
+                candidate.identity, fencing_epoch=candidate.identity.fencing_epoch + 1
+            ),
         )
     elif mutation == "expectation_generation":
         candidate = replace(
@@ -256,22 +268,33 @@ def test_independent_plan_binding_drift_is_rejected_before_manager_call(
     elif mutation == "expectation_projection":
         candidate = replace(
             candidate,
-            expectation=replace(candidate.expectation, projection_digest=alternate_digest),
+            expectation=replace(
+                candidate.expectation, projection_digest=alternate_digest
+            ),
         )
     else:
         attestation = candidate.home.attestation
         binding = attestation.binding
         if mutation == "home_principal":
-            binding = replace(binding, principal=replace(binding.principal, agent_id=alternate_agent))
+            binding = replace(
+                binding, principal=replace(binding.principal, agent_id=alternate_agent)
+            )
         elif mutation == "home_policy":
-            binding = replace(binding, policy=replace(binding.policy, policy_generation=10))
+            binding = replace(
+                binding, policy=replace(binding.policy, policy_generation=10)
+            )
         elif mutation == "home_projection":
-            binding = replace(binding, policy=replace(binding.policy, projection_digest=alternate_digest))
+            binding = replace(
+                binding,
+                policy=replace(binding.policy, projection_digest=alternate_digest),
+            )
         else:
             attestation = replace(attestation, mcs_pair="c2,c3")
         candidate = replace(
             candidate,
-            home=replace(candidate.home, attestation=replace(attestation, binding=binding)),
+            home=replace(
+                candidate.home, attestation=replace(attestation, binding=binding)
+            ),
         )
 
     assert_no_manager_call(operation, candidate_plan=candidate)
@@ -301,10 +324,22 @@ def test_invalid_or_mutated_v2_release_is_rejected_before_manager_call(
 @pytest.mark.parametrize(
     ("manager", "expected_calls"),
     (
-        (RecordingManager(start_error=RuntimeError("private c1,c2 detail")), [("start_unit", UNIT, "fail")]),
-        (RecordingManager(start_result="private c1,c2 completion"), [("start_unit", UNIT, "fail")]),
-        (RecordingManager(active=False), [("start_unit", UNIT, "fail"), ("unit_is_active", UNIT)]),
-        (RecordingManager(active=1), [("start_unit", UNIT, "fail"), ("unit_is_active", UNIT)]),
+        (
+            RecordingManager(start_error=RuntimeError("private c1,c2 detail")),
+            [("start_unit", UNIT, "fail")],
+        ),
+        (
+            RecordingManager(start_result="private c1,c2 completion"),
+            [("start_unit", UNIT, "fail")],
+        ),
+        (
+            RecordingManager(active=False),
+            [("start_unit", UNIT, "fail"), ("unit_is_active", UNIT)],
+        ),
+        (
+            RecordingManager(active=1),
+            [("start_unit", UNIT, "fail"), ("unit_is_active", UNIT)],
+        ),
     ),
 )
 def test_manager_failure_invalid_completion_or_nonbool_inactive_state_is_terminal(
@@ -372,7 +407,9 @@ def test_two_synchronized_concurrent_calls_cause_at_most_one_start() -> None:
 
 def test_runner_private_state_is_init_disabled_and_repr_redacted() -> None:
     module = runner_module()
-    operation = module.RootSystemdDynamicTeamleadRunnerOperations(V2_RELEASE, RecordingManager())
+    operation = module.RootSystemdDynamicTeamleadRunnerOperations(
+        V2_RELEASE, RecordingManager()
+    )
     signature = inspect.signature(module.RootSystemdDynamicTeamleadRunnerOperations)
     assert "_lock" not in signature.parameters
     assert "_terminal" not in signature.parameters

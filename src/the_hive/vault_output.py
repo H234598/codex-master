@@ -5,6 +5,7 @@ import secrets
 from datetime import UTC, datetime
 from pathlib import Path
 
+
 def write_hourly_report(
     vault_root: Path,
     bucket_start: datetime,
@@ -25,7 +26,15 @@ def write_hourly_report(
         raise ValueError("vault root must be a real directory")
     vault_root.mkdir(parents=True, mode=0o700, exist_ok=True)
     bucket = bucket_start.astimezone(UTC)
-    directory = vault_root / "Reports" / "Masterjet" / "Göttinnenberichte" / f"{bucket.year:04d}" / f"{bucket.month:02d}" / f"{bucket.day:02d}"
+    directory = (
+        vault_root
+        / "Reports"
+        / "Masterjet"
+        / "Göttinnenberichte"
+        / f"{bucket.year:04d}"
+        / f"{bucket.month:02d}"
+        / f"{bucket.day:02d}"
+    )
     _mkdir_real(directory)
     target = directory / f"{bucket.hour:02d}-{bucket.minute:02d}+00-00.md"
     if target.is_symlink() or (target.exists() and not target.is_file()):

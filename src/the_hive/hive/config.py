@@ -39,14 +39,40 @@ class AgentClassProfile:
     introduces_to_user: bool = False
 
     def __post_init__(self) -> None:
-        for value, field in ((self.class_id, "class_id"), (self.role_kind, "role_kind"), (self.worker_kind, "worker_kind"), (self.scope_kind, "scope_kind"), (self.authority_profile, "authority_profile"), (self.identity_lifetime, "identity_lifetime"), (self.memory_lifetime, "memory_lifetime"), (self.home_policy, "home_policy"), (self.session_policy, "session_policy"), (self.write_mode, "write_mode")):
-            if not isinstance(value, str) or not 1 <= len(value) <= 128 or any(ord(char) < 32 for char in value):
+        for value, field in (
+            (self.class_id, "class_id"),
+            (self.role_kind, "role_kind"),
+            (self.worker_kind, "worker_kind"),
+            (self.scope_kind, "scope_kind"),
+            (self.authority_profile, "authority_profile"),
+            (self.identity_lifetime, "identity_lifetime"),
+            (self.memory_lifetime, "memory_lifetime"),
+            (self.home_policy, "home_policy"),
+            (self.session_policy, "session_policy"),
+            (self.write_mode, "write_mode"),
+        ):
+            if (
+                not isinstance(value, str)
+                or not 1 <= len(value) <= 128
+                or any(ord(char) < 32 for char in value)
+            ):
                 raise HiveConfigError(f"invalid_{field}")
-        if self.scope_kind not in {"global", "repository", "read", "write"} or self.write_mode not in {"none", "scoped", "integration"}:
+        if self.scope_kind not in {
+            "global",
+            "repository",
+            "read",
+            "write",
+        } or self.write_mode not in {"none", "scoped", "integration"}:
             raise HiveConfigError("invalid_class_scope")
-        if not _is_string_tuple(self.capabilities) or not _is_string_tuple(self.delegation_targets):
+        if not _is_string_tuple(self.capabilities) or not _is_string_tuple(
+            self.delegation_targets
+        ):
             raise HiveConfigError("invalid_class_lists")
-        if isinstance(self.max_delegation_depth, bool) or not isinstance(self.max_delegation_depth, int) or not 0 <= self.max_delegation_depth <= 32:
+        if (
+            isinstance(self.max_delegation_depth, bool)
+            or not isinstance(self.max_delegation_depth, int)
+            or not 0 <= self.max_delegation_depth <= 32
+        ):
             raise HiveConfigError("invalid_delegation_depth")
         if (
             self.public_lifecycle not in {"ephemeral", "binding", "persistent"}
@@ -55,7 +81,10 @@ class AgentClassProfile:
             or not _is_string_tuple(self.allowed_model_ids)
             or self.public_lifecycle not in self.allowed_lifecycles
             or not self.allowed_model_families
-            or any(not isinstance(model_id, str) or not model_id for model_id in self.allowed_model_ids)
+            or any(
+                not isinstance(model_id, str) or not model_id
+                for model_id in self.allowed_model_ids
+            )
             or len(set(self.allowed_model_ids)) != len(self.allowed_model_ids)
             or self.min_reasoning not in {"low", "medium", "high", "xhigh", "max"}
             or self.max_reasoning not in {"low", "medium", "high", "xhigh", "max"}
@@ -64,7 +93,9 @@ class AgentClassProfile:
             raise HiveConfigError("invalid_class_resolver_profile")
 
     @property
-    def resolver_profile(self) -> tuple[str, tuple[str, ...], tuple[str, ...], str, str]:
+    def resolver_profile(
+        self,
+    ) -> tuple[str, tuple[str, ...], tuple[str, ...], str, str]:
         return (
             self.public_lifecycle,
             self.allowed_lifecycles,
@@ -79,7 +110,9 @@ def _is_string_tuple(value: object) -> bool:
 
 
 def _is_catalog_digest(value: object) -> bool:
-    return type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    return (
+        type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    )
 
 
 def _profile_is_deeply_immutable(profile: object) -> bool:
@@ -123,11 +156,19 @@ class HiveConfig:
     digest: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.mode not in {"disabled", "shadow", "enforced"}:
+        if self.schema_version != 1 or self.mode not in {
+            "disabled",
+            "shadow",
+            "enforced",
+        }:
             raise HiveConfigError("invalid_hive_config")
-        if not isinstance(self.repositories, tuple) or not isinstance(self.principals, tuple):
+        if not isinstance(self.repositories, tuple) or not isinstance(
+            self.principals, tuple
+        ):
             raise HiveConfigError("invalid_hive_config_lists")
-        if not isinstance(self.feature_flags, Mapping) or any(not isinstance(value, bool) for value in self.feature_flags.values()):
+        if not isinstance(self.feature_flags, Mapping) or any(
+            not isinstance(value, bool) for value in self.feature_flags.values()
+        ):
             raise HiveConfigError("invalid_hive_feature_flags")
         if not isinstance(self.digest, str) or not self.digest.startswith("sha256:"):
             raise HiveConfigError("invalid_hive_config_digest")
@@ -155,28 +196,70 @@ def load_agent_class_catalog_snapshot_bytes(raw: bytes) -> AgentClassCatalogSnap
     )
 
 
-def _parse_agent_class_catalog(payload: Mapping[str, object]) -> Mapping[str, AgentClassProfile]:
-    if set(payload) != {"schema_version", "classes"} or payload["schema_version"] != 1 or not isinstance(payload["classes"], list):
+def _parse_agent_class_catalog(
+    payload: Mapping[str, object],
+) -> Mapping[str, AgentClassProfile]:
+    if (
+        set(payload) != {"schema_version", "classes"}
+        or payload["schema_version"] != 1
+        or not isinstance(payload["classes"], list)
+    ):
         raise HiveConfigError("invalid_class_catalog")
     result: dict[str, AgentClassProfile] = {}
-    fields = {"class_id", "role_kind", "worker_kind", "scope_kind", "authority_profile", "identity_lifetime", "memory_lifetime", "home_policy", "session_policy", "write_mode", "capabilities", "delegation_targets", "max_delegation_depth"}
-    resolver_fields = {"public_lifecycle", "allowed_lifecycles", "allowed_model_families", "allowed_model_ids", "min_reasoning", "max_reasoning", "introduces_to_user"}
+    fields = {
+        "class_id",
+        "role_kind",
+        "worker_kind",
+        "scope_kind",
+        "authority_profile",
+        "identity_lifetime",
+        "memory_lifetime",
+        "home_policy",
+        "session_policy",
+        "write_mode",
+        "capabilities",
+        "delegation_targets",
+        "max_delegation_depth",
+    }
+    resolver_fields = {
+        "public_lifecycle",
+        "allowed_lifecycles",
+        "allowed_model_families",
+        "allowed_model_ids",
+        "min_reasoning",
+        "max_reasoning",
+        "introduces_to_user",
+    }
     for raw in payload["classes"]:
-        if not isinstance(raw, Mapping) or not fields <= set(raw) or set(raw) - fields - resolver_fields:
+        if (
+            not isinstance(raw, Mapping)
+            or not fields <= set(raw)
+            or set(raw) - fields - resolver_fields
+        ):
             raise HiveConfigError("invalid_class_profile")
         try:
             item = AgentClassProfile(
-                class_id=raw["class_id"], role_kind=raw["role_kind"], worker_kind=raw["worker_kind"],
-                scope_kind=raw["scope_kind"], authority_profile=raw["authority_profile"],
-                identity_lifetime=raw["identity_lifetime"], memory_lifetime=raw["memory_lifetime"],
-                home_policy=raw["home_policy"], session_policy=raw["session_policy"], write_mode=raw["write_mode"],
-                capabilities=tuple(raw["capabilities"]), delegation_targets=tuple(raw["delegation_targets"]),
+                class_id=raw["class_id"],
+                role_kind=raw["role_kind"],
+                worker_kind=raw["worker_kind"],
+                scope_kind=raw["scope_kind"],
+                authority_profile=raw["authority_profile"],
+                identity_lifetime=raw["identity_lifetime"],
+                memory_lifetime=raw["memory_lifetime"],
+                home_policy=raw["home_policy"],
+                session_policy=raw["session_policy"],
+                write_mode=raw["write_mode"],
+                capabilities=tuple(raw["capabilities"]),
+                delegation_targets=tuple(raw["delegation_targets"]),
                 max_delegation_depth=raw["max_delegation_depth"],
                 public_lifecycle=raw.get("public_lifecycle", "ephemeral"),
                 allowed_lifecycles=tuple(raw.get("allowed_lifecycles", ("ephemeral",))),
-                allowed_model_families=tuple(raw.get("allowed_model_families", ("luna",))),
+                allowed_model_families=tuple(
+                    raw.get("allowed_model_families", ("luna",))
+                ),
                 allowed_model_ids=tuple(raw.get("allowed_model_ids", ())),
-                min_reasoning=raw.get("min_reasoning", "low"), max_reasoning=raw.get("max_reasoning", "xhigh"),
+                min_reasoning=raw.get("min_reasoning", "low"),
+                max_reasoning=raw.get("max_reasoning", "xhigh"),
                 introduces_to_user=raw.get("introduces_to_user", False),
             )
         except (KeyError, TypeError) as exc:
@@ -211,14 +294,20 @@ def _decode_catalog_mapping(raw: bytes) -> Mapping[str, object]:
     return payload
 
 
-def load_hive_config(path: Path, classes: Mapping[str, AgentClassProfile]) -> HiveConfig:
-    if not isinstance(classes, Mapping) or any(not isinstance(value, AgentClassProfile) for value in classes.values()):
+def load_hive_config(
+    path: Path, classes: Mapping[str, AgentClassProfile]
+) -> HiveConfig:
+    if not isinstance(classes, Mapping) or any(
+        not isinstance(value, AgentClassProfile) for value in classes.values()
+    ):
         raise HiveConfigError("invalid_class_catalog")
     payload = _load(path, "hive_config")
     return load_hive_config_payload(payload, classes)
 
 
-def load_hive_config_bytes(raw: bytes, classes: Mapping[str, AgentClassProfile]) -> HiveConfig:
+def load_hive_config_bytes(
+    raw: bytes, classes: Mapping[str, AgentClassProfile]
+) -> HiveConfig:
     """Parse a Hive config from bytes already read through a trusted FD."""
 
     if type(raw) is not bytes:
@@ -237,16 +326,36 @@ def load_hive_config_payload(
 ) -> HiveConfig:
     """Validate one decoded public config without rereading its source."""
 
-    if not isinstance(classes, Mapping) or any(not isinstance(value, AgentClassProfile) for value in classes.values()):
+    if not isinstance(classes, Mapping) or any(
+        not isinstance(value, AgentClassProfile) for value in classes.values()
+    ):
         raise HiveConfigError("invalid_class_catalog")
     allowed = {"schema_version", "mode", "repositories", "principals", "feature_flags"}
-    if set(payload) != allowed or payload.get("schema_version") != 1 or not isinstance(payload.get("repositories"), list) or not isinstance(payload.get("principals"), list) or not isinstance(payload.get("feature_flags"), Mapping):
+    if (
+        set(payload) != allowed
+        or payload.get("schema_version") != 1
+        or not isinstance(payload.get("repositories"), list)
+        or not isinstance(payload.get("principals"), list)
+        or not isinstance(payload.get("feature_flags"), Mapping)
+    ):
         raise HiveConfigError("invalid_hive_config")
-    repositories = tuple(_strict_mapping(value, {"repo_id", "remote_identity", "default_branch", "config_digest"}) for value in payload["repositories"])
+    repositories = tuple(
+        _strict_mapping(
+            value, {"repo_id", "remote_identity", "default_branch", "config_digest"}
+        )
+        for value in payload["repositories"]
+    )
     repo_ids = [value["repo_id"] for value in repositories]
-    if len(set(repo_ids)) != len(repo_ids) or any(not isinstance(value, str) or not value for value in repo_ids):
+    if len(set(repo_ids)) != len(repo_ids) or any(
+        not isinstance(value, str) or not value for value in repo_ids
+    ):
         raise HiveConfigError("invalid_hive_repositories")
-    principals = tuple(_strict_mapping(value, {"principal_id", "class_id", "parent_principal_id", "repo_id"}) for value in payload["principals"])
+    principals = tuple(
+        _strict_mapping(
+            value, {"principal_id", "class_id", "parent_principal_id", "repo_id"}
+        )
+        for value in payload["principals"]
+    )
     principal_ids = [value["principal_id"] for value in principals]
     if len(set(principal_ids)) != len(principal_ids):
         raise HiveConfigError("duplicate_principal_id")
@@ -258,12 +367,20 @@ def load_hive_config_payload(
         repo_id = value["repo_id"]
         if profile.scope_kind == "global" and repo_id is not None:
             raise HiveConfigError("global_principal_has_repository")
-        if profile.scope_kind == "repository" and (repo_id is None or repo_id not in repo_ids):
+        if profile.scope_kind == "repository" and (
+            repo_id is None or repo_id not in repo_ids
+        ):
             raise HiveConfigError("repository_principal_missing_repository")
-    flags = {key: value for key, value in payload["feature_flags"].items() if isinstance(key, str) and isinstance(value, bool)}
+    flags = {
+        key: value
+        for key, value in payload["feature_flags"].items()
+        if isinstance(key, str) and isinstance(value, bool)
+    }
     if len(flags) != len(payload["feature_flags"]):
         raise HiveConfigError("invalid_hive_feature_flags")
-    canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    canonical = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
     digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
     return HiveConfig(1, payload["mode"], repositories, principals, flags, digest)
 

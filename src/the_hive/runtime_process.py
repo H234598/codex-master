@@ -34,9 +34,7 @@ _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _RUNTIME_DIRECTORY_ROOT = Path("/run/user")
 # ProtectHome=tmpfs recreates the UID runtime root. The Hourly unit exposes only
 # the two manager sockets there; bounded child units mask both again.
-_PROTECTED_HOME_RUNTIME_DIRECTORY = (
-    _RUNTIME_DIRECTORY_ROOT / str(os.geteuid())
-)
+_PROTECTED_HOME_RUNTIME_DIRECTORY = _RUNTIME_DIRECTORY_ROOT / str(os.geteuid())
 BOUNDED_PROCESS_CLEANUP_SECONDS = 0.5
 _PREEXEC_STAGE_CODES = frozenset(
     {
@@ -90,7 +88,10 @@ class G5ScopeIdentity:
     def __post_init__(self) -> None:
         if not re.fullmatch(r"the-hive-resource-[0-9a-f]{32}\.scope", self.unit_name):
             raise BoundedProcessError("command_group_unavailable")
-        if not isinstance(self.control_group, str) or not 2 <= len(self.control_group) <= 512:
+        if (
+            not isinstance(self.control_group, str)
+            or not 2 <= len(self.control_group) <= 512
+        ):
             raise BoundedProcessError("command_group_unavailable")
         if not self.control_group.startswith("/") or self.control_group.endswith("/"):
             raise BoundedProcessError("command_group_unavailable")
@@ -105,8 +106,7 @@ class G5ScopeIdentity:
             or parts[-2] != "the-hive.slice"
             or parts.count("the-hive.slice") != 1
             or not (
-                parts == ["the-hive.slice", self.unit_name]
-                or parts[0] == "user.slice"
+                parts == ["the-hive.slice", self.unit_name] or parts[0] == "user.slice"
             )
         ):
             raise BoundedProcessError("command_group_unavailable")
@@ -601,7 +601,9 @@ def bind_g5_scope(unit_name: str, expected_control_group: str) -> G5ScopeIdentit
     descriptor, identity = _open_cgroup_directory(cgroup)
     try:
         events = _read_g5_cgroup_file(descriptor, "cgroup.events").decode("ascii")
-        populated = [line for line in events.splitlines() if line.startswith("populated ")]
+        populated = [
+            line for line in events.splitlines() if line.startswith("populated ")
+        ]
         processes = _read_g5_cgroup_file(descriptor, "cgroup.procs").split()
         if populated != ["populated 1"] or not processes:
             raise BoundedProcessError("command_group_unavailable")
@@ -625,9 +627,7 @@ def g5_scope_is_empty(identity: G5ScopeIdentity) -> bool:
     if type(identity) is not G5ScopeIdentity:
         return False
     try:
-        control_group, invocation_id, load_state = _g5_unit_snapshot(
-            identity.unit_name
-        )
+        control_group, invocation_id, load_state = _g5_unit_snapshot(identity.unit_name)
         if load_state == "not-found":
             try:
                 (_CGROUP_ROOT / identity.control_group.lstrip("/")).lstat()

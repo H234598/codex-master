@@ -15,6 +15,7 @@ import subprocess
 import time
 
 from the_hive.hive.types import HiveValidationError, validate_identifier
+
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,128}\Z")
 MAX_REMOTE_LENGTH = 512
@@ -57,9 +58,13 @@ class RepositoryBinding:
             raise RepositoryError("invalid_remote_identity")
         if not isinstance(self.local_root, Path) or not self.local_root.is_absolute():
             raise RepositoryError("invalid_repository_root")
-        if not isinstance(self.default_branch, str) or not _BRANCH_RE.fullmatch(self.default_branch):
+        if not isinstance(self.default_branch, str) or not _BRANCH_RE.fullmatch(
+            self.default_branch
+        ):
             raise RepositoryError("invalid_default_branch")
-        if not isinstance(self.config_digest, str) or not _DIGEST_RE.fullmatch(self.config_digest):
+        if not isinstance(self.config_digest, str) or not _DIGEST_RE.fullmatch(
+            self.config_digest
+        ):
             raise RepositoryError("invalid_repository_config_digest")
 
 
@@ -168,7 +173,9 @@ class RepositoryRegistry:
         except (OSError, RuntimeError):
             return RepositoryValidation(repo_id, False, "repository_root_changed")
         remote = self._git(root, "config", "--get", "remote.origin.url")
-        if remote is None or _normalize_remote(remote) != _normalize_remote(binding.remote_identity):
+        if remote is None or _normalize_remote(remote) != _normalize_remote(
+            binding.remote_identity
+        ):
             return RepositoryValidation(repo_id, False, "repository_remote_mismatch")
         branch = self._git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
         if branch != binding.default_branch:
@@ -182,7 +189,10 @@ class RepositoryRegistry:
         )
         if commit is None:
             return RepositoryValidation(repo_id, False, "repository_commit_unavailable")
-        if self._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}") != commit:
+        if (
+            self._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+            != commit
+        ):
             return RepositoryValidation(repo_id, False, "repository_branch_mismatch")
         return RepositoryValidation(repo_id, True, "repository_verified")
 
@@ -213,7 +223,16 @@ class RepositoryRegistry:
 
         if mode not in {"read", "write"}:
             raise RepositoryError("invalid_scope_mode")
-        canonical = tuple(sorted(os.fspath(self.resolve_path(repo_id, value).relative_to(self.get(repo_id).local_root.resolve(strict=True))) for value in paths))
+        canonical = tuple(
+            sorted(
+                os.fspath(
+                    self.resolve_path(repo_id, value).relative_to(
+                        self.get(repo_id).local_root.resolve(strict=True)
+                    )
+                )
+                for value in paths
+            )
+        )
         if not canonical:
             raise RepositoryError("invalid_scope_paths")
         payload = f"{repo_id}\0{mode}\0" + "\0".join(canonical)
@@ -256,7 +275,9 @@ class RepositoryRegistry:
                     _terminate_process_group(process)
                     return None
                 for key, _ in events:
-                    chunk = os.read(key.fd, min(65536, MAX_GIT_OUTPUT + 1 - output_size))
+                    chunk = os.read(
+                        key.fd, min(65536, MAX_GIT_OUTPUT + 1 - output_size)
+                    )
                     if not chunk:
                         selector.unregister(key.fileobj)
                         continue

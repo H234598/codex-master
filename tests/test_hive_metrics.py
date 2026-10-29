@@ -74,9 +74,18 @@ def overview(*, generation: int = 4, homes: int = 0) -> FleetOverviewSnapshot:
         integration_freshness="fresh",
         series=(
             FleetOverviewSeriesRow(
-                "x", "Example", "openai_api", "codex", "model", 0, homes, (),
+                "x",
+                "Example",
+                "openai_api",
+                "codex",
+                "model",
+                0,
+                homes,
+                (),
             ),
-        ) if homes else (),
+        )
+        if homes
+        else (),
         agents=(),
         account_limits=(),
         warnings=(),
@@ -87,7 +96,12 @@ def test_detail_tiers_validate_each_axis_including_zero_and_future_levels() -> N
     def state_for(model_tier: str, reasoning_tier: str) -> str:
         return project_hive_metrics(
             observations=(
-                observation("gemini", "worker", model_tier=model_tier, reasoning_tier=reasoning_tier),
+                observation(
+                    "gemini",
+                    "worker",
+                    model_tier=model_tier,
+                    reasoning_tier=reasoning_tier,
+                ),
             ),
             registered_homes=1,
             captured_at=CAPTURED,
@@ -101,7 +115,9 @@ def test_detail_tiers_validate_each_axis_including_zero_and_future_levels() -> N
 
 
 @pytest.mark.parametrize("unsafe_class", ("sk-live-secret", "account-123"))
-def test_detail_projects_unrecognized_special_class_to_unknown(unsafe_class: str) -> None:
+def test_detail_projects_unrecognized_special_class_to_unknown(
+    unsafe_class: str,
+) -> None:
     projection = project_hive_metrics(
         observations=(observation("gemini", "worker", special_class=unsafe_class),),
         registered_homes=1,
@@ -114,7 +130,9 @@ def test_detail_projects_unrecognized_special_class_to_unknown(unsafe_class: str
     assert unsafe_class not in repr(projection)
 
 
-def test_projection_deduplicates_opaque_observation_keys_without_exposing_them() -> None:
+def test_projection_deduplicates_opaque_observation_keys_without_exposing_them() -> (
+    None
+):
     first_key = opaque_key(1)
     second_key = opaque_key(2)
     original = observation("gemini", "worker", observation_key=first_key)
@@ -123,7 +141,9 @@ def test_projection_deduplicates_opaque_observation_keys_without_exposing_them()
         observations=(
             original,
             repeated_event,
-            observation("gemini", "worker", model_tier="M3", observation_key=second_key),
+            observation(
+                "gemini", "worker", model_tier="M3", observation_key=second_key
+            ),
         ),
         registered_homes=2,
         captured_at=CAPTURED,
@@ -138,9 +158,7 @@ def test_projection_deduplicates_opaque_observation_keys_without_exposing_them()
 
 def test_projection_rejects_nonopaque_observation_keys() -> None:
     projection = project_hive_metrics(
-        observations=(
-            observation("gemini", "worker", observation_key="account-123"),
-        ),
+        observations=(observation("gemini", "worker", observation_key="account-123"),),
         registered_homes=1,
         captured_at=CAPTURED,
         observed_at=CAPTURED,
@@ -199,7 +217,9 @@ def test_projection_consumes_no_more_than_bounded_input_prefix() -> None:
 @pytest.mark.parametrize("count", (MAX_OBSERVATIONS - 1, MAX_OBSERVATIONS))
 def test_projection_accepts_observation_input_at_telemetry_bound(count: int) -> None:
     projection = project_hive_metrics(
-        observations=tuple(observation("gemini", "worker", detail=False) for _ in range(count)),
+        observations=tuple(
+            observation("gemini", "worker", detail=False) for _ in range(count)
+        ),
         registered_homes=0,
         captured_at=CAPTURED,
         observed_at=CAPTURED,
@@ -222,7 +242,9 @@ def test_projection_rejects_observation_input_above_telemetry_bound() -> None:
 
 
 @pytest.mark.parametrize("registered_homes", (MAX_OBSERVATIONS - 1, MAX_OBSERVATIONS))
-def test_projection_accepts_inventory_at_telemetry_input_bound(registered_homes: int) -> None:
+def test_projection_accepts_inventory_at_telemetry_input_bound(
+    registered_homes: int,
+) -> None:
     projection = project_hive_metrics(
         observations=(),
         registered_homes=registered_homes,
@@ -244,7 +266,9 @@ def test_projection_rejects_inventory_above_telemetry_input_bound() -> None:
 
 
 @pytest.mark.parametrize("native_active", (MAX_OBSERVATIONS - 1, MAX_OBSERVATIONS))
-def test_overview_adapter_accepts_native_input_at_telemetry_bound(native_active: int) -> None:
+def test_overview_adapter_accepts_native_input_at_telemetry_bound(
+    native_active: int,
+) -> None:
     snapshot = overview(generation=9)
 
     values = fleet_metric_values(
@@ -378,21 +402,70 @@ def test_legacy_overview_adapter_uses_one_active_counting_semantics() -> None:
         integration_freshness="fresh",
         series=(
             FleetOverviewSeriesRow(
-                "x", "Example", "openai_api", "codex", "model", 2, 5, ("x1", "x2"),
+                "x",
+                "Example",
+                "openai_api",
+                "codex",
+                "model",
+                2,
+                5,
+                ("x1", "x2"),
             ),
         ),
         agents=(
             FleetOverviewAgentRow(
-                "x1", "Example", "openai_api", "codex", "model", None, None,
-                "running", "teamleiterin", None, None, None, None, None, None, "fresh",
+                "x1",
+                "Example",
+                "openai_api",
+                "codex",
+                "model",
+                None,
+                None,
+                "running",
+                "teamleiterin",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "fresh",
             ),
             FleetOverviewAgentRow(
-                "x2", "Example", "unlisted-provider", "codex", "model", None, None,
-                "running", "unlisted-role", None, None, None, None, None, None, "fresh",
+                "x2",
+                "Example",
+                "unlisted-provider",
+                "codex",
+                "model",
+                None,
+                None,
+                "running",
+                "unlisted-role",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "fresh",
             ),
             FleetOverviewAgentRow(
-                "x3", "Example", "gemini_api", "gemini", "model", None, None,
-                "stopped", "worker", None, None, None, None, None, None, "fresh",
+                "x3",
+                "Example",
+                "gemini_api",
+                "gemini",
+                "model",
+                None,
+                None,
+                "stopped",
+                "worker",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "fresh",
             ),
         ),
         account_limits=(),
@@ -424,15 +497,15 @@ def test_openmetrics_renderer_is_deterministic_and_rejects_nonfinite_values() ->
     )
 
     assert rendered == (
-        "the_hive_bees_total 4\n"
-        "the_hive_hive_metrics_age_seconds 0.5\n"
-        "# EOF\n"
+        "the_hive_bees_total 4\nthe_hive_hive_metrics_age_seconds 0.5\n# EOF\n"
     )
     with pytest.raises(HiveMetricsError, match="invalid_metric_values"):
         render_openmetrics({"the_hive_bees_total": float("nan")})
 
 
-def test_projection_consumes_one_typed_snapshot_without_runtime_or_callback_inputs() -> None:
+def test_projection_consumes_one_typed_snapshot_without_runtime_or_callback_inputs() -> (
+    None
+):
     snapshot = FleetMetricSnapshot(
         observations=(
             observation("native", "gottbiene", detail=False),
@@ -442,7 +515,14 @@ def test_projection_consumes_one_typed_snapshot_without_runtime_or_callback_inpu
         captured_at=CAPTURED,
         block_devices=(
             FleetMetricBlockDevice(
-                "nvme0n1", 12.5, 3.25, 2, 14.0, 0.125, "nvme", True,
+                "nvme0n1",
+                12.5,
+                3.25,
+                2,
+                14.0,
+                0.125,
+                "nvme",
+                True,
             ),
         ),
         hive_io_psi=FleetMetricIoPsi(4.0, 2.0, 1.0),
@@ -514,7 +594,9 @@ def test_snapshot_projection_preserves_all_provider_and_role_buckets() -> None:
     }
 
 
-@pytest.mark.parametrize("state", ("OK", "WARN", "BLOCK", "CONTAMINATED", "STALE", "RUCKEL-HOLD"))
+@pytest.mark.parametrize(
+    "state", ("OK", "WARN", "BLOCK", "CONTAMINATED", "STALE", "RUCKEL-HOLD")
+)
 def test_snapshot_projection_exposes_each_plan_state(state: str) -> None:
     projection = project_hive_metrics(
         snapshot=FleetMetricSnapshot(
@@ -582,14 +664,17 @@ def test_pcp_htop_meter_config_has_exactly_two_complete_canonical_blocks() -> No
     (("dm-0", "nvme"), ("vda", "scsi"), ("xvda", "scsi"), ("nvme0n1", "virtio")),
 )
 def test_snapshot_projection_rejects_virtual_or_nonphysical_devices(
-    device: str, transport: str,
+    device: str,
+    transport: str,
 ) -> None:
     projection = project_hive_metrics(
         snapshot=FleetMetricSnapshot(
             observations=(),
             registered_homes=0,
             captured_at=CAPTURED,
-            block_devices=(FleetMetricBlockDevice(device, 1.0, 1.0, 1, 1.0, 1.0, transport, True),),
+            block_devices=(
+                FleetMetricBlockDevice(device, 1.0, 1.0, 1, 1.0, 1.0, transport, True),
+            ),
         ),
         observed_at=CAPTURED,
     )
@@ -604,14 +689,17 @@ def test_snapshot_projection_rejects_virtual_or_nonphysical_devices(
     (("/dev/nvme0n1", "nvme"), ("nvme0n1", "unknown"), ("unknown", "nvme")),
 )
 def test_snapshot_projection_fails_closed_without_physicality_evidence(
-    device: str, transport: str,
+    device: str,
+    transport: str,
 ) -> None:
     projection = project_hive_metrics(
         snapshot=FleetMetricSnapshot(
             observations=(),
             registered_homes=0,
             captured_at=CAPTURED,
-            block_devices=(FleetMetricBlockDevice(device, 1.0, 1.0, 1, 1.0, 1.0, transport, True),),
+            block_devices=(
+                FleetMetricBlockDevice(device, 1.0, 1.0, 1, 1.0, 1.0, transport, True),
+            ),
         ),
         observed_at=CAPTURED,
     )
@@ -622,13 +710,17 @@ def test_snapshot_projection_fails_closed_without_physicality_evidence(
     assert device not in repr(projection)
 
 
-def test_snapshot_projection_keeps_validated_physical_devices_bounded_scalar_and_path_free() -> None:
+def test_snapshot_projection_keeps_validated_physical_devices_bounded_scalar_and_path_free() -> (
+    None
+):
     projection = project_hive_metrics(
         snapshot=FleetMetricSnapshot(
             observations=(),
             registered_homes=0,
             captured_at=CAPTURED,
-            block_devices=(FleetMetricBlockDevice("nvme0n1", 1.0, 2.0, 3, 4.0, 5.0, "nvme", True),),
+            block_devices=(
+                FleetMetricBlockDevice("nvme0n1", 1.0, 2.0, 3, 4.0, 5.0, "nvme", True),
+            ),
         ),
         observed_at=CAPTURED,
     )
@@ -636,7 +728,14 @@ def test_snapshot_projection_keeps_validated_physical_devices_bounded_scalar_and
     assert projection.state == "fresh"
     assert len(projection.block_devices) == 1
     assert projection.block_devices[0] == FleetMetricBlockDevice(
-        "nvme0n1", 1.0, 2.0, 3, 4.0, 5.0, "nvme", True,
+        "nvme0n1",
+        1.0,
+        2.0,
+        3,
+        4.0,
+        5.0,
+        "nvme",
+        True,
     )
     assert "/" not in projection.block_devices[0].device
 
@@ -657,7 +756,9 @@ def test_explicit_stale_snapshot_sets_freshness_and_stale_metric_consistently() 
     assert values["the_hive_hive_metrics_stale"] == 1
 
 
-def test_age_stale_snapshot_sets_freshness_health_and_stale_metric_consistently() -> None:
+def test_age_stale_snapshot_sets_freshness_health_and_stale_metric_consistently() -> (
+    None
+):
     snapshot = FleetMetricSnapshot(
         observations=(observation("gemini", "worker", detail=False),),
         registered_homes=1,
@@ -686,7 +787,14 @@ def test_snapshot_projection_bounds_and_redacts_untrusted_detail_values() -> Non
             captured_at=CAPTURED,
             block_devices=(
                 FleetMetricBlockDevice(
-                    "nvme0n1", 1.0, 1.0, 1, 1.0, 1.0, "nvme", True,
+                    "nvme0n1",
+                    1.0,
+                    1.0,
+                    1,
+                    1.0,
+                    1.0,
+                    "nvme",
+                    True,
                 ),
             ),
         ),
@@ -736,7 +844,9 @@ def test_snapshot_rejects_foreign_devices_without_entering_iterable() -> None:
 
 def test_snapshot_accepts_exact_tuple_inputs_without_coercion() -> None:
     observations = (observation("gemini", "worker", detail=False),)
-    block_devices = (FleetMetricBlockDevice("nvme0n1", 1.0, 1.0, 1, 1.0, 1.0, "nvme", True),)
+    block_devices = (
+        FleetMetricBlockDevice("nvme0n1", 1.0, 1.0, 1, 1.0, 1.0, "nvme", True),
+    )
 
     snapshot = FleetMetricSnapshot(observations, 1, CAPTURED, block_devices)
 
@@ -746,7 +856,10 @@ def test_snapshot_accepts_exact_tuple_inputs_without_coercion() -> None:
 
 def test_snapshot_tuple_observations_above_bound_remain_fail_closed() -> None:
     snapshot = FleetMetricSnapshot(
-        tuple(observation("gemini", "worker", detail=False) for _ in range(MAX_OBSERVATIONS + 1)),
+        tuple(
+            observation("gemini", "worker", detail=False)
+            for _ in range(MAX_OBSERVATIONS + 1)
+        ),
         MAX_OBSERVATIONS,
         CAPTURED,
     )

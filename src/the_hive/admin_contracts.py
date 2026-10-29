@@ -270,9 +270,7 @@ _MAX_COUNT = 100_000
 _MAX_OPERATION_LIFETIME = timedelta(days=1)
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
-_UTC_TIMESTAMP = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
-)
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 _PRIVATE_TEXT = re.compile(
     r"\b(?:bearer|basic|(?:access|refresh)[\s_.-]*token|client[\s_.-]*secret|api[\s_.-]*key|auth(?:entication|orization)?|token|cookie|credential|passphrase|password|session|secret|jwt)\b"
     r"|(?:\bsk-[A-Za-z0-9_-]*|\bAIza[A-Za-z0-9_-]*|\bya29(?:\.[A-Za-z0-9._-]*)?|\b1//|\bGOCSPX-|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
@@ -282,7 +280,16 @@ _PRIVATE_TEXT = re.compile(
     re.IGNORECASE,
 )
 _OPERATION_STATES = frozenset(
-    {"planned", "queued", "running", "partial", "succeeded", "failed", "blocked", "unknown"}
+    {
+        "planned",
+        "queued",
+        "running",
+        "partial",
+        "succeeded",
+        "failed",
+        "blocked",
+        "unknown",
+    }
 )
 _TERMINAL_OPERATION_STATES = frozenset(
     {"partial", "succeeded", "failed", "blocked", "unknown"}
@@ -470,10 +477,7 @@ def _arguments(operation: str, value: object) -> Mapping[str, object]:
             result[field] = integer
         elif field in metadata.token_list_argument_fields:
             values = arguments[field]
-            if (
-                type(values) not in {list, tuple}
-                or not 1 <= len(values) <= 64
-            ):
+            if type(values) not in {list, tuple} or not 1 <= len(values) <= 64:
                 _invalid()
             tokens = tuple(_token(item) for item in values)
             if len(set(tokens)) != len(tokens):
@@ -785,9 +789,7 @@ def public_operation_status(
     }
 
 
-def public_agent_result(
-    result_kind: object, value: object
-) -> dict[str, object]:
+def public_agent_result(result_kind: object, value: object) -> dict[str, object]:
     """Fail closed to the five result shapes that may cross the Admin boundary."""
 
     if type(result_kind) is not str or result_kind not in _AGENT_RESULT_KINDS.values():
@@ -875,7 +877,9 @@ def _result_bool(value: object) -> bool:
 def _public_agent_reason_codes(value: object) -> list[str]:
     if type(value) is not list or len(value) > 32:
         raise AdminContractError("resource.host_response_invalid")
-    if any(type(code) is not str or code not in PUBLIC_AGENT_REASON_CODES for code in value):
+    if any(
+        type(code) is not str or code not in PUBLIC_AGENT_REASON_CODES for code in value
+    ):
         raise AdminContractError("resource.host_response_invalid")
     if len(set(value)) != len(value):
         raise AdminContractError("resource.host_response_invalid")

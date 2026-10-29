@@ -174,9 +174,7 @@ def build_home_broker_install_plan() -> InstallPlan:
             InstallDirectory("/etc/the-hive", 0, 0, 0o755),
             InstallDirectory("/usr/lib/the-hive-home-broker", 0, 0, 0o555),
             InstallDirectory("/usr/lib/the-hive-home-broker/0.10.5", 0, 0, 0o555),
-            InstallDirectory(
-                "/usr/lib/the-hive-home-broker/0.10.5/bin", 0, 0, 0o555
-            ),
+            InstallDirectory("/usr/lib/the-hive-home-broker/0.10.5/bin", 0, 0, 0o555),
             InstallDirectory(
                 "/usr/lib/the-hive-home-broker/0.10.5/python", 0, 0, 0o555
             ),

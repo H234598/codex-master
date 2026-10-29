@@ -37,6 +37,26 @@ def _installer() -> dict[str, object]:
     return runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
 
 
+def _install_runtime_for_test(
+    installer: dict[str, object], home: Path
+) -> dict[str, object]:
+    function = installer["_install_attested_runtime"]
+    local = home / ".local"
+    if not local.exists():
+        local.mkdir(mode=0o700)
+    stage_name = (
+        ".the-hive-runtime.stage.test-"
+        + hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:12]
+    )
+    return function(  # type: ignore[operator,return-value]
+        home=home,
+        stage_name=stage_name,
+        record_setup=lambda _stage: None,
+        reserve_setup=lambda _target, _temporary, _digest: None,
+        before_publish=lambda _stage, _layout, _outputs: None,
+    )
+
+
 def _stage(
     installer: dict[str, object],
     root: Path,
@@ -195,7 +215,7 @@ def test_production_publish_rechecks_clean_r2_base_descendant_after_stage_copy(
     with pytest.raises(
         installer["InstallError"], match="install_release_checkout_changed"
     ):  # type: ignore[index]
-        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+        _install_runtime_for_test(installer, home)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     assert not (release_root / ".the-hive-release-pointers.json").exists()
 
@@ -264,7 +284,7 @@ def test_dirty_provenance_is_rejected_before_stage_or_pointer_mutation(
     with pytest.raises(
         installer["InstallError"], match="install_release_checkout_dirty"
     ):  # type: ignore[index]
-        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+        _install_runtime_for_test(installer, home)
     assert built == []
     assert not (home / ".local" / "lib" / "the-hive-runtime").exists()
 

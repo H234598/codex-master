@@ -34,10 +34,7 @@ RESOLVE_NO_MAGICLINKS = 0x02
 RESOLVE_NO_SYMLINKS = 0x04
 RESOLVE_BENEATH = 0x08
 REQUIRED_RESOLVE_FLAGS = (
-    RESOLVE_BENEATH
-    | RESOLVE_NO_SYMLINKS
-    | RESOLVE_NO_MAGICLINKS
-    | RESOLVE_NO_XDEV
+    RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV
 )
 
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
@@ -131,7 +128,9 @@ class LinuxBrokerOps(Protocol):
 
     def fsync(self, fd: int) -> None: ...
 
-    def renameat2_noreplace(self, parent_fd: int, staging_name: str, final_name: str) -> None: ...
+    def renameat2_noreplace(
+        self, parent_fd: int, staging_name: str, final_name: str
+    ) -> None: ...
 
     def unlinkat(self, parent_fd: int, name: str) -> None: ...
 
@@ -156,7 +155,9 @@ def _fd(value: object) -> int:
     return _integer(value, 0, MAX_CHPB_INODE, LinuxBrokerCode.IDENTITY_MISMATCH)
 
 
-def _identity(value: object, code: LinuxBrokerCode = LinuxBrokerCode.IDENTITY_MISMATCH) -> ObjectIdentity:
+def _identity(
+    value: object, code: LinuxBrokerCode = LinuxBrokerCode.IDENTITY_MISMATCH
+) -> ObjectIdentity:
     if type(value) is not ObjectIdentity:
         _fail(code)
     _integer(value.dev, 0, MAX_CHPB_DEVICE, code)
@@ -190,14 +191,19 @@ def _unit_evidence(value: object) -> SystemdUnitEvidence:
         _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
     if type(value.unit_name) is not str or _UNIT.fullmatch(value.unit_name) is None:
         _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    if type(value.invocation_id) is not str or _HEX32.fullmatch(value.invocation_id) is None:
+    if (
+        type(value.invocation_id) is not str
+        or _HEX32.fullmatch(value.invocation_id) is None
+    ):
         _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
     cgroup = _identity(value.cgroup)
     if cgroup.mode & _TYPE_MASK != _DIRECTORY_TYPE or cgroup.nlink < 2:
         _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
     if cgroup.uid != 0 or cgroup.gid != 0 or cgroup.mode & _NO_GROUP_OTHER_WRITE:
         _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    _integer(value.unit_generation, 1, MAX_CHPB_GENERATION, LinuxBrokerCode.IDENTITY_MISMATCH)
+    _integer(
+        value.unit_generation, 1, MAX_CHPB_GENERATION, LinuxBrokerCode.IDENTITY_MISMATCH
+    )
     _mcs(value.mcs_pair)
     return value
 

@@ -258,11 +258,8 @@ class _AdminHandler(BaseHTTPRequestHandler):
             self._reply_problem(400, "control.request_invalid")
             return
         if (
-            expected_operation is not None
-            and request.operation != expected_operation
-        ) or (
-            not _route_arguments_match(request, route_arguments)
-        ):
+            expected_operation is not None and request.operation != expected_operation
+        ) or (not _route_arguments_match(request, route_arguments)):
             self._reply_problem(400, "control.request_invalid")
             return
         try:

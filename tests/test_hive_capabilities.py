@@ -13,7 +13,12 @@ from the_hive.hive.capabilities import (
     CapabilityError,
     requires_goddess_auto_report,
 )
-from the_hive.hive.principals import ExecutionBinding, Principal, PrincipalError, PrincipalRegistry
+from the_hive.hive.principals import (
+    ExecutionBinding,
+    Principal,
+    PrincipalError,
+    PrincipalRegistry,
+)
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -77,7 +82,9 @@ def registry_with_root(class_id: str = "goettin") -> PrincipalRegistry:
 
 
 def test_constants_and_import_surface_are_exact() -> None:
-    assert ROOT_EXECUTIVE_CLASSES == frozenset({"gottbiene", "godbee", "goettin", "goddess"})
+    assert ROOT_EXECUTIVE_CLASSES == frozenset(
+        {"gottbiene", "godbee", "goettin", "goddess"}
+    )
     assert QUEEN_CLASSES == frozenset({"koenigin", "queen"})
     assert GODDESS_REPORT_AUTO_CAPABILITY == "goddess.report.auto"
     assert capabilities.__all__ == [
@@ -106,19 +113,26 @@ def test_all_canonical_roots_accept_queens_without_changing_old_hierarchy(
 
 
 @pytest.mark.parametrize("root_class", sorted(ROOT_EXECUTIVE_CLASSES))
-def test_active_root_with_capability_and_own_unexpired_binding_is_eligible(root_class: str) -> None:
+def test_active_root_with_capability_and_own_unexpired_binding_is_eligible(
+    root_class: str,
+) -> None:
     registry = registry_with_root(root_class)
     root_id = f"{root_class}-root"
     registry.bind_execution(binding("binding-own", root_id))
-    assert requires_goddess_auto_report(
-        registry.get(root_id),
-        capabilities=frozenset({GODDESS_REPORT_AUTO_CAPABILITY}),
-        registry=registry,
-        now=NOW,
-    ) is True
+    assert (
+        requires_goddess_auto_report(
+            registry.get(root_id),
+            capabilities=frozenset({GODDESS_REPORT_AUTO_CAPABILITY}),
+            registry=registry,
+            now=NOW,
+        )
+        is True
+    )
 
 
-def test_truth_table_denies_missing_released_expired_foreign_and_nonroot_bindings() -> None:
+def test_truth_table_denies_missing_released_expired_foreign_and_nonroot_bindings() -> (
+    None
+):
     registry = PrincipalRegistry()
     registry.create(principal("goettin-root", "goettin"))
     registry.create(principal("goddess-root", "goddess"))
@@ -126,33 +140,74 @@ def test_truth_table_denies_missing_released_expired_foreign_and_nonroot_binding
     capability = frozenset({GODDESS_REPORT_AUTO_CAPABILITY})
     root = registry.get("goettin-root")
 
-    assert requires_goddess_auto_report(root, capabilities=capability, registry=registry, now=NOW) is False
-    registry.bind_execution(binding("binding-expired", "goettin-root", expires_at_utc=EXPIRED))
-    assert requires_goddess_auto_report(root, capabilities=capability, registry=registry, now=NOW) is False
+    assert (
+        requires_goddess_auto_report(
+            root, capabilities=capability, registry=registry, now=NOW
+        )
+        is False
+    )
+    registry.bind_execution(
+        binding("binding-expired", "goettin-root", expires_at_utc=EXPIRED)
+    )
+    assert (
+        requires_goddess_auto_report(
+            root, capabilities=capability, registry=registry, now=NOW
+        )
+        is False
+    )
     registry.bind_execution(binding("binding-foreign", "goddess-root"))
-    assert requires_goddess_auto_report(root, capabilities=capability, registry=registry, now=NOW) is False
+    assert (
+        requires_goddess_auto_report(
+            root, capabilities=capability, registry=registry, now=NOW
+        )
+        is False
+    )
     registry.bind_execution(binding("binding-released", "goettin-root"))
     registry.release_execution("binding-released")
-    assert requires_goddess_auto_report(root, capabilities=capability, registry=registry, now=NOW) is False
+    assert (
+        requires_goddess_auto_report(
+            root, capabilities=capability, registry=registry, now=NOW
+        )
+        is False
+    )
 
     queen = registry.get("queen-child")
     registry.bind_execution(binding("binding-queen", "queen-child", repo_id="repo-one"))
-    assert requires_goddess_auto_report(queen, capabilities=capability, registry=registry, now=NOW) is False
+    assert (
+        requires_goddess_auto_report(
+            queen, capabilities=capability, registry=registry, now=NOW
+        )
+        is False
+    )
 
 
 def test_expiry_equality_is_not_active_and_active_plus_expired_is_true() -> None:
     registry = registry_with_root()
     root = registry.get("goettin-root")
     capability = frozenset({GODDESS_REPORT_AUTO_CAPABILITY})
-    registry.bind_execution(binding("binding-equal", root.principal_id, expires_at_utc=NOW.isoformat().replace("+00:00", "Z")))
+    registry.bind_execution(
+        binding(
+            "binding-equal",
+            root.principal_id,
+            expires_at_utc=NOW.isoformat().replace("+00:00", "Z"),
+        )
+    )
     assert registry.has_active_execution_binding(root.principal_id, now=NOW) is False
     registry.bind_execution(binding("binding-active", root.principal_id))
-    assert requires_goddess_auto_report(root, capabilities=capability, registry=registry, now=NOW) is True
+    assert (
+        requires_goddess_auto_report(
+            root, capabilities=capability, registry=registry, now=NOW
+        )
+        is True
+    )
 
 
 def test_multiple_binding_order_has_same_boolean_result() -> None:
     outcomes: list[bool] = []
-    for binding_ids in (("binding-expired", "binding-active"), ("binding-active", "binding-expired")):
+    for binding_ids in (
+        ("binding-expired", "binding-active"),
+        ("binding-active", "binding-expired"),
+    ):
         registry = registry_with_root()
         root = registry.get("goettin-root")
         for binding_id in binding_ids:
@@ -160,7 +215,9 @@ def test_multiple_binding_order_has_same_boolean_result() -> None:
                 binding(
                     binding_id,
                     root.principal_id,
-                    expires_at_utc=EXPIRED if binding_id.endswith("expired") else FUTURE,
+                    expires_at_utc=EXPIRED
+                    if binding_id.endswith("expired")
+                    else FUTURE,
                 )
             )
         outcomes.append(
@@ -175,9 +232,15 @@ def test_multiple_binding_order_has_same_boolean_result() -> None:
 
     expired_only = registry_with_root()
     root = expired_only.get("goettin-root")
-    expired_only.bind_execution(binding("binding-expired-one", root.principal_id, expires_at_utc=EXPIRED))
-    expired_only.bind_execution(binding("binding-expired-two", root.principal_id, expires_at_utc=EXPIRED))
-    assert expired_only.has_active_execution_binding(root.principal_id, now=NOW) is False
+    expired_only.bind_execution(
+        binding("binding-expired-one", root.principal_id, expires_at_utc=EXPIRED)
+    )
+    expired_only.bind_execution(
+        binding("binding-expired-two", root.principal_id, expires_at_utc=EXPIRED)
+    )
+    assert (
+        expired_only.has_active_execution_binding(root.principal_id, now=NOW) is False
+    )
 
 
 def test_inactive_unknown_nonroot_and_missing_capability_are_denied() -> None:
@@ -188,17 +251,40 @@ def test_inactive_unknown_nonroot_and_missing_capability_are_denied() -> None:
     registry.bind_execution(binding("binding-queen", "queen-child", repo_id="repo-one"))
     capability = frozenset({GODDESS_REPORT_AUTO_CAPABILITY})
 
-    assert requires_goddess_auto_report(
-        registry.get("goddess-root"), capabilities=capability, registry=registry, now=NOW
-    ) is False
-    assert requires_goddess_auto_report(
-        registry.get("queen-child"), capabilities=capability, registry=registry, now=NOW
-    ) is False
-    assert requires_goddess_auto_report(
-        registry.get("goettin-root"), capabilities=frozenset(), registry=registry, now=NOW
-    ) is False
+    assert (
+        requires_goddess_auto_report(
+            registry.get("goddess-root"),
+            capabilities=capability,
+            registry=registry,
+            now=NOW,
+        )
+        is False
+    )
+    assert (
+        requires_goddess_auto_report(
+            registry.get("queen-child"),
+            capabilities=capability,
+            registry=registry,
+            now=NOW,
+        )
+        is False
+    )
+    assert (
+        requires_goddess_auto_report(
+            registry.get("goettin-root"),
+            capabilities=frozenset(),
+            registry=registry,
+            now=NOW,
+        )
+        is False
+    )
     unknown = principal("unknown-class", "unknown-class")
-    assert requires_goddess_auto_report(unknown, capabilities=capability, registry=registry, now=NOW) is False
+    assert (
+        requires_goddess_auto_report(
+            unknown, capabilities=capability, registry=registry, now=NOW
+        )
+        is False
+    )
 
 
 def test_authoritative_registry_identity_blocks_forged_goddess() -> None:
@@ -209,27 +295,37 @@ def test_authoritative_registry_identity_blocks_forged_goddess() -> None:
     registry.create(principal("specialist-one", "specialist", "lead-one", "repo-one"))
     worker = principal("worker-one", "worker", "specialist-one", "repo-one")
     registry.create(worker)
-    registry.bind_execution(binding("binding-worker", worker.principal_id, repo_id="repo-one"))
+    registry.bind_execution(
+        binding("binding-worker", worker.principal_id, repo_id="repo-one")
+    )
 
     forged_goddess = principal(worker.principal_id, "goddess")
-    assert requires_goddess_auto_report(
-        forged_goddess,
-        capabilities=frozenset({GODDESS_REPORT_AUTO_CAPABILITY}),
-        registry=registry,
-        now=NOW,
-    ) is False
+    assert (
+        requires_goddess_auto_report(
+            forged_goddess,
+            capabilities=frozenset({GODDESS_REPORT_AUTO_CAPABILITY}),
+            registry=registry,
+            now=NOW,
+        )
+        is False
+    )
 
 
 def test_additional_string_capabilities_are_allowed_but_non_strings_are_not() -> None:
     registry = registry_with_root("goddess")
     root = registry.get("goddess-root")
     registry.bind_execution(binding("binding-goddess", root.principal_id))
-    assert requires_goddess_auto_report(
-        root,
-        capabilities=frozenset({GODDESS_REPORT_AUTO_CAPABILITY, "fleet.read_compact"}),
-        registry=registry,
-        now=NOW,
-    ) is True
+    assert (
+        requires_goddess_auto_report(
+            root,
+            capabilities=frozenset(
+                {GODDESS_REPORT_AUTO_CAPABILITY, "fleet.read_compact"}
+            ),
+            registry=registry,
+            now=NOW,
+        )
+        is True
+    )
     with pytest.raises(CapabilityError):
         requires_goddess_auto_report(
             root,
@@ -239,7 +335,9 @@ def test_additional_string_capabilities_are_allowed_but_non_strings_are_not() ->
         )
 
 
-def test_marker_only_capability_short_circuits_without_marker_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_marker_only_capability_short_circuits_without_marker_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     registry = registry_with_root("goddess")
     root = registry.get("goddess-root")
     calls: list[str] = []
@@ -288,9 +386,19 @@ class BrokenTimezone(tzinfo):
         (SimpleNamespace(), None, frozenset({GODDESS_REPORT_AUTO_CAPABILITY}), NOW),
         (None, SimpleNamespace(), frozenset({GODDESS_REPORT_AUTO_CAPABILITY}), NOW),
         (None, None, [GODDESS_REPORT_AUTO_CAPABILITY], NOW),
-        (None, None, frozenset({GODDESS_REPORT_AUTO_CAPABILITY}), datetime(2026, 8, 15, 12, 0)),
+        (
+            None,
+            None,
+            frozenset({GODDESS_REPORT_AUTO_CAPABILITY}),
+            datetime(2026, 8, 15, 12, 0),
+        ),
         (None, None, frozenset({GODDESS_REPORT_AUTO_CAPABILITY}), "secret-time-marker"),
-        (None, None, frozenset({GODDESS_REPORT_AUTO_CAPABILITY}), datetime(2026, 8, 15, 12, 0, tzinfo=BrokenTimezone())),
+        (
+            None,
+            None,
+            frozenset({GODDESS_REPORT_AUTO_CAPABILITY}),
+            datetime(2026, 8, 15, 12, 0, tzinfo=BrokenTimezone()),
+        ),
     ],
 )
 def test_invalid_inputs_raise_marker_free_capability_errors(
@@ -314,7 +422,9 @@ def test_invalid_inputs_raise_marker_free_capability_errors(
     assert "secret-time-marker" not in repr(raised.value)
 
 
-def test_registry_query_is_private_boolean_read_only_and_marker_free(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registry_query_is_private_boolean_read_only_and_marker_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     registry = registry_with_root()
     root = registry.get("goettin-root")
     registry.bind_execution(binding("binding-private", root.principal_id))

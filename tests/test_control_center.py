@@ -13,7 +13,9 @@ from the_hive.fleet_control import OllamaPageState
 from the_hive.server import AgentError
 
 
-def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal() -> None:
+def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal() -> (
+    None
+):
     calls: list[tuple[str, dict]] = []
     events: list[str] = []
     delayed: list[tuple[object, tuple[object, ...]]] = []
@@ -134,7 +136,9 @@ def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal
             }
         else:
             assert arguments == {}
-    rendered = [call.args[0] for call in window.host_probe_status_label.set_text.call_args_list]
+    rendered = [
+        call.args[0] for call in window.host_probe_status_label.set_text.call_args_list
+    ]
     assert "Host-Probe: QUEUED" in rendered
     assert "Host-Probe: RUNNING" in rendered
     assert "Host-Probe: SUCCEEDED" in rendered
@@ -149,7 +153,9 @@ def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal
         "backend:failed",
         "backend:host-refresh",
     ]
-    host_cards = [call.args[0] for call in window.host_card_label.set_text.call_args_list]
+    host_cards = [
+        call.args[0] for call in window.host_card_label.set_text.call_args_list
+    ]
     assert any("Worker One" in value for value in host_cards)
     assert any("Generation 5" in value for value in host_cards)
 
@@ -168,18 +174,14 @@ def test_host_probe_submit_and_timer_scheduling_failures_are_visible() -> None:
 
     window._probe_selected_host()
 
-    window.host_probe_status_label.set_text.assert_called_with(
-        "Host-Probe: UNKNOWN"
-    )
+    window.host_probe_status_label.set_text.assert_called_with("Host-Probe: UNKNOWN")
 
     window.controller = Mock()
     window.controller.submit.return_value = True
     window.GLib = Mock()
     window.GLib.timeout_add.return_value = 0
     window._host_probe_started({"id": "op-one", "state": "planned"})
-    window.host_probe_status_label.set_text.assert_called_with(
-        "Host-Probe: UNKNOWN"
-    )
+    window.host_probe_status_label.set_text.assert_called_with("Host-Probe: UNKNOWN")
 
 
 def test_delayed_host_probe_status_submit_exception_clears_poll_state() -> None:
@@ -203,9 +205,7 @@ def test_delayed_host_probe_status_submit_exception_clears_poll_state() -> None:
 
     assert callback(*arguments) is False
 
-    window.host_probe_status_label.set_text.assert_called_with(
-        "Host-Probe: UNKNOWN"
-    )
+    window.host_probe_status_label.set_text.assert_called_with("Host-Probe: UNKNOWN")
     assert window._host_probe_operation_id is None
     assert window._host_probe_poll_attempts == 0
     window.refresh_host_card.assert_not_called()
@@ -228,9 +228,7 @@ def test_host_probe_unknown_terminality_follows_canonical_operation_contract() -
 
     window._host_probe_started({"id": "op-running", "state": "running"})
 
-    window.host_probe_status_label.set_text.assert_called_with(
-        "Host-Probe: UNKNOWN"
-    )
+    window.host_probe_status_label.set_text.assert_called_with("Host-Probe: UNKNOWN")
     window.GLib.timeout_add.assert_not_called()
     window.refresh_host_card.assert_not_called()
 
@@ -317,7 +315,9 @@ class ControlCenterViewModelTest(unittest.TestCase):
         ):
             self.assertNotIn(secret, encoded)
 
-    def test_stop_is_limit_independent_but_requires_verified_identity_and_free_lease(self) -> None:
+    def test_stop_is_limit_independent_but_requires_verified_identity_and_free_lease(
+        self,
+    ) -> None:
         blocked_running = self._status_result(running=True, blocked=True)
         page = control_center.normalize_status_page(self._page(blocked_running))
 
@@ -364,7 +364,9 @@ class ControlCenterViewModelTest(unittest.TestCase):
             categories,
             {"Aufträge", "Serien", "Auth & Limits", "Agentinnen", "Diagnose"},
         )
-        self.assertEqual(control_center.tool_category("agent_pool_copy_auth"), "Auth & Limits")
+        self.assertEqual(
+            control_center.tool_category("agent_pool_copy_auth"), "Auth & Limits"
+        )
 
     def test_control_center_declares_ollama_models_and_instances_pages(self) -> None:
         window = control_center.ControlCenterWindow.__new__(
@@ -455,8 +457,12 @@ class ControlCenterViewModelTest(unittest.TestCase):
         window.ollama_state = OllamaPageState(7, (), ())
         window.ollama_ref_entry = Mock(get_text=Mock(return_value="quiet-runner"))
         window.ollama_label_entry = Mock(get_text=Mock(return_value="Quiet Runner"))
-        window.ollama_executable_entry = Mock(get_text=Mock(return_value="/usr/bin/ollama"))
-        window.ollama_models_path_entry = Mock(get_text=Mock(return_value="/srv/ollama/models"))
+        window.ollama_executable_entry = Mock(
+            get_text=Mock(return_value="/usr/bin/ollama")
+        )
+        window.ollama_models_path_entry = Mock(
+            get_text=Mock(return_value="/srv/ollama/models")
+        )
         window.ollama_cpus_entry = Mock(get_text=Mock(return_value="4-7"))
         window.ollama_host_combo = Mock(get_active_id=Mock(return_value="control-host"))
         window.ollama_quota_spin = Mock(get_value_as_int=Mock(return_value=350))
@@ -532,12 +538,21 @@ class ControlCenterViewModelTest(unittest.TestCase):
         window.refresh_ollama.assert_called_once_with()
 
     def test_action_block_reason_explains_safety_gate(self) -> None:
-        clear = control_center.normalize_status_page(self._page(self._status_result())).rows[0]
+        clear = control_center.normalize_status_page(
+            self._page(self._status_result())
+        ).rows[0]
         self.assertIsNone(control_center.action_block_reason(clear, "start"))
-        self.assertEqual(control_center.action_block_reason(clear, "stop"), "Biene läuft nicht")
-        self.assertIn("Letzter Auftrag: 2026-08-03T12:00:00+00:00", control_center.row_summary(clear))
+        self.assertEqual(
+            control_center.action_block_reason(clear, "stop"), "Biene läuft nicht"
+        )
+        self.assertIn(
+            "Letzter Auftrag: 2026-08-03T12:00:00+00:00",
+            control_center.row_summary(clear),
+        )
 
-        blocked = control_center.normalize_status_page(self._page(self._status_result(blocked=True))).rows[0]
+        blocked = control_center.normalize_status_page(
+            self._page(self._status_result(blocked=True))
+        ).rows[0]
         self.assertEqual(
             control_center.action_block_reason(blocked, "start"),
             "Geteilte Account-Reihe am Limit",
@@ -553,11 +568,15 @@ class ControlCenterControllerTest(unittest.TestCase):
             schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
         try:
-            self.assertEqual(controller._executor._thread_name_prefix, "the-hive-control")
+            self.assertEqual(
+                controller._executor._thread_name_prefix, "the-hive-control"
+            )
         finally:
             self.assertTrue(controller.close())
 
-    def test_backend_timeout_policy_and_prepared_abort_restore_idle_dispatcher(self) -> None:
+    def test_backend_timeout_policy_and_prepared_abort_restore_idle_dispatcher(
+        self,
+    ) -> None:
         self.assertEqual(
             control_center.backend_timeout_seconds(
                 "agent_wait", {"timeout_seconds": 300}
@@ -595,10 +614,18 @@ class ControlCenterControllerTest(unittest.TestCase):
             dispatch=dispatch,
             schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
-        self.assertTrue(controller.submit("agent_status", {"agent": "a1"}, lambda result: (results.append(result), completed.set())))
+        self.assertTrue(
+            controller.submit(
+                "agent_status",
+                {"agent": "a1"},
+                lambda result: (results.append(result), completed.set()),
+            )
+        )
         self.assertTrue(started.wait(1))
         self.assertTrue(controller.busy)
-        self.assertFalse(controller.submit("agent_stop", {"agent": "a1"}, lambda _result: None))
+        self.assertFalse(
+            controller.submit("agent_stop", {"agent": "a1"}, lambda _result: None)
+        )
 
         release.set()
         self.assertTrue(completed.wait(2))
@@ -617,7 +644,13 @@ class ControlCenterControllerTest(unittest.TestCase):
             dispatch=dispatch,
             schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
-        self.assertTrue(controller.submit("agent_status", {}, lambda result: (results.append(result), completed.set())))
+        self.assertTrue(
+            controller.submit(
+                "agent_status",
+                {},
+                lambda result: (results.append(result), completed.set()),
+            )
+        )
         self.assertTrue(completed.wait(2))
         self.assertNotIn("sk-super-secret-value", json.dumps(results))
         self.assertIn("error", results[0])
@@ -649,12 +682,18 @@ class ControlCenterControllerTest(unittest.TestCase):
             argv=[sys.executable, "-c", child],
             timeout_seconds=2,
         )
-        self.assertEqual(dispatcher("agent_status", {}), {"ok": True, "name": "agent_status"})
+        self.assertEqual(
+            dispatcher("agent_status", {}), {"ok": True, "name": "agent_status"}
+        )
 
-    def test_subprocess_dispatcher_defaults_to_the_runtime_image_entrypoint(self) -> None:
+    def test_subprocess_dispatcher_defaults_to_the_runtime_image_entrypoint(
+        self,
+    ) -> None:
         entrypoint = Path("/tmp/the-hive-runtime/bin/the-hive-mcp")
 
-        with patch.object(control_center, "runtime_mcp_entrypoint", return_value=entrypoint):
+        with patch.object(
+            control_center, "runtime_mcp_entrypoint", return_value=entrypoint
+        ):
             dispatcher = control_center.SubprocessToolDispatcher()
 
         self.assertEqual(dispatcher._argv, [str(entrypoint)])
@@ -713,7 +752,9 @@ class ControlCenterControllerTest(unittest.TestCase):
             dispatch=CancelDispatch(),
             schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
-        self.assertTrue(controller.submit("agent_status", {}, lambda _result: completed.set()))
+        self.assertTrue(
+            controller.submit("agent_status", {}, lambda _result: completed.set())
+        )
         self.assertTrue(started.wait(1))
         self.assertTrue(controller.cancel())
         self.assertTrue(completed.wait(2))
@@ -730,7 +771,13 @@ class ControlCenterControllerTest(unittest.TestCase):
             dispatch=dispatcher,
             schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
-        self.assertTrue(controller.submit("agent_status", {}, lambda result: (results.append(result), completed.set())))
+        self.assertTrue(
+            controller.submit(
+                "agent_status",
+                {},
+                lambda result: (results.append(result), completed.set()),
+            )
+        )
         deadline = time.monotonic() + 2
         while not controller.cancel() and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -738,7 +785,9 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertIn("outcome unknown after cancellation", results[0]["error"])
         self.assertTrue(controller.close())
 
-    def test_subprocess_dispatcher_honors_prepared_cancel_without_poisoning_idle(self) -> None:
+    def test_subprocess_dispatcher_honors_prepared_cancel_without_poisoning_idle(
+        self,
+    ) -> None:
         dispatcher = control_center.SubprocessToolDispatcher(
             argv=[sys.executable, "-c", "import time; time.sleep(30)"],
             timeout_seconds=30,
@@ -774,7 +823,9 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertTrue(controller.submit("agent_status", {}, callback))
         self.assertTrue(started.wait(1))
         self.assertFalse(controller.close())
-        self.assertFalse(controller.submit("agent_stop", {"agent": "a1"}, lambda _result: None))
+        self.assertFalse(
+            controller.submit("agent_stop", {"agent": "a1"}, lambda _result: None)
+        )
         release.set()
         deadline = time.monotonic() + 2
         while controller.busy and time.monotonic() < deadline:
@@ -783,7 +834,9 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertFalse(callback_called.is_set())
         self.assertTrue(controller.close())
 
-    def test_scheduler_registration_failure_reports_visible_unknown_result(self) -> None:
+    def test_scheduler_registration_failure_reports_visible_unknown_result(
+        self,
+    ) -> None:
         for schedule in (
             lambda _callback, *_args: 0,
             lambda _callback, *_args: (_ for _ in ()).throw(
@@ -807,10 +860,14 @@ class ControlCenterControllerTest(unittest.TestCase):
 
             self.assertTrue(callback_called.wait(2))
             self.assertFalse(controller.busy)
-            self.assertEqual(results, [{"error": "control-center delivery unavailable"}])
+            self.assertEqual(
+                results, [{"error": "control-center delivery unavailable"}]
+            )
             self.assertTrue(controller.close())
 
-    def test_window_close_retries_cancel_then_destroys_after_backend_cleanup(self) -> None:
+    def test_window_close_retries_cancel_then_destroys_after_backend_cleanup(
+        self,
+    ) -> None:
         class Controller:
             busy = True
             close_calls = 0
@@ -825,10 +882,14 @@ class ControlCenterControllerTest(unittest.TestCase):
                 return True
 
         callbacks = []
-        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
         view.controller = Controller()
         view.GLib = Mock()
-        view.GLib.timeout_add.side_effect = lambda _delay, callback: callbacks.append(callback) or 7
+        view.GLib.timeout_add.side_effect = (
+            lambda _delay, callback: callbacks.append(callback) or 7
+        )
         view.window = Mock()
         view.status_label = Mock()
         view.tool_status_label = Mock()
@@ -847,7 +908,9 @@ class ControlCenterControllerTest(unittest.TestCase):
         controller = Mock()
         controller.close.side_effect = [False, True]
         controller.cancel.return_value = True
-        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
         view.controller = controller
         view.GLib = Mock()
         view.GLib.timeout_add.return_value = 9
@@ -861,7 +924,9 @@ class ControlCenterControllerTest(unittest.TestCase):
         view.GLib.source_remove.assert_called_once_with(9)
         self.assertEqual(view._close_poll_id, 0)
 
-    def test_window_close_does_not_wedge_when_close_timer_registration_fails(self) -> None:
+    def test_window_close_does_not_wedge_when_close_timer_registration_fails(
+        self,
+    ) -> None:
         for failure in (0, RuntimeError("injected close timer failure")):
             controller = Mock()
             controller.close.return_value = False
@@ -926,7 +991,9 @@ class ControlCenterControllerTest(unittest.TestCase):
         tool = control_center.ToolDescriptor(
             "agent_status", "Status", control_center.Risk.READ_ONLY, (), True, None
         )
-        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
         view.tool_selector = Mock()
         view.tool_selector.get_active_id.return_value = "0"
         view.visible_tools = (tool,)
@@ -940,11 +1007,15 @@ class ControlCenterControllerTest(unittest.TestCase):
         view._run_selected_tool.assert_called_once_with()
 
     def test_tool_with_options_waits_for_execute_button(self) -> None:
-        field = control_center.FieldDescriptor("agent", control_center.FieldKind.STRING, True)
+        field = control_center.FieldDescriptor(
+            "agent", control_center.FieldKind.STRING, True
+        )
         tool = control_center.ToolDescriptor(
             "agent_send", "Send", control_center.Risk.MUTATING, (field,), True, None
         )
-        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
         view.tool_selector = Mock()
         view.tool_selector.get_active_id.return_value = "0"
         view.visible_tools = (tool,)
@@ -978,14 +1049,20 @@ class ControlCenterWindowContractTest(unittest.TestCase):
         controller.close.return_value = True
         # The GUI consumes an authorized catalog; obtaining authorization belongs
         # to the provider's tests, not this display-free construction fixture.
-        catalog = [{
-            "name": "fleet_hosts",
-            "description": "List fleet hosts",
-            "inputSchema": {
-                "type": "object", "properties": {}, "additionalProperties": False,
-            },
-        }]
-        with patch.object(control_center, "teamleader_tool_catalog", return_value=catalog):
+        catalog = [
+            {
+                "name": "fleet_hosts",
+                "description": "List fleet hosts",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            }
+        ]
+        with patch.object(
+            control_center, "teamleader_tool_catalog", return_value=catalog
+        ):
             window = control_center.ControlCenterWindow(
                 Gtk, GLib, object(), controller=controller
             )
@@ -1069,13 +1146,9 @@ class ControlCenterWindowContractTest(unittest.TestCase):
 
         self.assertTrue(view._confirm_message("Fortfahren?"))
         self.assertTrue(view._confirm_destructive(tool))
-        self.assertTrue(
-            view._confirm_tool_run(tool, control_center.Risk.READ_ONLY, 0)
-        )
+        self.assertTrue(view._confirm_tool_run(tool, control_center.Risk.READ_ONLY, 0))
         with patch.object(view, "_confirm_message", return_value=True) as confirm:
-            self.assertTrue(
-                view._confirm_tool_run(tool, control_center.Risk.BROAD, 2)
-            )
+            self.assertTrue(view._confirm_tool_run(tool, control_center.Risk.BROAD, 2))
             self.assertEqual(confirm.call_count, 2)
 
     def test_tool_run_preview_and_completion_follow_risk_contract(self) -> None:
@@ -1228,7 +1301,9 @@ class ControlCenterGtkBoundaryTest(unittest.TestCase):
         application.run.assert_called_once_with(
             ["the-hive-control-center", "--page", "ollama"]
         )
-        window_class.assert_called_once_with(Gtk, mock_load.return_value[1], application)
+        window_class.assert_called_once_with(
+            Gtk, mock_load.return_value[1], application
+        )
         self.assertEqual(window.show.call_args_list[0].args, ("ollama",))
         self.assertEqual(window.show.call_count, 2)
 
@@ -1237,7 +1312,9 @@ class ControlCenterCliTest(unittest.TestCase):
     @patch("the_hive.control_center.launch_gtk_application", return_value=0)
     @patch("the_hive.control_center.require_teamleader_tool_access")
     @patch("the_hive.control_center.assert_install_context_allows_master_registration")
-    def test_run_checks_main_context_and_role_then_launches(self, mock_context, mock_access, mock_launch) -> None:
+    def test_run_checks_main_context_and_role_then_launches(
+        self, mock_context, mock_access, mock_launch
+    ) -> None:
         self.assertEqual(control_center.run_control_center([]), 0)
         mock_context.assert_called_once_with()
         mock_access.assert_called_once_with()
@@ -1249,15 +1326,17 @@ class ControlCenterCliTest(unittest.TestCase):
     def test_run_accepts_only_ollama_deep_link(
         self, _mock_context, _mock_access, mock_launch
     ) -> None:
-        self.assertEqual(
-            control_center.run_control_center(["--page", "ollama"]), 0
-        )
+        self.assertEqual(control_center.run_control_center(["--page", "ollama"]), 0)
         mock_launch.assert_called_once_with(["--page", "ollama"])
         with self.assertRaisesRegex(AgentError, "page is invalid"):
             control_center.run_control_center(["--page", "secrets"])
 
-    @patch("the_hive.control_center.load_gtk", side_effect=RuntimeError("GTK unavailable"))
-    def test_launch_fails_without_traceback_when_gtk_is_missing(self, _mock_load) -> None:
+    @patch(
+        "the_hive.control_center.load_gtk", side_effect=RuntimeError("GTK unavailable")
+    )
+    def test_launch_fails_without_traceback_when_gtk_is_missing(
+        self, _mock_load
+    ) -> None:
         with self.assertRaisesRegex(AgentError, "GTK is unavailable"):
             control_center.launch_gtk_application([])
 

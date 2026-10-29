@@ -109,7 +109,10 @@ class ControlReleaseSpecV2:
     launcher_path: str
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != _SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != _SCHEMA_VERSION
+        ):
             _invalid()
         _validate_utf8_text(self.payload_version)
         _validate_payloads(self.payloads)

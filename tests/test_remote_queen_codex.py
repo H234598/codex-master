@@ -108,7 +108,9 @@ def test_builder_rejects_unpinned_or_malformed_installer_generation(value):
     _assert_code(lambda: _build_manifest(installer_generation=value))
 
 
-@pytest.mark.parametrize("value", ["latest", "stable", "daily", "main", "HEAD", " ", "x\n", "x" * 129])
+@pytest.mark.parametrize(
+    "value", ["latest", "stable", "daily", "main", "HEAD", " ", "x\n", "x" * 129]
+)
 def test_builder_rejects_unpinned_manifest_generations(value):
     _assert_code(
         lambda: _build_manifest(
@@ -123,7 +125,9 @@ def test_builder_rejects_unpinned_manifest_generations(value):
 
 
 @pytest.mark.parametrize("field", ["installer_sha256", "expected_binary_sha256"])
-@pytest.mark.parametrize("value", ["a" * 63, "A" * 64, "sha256:" + "a" * 64, "a" * 65, "é" * 64])
+@pytest.mark.parametrize(
+    "value", ["a" * 63, "A" * 64, "sha256:" + "a" * 64, "a" * 65, "é" * 64]
+)
 def test_builder_rejects_unprefixed_lowercase_sha256_only(field, value):
     _assert_code(lambda: _build_manifest(**{field: value}))
 
@@ -469,7 +473,11 @@ def test_absent_fact_requires_all_attestation_fields_null_or_false(field):
         "resume_supported": True,
     }
     values = {
-        key: (None if key not in {"cli_start_ok", "mcp_list_ok", "resume_supported"} else False)
+        key: (
+            None
+            if key not in {"cli_start_ok", "mcp_list_ok", "resume_supported"}
+            else False
+        )
         for key in defaults
     }
     values[field] = defaults[field]
@@ -494,7 +502,10 @@ def test_manifest_and_plan_digests_change_when_bound_manifest_inputs_change():
         {"remote_home": "/srv/queen"},
         {"expected_owner_uid": 1001},
     ]
-    assert all(_build_manifest(**variant).manifest_digest != manifest.manifest_digest for variant in variants)
+    assert all(
+        _build_manifest(**variant).manifest_digest != manifest.manifest_digest
+        for variant in variants
+    )
 
 
 def test_plan_digest_is_deterministic_and_binds_before_fact():
@@ -561,7 +572,9 @@ def _rollback_request(manifest, plan):
 
 
 class _FakeCodexOperations:
-    def __init__(self, fact, post_fact=None, *, install_error=None, rollback_error=None):
+    def __init__(
+        self, fact, post_fact=None, *, install_error=None, rollback_error=None
+    ):
         self.fact = fact
         self.post_fact = post_fact
         self.install_error = install_error
@@ -849,7 +862,9 @@ def test_rollback_foreign_state_blocks_without_rollback_call():
     assert [call[0] for call in operations.calls] == ["inspect"]
 
 
-@pytest.mark.parametrize("field", ["generation", "manifest_digest", "plan_digest", "prior"])
+@pytest.mark.parametrize(
+    "field", ["generation", "manifest_digest", "plan_digest", "prior"]
+)
 def test_rollback_stale_journal_blocks_before_rollback_call(field):
     manifest = _build_manifest()
     operations = _FakeCodexOperations(_absent_fact(), _owned_fact(manifest))
@@ -1059,8 +1074,7 @@ def test_public_dataclasses_have_no_secret_or_command_fields():
     for public_type in public_types:
         for field in fields(public_type):
             assert not any(
-                fragment in field.name.lower()
-                for fragment in forbidden_field_fragments
+                fragment in field.name.lower() for fragment in forbidden_field_fragments
             )
 
 

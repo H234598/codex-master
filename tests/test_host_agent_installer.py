@@ -158,7 +158,9 @@ def prepared_installer(
     sysusers.write_text("g the-hive-agent-state -\n", encoding="utf-8")
     sysusers.chmod(0o644)
     tmpfiles = tmp_path / "the-hive-host-agent.tmpfiles"
-    tmpfiles.write_text("d /var/lib/codex-master-agent 2770 root root -\n", encoding="utf-8")
+    tmpfiles.write_text(
+        "d /var/lib/codex-master-agent 2770 root root -\n", encoding="utf-8"
+    )
     tmpfiles.chmod(0o644)
     monkeypatch.setattr(module, "UNIT_SOURCES", units)
     monkeypatch.setattr(module, "SYSUSERS_SOURCE", sysusers, raising=False)
@@ -223,8 +225,7 @@ def test_master_role_never_accepts_or_installs_worker_credentials(
         "agent-listen-address",
     }
     assert {
-        path.name
-        for path in (destination / "etc" / "the-hive-admin").iterdir()
+        path.name for path in (destination / "etc" / "the-hive-admin").iterdir()
     } == {
         "admin-config.json",
         "admin-bearer",
@@ -286,12 +287,12 @@ def test_in_place_role_upgrade_removes_foreign_installer_artifacts(
     assert {
         path.name for path in (destination / "etc/systemd/system").iterdir()
     } == expected_units
-    assert {
-        path.name for path in (destination / "usr/lib/sysusers.d").iterdir()
-    } == {expected_layout}
-    assert {
-        path.name for path in (destination / "usr/lib/tmpfiles.d").iterdir()
-    } == {expected_layout}
+    assert {path.name for path in (destination / "usr/lib/sysusers.d").iterdir()} == {
+        expected_layout
+    }
+    assert {path.name for path in (destination / "usr/lib/tmpfiles.d").iterdir()} == {
+        expected_layout
+    }
     admin_credentials = destination / "etc/the-hive-admin"
     if second_role == "master":
         assert len(list(admin_credentials.iterdir())) == 7
@@ -383,8 +384,7 @@ def test_installer_renders_unit_entrypoint_from_its_install_prefix(
 
     installed = destination / "etc/systemd/system/the-hive-host-agent.service"
     assert installed.read_text(encoding="utf-8") == (
-        "[Service]\n"
-        "ExecStart=/opt/the-hive-venv/bin/the-hive-host-agent\n"
+        "[Service]\nExecStart=/opt/the-hive-venv/bin/the-hive-host-agent\n"
     )
 
 
@@ -462,11 +462,14 @@ def test_install_is_atomic_idempotent_and_uses_exact_modes(
     }
     assert not (destination / "etc" / "the-hive-admin").exists()
     assert {
-        path.name
-        for path in (destination / "etc" / "systemd" / "system").iterdir()
+        path.name for path in (destination / "etc" / "systemd" / "system").iterdir()
     } == {UNIT_NAME}
-    assert (destination / "usr" / "lib" / "sysusers.d" / "the-hive-host-agent.conf").is_file()
-    assert (destination / "usr" / "lib" / "tmpfiles.d" / "the-hive-host-agent.conf").is_file()
+    assert (
+        destination / "usr" / "lib" / "sysusers.d" / "the-hive-host-agent.conf"
+    ).is_file()
+    assert (
+        destination / "usr" / "lib" / "tmpfiles.d" / "the-hive-host-agent.conf"
+    ).is_file()
     assert all(uid_gid == (os.geteuid(), os.getegid()) for uid_gid in fchown_calls)
     assert not list(credentials.glob(".*.tmp"))
 
@@ -710,6 +713,7 @@ def test_provisioning_rollback_removes_only_new_role_state(
 
     monkeypatch.setattr(module.pwd, "getpwnam", user)
     monkeypatch.setattr(module.grp, "getgrnam", group)
+
     def remove_tree(path: Path) -> None:
         removed_directories.append(Path(path))
 
@@ -815,6 +819,7 @@ def test_provisioning_rollback_restores_directory_metadata_and_group_membership(
     monkeypatch.setitem(module.ROLE_GROUPS, "master", ("state-group",))
     monkeypatch.setitem(module.ROLE_STATE_DIRECTORIES, "master", (path,))
     monkeypatch.setattr(module.os, "open", lambda *args, **kwargs: 91)
+
     def fixture_fstat(descriptor: int):
         if descriptor == 91:
             fstat_calls.append(descriptor)
@@ -836,8 +841,12 @@ def test_provisioning_rollback_restores_directory_metadata_and_group_membership(
         "fchmod",
         lambda descriptor, mode: calls.append(("chmod", descriptor, mode)),
     )
-    monkeypatch.setattr(module.os, "fsync", lambda descriptor: calls.append(("fsync", descriptor)))
-    monkeypatch.setattr(module.os, "close", lambda descriptor: calls.append(("close", descriptor)))
+    monkeypatch.setattr(
+        module.os, "fsync", lambda descriptor: calls.append(("fsync", descriptor))
+    )
+    monkeypatch.setattr(
+        module.os, "close", lambda descriptor: calls.append(("close", descriptor))
+    )
     memberships = {"state-group": ["kept", "added"]}
     monkeypatch.setattr(
         module.grp,
@@ -876,7 +885,10 @@ def test_post_commit_failure_restores_previous_complete_file_generation(
     module, sources, destination, _fchown_calls = prepared_installer
     assert module.main(_role_arguments("master", sources, destination)) == 0
     original = {
-        path.relative_to(destination): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        path.relative_to(destination): (
+            path.read_bytes(),
+            stat.S_IMODE(path.stat().st_mode),
+        )
         for path in destination.rglob("*")
         if path.is_file()
     }
@@ -913,7 +925,10 @@ def test_post_commit_failure_restores_previous_complete_file_generation(
             os.close(source.descriptor)
 
     assert {
-        path.relative_to(destination): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        path.relative_to(destination): (
+            path.read_bytes(),
+            stat.S_IMODE(path.stat().st_mode),
+        )
         for path in destination.rglob("*")
         if path.is_file()
     } == original
@@ -927,10 +942,17 @@ def test_service_state_restore_removes_new_role_and_preserves_previous_state(
 
     def fake_run(argv: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        returncode = 0 if argv[1:] in (
-            ["is-enabled", "--quiet", "the-hive-admin.service"],
-            ["is-active", "--quiet", "the-hive-agent-api.service"],
-        ) else 1 if argv[1] == "is-enabled" else 3
+        returncode = (
+            0
+            if argv[1:]
+            in (
+                ["is-enabled", "--quiet", "the-hive-admin.service"],
+                ["is-active", "--quiet", "the-hive-agent-api.service"],
+            )
+            else 1
+            if argv[1] == "is-enabled"
+            else 3
+        )
         return subprocess.CompletedProcess(argv, returncode)
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
@@ -1042,7 +1064,8 @@ def test_enable_rejects_a_staged_destdir_before_any_mutation_or_systemctl(
     monkeypatch.setattr(
         module.subprocess,
         "run",
-        lambda argv, **_kwargs: calls.append(argv) or subprocess.CompletedProcess(argv, 0),
+        lambda argv, **_kwargs: calls.append(argv)
+        or subprocess.CompletedProcess(argv, 0),
     )
 
     assert module.main(_arguments(sources, destination, "--enable")) == 1
@@ -1106,7 +1129,10 @@ def test_commit_failure_restores_the_previous_complete_generation(
     real_replace = module.os.replace
 
     def fail_second_commit(source, target, *args, **kwargs):
-        if str(source).startswith(".agent-client.crt.stage-") and target == "agent-client.crt":
+        if (
+            str(source).startswith(".agent-client.crt.stage-")
+            and target == "agent-client.crt"
+        ):
             raise OSError
         return real_replace(source, target, *args, **kwargs)
 
@@ -1125,7 +1151,10 @@ def test_role_switch_commit_failure_restores_foreign_artifacts(
     module, sources, destination, _fchown_calls = prepared_installer
     assert module.main(_role_arguments("master", sources, destination)) == 0
     original = {
-        path.relative_to(destination): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        path.relative_to(destination): (
+            path.read_bytes(),
+            stat.S_IMODE(path.stat().st_mode),
+        )
         for path in destination.rglob("*")
         if path.is_file()
     }
@@ -1140,7 +1169,10 @@ def test_role_switch_commit_failure_restores_foreign_artifacts(
 
     assert module.main(_role_arguments("worker", sources, destination)) == 1
     assert {
-        path.relative_to(destination): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        path.relative_to(destination): (
+            path.read_bytes(),
+            stat.S_IMODE(path.stat().st_mode),
+        )
         for path in destination.rglob("*")
         if path.is_file()
     } == original

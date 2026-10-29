@@ -19,21 +19,33 @@ def test_task_aggregation_uses_assignment_and_terminal_events():
     completed, pending = aggregate_task_rows(
         start,
         assignments=(
-            {"assignment_id": "done-1", "created_at_utc": "2026-08-16T10:05:00Z", "agent": "g1"},
-            {"assignment_id": "open-1", "created_at_utc": "2026-08-16T09:30:00Z", "agent": "g2"},
+            {
+                "assignment_id": "done-1",
+                "created_at_utc": "2026-08-16T10:05:00Z",
+                "agent": "g1",
+            },
+            {
+                "assignment_id": "open-1",
+                "created_at_utc": "2026-08-16T09:30:00Z",
+                "agent": "g2",
+            },
         ),
         events=(
-            {"assignment_id": "done-1", "at_utc": "2026-08-16T10:20:00Z", "status": "completed"},
-            {"assignment_id": "open-1", "at_utc": "2026-08-16T10:10:00Z", "status": "rate_limited"},
+            {
+                "assignment_id": "done-1",
+                "at_utc": "2026-08-16T10:20:00Z",
+                "status": "completed",
+            },
+            {
+                "assignment_id": "open-1",
+                "at_utc": "2026-08-16T10:10:00Z",
+                "status": "rate_limited",
+            },
         ),
     )
 
-    assert completed == (
-        {"title": "done-1", "status": "completed", "agent_id": "g1"},
-    )
-    assert pending == (
-        {"title": "open-1", "status": "rate_limited", "agent_id": "g2"},
-    )
+    assert completed == ({"title": "done-1", "status": "completed", "agent_id": "g1"},)
+    assert pending == ({"title": "open-1", "status": "rate_limited", "agent_id": "g2"},)
 
 
 def test_task_aggregation_keeps_hive_blocked_state_pending():
@@ -41,17 +53,23 @@ def test_task_aggregation_keeps_hive_blocked_state_pending():
     completed, pending = aggregate_task_rows(
         start,
         assignments=(
-            {"assignment_id": "blocked-1", "created_at_utc": "2026-08-16T10:05:00Z", "agent": "g1"},
+            {
+                "assignment_id": "blocked-1",
+                "created_at_utc": "2026-08-16T10:05:00Z",
+                "agent": "g1",
+            },
         ),
         events=(
-            {"assignment_id": "blocked-1", "at_utc": "2026-08-16T10:20:00Z", "status": "blocked"},
+            {
+                "assignment_id": "blocked-1",
+                "at_utc": "2026-08-16T10:20:00Z",
+                "status": "blocked",
+            },
         ),
     )
 
     assert completed == ()
-    assert pending == (
-        {"title": "blocked-1", "status": "blocked", "agent_id": "g1"},
-    )
+    assert pending == ({"title": "blocked-1", "status": "blocked", "agent_id": "g1"},)
 
 
 def test_hourly_report_uses_utc_bucket_and_allowlisted_data():
@@ -66,7 +84,7 @@ def test_hourly_report_uses_utc_bucket_and_allowlisted_data():
                 "prompt": "SECRET_PROMPT",
             },
         ),
-        pending=( {"title": "Noch offen", "status": "queued", "agent_id": "g2"}, ),
+        pending=({"title": "Noch offen", "status": "queued", "agent_id": "g2"},),
         agents=(
             {
                 "agent_id": "g1",

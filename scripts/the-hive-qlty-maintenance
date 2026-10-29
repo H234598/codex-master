@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Coordinate Qlty attempts; repository mutation requires its existing owner."""
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import pwd
+import stat
+import subprocess
+import tempfile
+import time
+from uuid import uuid4
+
+DAY = 24 * 60 * 60
+
+
+def private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("qlty_state_directory_untrusted")
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    fd, name = tempfile.mkstemp(prefix=".qlty-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+@contextmanager
+def record_lock(state_root: Path, identity: str, suffix: str = ""):
+    private_directory(state_root)
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    fd = os.open(state_root / f"{key}{suffix}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise ValueError("qlty_lock_untrusted")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield state_root / f"{key}{suffix}.json"
+    finally:
+        os.close(fd)
+
+
+def read_record(record: Path) -> dict:
+    record_fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(record_fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 1048576:
+            raise ValueError("qlty_record_untrusted")
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("qlty_record_invalid")
+    return value
+
+
+@contextmanager
+def attempt(state_root: Path, identity: str, *, activity_at: float | None = None):
+    """Hold one process lock and persist an attempt before its first effect."""
+    with record_lock(state_root, identity) as record:
+        previous = read_record(record) if record.exists() or record.is_symlink() else None
+        now = time.time()
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
+            raise ValueError("qlty_attempt_time_invalid")
+        if previous is not None:
+            started = previous["attempted_at"]
+            if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started) or started < 0:
+                raise ValueError("qlty_attempt_invalid")
+            if now - started < DAY:
+                yield None
+                return
+        if activity_at is not None and not 0 <= now - activity_at < DAY:
+            yield None
+            return
+        value = {"identity": identity, "attempted_at": now, "status": "running", "steps": []}
+        atomic_json(record, value)
+        yield record, value
+
+
+def execute_steps(record: Path, value: dict, commands: list[list[str]], *, cwd: Path | None, expected_source: dict | None = None) -> int:
+    logs = record.parent / "logs"
+    private_directory(logs)
+    run_logs = logs / uuid4().hex
+    run_logs.mkdir(mode=0o700)
+    for index, command in enumerate(commands):
+        before = source_state(cwd) if cwd else None
+        expected = value["steps"][-1].get("source_after") if value["steps"] else value.get("source_before")
+        if index == 0 and expected_source is not None:
+            expected = expected_source
+        if cwd and before != expected:
+            value["status"] = "source_changed"
+            value["source_observed"] = before
+            atomic_json(record, value)
+            return 1
+        log = run_logs / f"{index:02d}-{Path(command[1]).name}.log"
+        with log.open("xb") as stream:
+            environment = dict(os.environ, HOME=pwd.getpwuid(os.getuid()).pw_dir)
+            result = subprocess.run(command, cwd=cwd, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
+        after = source_state(cwd) if cwd else None
+        with log.open("rb") as stream:
+            log_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+        value["steps"].append({"command": command[1:], "exit_code": result.returncode, "log": str(log), "log_sha256": log_hash, "source_before": before, "source_after": after})
+        if cwd and command[1] != "fmt" and before != after:
+            value["status"] = "source_changed"
+            atomic_json(record, value)
+            return 1
+        atomic_json(record, value)
+    value["status"] = "complete" if all(step["exit_code"] == 0 for step in value["steps"]) else "findings_or_error"
+    atomic_json(record, value)
+    return 0 if value["status"] == "complete" else 1
+
+
+def upgrade(state_root: Path, qlty: str) -> int:
+    with attempt(state_root, "qlty-upgrade") as claimed:
+        if claimed is None:
+            return 0
+        if not os.access(qlty, os.X_OK):
+            installer = str(Path(__file__).with_name("install-qlty.sh"))
+            if execute_steps(*claimed, [["/bin/bash", installer]], cwd=None):
+                return 1
+            if not os.access(qlty, os.X_OK):
+                claimed[1]["status"] = "cli_unavailable"
+                atomic_json(*claimed)
+                return 1
+        return execute_steps(*claimed, [[qlty, "upgrade", "--verify-attestations"]], cwd=None)
+
+
+def repository_identity(repository: Path) -> str:
+    common = subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        text=True,
+    ).strip()
+    path = Path(common).resolve(strict=True)
+    info = path.stat()
+    return f"{path}\0{info.st_dev}:{info.st_ino}"
+
+
+def repository_binding(repository: Path) -> dict:
+    root = Path(subprocess.check_output(["git", "-C", str(repository), "rev-parse", "--show-toplevel"], text=True).strip()).resolve(strict=True)
+    info = root.stat()
+    return {"repository": str(root), "identity": repository_identity(root), "device": info.st_dev, "inode": info.st_ino}
+
+
+def source_state(repository: Path) -> dict:
+    """Bind HEAD, Git status and file metadata without reading credential files."""
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", str(repository), *arguments])
+    paths = git("ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0")
+    metadata = []
+    for raw in paths:
+        if raw:
+            path = os.fsdecode(raw)
+            try:
+                info = (repository / path).lstat()
+                metadata.append((path, info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+            except FileNotFoundError:
+                metadata.append((path, "missing"))
+    head = subprocess.run(["git", "-C", str(repository), "rev-parse", "--verify", "--quiet", "HEAD"], text=True, capture_output=True)
+    if head.returncode not in {0, 1}:
+        raise ValueError("qlty_source_head_unavailable")
+    return {"head": head.stdout.strip() if head.returncode == 0 else None, "status_sha256": hashlib.sha256(git("status", "--porcelain=v1", "-z")).hexdigest(), "file_metadata_sha256": hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()}
+
+
+def work_document(path: Path) -> dict:
+    if not path.exists() and not path.is_symlink():
+        return {"schema_version": 1, "revision": 0, "guards": [], "activities": {}, "approval": None, "format_guard": None}
+    value = read_record(path)
+    if value.get("schema_version") != 1 or not isinstance(value.get("guards"), list) or not isinstance(value.get("activities"), dict) or type(value.get("revision")) is not int:
+        raise ValueError("qlty_work_record_invalid")
+    return value
+
+
+def registered_state(repository: Path, state_root: Path) -> dict:
+    with record_lock(state_root, repository_identity(repository), ".work") as record:
+        return work_document(record)
+
+
+def work_event(document: dict, binding: dict, owner: str) -> None:
+    document["activities"][binding["repository"]] = {"kind": "user_work", "source": "declared_local_work", "worked_at": time.time(), "event_id": uuid4().hex, "owner": owner, "binding": binding}
+
+
+def begin_guard(repository: Path, state_root: Path, *, owner: str, phase: str) -> dict:
+    if not owner or len(owner) > 256 or any(ord(character) < 32 for character in owner) or phase not in {"work", "freeze", "test"}:
+        raise ValueError("qlty_work_owner_invalid")
+    binding = repository_binding(repository)
+    with record_lock(state_root, binding["identity"], ".work") as record:
+        document = work_document(record)
+        if document["format_guard"] is not None:
+            raise ValueError("qlty_format_owner_unresolved")
+        if phase == "work" and any(row["phase"] in {"freeze", "test"} for row in document["guards"]):
+            raise ValueError("qlty_source_freeze_active")
+        if phase in {"freeze", "test"} and any(row["phase"] == "work" for row in document["guards"]):
+            raise ValueError("qlty_work_guard_active")
+        guard = {"guard_id": uuid4().hex, "owner": owner, "phase": phase, "binding": binding, "started_at": time.time()}
+        document["guards"].append(guard)
+        document["approval"] = None
+        document["revision"] += 1
+        if phase == "work":
+            work_event(document, binding, owner)
+        atomic_json(record, document)
+        return guard
+
+
+def end_guard(repository: Path, state_root: Path, *, owner: str, guard_id: str, approve_format: bool) -> dict:
+    binding = repository_binding(repository)
+    with record_lock(state_root, binding["identity"], ".work") as record:
+        document = work_document(record)
+        matches = [guard for guard in document["guards"] if guard["guard_id"] == guard_id and guard["owner"] == owner and guard["binding"] == binding]
+        if len(matches) != 1:
+            raise ValueError("qlty_guard_owner_mismatch")
+        document["guards"].remove(matches[0])
+        document["revision"] += 1
+        document["approval"] = None
+        if matches[0]["phase"] == "work":
+            work_event(document, binding, owner)
+        atomic_json(record, document)
+        status = "not_requested"
+        if approve_format:
+            status = "deferred" if document["guards"] or document["format_guard"] is not None else "approved"
+            if status == "approved":
+                try:
+                    snapshot = source_state(Path(binding["repository"]))
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    status = "deferred"
+                else:
+                    document["approval"] = {"approval_id": uuid4().hex, "owner": owner, "binding": binding, "revision": document["revision"], "source_state": snapshot, "approved_at": time.time()}
+        atomic_json(record, document)
+        return {"ended_guard_id": guard_id, "approval": status, "coverage": "declared_local_work_only"}
+
+
+@contextmanager
+def quality_guard(repository: Path, state_root: Path):
+    binding = repository_binding(repository)
+    with record_lock(state_root, binding["identity"], ".work") as record:
+        document = work_document(record)
+        if document["format_guard"] is not None:
+            raise ValueError("qlty_format_owner_unresolved")
+        if document["guards"]:
+            raise ValueError("qlty_work_guard_active")
+        approval = document["approval"]
+        if not isinstance(approval, dict) or approval["binding"] != binding or approval["revision"] != document["revision"]:
+            raise ValueError("qlty_format_approval_missing")
+        if approval["source_state"] != source_state(repository):
+            raise ValueError("qlty_source_changed")
+        receipt = {"guard_id": uuid4().hex, "owner": approval["owner"], "approval_id": approval["approval_id"], "binding": binding, "source_state": approval["source_state"], "coverage": "declared_local_work_only", "started_at": time.time()}
+        document["approval"] = None
+        document["format_guard"] = receipt
+        document["revision"] += 1
+        atomic_json(record, document)
+        completed = False
+        try:
+            yield receipt
+            completed = True
+        finally:
+            if completed:
+                document["format_guard"] = None
+                document["revision"] += 1
+                atomic_json(record, document)
+
+
+def run_repository(repository: Path, state_root: Path, qlty: str, *, activity: dict, now: float, mutation_guard) -> int:
+    """The caller supplies evidenced work metadata and the canonical writer guard."""
+    worked_at = activity.get("worked_at")
+    if activity.get("kind") != "user_work" or isinstance(worked_at, bool) or not isinstance(worked_at, (int, float)) or not 0 <= now - worked_at < DAY:
+        return 0
+    if mutation_guard is None:
+        raise ValueError("qlty_mutation_owner_unavailable")
+    identity = repository_identity(repository)
+    with mutation_guard(repository) as receipt:
+        if not 0 <= time.time() - worked_at < DAY:
+            return 0
+        with attempt(state_root, identity, activity_at=worked_at) as claimed:
+            if claimed is None:
+                return 0
+            claimed[1]["quality_guard"] = receipt
+            claimed[1]["source_before"] = source_state(repository)
+            if receipt and receipt["source_state"] != claimed[1]["source_before"]:
+                raise ValueError("qlty_source_changed")
+            atomic_json(*claimed)
+            commands = [[qlty, command, "--all", "--no-upgrade-check"] for command in ("metrics", "smells", "check", "fmt")]
+            commands[1].append("--no-snippets")
+            commands[2].append("--no-fix")
+            if repository_identity(repository) != identity:
+                raise ValueError("qlty_repository_changed")
+            return execute_steps(*claimed, commands, cwd=repository)
+
+
+def run_registered(repository: Path, state_root: Path, qlty: str) -> int:
+    if upgrade(state_root, qlty) or not os.access(qlty, os.X_OK):
+        return 1
+    binding = repository_binding(repository)
+    repository = Path(binding["repository"])
+    with record_lock(state_root, binding["identity"]) as record:
+        if record.exists():
+            previous = read_record(record)
+            started = previous["attempted_at"]
+            if type(started) not in {int, float} or not math.isfinite(started):
+                raise ValueError("qlty_attempt_invalid")
+            if time.time() - started < DAY:
+                return 0
+    document = registered_state(repository, state_root)
+    activity = document["activities"].get(binding["repository"], {})
+    if activity.get("source") != "declared_local_work" or activity.get("binding") != binding:
+        raise ValueError("qlty_declared_work_missing")
+    return run_repository(repository, state_root, qlty, activity=activity, now=time.time(), mutation_guard=lambda path: quality_guard(path, state_root))
+
+
+def pending_fmt(record: Path, binding: dict, expected_attempted_at: float) -> dict:
+    value = read_record(record)
+    if value.get("identity") != binding["identity"] or value.get("attempted_at") != expected_attempted_at:
+        raise ValueError("qlty_fmt_attempt_mismatch")
+    original_guard = value.get("quality_guard")
+    if not isinstance(original_guard, dict) or original_guard.get("binding") != binding:
+        raise ValueError("qlty_fmt_worktree_mismatch")
+    if "fmt_continuation" in value:
+        raise ValueError("qlty_fmt_already_started")
+    steps = value.get("steps", [])
+    if value.get("status") != "source_changed" or len(steps) != 3 or [step.get("command", [None])[0] for step in steps] != ["metrics", "smells", "check"]:
+        raise ValueError("qlty_fmt_not_pending")
+    return value
+
+
+def finish_fmt(repository: Path, state_root: Path, qlty: str, *, expected_attempted_at: float) -> int:
+    if not os.access(qlty, os.X_OK):
+        raise ValueError("qlty_cli_unavailable")
+    identity = repository_identity(repository)
+    with record_lock(state_root, identity) as record:
+        pending_fmt(record, repository_binding(repository), expected_attempted_at)
+    with quality_guard(repository, state_root) as receipt:
+        with record_lock(state_root, identity) as record:
+            value = pending_fmt(record, repository_binding(repository), expected_attempted_at)
+            continuation = {"id": uuid4().hex, "status": "started", "started_at": time.time(), "original_status": value["status"], "previous_steps_sha256": hashlib.sha256(json.dumps(value["steps"], sort_keys=True).encode()).hexdigest(), "quality_guard": receipt, "source_before": receipt["source_state"]}
+            value["fmt_continuation"] = continuation
+            value["status"] = "fmt_in_progress"
+            atomic_json(record, value)
+            execute_steps(record, value, [[qlty, "fmt", "--all", "--no-upgrade-check"]], cwd=repository, expected_source=receipt["source_state"])
+            if len(value["steps"]) != 4:
+                continuation["status"] = "not_executed"
+                atomic_json(record, value)
+                return 1
+            continuation["status"] = "finished"
+            continuation["exit_code"] = value["steps"][-1]["exit_code"]
+            continuation["finished_at"] = time.time()
+            atomic_json(record, value)
+            return continuation["exit_code"]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    operator_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    parser.add_argument("operation", choices=["upgrade", "daily", "begin", "end", "run", "status", "finish-fmt"])
+    parser.add_argument("--state-root", type=Path, default=operator_home / ".local/state/the-hive/qlty-maintenance")
+    parser.add_argument("--qlty", default=str(operator_home / ".qlty/bin/qlty"))
+    parser.add_argument("--repo", type=Path)
+    parser.add_argument("--owner")
+    parser.add_argument("--phase", choices=["work", "freeze", "test"], default="work")
+    parser.add_argument("--guard-id")
+    parser.add_argument("--approve-format", action="store_true")
+    parser.add_argument("--attempted-at", type=float)
+    args = parser.parse_args()
+    if args.operation == "finish-fmt":
+        if args.repo is None or args.attempted_at is None:
+            parser.error("finish-fmt requires --repo and --attempted-at")
+        code = finish_fmt(args.repo, args.state_root, args.qlty, expected_attempted_at=args.attempted_at)
+        print(json.dumps({"exit": code, "scope": "fmt_only", "previous_checks_repeated": False}))
+        return code
+    if args.operation in {"begin", "end", "run", "status"}:
+        if args.repo is None or args.operation in {"begin", "end"} and not args.owner or args.operation == "end" and not args.guard_id:
+            parser.error("--repo and the operation's owner/guard fields are required")
+        if args.operation == "begin":
+            result = begin_guard(args.repo, args.state_root, owner=args.owner, phase=args.phase)
+        elif args.operation == "end":
+            result = end_guard(args.repo, args.state_root, owner=args.owner, guard_id=args.guard_id, approve_format=args.approve_format)
+        elif args.operation == "status":
+            result = registered_state(args.repo, args.state_root)
+        else:
+            code = run_registered(args.repo, args.state_root, args.qlty)
+            print(json.dumps({"exit": code, "coverage": "declared_local_work_only"}))
+            return code
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    result = upgrade(args.state_root, args.qlty)
+    if args.operation == "daily":
+        outcomes = []
+        for record in args.state_root.glob("*.work.json"):
+            document = work_document(record)
+            for repository, activity in document["activities"].items():
+                if not 0 <= time.time() - activity["worked_at"] < DAY:
+                    continue
+                try:
+                    code = run_registered(Path(repository), args.state_root, args.qlty)
+                    outcomes.append({"repository": repository, "exit": code})
+                    result = result or code
+                except ValueError as error:
+                    outcomes.append({"repository": repository, "status": "hold", "reason": str(error)})
+                    result = result or 2
+        print(json.dumps({"coverage": "declared_local_work_only", "repositories": outcomes}, sort_keys=True))
+    return result
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        reason = str(error) if isinstance(error, ValueError) else "qlty_environment_error"
+        print(json.dumps({"status": "hold", "reason": reason, "error_type": type(error).__name__}))
+        raise SystemExit(2)

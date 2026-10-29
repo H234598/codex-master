@@ -45,9 +45,12 @@ def poll_bytes(**changes: object) -> bytes:
 
 def receipt_bytes(operation_id: str = "operation-one") -> bytes:
     result = {"kind": "host.probe", "action": "collect", "payload": {"reachable": True}}
-    result_digest = "sha256:" + hashlib.sha256(
-        json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    result_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     return json.dumps(
         {
             "schema_version": 1,
@@ -95,17 +98,33 @@ def app(store: Store) -> AgentHttpApplication:
 
 
 def test_agent_api_exposes_only_poll_and_receipt_routes(app) -> None:
-    assert app.handle(principal(), "POST", "/agent/v1/polls", poll_bytes()).status == 200
+    assert (
+        app.handle(principal(), "POST", "/agent/v1/polls", poll_bytes()).status == 200
+    )
     assert app.handle(principal(), "POST", "/admin/v1/hosts", b"{}").status == 404
     assert app.handle(principal(), "GET", "/agent/v1/polls", b"").status == 405
-    assert app.handle(principal(), "POST", "/agent/v1/operations//receipts", b"{}").status == 404
-    assert app.handle(principal(), "POST", "/agent/v1/operations/" + "a" * 129 + "/receipts", b"{}").status == 404
+    assert (
+        app.handle(principal(), "POST", "/agent/v1/operations//receipts", b"{}").status
+        == 404
+    )
+    assert (
+        app.handle(
+            principal(),
+            "POST",
+            "/agent/v1/operations/" + "a" * 129 + "/receipts",
+            b"{}",
+        ).status
+        == 404
+    )
 
 
 def test_poll_reuses_task_one_parser_and_projects_bounded_no_work(app, store) -> None:
     response = app.handle(principal(), "POST", "/agent/v1/polls", poll_bytes())
     assert response.status == 200
-    assert response.headers == (("Content-Type", "application/json"), ("Cache-Control", "no-store"))
+    assert response.headers == (
+        ("Content-Type", "application/json"),
+        ("Cache-Control", "no-store"),
+    )
     assert json.loads(response.body) == {
         "schema_version": 1,
         "registry_generation": 7,
@@ -179,13 +198,16 @@ def test_admin_owned_shared_binding_reaches_real_api_poll_with_authoritative_fen
         "collect",
         {"status": "collected"},
     )
-    result_digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            serialize_agent_result(result),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    result_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                serialize_agent_result(result),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
     receipt = AgentReceiptV1(
         lease.operation_id,
         lease.lease_id,
@@ -229,7 +251,9 @@ def test_admin_owned_shared_binding_reaches_real_api_poll_with_authoritative_fen
     assert stale_epoch.status == 409
 
 
-def test_receipt_route_binds_path_to_task_one_receipt_before_completion(app, store) -> None:
+def test_receipt_route_binds_path_to_task_one_receipt_before_completion(
+    app, store
+) -> None:
     response = app.handle(
         principal(),
         "POST",
@@ -249,7 +273,10 @@ def test_host_probe_receipt_uses_task_specific_completion_owner(store) -> None:
 
     app = AgentHttpApplication(store, Owner())
     response = app.handle(
-        principal(), "POST", "/agent/v1/operations/operation-one/receipts", receipt_bytes()
+        principal(),
+        "POST",
+        "/agent/v1/operations/operation-one/receipts",
+        receipt_bytes(),
     )
 
     assert response.status == 200
@@ -269,7 +296,9 @@ def test_host_probe_receipt_uses_task_specific_completion_owner(store) -> None:
     "body",
     [b"", b"[]", b'{"schema_version":1}', b'{"schema_version":1,"schema_version":1}'],
 )
-def test_malformed_poll_is_deterministic_and_never_touches_store(app, store, body) -> None:
+def test_malformed_poll_is_deterministic_and_never_touches_store(
+    app, store, body
+) -> None:
     response = app.handle(principal(), "POST", "/agent/v1/polls", body)
     assert response.status == 400
     assert json.loads(response.body) == {"error": "agent.request_invalid"}

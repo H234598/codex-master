@@ -18,9 +18,7 @@ def project(root: Path, body: str, *, timeout: int = 10):
     (root / "tests").mkdir()
     (root / "src/example.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     (root / "tests/test_example.py").write_text(
-        "from example import run\n\n"
-        "def test_run():\n"
-        f"{body}",
+        f"from example import run\n\ndef test_run():\n{body}",
         encoding="utf-8",
     )
     function_id = "python:src/example.py:run"
@@ -46,11 +44,15 @@ def runner(root: Path, store: StatusStore) -> EvidenceRunner:
     )
 
 
-def test_runner_mints_passed_receipt_only_after_real_pytest_exit(tmp_path: Path) -> None:
+def test_runner_mints_passed_receipt_only_after_real_pytest_exit(
+    tmp_path: Path,
+) -> None:
     index, test_id = project(tmp_path, "    assert run() == 1\n")
     store = StatusStore(tmp_path / ".state")
 
-    result = runner(tmp_path, store).run(index, test_id, expected_index_digest=index.digest)
+    result = runner(tmp_path, store).run(
+        index, test_id, expected_index_digest=index.digest
+    )
 
     assert result.result == "passed"
     assert result.reason_code == "test.run_passed"
@@ -93,7 +95,9 @@ def test_runner_records_failed_exit_without_reuse_ttl(tmp_path: Path) -> None:
     index, test_id = project(tmp_path, "    assert run() == 2\n")
     store = StatusStore(tmp_path / ".state")
 
-    result = runner(tmp_path, store).run(index, test_id, expected_index_digest=index.digest)
+    result = runner(tmp_path, store).run(
+        index, test_id, expected_index_digest=index.digest
+    )
 
     assert (result.result, result.reason_code) == ("failed", "test.run_failed")
     assert result.expires_monotonic_ns == result.finished_monotonic_ns
@@ -107,7 +111,9 @@ def test_runner_times_out_own_process_group_and_records_blocked(tmp_path: Path) 
     )
     store = StatusStore(tmp_path / ".state")
 
-    result = runner(tmp_path, store).run(index, test_id, expected_index_digest=index.digest)
+    result = runner(tmp_path, store).run(
+        index, test_id, expected_index_digest=index.digest
+    )
 
     assert (result.result, result.reason_code) == ("blocked", "test.run_timeout")
 
@@ -149,6 +155,8 @@ def test_runner_executes_one_exact_indexed_node_test(tmp_path: Path) -> None:
     )
     store = StatusStore(tmp_path / ".state")
 
-    result = runner(tmp_path, store).run(index, test_id, expected_index_digest=index.digest)
+    result = runner(tmp_path, store).run(
+        index, test_id, expected_index_digest=index.digest
+    )
 
     assert (result.result, result.reason_code) == ("passed", "test.run_passed")

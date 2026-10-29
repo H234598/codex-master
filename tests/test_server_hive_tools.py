@@ -29,7 +29,9 @@ GREEN_HIVE_PROBE = {
 }
 
 
-def test_dynamic_pool_product_callback_has_one_private_dispatcher_callsite_and_no_tool_bypass() -> None:
+def test_dynamic_pool_product_callback_has_one_private_dispatcher_callsite_and_no_tool_bypass() -> (
+    None
+):
     """D69 binding and its effect callback stay out of every public server path."""
 
     dispatcher_tree = ast.parse(inspect.getsource(work_dispatcher_module))
@@ -54,14 +56,8 @@ def test_dynamic_pool_product_callback_has_one_private_dispatcher_callsite_and_n
         and node.name == "_hive_assignment_callback"
     )
     callback_tokens = {
-        node.id
-        for node in ast.walk(callback)
-        if isinstance(node, ast.Name)
-    } | {
-        node.attr
-        for node in ast.walk(callback)
-        if isinstance(node, ast.Attribute)
-    }
+        node.id for node in ast.walk(callback) if isinstance(node, ast.Name)
+    } | {node.attr for node in ast.walk(callback) if isinstance(node, ast.Attribute)}
 
     assert len(dispatcher_calls) == 1
     assert len(callback_keywords) == 1
@@ -84,9 +80,7 @@ def test_dynamic_pool_product_callback_has_one_private_dispatcher_callsite_and_n
         if isinstance(node, ast.FunctionDef) and node.name == "execute"
     )
     bridge_tokens = {
-        node.id
-        for node in ast.walk(bridge_execute)
-        if isinstance(node, ast.Name)
+        node.id for node in ast.walk(bridge_execute) if isinstance(node, ast.Name)
     } | {
         node.attr
         for node in ast.walk(bridge_execute)
@@ -115,15 +109,18 @@ def test_dynamic_pool_product_callback_has_one_private_dispatcher_callsite_and_n
     ("probe_missing", "probe_stale", "probe_invalid", "probe_red"),
 )
 def test_server_hive_probe_gate_rejects_every_non_green_probe(reason_code: str) -> None:
-    with patch.object(
-        server,
-        "read_probe_gate",
-        return_value={
+    with (
+        patch.object(
+            server,
+            "read_probe_gate",
+            return_value={
                 "allowed": False,
                 "reason_code": reason_code,
                 "raw_output": "not_returned",
-        },
-    ), pytest.raises(server.AgentError, match="hive_spawn_probe_blocked") as raised:
+            },
+        ),
+        pytest.raises(server.AgentError, match="hive_spawn_probe_blocked") as raised,
+    ):
         server.require_hive_probe_for_spawn(operation="agent_start")
     assert raised.value.payload == {
         "error_code": "hive_spawn_probe_blocked",
@@ -137,9 +134,15 @@ def test_server_hive_probe_gate_requires_exact_fresh_green_result() -> None:
     with patch.object(
         server,
         "read_probe_gate",
-        return_value={"allowed": False, "reason_code": "probe_stale", "raw_output": "not_returned"},
+        return_value={
+            "allowed": False,
+            "reason_code": "probe_stale",
+            "raw_output": "not_returned",
+        },
     ):
-        with pytest.raises(server.AgentError, match="hive_spawn_probe_blocked") as raised:
+        with pytest.raises(
+            server.AgentError, match="hive_spawn_probe_blocked"
+        ) as raised:
             server.require_hive_probe_for_spawn(operation="agent_start")
     assert raised.value.payload == {
         "error_code": "hive_spawn_probe_blocked",
@@ -151,7 +154,11 @@ def test_server_hive_probe_gate_requires_exact_fresh_green_result() -> None:
     with patch.object(
         server,
         "read_probe_gate",
-        return_value={"allowed": True, "reason_code": "probe_ready", "raw_output": "not_returned"},
+        return_value={
+            "allowed": True,
+            "reason_code": "probe_ready",
+            "raw_output": "not_returned",
+        },
     ):
         result = server.require_hive_probe_for_spawn(operation="agent_start")
     assert result["allowed"] is True
@@ -171,13 +178,21 @@ def test_server_hive_probe_gate_has_no_injectable_green_dto() -> None:
     (
         {"allowed": True, "reason_code": "probe_stale", "raw_output": "not_returned"},
         {"allowed": True, "reason_code": "probe_ready", "raw_output": "returned"},
-        {"allowed": True, "reason_code": "probe_ready", "raw_output": "not_returned", "extra": True},
+        {
+            "allowed": True,
+            "reason_code": "probe_ready",
+            "raw_output": "not_returned",
+            "extra": True,
+        },
     ),
 )
-def test_server_hive_probe_gate_rejects_malformed_green_claims(probe_gate: dict[str, object]) -> None:
-    with patch.object(
-        server, "read_probe_gate", return_value=probe_gate
-    ), pytest.raises(server.AgentError, match="hive_spawn_probe_blocked") as raised:
+def test_server_hive_probe_gate_rejects_malformed_green_claims(
+    probe_gate: dict[str, object],
+) -> None:
+    with (
+        patch.object(server, "read_probe_gate", return_value=probe_gate),
+        pytest.raises(server.AgentError, match="hive_spawn_probe_blocked") as raised,
+    ):
         server.require_hive_probe_for_spawn(operation="agent_start")
 
     assert raised.value.payload == {
@@ -188,7 +203,9 @@ def test_server_hive_probe_gate_rejects_malformed_green_claims(probe_gate: dict[
     }
 
 
-def test_spawn_entrypoints_check_hive_probe_before_reservation_or_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_spawn_entrypoints_check_hive_probe_before_reservation_or_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[str] = []
     recovery_gates: list[str] = []
 
@@ -301,7 +318,16 @@ def test_red_probe_blocks_new_hive_side_effects_before_locks_or_services(
     )
     attempts = (
         ("agent_claim", lambda: server.claim_agent("a1")),
-        ("agent_assign", lambda: server.assign_agent("a1", role="arbeitsbiene", task="task", scope=["src"], write_paths=["src/task.py"])),
+        (
+            "agent_assign",
+            lambda: server.assign_agent(
+                "a1",
+                role="arbeitsbiene",
+                task="task",
+                scope=["src"],
+                write_paths=["src/task.py"],
+            ),
+        ),
         ("agent_start", lambda: server.start_agent_with_lease("a1")),
     )
     for expected_operation, attempt in attempts:
@@ -623,11 +649,15 @@ def test_applet_start_rechecks_the_probe_after_the_agent_lock(
         "validate_applet_action_token",
         lambda *_args: {"a": "start", "g": "a1", "f": "fingerprint"},
     )
-    monkeypatch.setattr(server, "applet_agent_observation", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        server, "applet_agent_observation", lambda *_args, **_kwargs: {}
+    )
     monkeypatch.setattr(server, "codex_usage_watchdog_status", lambda *_args: {})
     monkeypatch.setattr(server, "read_meta", lambda *_args: {})
     monkeypatch.setattr(server, "applet_action_state", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(server, "applet_action_fingerprint_for", lambda *_args: "fingerprint")
+    monkeypatch.setattr(
+        server, "applet_action_fingerprint_for", lambda *_args: "fingerprint"
+    )
     monkeypatch.setattr(server, "applet_action_allowed", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(server, "_start_agent_with_lease_unlocked", sink_reached)
 
@@ -853,9 +883,13 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
         server, "hive_capacity_probe_guard", capacity_or_recovery_gate_used
     )
     monkeypatch.setattr(
-        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+        server,
+        "agent_lifecycle_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
-    monkeypatch.setattr(server, "require_invocation_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server, "require_invocation_status", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(server, "agent_config", lambda _agent: {"session": "a1"})
     monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
     monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
@@ -871,7 +905,9 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
     monkeypatch.setattr(
         server, "_tmux_args_for_session", lambda _session, args: list(args)
     )
-    monkeypatch.setattr(server, "list_assignments", lambda *_args, **_kwargs: {"records": []})
+    monkeypatch.setattr(
+        server, "list_assignments", lambda *_args, **_kwargs: {"records": []}
+    )
     monkeypatch.setattr(
         server,
         "agent_lease_status",
@@ -940,7 +976,9 @@ def test_d244_tool_pure_ollama_send_and_report_skip_spawn_and_auth_gates(
     )
     monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
     monkeypatch.setattr(
-        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+        server,
+        "agent_lifecycle_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
     monkeypatch.setattr(server, "read_meta", lambda _agent: metadata)
@@ -954,8 +992,12 @@ def test_d244_tool_pure_ollama_send_and_report_skip_spawn_and_auth_gates(
         "_claim_agent_unlocked",
         lambda *_args, **_kwargs: {"status": "renewed", "lease": lease},
     )
-    monkeypatch.setattr(server, "list_assignments", lambda *_args, **_kwargs: {"records": []})
-    monkeypatch.setattr(server, "_tmux_args_for_session", lambda _session, args: list(args))
+    monkeypatch.setattr(
+        server, "list_assignments", lambda *_args, **_kwargs: {"records": []}
+    )
+    monkeypatch.setattr(
+        server, "_tmux_args_for_session", lambda _session, args: list(args)
+    )
     tmux_calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         server,
@@ -1037,11 +1079,15 @@ def test_d244_tool_ollama_rejects_mismatched_session_binding_before_tmux_effect(
     )
     monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
     monkeypatch.setattr(
-        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+        server,
+        "agent_lifecycle_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
     monkeypatch.setattr(server, "read_meta", lambda _agent: metadata)
-    monkeypatch.setattr(server, "require_authenticated_agent_for_mutation", unexpected_auth)
+    monkeypatch.setattr(
+        server, "require_authenticated_agent_for_mutation", unexpected_auth
+    )
     monkeypatch.setattr(server, "run_tmux", tmux_sink)
 
     with pytest.raises(server.AgentError, match="ollama_session_binding_unverified"):
@@ -1118,7 +1164,9 @@ def test_d244_tool_ollama_rejects_fencing_change_before_tmux_effect(
     )
     monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
     monkeypatch.setattr(
-        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+        server,
+        "agent_lifecycle_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
     monkeypatch.setattr(server, "read_meta", lambda _agent: metadata)
@@ -1126,9 +1174,15 @@ def test_d244_tool_ollama_rejects_fencing_change_before_tmux_effect(
     monkeypatch.setattr(
         server, "wait_agent_input_ready", lambda *_args, **_kwargs: {"ready": True}
     )
-    monkeypatch.setattr(server, "_claim_agent_unlocked", lambda *_args, **_kwargs: {"status": "renewed", "lease": expected_lease})
+    monkeypatch.setattr(
+        server,
+        "_claim_agent_unlocked",
+        lambda *_args, **_kwargs: {"status": "renewed", "lease": expected_lease},
+    )
     monkeypatch.setattr(server, "agent_lease_status", lambda _agent: changed_lease)
-    monkeypatch.setattr(server, "require_authenticated_agent_for_mutation", unexpected_auth)
+    monkeypatch.setattr(
+        server, "require_authenticated_agent_for_mutation", unexpected_auth
+    )
     monkeypatch.setattr(server, "run_tmux", tmux_sink)
 
     with pytest.raises(server.AgentError, match="agent_lease_binding_unverified"):
@@ -1183,31 +1237,41 @@ def test_d244_tool_send_blocks_stale_evidence_before_tmux_effect(
 
     monkeypatch.setattr(server, "single_agent_id", lambda _agent, _operation: "a1")
     monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
-    monkeypatch.setattr(server, "agent_config", lambda _agent: {"session": "a1-session"})
+    monkeypatch.setattr(
+        server, "agent_config", lambda _agent: {"session": "a1-session"}
+    )
     monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
     monkeypatch.setattr(
-        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+        server,
+        "agent_lifecycle_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
-    monkeypatch.setattr(server, "require_invocation_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server, "require_invocation_status", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         server, "wait_agent_input_ready", lambda *_args, **_kwargs: {"ready": True}
     )
     monkeypatch.setattr(server, "read_meta", lambda _agent: {"model": "gpt-6-sol"})
-    monkeypatch.setattr(server, "read_usage_evidence_v2", lambda **_kwargs: stale_evidence)
+    monkeypatch.setattr(
+        server, "read_usage_evidence_v2", lambda **_kwargs: stale_evidence
+    )
     monkeypatch.setattr(
         server,
         "require_authenticated_agent_for_mutation",
         lambda *_args, **_kwargs: {"authenticated": True, "raw_output": "not_returned"},
     )
-    monkeypatch.setattr(
-        server, "run_with_agent_lease", lambda _agent, fn: fn(lease)
-    )
+    monkeypatch.setattr(server, "run_with_agent_lease", lambda _agent, fn: fn(lease))
     monkeypatch.setattr(server, "agent_lease_status", lambda _agent: lease)
-    monkeypatch.setattr(server, "_tmux_args_for_session", lambda _session, args: list(args))
+    monkeypatch.setattr(
+        server, "_tmux_args_for_session", lambda _session, args: list(args)
+    )
     monkeypatch.setattr(server, "run_tmux", tmux_sink)
 
-    with pytest.raises(server.AgentError, match="provider.model_invocability_unattested"):
+    with pytest.raises(
+        server.AgentError, match="provider.model_invocability_unattested"
+    ):
         server.call_tool("agent_send", {"agent": "a1", "text": "status"})
 
     assert tmux_commands == []
@@ -1239,7 +1303,9 @@ def test_red_probe_allows_agent_assign_that_only_sends_to_a_running_agent(
         lambda *_args, **_kwargs: {"allowed": True, "reason_codes": []},
     )
     monkeypatch.setattr(
-        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+        server,
+        "agent_lifecycle_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(
         server, "_resource_gate_composer_scope", lambda: contextlib.nullcontext()
@@ -1346,9 +1412,19 @@ def test_red_probe_allows_safe_stop_interrupt_release_and_applet_stop(
         "agent_lifecycle_lock",
         lambda *_args, **_kwargs: LifecycleLock(),
     )
-    monkeypatch.setattr(server, "_stop_agent_unlocked", lambda *_args, **_kwargs: {"status": "stopped"})
-    monkeypatch.setattr(server, "_interrupt_agent_unlocked", lambda *_args, **_kwargs: {"status": "interrupted"})
-    monkeypatch.setattr(server, "_release_agent_unlocked", lambda *_args, **_kwargs: {"status": "released"})
+    monkeypatch.setattr(
+        server, "_stop_agent_unlocked", lambda *_args, **_kwargs: {"status": "stopped"}
+    )
+    monkeypatch.setattr(
+        server,
+        "_interrupt_agent_unlocked",
+        lambda *_args, **_kwargs: {"status": "interrupted"},
+    )
+    monkeypatch.setattr(
+        server,
+        "_release_agent_unlocked",
+        lambda *_args, **_kwargs: {"status": "released"},
+    )
 
     assert server.stop_agent("a1")["status"] == "stopped"
     assert server.interrupt_agent("a1")["status"] == "interrupted"
@@ -1387,11 +1463,15 @@ def test_red_probe_allows_safe_stop_interrupt_release_and_applet_stop(
         "validate_applet_action_token",
         lambda *_args: {"a": "stop", "g": "a1", "f": "fingerprint"},
     )
-    monkeypatch.setattr(server, "applet_agent_observation", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        server, "applet_agent_observation", lambda *_args, **_kwargs: {}
+    )
     monkeypatch.setattr(server, "codex_usage_watchdog_status", lambda *_args: {})
     monkeypatch.setattr(server, "read_meta", lambda *_args: {})
     monkeypatch.setattr(server, "applet_action_state", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(server, "applet_action_fingerprint_for", lambda *_args: "fingerprint")
+    monkeypatch.setattr(
+        server, "applet_action_fingerprint_for", lambda *_args: "fingerprint"
+    )
     monkeypatch.setattr(server, "applet_action_allowed", lambda *_args, **_kwargs: True)
 
     def safe_shutdown_claim(*_args: object, **kwargs: object) -> dict[str, object]:
@@ -1420,7 +1500,9 @@ def test_red_probe_blocks_applet_start_before_the_start_sink(
     )
     monkeypatch.setattr(server, "require_fleet_recovery_ready", lambda _operation: None)
     monkeypatch.setattr(
-        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+        server,
+        "agent_lifecycle_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(server, "read_applet_action_key", lambda: b"key")
     monkeypatch.setattr(
@@ -1428,7 +1510,9 @@ def test_red_probe_blocks_applet_start_before_the_start_sink(
         "validate_applet_action_token",
         lambda *_args: {"a": "start", "g": "a1", "f": "fingerprint"},
     )
-    monkeypatch.setattr(server, "applet_agent_observation", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        server, "applet_agent_observation", lambda *_args, **_kwargs: {}
+    )
     monkeypatch.setattr(server, "codex_usage_watchdog_status", lambda *_args: {})
     monkeypatch.setattr(server, "read_meta", lambda *_args: {})
     monkeypatch.setattr(server, "applet_action_state", lambda *_args, **_kwargs: {})
@@ -1505,9 +1589,12 @@ def test_red_probe_allows_dedicated_g_migration_recovery(
     )
     monkeypatch.setattr(server, "_g_migration_read_journal", lambda *_args: None)
 
-    assert server._recover_g_series_migration_for_authorized_caller(
-        service=object(), pool_root=tmp_path
-    ) is None
+    assert (
+        server._recover_g_series_migration_for_authorized_caller(
+            service=object(), pool_root=tmp_path
+        )
+        is None
+    )
 
 
 def test_red_probe_allows_existing_g_migration_journal_recovery(
@@ -1539,9 +1626,12 @@ def test_red_probe_allows_existing_g_migration_journal_recovery(
         lambda *_args: recovered,
     )
 
-    assert server._apply_g_series_migration_for_authorized_caller(
-        service=Service(), manifest=object(), pool_root=tmp_path
-    ) is recovered
+    assert (
+        server._apply_g_series_migration_for_authorized_caller(
+            service=Service(), manifest=object(), pool_root=tmp_path
+        )
+        is recovered
+    )
 
 
 def test_red_probe_recovers_a_pending_q_transaction_before_journal_blocks_new_apply(
@@ -1588,7 +1678,9 @@ def test_red_probe_recovers_a_pending_q_transaction_before_journal_blocks_new_ap
         lambda service, paths: recovered.append((service, paths)),
     )
 
-    with pytest.raises(server.FleetRecoveryBlockedError, match="fleet_recovery_pending"):
+    with pytest.raises(
+        server.FleetRecoveryBlockedError, match="fleet_recovery_pending"
+    ):
         server.fleet_series_apply(
             prefix="q",
             count=1,
@@ -1669,7 +1761,9 @@ def test_red_probe_allows_existing_home_cutover_operations(
             return {"operation": "rollback"}
 
     def capacity_gate_used(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("existing-home cutover consulted the resource-capacity gate")
+        raise AssertionError(
+            "existing-home cutover consulted the resource-capacity gate"
+        )
 
     handle = object.__new__(FleetHomeV2PlanHandle)
     monkeypatch.setattr(
@@ -1795,18 +1889,24 @@ def test_red_probe_routes_watchdogs_to_safe_shutdown_only(
         assert callable(callback)
         return {"results": [callback(agent) for agent in selected]}
 
-    def safe_watchdog(*_args: object, safe_shutdown_only: bool, **_kwargs: object) -> dict[str, object]:
+    def safe_watchdog(
+        *_args: object, safe_shutdown_only: bool, **_kwargs: object
+    ) -> dict[str, object]:
         safe_only_modes.append(safe_shutdown_only)
         return {"status": "safe"}
 
-    def safe_usage(*_args: object, safe_shutdown_only: bool, **_kwargs: object) -> dict[str, object]:
+    def safe_usage(
+        *_args: object, safe_shutdown_only: bool, **_kwargs: object
+    ) -> dict[str, object]:
         safe_only_modes.append(safe_shutdown_only)
         return {"status": "safe"}
 
     monkeypatch.setattr(server, "require_fleet_recovery_ready", blocked_gate)
     monkeypatch.setattr(server, "agent_ids", lambda _agent: ["a1"])
     monkeypatch.setattr(server, "current_agent_inventory", lambda: object())
-    monkeypatch.setattr(server, "agent_config", lambda *_args: {"home": "/tmp", "session": "a1"})
+    monkeypatch.setattr(
+        server, "agent_config", lambda *_args: {"home": "/tmp", "session": "a1"}
+    )
     monkeypatch.setattr(server, "create_fleet_snapshot", lambda **_kwargs: None)
     monkeypatch.setattr(server, "multi_agent_result", run_selected)
     monkeypatch.setattr(
@@ -1826,15 +1926,18 @@ def test_red_probe_routes_watchdogs_to_safe_shutdown_only(
 
     assert server.fleet_watchdog(dry_run=False, action="interrupt")["status"] == "ok"
     assert server.fleet_usage_watchdog(dry_run=False)["result_count"] == 1
-    assert server.watchdog_agent(
-        "a1",
-        idle_seconds=1,
-        action="interrupt",
-        report_grace_seconds=1,
-        require_lease=True,
-        manage_unclaimed=False,
-        dry_run=False,
-    )["status"] == "safe"
+    assert (
+        server.watchdog_agent(
+            "a1",
+            idle_seconds=1,
+            action="interrupt",
+            report_grace_seconds=1,
+            require_lease=True,
+            manage_unclaimed=False,
+            dry_run=False,
+        )["status"]
+        == "safe"
+    )
     assert server.usage_watchdog_agent("a1", dry_run=False)["status"] == "safe"
     assert safe_only_modes == [True, True, True, True]
 
@@ -1858,9 +1961,11 @@ def test_server_exposes_additive_read_only_hive_tools() -> None:
 def test_server_runtime_factory_can_forward_read_only_assembly() -> None:
     classes = load_agent_class_catalog(server.repo_root() / "codex-agent-classes.json")
     config = load_hive_config(server.repo_root() / "codex-hive.json", classes)
-    with patch.object(server, "load_agent_class_catalog", return_value=classes), patch.object(
-        server, "load_hive_config", return_value=config
-    ), patch.object(server, "build_hive_runtime", return_value=object()) as builder:
+    with (
+        patch.object(server, "load_agent_class_catalog", return_value=classes),
+        patch.object(server, "load_hive_config", return_value=config),
+        patch.object(server, "build_hive_runtime", return_value=object()) as builder,
+    ):
         result = server.build_current_hive_runtime(repository_roots={}, read_only=True)
 
     assert result is not None
@@ -1879,56 +1984,95 @@ def test_server_denies_test_mutations_without_queen_or_teamlead_principal() -> N
     with pytest.raises(server.AgentError, match="authority.scope_denied"):
         server.call_tool(
             "hive_test_run",
-            {"test_id": "pytest:tests/test_x.py:test_x", "index_digest": "sha256:" + "a" * 64},
+            {
+                "test_id": "pytest:tests/test_x.py:test_x",
+                "index_digest": "sha256:" + "a" * 64,
+            },
             principal_class="arbeitsbiene",
         )
 
 
 def queen_workpackage(mode: str = "enforced") -> dict[str, object]:
     return {
-        "workpackage_id": "workpackage-one", "repo_id": "codex-master",
-        "teamlead_principal_id": "lead-one", "specialist_principal_id": "specialist-one",
-        "writer_class_id": "spezialistin", "agent_id": "agent-one", "account_key": "sha256:" + "a" * 64,
-        "model_id": "gpt-primary", "model_role": "primary", "task_complexity": "complex",
-        "scope": ("src",), "write_paths": ("src/task.py",), "mode": mode,
-        "pilot_enabled": True, "account_confirmed": True, "authority_verified": True,
-        "repository_verified": True, "scope_verified": True, "lease_available": True,
+        "workpackage_id": "workpackage-one",
+        "repo_id": "codex-master",
+        "teamlead_principal_id": "lead-one",
+        "specialist_principal_id": "specialist-one",
+        "writer_class_id": "spezialistin",
+        "agent_id": "agent-one",
+        "account_key": "sha256:" + "a" * 64,
+        "model_id": "gpt-primary",
+        "model_role": "primary",
+        "task_complexity": "complex",
+        "scope": ("src",),
+        "write_paths": ("src/task.py",),
+        "mode": mode,
+        "pilot_enabled": True,
+        "account_confirmed": True,
+        "authority_verified": True,
+        "repository_verified": True,
+        "scope_verified": True,
+        "lease_available": True,
         "selection_band": "none",
     }
 
 
 def test_server_queen_adapter_is_closed_without_context_and_not_an_mcp_tool() -> None:
-    with patch.object(server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()), \
-         patch.object(server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()):
+    with (
+        patch.object(
+            server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()
+        ),
+        patch.object(
+            server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()
+        ),
+    ):
         result = server.execute_server_queen_assignment(
-            queen_id="queen-codex-master", dispatch_id="dispatch-one", workpackage=queen_workpackage()
+            queen_id="queen-codex-master",
+            dispatch_id="dispatch-one",
+            workpackage=queen_workpackage(),
         )
     assert result["reason_code"] == "pilot_gate_blocked"
-    assert "execute_server_queen_assignment" not in {tool["name"] for tool in server.TOOLS}
+    assert "execute_server_queen_assignment" not in {
+        tool["name"] for tool in server.TOOLS
+    }
 
 
 def test_server_queen_adapter_accepts_only_explicit_injected_callbacks() -> None:
     events: list[str] = []
     context = server.build_server_queen_assignment_context(
-        confirmed_accounts={"sha256:" + "a" * 64}, primary_models={"gpt-primary"},
+        confirmed_accounts={"sha256:" + "a" * 64},
+        primary_models={"gpt-primary"},
         create_teamlead_principal=lambda _plan: events.append("teamlead") or "lead",
-        create_specialist_principal=lambda _plan: events.append("specialist") or "specialist",
+        create_specialist_principal=lambda _plan: events.append("specialist")
+        or "specialist",
         issue_grant=lambda _plan: events.append("grant") or "grant",
         reserve_admission=lambda _plan: events.append("admission") or "admission",
-        execute_assignment=lambda _plan: events.append("assignment") or {"status": "accepted"},
+        execute_assignment=lambda _plan: events.append("assignment")
+        or {"status": "accepted"},
         compensate=lambda *_args: events.append("compensate"),
     )
-    with patch.object(server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()), \
-         patch.object(server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()):
+    with (
+        patch.object(
+            server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()
+        ),
+        patch.object(
+            server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()
+        ),
+    ):
         result = server.execute_server_queen_assignment(
-            queen_id="queen-codex-master", dispatch_id="dispatch-one", workpackage=queen_workpackage(), context=context
+            queen_id="queen-codex-master",
+            dispatch_id="dispatch-one",
+            workpackage=queen_workpackage(),
+            context=context,
         )
         assert result["reason_code"] == "assignment_executed"
         assert events == ["teamlead", "specialist", "grant", "admission", "assignment"]
         with pytest.raises(HiveDispatchError, match="pilot_allowlist_denied"):
             server.execute_server_queen_assignment(
-                queen_id="queen-codex-master", dispatch_id="dispatch-one",
-                workpackage={**queen_workpackage(), "repo_id": "foreign-repo"}, context=context,
+                queen_id="queen-codex-master",
+                dispatch_id="dispatch-one",
+                workpackage={**queen_workpackage(), "repo_id": "foreign-repo"},
+                context=context,
             )
 
 
@@ -1945,12 +2089,14 @@ def test_server_queen_bridge_rechecks_each_forward_sink_after_mutation_lock(
         yield
 
     context = server.build_server_queen_assignment_context(
-        confirmed_accounts={"sha256:" + "a" * 64}, primary_models={"gpt-primary"},
+        confirmed_accounts={"sha256:" + "a" * 64},
+        primary_models={"gpt-primary"},
         create_teamlead_principal=lambda _plan: callbacks.append("teamlead"),
         create_specialist_principal=lambda _plan: callbacks.append("specialist"),
         issue_grant=lambda _plan: callbacks.append("grant"),
         reserve_admission=lambda _plan: callbacks.append("admission"),
-        execute_assignment=lambda _plan: callbacks.append("assignment") or {"status": "unexpected"},
+        execute_assignment=lambda _plan: callbacks.append("assignment")
+        or {"status": "unexpected"},
         compensate=lambda name, *_args: compensated.append(name),
     )
     monkeypatch.setattr(server, "agent_lifecycle_lock", mutation_lock)
@@ -1966,7 +2112,10 @@ def test_server_queen_bridge_rechecks_each_forward_sink_after_mutation_lock(
     )
 
     result = server.execute_server_queen_assignment(
-        queen_id="queen-codex-master", dispatch_id="dispatch-one", workpackage=queen_workpackage(), context=context
+        queen_id="queen-codex-master",
+        dispatch_id="dispatch-one",
+        workpackage=queen_workpackage(),
+        context=context,
     )
 
     assert result["reason_code"] == "assignment_transaction_failed"
@@ -1977,7 +2126,8 @@ def test_server_queen_bridge_rechecks_each_forward_sink_after_mutation_lock(
 def test_server_queen_adapter_persists_queue_and_completion_events(tmp_path) -> None:
     events = HiveEventStore(tmp_path / "hive")
     context = server.build_server_queen_assignment_context(
-        confirmed_accounts={"sha256:" + "a" * 64}, primary_models={"gpt-primary"},
+        confirmed_accounts={"sha256:" + "a" * 64},
+        primary_models={"gpt-primary"},
         create_teamlead_principal=lambda _plan: "lead",
         create_specialist_principal=lambda _plan: "specialist",
         issue_grant=lambda _plan: "grant",
@@ -1986,8 +2136,14 @@ def test_server_queen_adapter_persists_queue_and_completion_events(tmp_path) -> 
         compensate=lambda *_args: None,
     )
 
-    with patch.object(server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()), \
-         patch.object(server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()):
+    with (
+        patch.object(
+            server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()
+        ),
+        patch.object(
+            server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()
+        ),
+    ):
         result = server.execute_server_queen_assignment(
             queen_id="queen-codex-master",
             dispatch_id="dispatch-one",
@@ -2002,30 +2158,65 @@ def test_server_queen_adapter_persists_queue_and_completion_events(tmp_path) -> 
 
 
 def test_server_pause_preview_is_checkpointed_and_never_selection_driven() -> None:
-    assert server.server_cooperative_pause_preview(
-        "workpackage-one", reason="higher_priority_slot_required", assignment_pausable=False
-    )["reason_code"] == "assignment_not_pausable"
-    assert server.server_cooperative_pause_preview(
-        "workpackage-one", reason="higher_priority_slot_required", assignment_pausable=True, selection_source=True
-    )["reason_code"] == "selection_preemption_forbidden"
+    assert (
+        server.server_cooperative_pause_preview(
+            "workpackage-one",
+            reason="higher_priority_slot_required",
+            assignment_pausable=False,
+        )["reason_code"]
+        == "assignment_not_pausable"
+    )
+    assert (
+        server.server_cooperative_pause_preview(
+            "workpackage-one",
+            reason="higher_priority_slot_required",
+            assignment_pausable=True,
+            selection_source=True,
+        )["reason_code"]
+        == "selection_preemption_forbidden"
+    )
     pending = server.server_cooperative_pause_preview(
-        "workpackage-one", reason="higher_priority_slot_required", assignment_pausable=True
+        "workpackage-one",
+        reason="higher_priority_slot_required",
+        assignment_pausable=True,
     )
     assert pending["reason_code"] == "checkpoint_required"
-    checkpoint = validate_message({
-        "schema_version": 1, "message_id": "report-one", "correlation_id": "request-one", "causation_id": None,
-        "message_type": "progress.report",
-        "sender": {"principal_id": "specialist-one", "class_id": "spezialistin"},
-        "recipient": {"principal_id": "lead-one", "class_id": "teamleiterin"},
-        "repo_id": "codex-master", "dispatch_id": "dispatch-one", "workpackage_id": "workpackage-one",
-        "dispatch_priority": "DP1", "created_at_utc": NOW.isoformat(),
-        "expires_at_utc": (NOW + timedelta(hours=1)).isoformat(),
-        "authorization": {"grant_id": "grant-one", "scope_digest": "sha256:scope", "principal_version": 1},
-        "payload": {"status": "executing", "checkpoint": True, "checkpoint_state": "safe", "pause_requested": True, "origin": "work_orchestration", "raw_output": "not_returned"},
-        "raw_output": "not_returned",
-    })
+    checkpoint = validate_message(
+        {
+            "schema_version": 1,
+            "message_id": "report-one",
+            "correlation_id": "request-one",
+            "causation_id": None,
+            "message_type": "progress.report",
+            "sender": {"principal_id": "specialist-one", "class_id": "spezialistin"},
+            "recipient": {"principal_id": "lead-one", "class_id": "teamleiterin"},
+            "repo_id": "codex-master",
+            "dispatch_id": "dispatch-one",
+            "workpackage_id": "workpackage-one",
+            "dispatch_priority": "DP1",
+            "created_at_utc": NOW.isoformat(),
+            "expires_at_utc": (NOW + timedelta(hours=1)).isoformat(),
+            "authorization": {
+                "grant_id": "grant-one",
+                "scope_digest": "sha256:scope",
+                "principal_version": 1,
+            },
+            "payload": {
+                "status": "executing",
+                "checkpoint": True,
+                "checkpoint_state": "safe",
+                "pause_requested": True,
+                "origin": "work_orchestration",
+                "raw_output": "not_returned",
+            },
+            "raw_output": "not_returned",
+        }
+    )
     ready = server.server_cooperative_pause_preview(
-        "workpackage-one", reason="higher_priority_slot_required", assignment_pausable=True, checkpoint=checkpoint
+        "workpackage-one",
+        reason="higher_priority_slot_required",
+        assignment_pausable=True,
+        checkpoint=checkpoint,
     )
     assert ready["reason_code"] == "safe_checkpoint_ready"
     assert ready["mutation_performed"] is False

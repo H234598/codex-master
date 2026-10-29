@@ -20,13 +20,20 @@ class ResourceState:
     selection_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or not 0 <= self.revision <= 10**12:
+        if (
+            isinstance(self.revision, bool)
+            or not isinstance(self.revision, int)
+            or not 0 <= self.revision <= 10**12
+        ):
             raise ResourceStateError("invalid_resource_revision")
         if not isinstance(self.fairness, FairnessLedger):
             raise ResourceStateError("invalid_resource_fairness")
         if not isinstance(self.selection_ids, tuple) or len(self.selection_ids) > 4096:
             raise ResourceStateError("invalid_selection_ids")
-        if any(not isinstance(value, str) or not 1 <= len(value) <= 128 for value in self.selection_ids):
+        if any(
+            not isinstance(value, str) or not 1 <= len(value) <= 128
+            for value in self.selection_ids
+        ):
             raise ResourceStateError("invalid_selection_ids")
 
 
@@ -39,7 +46,9 @@ class ResourceStateStore:
         with self._lock:
             return self._state
 
-    def compare_and_replace(self, *, expected_revision: int, state: ResourceState) -> ResourceState:
+    def compare_and_replace(
+        self, *, expected_revision: int, state: ResourceState
+    ) -> ResourceState:
         if not isinstance(state, ResourceState):
             raise ResourceStateError("invalid_resource_state")
         with self._lock:
@@ -60,4 +69,9 @@ def migrate_resource_state(payload: Mapping[str, object]) -> ResourceState:
     return ResourceState(int(payload.get("revision", 0)), FairnessLedger({}))
 
 
-__all__ = ["ResourceState", "ResourceStateError", "ResourceStateStore", "migrate_resource_state"]
+__all__ = [
+    "ResourceState",
+    "ResourceStateError",
+    "ResourceStateStore",
+    "migrate_resource_state",
+]

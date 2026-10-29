@@ -180,29 +180,43 @@ def _remote_owner_context(
         != target_host_ref
         or _integer(value.get("registry_generation"), "host.operation_owner_invalid")
         != registry_generation
-        or _integer(value.get("ollama_registry_generation"), "host.operation_owner_invalid")
+        or _integer(
+            value.get("ollama_registry_generation"), "host.operation_owner_invalid"
+        )
         < 0
         or _integer(value.get("lease_epoch"), "host.operation_owner_invalid")
         != lease_epoch
         or _digest(value.get("queue_plan_digest"), "host.operation_owner_invalid")
         != queue_plan_digest
-        or _digest(value.get("plan_precondition_digest"), "host.operation_owner_invalid")
+        or _digest(
+            value.get("plan_precondition_digest"), "host.operation_owner_invalid"
+        )
         != plan_precondition_digest
     ):
         _raise("host.operation_owner_invalid")
     context_resource = value.get("resource_generation")
-    if context_resource is not None and _integer(
-        context_resource, "host.operation_owner_invalid"
-    ) != resource_generation:
+    if (
+        context_resource is not None
+        and _integer(context_resource, "host.operation_owner_invalid")
+        != resource_generation
+    ):
         _raise("host.operation_owner_invalid")
     if context_resource is None and resource_generation is not None:
         _raise("host.operation_owner_invalid")
     _token(value.get("instance_ref"), "host.operation_owner_invalid")
     instance = value.get("instance")
     instance_fields = {
-        "ref", "label", "host_ref", "ollama_executable", "models_directory",
-        "selected_model_refs", "allowed_cpus", "cpu_quota_percent", "cpu_weight",
-        "lifecycle_state", "readiness_state",
+        "ref",
+        "label",
+        "host_ref",
+        "ollama_executable",
+        "models_directory",
+        "selected_model_refs",
+        "allowed_cpus",
+        "cpu_quota_percent",
+        "cpu_weight",
+        "lifecycle_state",
+        "readiness_state",
     }
     if (
         not isinstance(instance, Mapping)
@@ -212,8 +226,14 @@ def _remote_owner_context(
         or any(
             not isinstance(instance.get(key), str)
             for key in (
-                "ref", "label", "host_ref", "ollama_executable", "models_directory",
-                "allowed_cpus", "lifecycle_state", "readiness_state",
+                "ref",
+                "label",
+                "host_ref",
+                "ollama_executable",
+                "models_directory",
+                "allowed_cpus",
+                "lifecycle_state",
+                "readiness_state",
             )
         )
         or not isinstance(instance.get("selected_model_refs"), (list, tuple))
@@ -407,9 +427,7 @@ class AgentOperationViewV1:
         )
         object.__setattr__(self, "attempt", _integer(self.attempt))
         object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
-        object.__setattr__(
-            self, "arguments_digest", _digest(self.arguments_digest)
-        )
+        object.__setattr__(self, "arguments_digest", _digest(self.arguments_digest))
         object.__setattr__(self, "created_at", _utc(self.created_at))
         object.__setattr__(self, "deadline", _utc(self.deadline))
         if self.host_ref is not None:
@@ -417,9 +435,7 @@ class AgentOperationViewV1:
         if self.lease_id is not None:
             object.__setattr__(self, "lease_id", _token(self.lease_id))
         if self.lease_epoch is not None:
-            object.__setattr__(
-                self, "lease_epoch", _integer(self.lease_epoch)
-            )
+            object.__setattr__(self, "lease_epoch", _integer(self.lease_epoch))
         object.__setattr__(
             self,
             "reason_codes",
@@ -640,12 +656,17 @@ class AgentOperationStore:
                 "plan_precondition_digest": request.plan_precondition_digest,
                 "envelope_digest": (
                     remote_envelope_digest(
-                        registry_generation=cast(int, request.required_registry_generation),
+                        registry_generation=cast(
+                            int, request.required_registry_generation
+                        ),
                         lease_epoch=cast(int, request.required_lease_epoch),
                         resource_generation=request.resource_generation,
-                        plan_precondition_digest=cast(str, request.plan_precondition_digest),
+                        plan_precondition_digest=cast(
+                            str, request.plan_precondition_digest
+                        ),
                     )
-                    if request.kind == "ollama.instance" else None
+                    if request.kind == "ollama.instance"
+                    else None
                 ),
                 "owner_context": _public_json(request.owner_context),
                 "lease": None,
@@ -685,10 +706,7 @@ class AgentOperationStore:
             _raise("host.registry_generation_stale")
         self._begin_poll(principal.host_ref)
         try:
-            if (
-                attempt_exhaustion_owner is None
-                and operation_deadline_owner is None
-            ):
+            if attempt_exhaustion_owner is None and operation_deadline_owner is None:
                 self.expire_leases()
             else:
                 self.expire_leases(
@@ -727,9 +745,7 @@ class AgentOperationStore:
                         and record["required_registry_generation"]
                         != poll.registry_generation
                     ):
-                        self._set_fence_stale(
-                            record, "host.registry_generation_stale"
-                        )
+                        self._set_fence_stale(record, "host.registry_generation_stale")
                         continue
                     if (
                         record["required_lease_epoch"] is not None
@@ -793,7 +809,10 @@ class AgentOperationStore:
     def complete(
         self, principal: AgentPrincipalV1, receipt: AgentReceiptV1
     ) -> AgentOperationViewV1:
-        if type(principal) is not AgentPrincipalV1 or type(receipt) is not AgentReceiptV1:
+        if (
+            type(principal) is not AgentPrincipalV1
+            or type(receipt) is not AgentReceiptV1
+        ):
             _raise("host.request_invalid")
         with self._state.locked():
             document = self._read_locked()
@@ -822,12 +841,13 @@ class AgentOperationStore:
         self, principal: AgentPrincipalV1, receipt: AgentReceiptV1
     ) -> Mapping[str, object]:
         """Validate receipt fences and expose fixed owner context without mutation."""
-        if type(principal) is not AgentPrincipalV1 or type(receipt) is not AgentReceiptV1:
+        if (
+            type(principal) is not AgentPrincipalV1
+            or type(receipt) is not AgentReceiptV1
+        ):
             _raise("host.request_invalid")
         with self._state.locked():
-            record = self._find(
-                self._read_locked()["operations"], receipt.operation_id
-            )
+            record = self._find(self._read_locked()["operations"], receipt.operation_id)
             self._validate_completion_locked(principal, receipt, record)
             return MappingProxyType(
                 {
@@ -848,7 +868,9 @@ class AgentOperationStore:
         """Return bounded queue-owned metadata for deterministic owner recovery."""
         operation_id = _token(operation_id, "host.operation_not_found")
         with self._state.locked():
-            value = self._find(self._read_locked()["operations"], operation_id)["owner_context"]
+            value = self._find(self._read_locked()["operations"], operation_id)[
+                "owner_context"
+            ]
             return (
                 None
                 if value is None
@@ -889,32 +911,32 @@ class AgentOperationStore:
         owner_host_ref: str | None = None,
     ) -> tuple[str, ...]:
         has_owner = (
-            attempt_exhaustion_owner is not None
-            or operation_deadline_owner is not None
+            attempt_exhaustion_owner is not None or operation_deadline_owner is not None
         )
         if has_owner:
             if (
-                attempt_exhaustion_owner is not None
-                and not callable(attempt_exhaustion_owner)
-            ) or (
-                operation_deadline_owner is not None
-                and not callable(operation_deadline_owner)
-            ) or (
-                lifecycle_ack_owner is not None
-                and not callable(lifecycle_ack_owner)
-            ) or owner_host_ref is None:
+                (
+                    attempt_exhaustion_owner is not None
+                    and not callable(attempt_exhaustion_owner)
+                )
+                or (
+                    operation_deadline_owner is not None
+                    and not callable(operation_deadline_owner)
+                )
+                or (
+                    lifecycle_ack_owner is not None
+                    and not callable(lifecycle_ack_owner)
+                )
+                or owner_host_ref is None
+            ):
                 _raise("host.request_invalid")
             owner_host_ref = _token(owner_host_ref)
         elif owner_host_ref is not None or lifecycle_ack_owner is not None:
             _raise("host.request_invalid")
         now = self._now()
         with self._active_lock:
-            reconciled_exhaustions = frozenset(
-                self._reconciled_attempt_exhaustions
-            )
-            reconciled_deadlines = frozenset(
-                self._reconciled_operation_deadlines
-            )
+            reconciled_exhaustions = frozenset(self._reconciled_attempt_exhaustions)
+            reconciled_deadlines = frozenset(self._reconciled_operation_deadlines)
         expired: list[str] = []
         exhaustions: list[AgentAttemptExhaustionV1] = []
         deadline_expiries: list[AgentOperationDeadlineExpiryV1] = []
@@ -1027,9 +1049,7 @@ class AgentOperationStore:
                 if claimed and lifecycle_ack_owner is not None:
                     lifecycle_ack_owner(expiry)
                 with self._active_lock:
-                    self._reconciled_operation_deadlines.add(
-                        expiry.operation_id
-                    )
+                    self._reconciled_operation_deadlines.add(expiry.operation_id)
         if attempt_exhaustion_owner is not None:
             for exhaustion in exhaustions:
                 claimed = attempt_exhaustion_owner(exhaustion)
@@ -1039,15 +1059,15 @@ class AgentOperationStore:
                 if claimed and lifecycle_ack_owner is not None:
                     lifecycle_ack_owner(exhaustion)
                 with self._active_lock:
-                    self._reconciled_attempt_exhaustions.add(
-                        exhaustion.operation_id
-                    )
+                    self._reconciled_attempt_exhaustions.add(exhaustion.operation_id)
         return tuple(expired)
 
     def get(self, operation_id: str) -> AgentOperationViewV1:
         operation_id = _token(operation_id, "host.operation_not_found")
         with self._state.locked():
-            return self._view(self._find(self._read_locked()["operations"], operation_id))
+            return self._view(
+                self._find(self._read_locked()["operations"], operation_id)
+            )
 
     def result(self, operation_id: str) -> AgentResultV1 | None:
         """Return only the durably accepted bounded receipt result for one ID."""
@@ -1093,10 +1113,9 @@ class AgentOperationStore:
                 serialized = serialize_agent_result(result)
             except (AgentContractError, KeyError, TypeError, ValueError):
                 _raise("host.operation_store_unavailable")
-            if (
-                wire != serialized
-                or completion.get("result_digest") != _canonical_digest(serialized)
-            ):
+            if wire != serialized or completion.get(
+                "result_digest"
+            ) != _canonical_digest(serialized):
                 _raise("host.operation_store_unavailable")
             return result
 
@@ -1130,19 +1149,17 @@ class AgentOperationStore:
                     record["arguments"],
                     "host.operation_store_unavailable",
                 )
-                lifecycle_unknown = (
-                    record["state"] == "unknown"
-                    and record["completion"]
-                    in (
-                        {
-                            "reason_codes": ["host.attempts_exhausted"],
-                            "result_digest": None,
-                        },
-                        {
-                            "reason_codes": ["host.lease_expired"],
-                            "result_digest": None,
-                        },
-                    )
+                lifecycle_unknown = record["state"] == "unknown" and record[
+                    "completion"
+                ] in (
+                    {
+                        "reason_codes": ["host.attempts_exhausted"],
+                        "result_digest": None,
+                    },
+                    {
+                        "reason_codes": ["host.lease_expired"],
+                        "result_digest": None,
+                    },
                 )
                 completion = record["completion"]
                 receipt_terminal = (
@@ -1172,7 +1189,9 @@ class AgentOperationStore:
                             "terminal_kind": (
                                 "lifecycle"
                                 if lifecycle_unknown
-                                else "receipt" if receipt_terminal else None
+                                else "receipt"
+                                if receipt_terminal
+                                else None
                             ),
                         }
                     )
@@ -1301,14 +1320,10 @@ class AgentOperationStore:
 
     @staticmethod
     def _is_operation_deadline_expired(record: Mapping[str, Any]) -> bool:
-        return (
-            record["state"] == "unknown"
-            and record["completion"]
-            == {
-                "reason_codes": ["host.lease_expired"],
-                "result_digest": None,
-            }
-        )
+        return record["state"] == "unknown" and record["completion"] == {
+            "reason_codes": ["host.lease_expired"],
+            "result_digest": None,
+        }
 
     @staticmethod
     def _set_attempts_exhausted(record: dict[str, Any]) -> None:
@@ -1402,7 +1417,10 @@ class AgentOperationStore:
             _raise("host.operation_store_unavailable")
         operations = payload["operations"]
         host_epochs = payload["host_epochs"]
-        if type(operations) is not list or len(operations) > MAX_AGENT_OPERATION_RECORDS:
+        if (
+            type(operations) is not list
+            or len(operations) > MAX_AGENT_OPERATION_RECORDS
+        ):
             _raise("host.operation_store_unavailable")
         if type(host_epochs) is not dict:
             _raise("host.operation_store_unavailable")
@@ -1480,7 +1498,9 @@ class AgentOperationStore:
             "target_host_ref": (
                 None
                 if record.get("target_host_ref") is None
-                else _token(record["target_host_ref"], "host.operation_store_unavailable")
+                else _token(
+                    record["target_host_ref"], "host.operation_store_unavailable"
+                )
             ),
             "required_registry_generation": self._optional_integer(
                 record.get("required_registry_generation")
@@ -1513,11 +1533,17 @@ class AgentOperationStore:
                     _remote_owner_context(
                         record["owner_context"],
                         action=action,
-                        registry_generation=cast(int, result["required_registry_generation"]),
+                        registry_generation=cast(
+                            int, result["required_registry_generation"]
+                        ),
                         lease_epoch=cast(int, result["required_lease_epoch"]),
-                        resource_generation=cast(int | None, result["resource_generation"]),
+                        resource_generation=cast(
+                            int | None, result["resource_generation"]
+                        ),
                         queue_plan_digest=cast(str, result["plan_digest"]),
-                        plan_precondition_digest=cast(str, result["plan_precondition_digest"]),
+                        plan_precondition_digest=cast(
+                            str, result["plan_precondition_digest"]
+                        ),
                         target_host_ref=cast(str | None, result["target_host_ref"]),
                     )
                 ),
@@ -1667,7 +1693,10 @@ class AgentOperationStore:
                 or receipt.envelope_digest != record["envelope_digest"]
             ):
                 _raise("host.operation_envelope_stale")
-        if receipt.result.kind != record["kind"] or receipt.result.action != record["action"]:
+        if (
+            receipt.result.kind != record["kind"]
+            or receipt.result.action != record["action"]
+        ):
             _raise("host.result_mismatch")
         if check_deadline:
             if _parse_time(record["deadline"]) <= now:
@@ -1746,9 +1775,7 @@ class AgentOperationStore:
         )
 
     @staticmethod
-    def _find(
-        records: list[dict[str, Any]], operation_id: str
-    ) -> dict[str, Any]:
+    def _find(records: list[dict[str, Any]], operation_id: str) -> dict[str, Any]:
         for record in records:
             if record["operation_id"] == operation_id:
                 return record
@@ -1765,6 +1792,7 @@ class AgentOperationStore:
             candidate = "operation-" + uuid.uuid4().hex
             if candidate not in existing:
                 return candidate
+
 
 __all__ = [
     "AGENT_OPERATION_LEASE",

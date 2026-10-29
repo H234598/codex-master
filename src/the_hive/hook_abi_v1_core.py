@@ -155,15 +155,12 @@ def _open_checked_directory(
         for index, part in enumerate(path.parts[1:], start=1):
             child = os.open(part, flags, dir_fd=descriptor)
             child_info = os.fstat(child)
-            if (
-                not stat.S_ISDIR(child_info.st_mode)
-                or (
-                    index >= protected_start
-                    and (
-                        child_info.st_uid != owner_uid
-                        or child_info.st_gid != owner_gid
-                        or stat.S_IMODE(child_info.st_mode) & 0o022
-                    )
+            if not stat.S_ISDIR(child_info.st_mode) or (
+                index >= protected_start
+                and (
+                    child_info.st_uid != owner_uid
+                    or child_info.st_gid != owner_gid
+                    or stat.S_IMODE(child_info.st_mode) & 0o022
                 )
             ):
                 os.close(child)
@@ -419,9 +416,7 @@ def _attest_plan(
         generation_root / _PLAN_NAME, modes={0o644}, maximum=_MAX_METADATA_BYTES
     )
     try:
-        plan = json.loads(
-            plan_raw.decode("utf-8"), object_pairs_hook=_unique_object
-        )
+        plan = json.loads(plan_raw.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise _invalid() from exc
     if not isinstance(plan, dict):
@@ -634,9 +629,8 @@ def _attest_dispatch_allowlist(
         modes={0o644},
         maximum=_MAX_HOOK_BYTES,
     )
-    if (
-        "sha256:" + hashlib.sha256(layout_raw).hexdigest()
-        != _manifest_hook_digest(manifest, _RUNTIME_LAYOUT_RELATIVE)
+    if "sha256:" + hashlib.sha256(layout_raw).hexdigest() != _manifest_hook_digest(
+        manifest, _RUNTIME_LAYOUT_RELATIVE
     ):
         raise _invalid()
     module_name = (
@@ -1155,10 +1149,18 @@ def dispatch_hook_v1(
 
 __all__ = ["AttestedHookDispatchV1", "HookAbiV1Error", "dispatch_hook_v1"]
 
+
 def cutover_pin_exchange_v1(stdin_bytes):
     if os.geteuid() != 0 or len(stdin_bytes) > _MAX_EVENT_BYTES:
         raise _invalid()
-    raw = _read_regular(Path(_PIN_STORE_TARGET), modes={0o644}, maximum=_MAX_HOOK_BYTES,
-                        owner_uid=0, owner_gid=0)
+    raw = _read_regular(
+        Path(_PIN_STORE_TARGET),
+        modes={0o644},
+        maximum=_MAX_HOOK_BYTES,
+        owner_uid=0,
+        owner_gid=0,
+    )
     store_type, _ = _pin_store_api(raw)
-    store_type.cutover_exchange(json.loads(stdin_bytes, object_pairs_hook=_unique_object))
+    store_type.cutover_exchange(
+        json.loads(stdin_bytes, object_pairs_hook=_unique_object)
+    )

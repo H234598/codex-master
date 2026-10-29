@@ -114,19 +114,126 @@ def test_publishes_only_attested_descriptor_and_is_idempotent(
     original = {name: (plugin / name).read_bytes() for name in FILES}
     first = _run(release)
     assert first.returncode == 0, first.stdout
-    assert json.loads(first.stdout) == {
-        "status": "published",
-        "descriptor_sha256": descriptor_digest,
-    }
+    first_result = json.loads(first.stdout)
+    assert first_result["status"] == "published"
+    assert first_result["descriptor_sha256"] == descriptor_digest
+    assert len(first_result["receipt_sha256"]) == 64
     target = plugin / "release-binding.json"
     assert hashlib.sha256(target.read_bytes()).hexdigest() == descriptor_digest[7:]
     assert json.loads(target.read_text())["generation"] == generation
     assert all(
         (plugin / name).read_bytes() == value for name, value in original.items()
     )
-    assert _run(release).returncode == 0
-    assert json.loads(_run(release).stdout)["status"] == "already_published"
+    second = _run(release)
+    assert second.returncode == 0
+    second_result = json.loads(second.stdout)
+    assert second_result["status"] == "already_published"
+    assert len(second_result["receipt_sha256"]) == 64
     assert not list(plugin.glob(".release-binding.json.*"))
+
+
+def test_publisher_persists_effect_receipt_after_descriptor_readback(
+    release: tuple[Path, Path, str, str, str],
+) -> None:
+    home, plugin, generation, manifest_digest, descriptor_digest = release
+
+    result = _run(release)
+
+    assert result.returncode == 0, result.stdout
+    state_root = home / ".local/state/codex-master-mcp/hive"
+    receipt_path = state_root / "plugin-release-effect-receipt-v1.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    target = plugin / "release-binding.json"
+    target_stat = target.stat()
+    assert receipt["schema_version"] == 1
+    assert receipt["owner"] == "plugin_release_publisher"
+    assert receipt["effect"] == "plugin_release_descriptor_verified_present"
+    assert receipt["generation"] == generation
+    assert receipt["manifest_digest"] == manifest_digest
+    assert receipt["descriptor_sha256"] == descriptor_digest
+    assert receipt["target"] == "plugins/the-hive/release-binding.json"
+    assert receipt["target_identity"] == {
+        "dev": target_stat.st_dev,
+        "gid": target_stat.st_gid,
+        "ino": target_stat.st_ino,
+        "mode": 0o644,
+        "nlink": 1,
+        "size": target_stat.st_size,
+        "uid": target_stat.st_uid,
+    }
+    assert receipt["issued_at_unix_ns"] > 0
+    assert result.stdout
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == descriptor_digest[7:]
+
+
+def test_publisher_rechecks_descriptor_after_crash_before_receipt(release):
+    home, plugin, generation, manifest_digest, descriptor_digest = release
+    namespace = runpy.run_path(str(OPERATOR), run_name="plugin_receipt_retry_test")
+    publisher_globals = namespace["publish"].__globals__
+    write_receipt = publisher_globals["_write_effect_receipt"]
+
+    def crash_before_receipt(**_kwargs):
+        raise namespace["PublishError"]("injected_receipt_crash")
+
+    publisher_globals["_write_effect_receipt"] = crash_before_receipt
+    with pytest.raises(namespace["PublishError"], match="injected_receipt_crash"):
+        namespace["publish"](home, generation, manifest_digest, descriptor_digest)
+    receipt_path = (
+        home
+        / ".local/state/codex-master-mcp/hive/plugin-release-effect-receipt-v1.json"
+    )
+    assert (plugin / "release-binding.json").is_file()
+    assert not receipt_path.exists()
+
+    publisher_globals["_write_effect_receipt"] = write_receipt
+    result = namespace["publish"](home, generation, manifest_digest, descriptor_digest)
+
+    assert result["status"] == "already_published"
+    assert (
+        json.loads(receipt_path.read_bytes())["descriptor_sha256"] == descriptor_digest
+    )
+
+
+def test_publisher_preserves_foreign_receipt_without_overwrite(release):
+    home, plugin, generation, manifest_digest, descriptor_digest = release
+    receipt_path = (
+        home
+        / ".local/state/codex-master-mcp/hive/plugin-release-effect-receipt-v1.json"
+    )
+    original = b"foreign receipt\n"
+    receipt_path.write_bytes(original)
+    receipt_path.chmod(0o600)
+    namespace = runpy.run_path(str(OPERATOR), run_name="plugin_receipt_foreign_test")
+
+    with pytest.raises(namespace["PublishError"]):
+        namespace["publish"](home, generation, manifest_digest, descriptor_digest)
+
+    assert receipt_path.read_bytes() == original
+    assert not (plugin / "release-binding.json").exists()
+
+
+def test_publisher_refreshes_stale_receipt_after_descriptor_readback(release):
+    home, plugin, generation, manifest_digest, descriptor_digest = release
+    first = _run(release)
+    assert first.returncode == 0, first.stdout
+    receipt_path = (
+        home
+        / ".local/state/codex-master-mcp/hive/plugin-release-effect-receipt-v1.json"
+    )
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["issued_at_unix_ns"] = 1
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    receipt_path.chmod(0o600)
+    namespace = runpy.run_path(str(OPERATOR), run_name="plugin_receipt_refresh_test")
+
+    result = namespace["publish"](home, generation, manifest_digest, descriptor_digest)
+
+    refreshed = json.loads(receipt_path.read_bytes())
+    assert result["status"] == "already_published"
+    assert refreshed["issued_at_unix_ns"] > 1
+    assert (plugin / "release-binding.json").is_file()
 
 
 @pytest.mark.parametrize(

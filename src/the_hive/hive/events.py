@@ -15,18 +15,41 @@ from the_hive.hive.messages import (
     record_child_report,
 )
 from the_hive.hive.state import HiveStateError, HiveStateStore
-from the_hive.hive.types import HiveValidationError, validate_identifier, validate_utc_datetime
+from the_hive.hive.types import (
+    HiveValidationError,
+    validate_identifier,
+    validate_utc_datetime,
+)
 
 
 MAX_EVENT_RECORDS = 4096
 MAX_EVENT_BYTES = 512 * 1024
 _EVENTS_PATH = PurePosixPath("events.jsonl")
-_ASSIGNMENT_MESSAGE_TYPES = frozenset({"workpackage.assign", "assignment.intent", "admission.planned"})
-_EVENT_STATUSES = frozenset({
-    "assigned", "planned", "ready", "queued", "admission_planned", "admitted", "executing", "integrating",
-    "completed", "blocked", "decision_required", "failed", "compensating", "failed_final", "paused",
-    "cancelled", "timeout", "rate_limited",
-})
+_ASSIGNMENT_MESSAGE_TYPES = frozenset(
+    {"workpackage.assign", "assignment.intent", "admission.planned"}
+)
+_EVENT_STATUSES = frozenset(
+    {
+        "assigned",
+        "planned",
+        "ready",
+        "queued",
+        "admission_planned",
+        "admitted",
+        "executing",
+        "integrating",
+        "completed",
+        "blocked",
+        "decision_required",
+        "failed",
+        "compensating",
+        "failed_final",
+        "paused",
+        "cancelled",
+        "timeout",
+        "rate_limited",
+    }
+)
 
 
 class HiveEventError(ValueError):
@@ -36,9 +59,13 @@ class HiveEventError(ValueError):
 class HiveEventStore:
     """Persist only sanitized queue and completion metadata."""
 
-    def __init__(self, state: Path | HiveStateStore, *, now: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self, state: Path | HiveStateStore, *, now: Callable[[], datetime] | None = None
+    ) -> None:
         try:
-            self._state = state if isinstance(state, HiveStateStore) else HiveStateStore(state)
+            self._state = (
+                state if isinstance(state, HiveStateStore) else HiveStateStore(state)
+            )
         except (HiveStateError, TypeError) as exc:
             raise HiveEventError("invalid_hive_event_state") from exc
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -51,7 +78,9 @@ class HiveEventStore:
                 "schema_version": 1,
                 "record_kind": "assignment",
                 "event_id": message.message_id,
-                "assignment_id": _task_id(message.workpackage_id, message.dispatch_id, message.correlation_id),
+                "assignment_id": _task_id(
+                    message.workpackage_id, message.dispatch_id, message.correlation_id
+                ),
                 "created_at_utc": _timestamp(message.created_at_utc),
                 "agent": message.recipient.principal_id,
                 "raw_output": "not_returned",
@@ -66,7 +95,9 @@ class HiveEventStore:
                 "record_kind": "event",
                 "event_id": message.message_id,
                 "at_utc": _timestamp(message.created_at_utc),
-                "assignment_id": _task_id(message.workpackage_id, message.dispatch_id, message.correlation_id),
+                "assignment_id": _task_id(
+                    message.workpackage_id, message.dispatch_id, message.correlation_id
+                ),
                 "agent": message.sender.principal_id,
                 "status": report["status"],
                 "raw_output": "not_returned",
@@ -93,22 +124,30 @@ class HiveEventStore:
         _optional_id(repo_id, "repo")
         agent_id = _id(agent_id, "agent")
         moment = _timestamp(at_utc or self._now())
-        event_id = event_id or "queue-" + hashlib.sha256(
-            f"{workpackage_id}\0{status}\0{moment}".encode("utf-8")
-        ).hexdigest()[:24]
+        event_id = (
+            event_id
+            or "queue-"
+            + hashlib.sha256(
+                f"{workpackage_id}\0{status}\0{moment}".encode("utf-8")
+            ).hexdigest()[:24]
+        )
         event_id = _id(event_id, "event")
-        self._append({
-            "schema_version": 1,
-            "record_kind": "event",
-            "event_id": event_id,
-            "at_utc": moment,
-            "assignment_id": workpackage_id,
-            "agent": agent_id,
-            "status": status,
-            "raw_output": "not_returned",
-        })
+        self._append(
+            {
+                "schema_version": 1,
+                "record_kind": "event",
+                "event_id": event_id,
+                "at_utc": moment,
+                "assignment_id": workpackage_id,
+                "agent": agent_id,
+                "status": status,
+                "raw_output": "not_returned",
+            }
+        )
 
-    def read_report_sources(self) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...]]:
+    def read_report_sources(
+        self,
+    ) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...]]:
         try:
             records = self._state.read_bounded_jsonl(
                 _EVENTS_PATH,
@@ -125,10 +164,18 @@ class HiveEventStore:
         for raw in records:
             kind = raw.get("record_kind")
             if kind == "assignment":
-                _validate_record(raw, {
-                    "schema_version", "record_kind", "event_id", "assignment_id", "created_at_utc", "agent",
-                    "raw_output",
-                })
+                _validate_record(
+                    raw,
+                    {
+                        "schema_version",
+                        "record_kind",
+                        "event_id",
+                        "assignment_id",
+                        "created_at_utc",
+                        "agent",
+                        "raw_output",
+                    },
+                )
                 assignment_id = _record_id(raw, "assignment_id")
                 _record_id(raw, "event_id")
                 created_at = _record_timestamp(raw, "created_at_utc")
@@ -141,10 +188,19 @@ class HiveEventStore:
                     "agent": agent,
                 }
             elif kind == "event":
-                _validate_record(raw, {
-                    "schema_version", "record_kind", "event_id", "at_utc", "assignment_id", "agent", "status",
-                    "raw_output",
-                })
+                _validate_record(
+                    raw,
+                    {
+                        "schema_version",
+                        "record_kind",
+                        "event_id",
+                        "at_utc",
+                        "assignment_id",
+                        "agent",
+                        "status",
+                        "raw_output",
+                    },
+                )
                 assignment_id = _record_id(raw, "assignment_id")
                 _record_id(raw, "event_id")
                 at_utc = _record_timestamp(raw, "at_utc")
@@ -152,12 +208,14 @@ class HiveEventStore:
                 status = raw["status"]
                 if not isinstance(status, str) or status not in _EVENT_STATUSES:
                     raise HiveEventError("hive_event_log_invalid")
-                events.append({
-                    "assignment_id": assignment_id,
-                    "at_utc": at_utc,
-                    "agent": agent,
-                    "status": status,
-                })
+                events.append(
+                    {
+                        "assignment_id": assignment_id,
+                        "at_utc": at_utc,
+                        "agent": agent,
+                        "status": status,
+                    }
+                )
                 if assignment_id not in assignments:
                     assignment_order.append(assignment_id)
                     assignments[assignment_id] = {
@@ -177,7 +235,9 @@ class HiveEventStore:
                     max_records=MAX_EVENT_RECORDS,
                     max_bytes=MAX_EVENT_BYTES,
                 )
-                if any(item.get("event_id") == record.get("event_id") for item in current):
+                if any(
+                    item.get("event_id") == record.get("event_id") for item in current
+                ):
                     return
                 self._state.append_bounded_jsonl(
                     _EVENTS_PATH,
@@ -189,7 +249,9 @@ class HiveEventStore:
             raise HiveEventError("hive_event_write_failed") from exc
 
 
-def _task_id(workpackage_id: str | None, dispatch_id: str | None, correlation_id: str) -> str:
+def _task_id(
+    workpackage_id: str | None, dispatch_id: str | None, correlation_id: str
+) -> str:
     return _id(workpackage_id or dispatch_id or correlation_id, "assignment")
 
 
@@ -212,7 +274,11 @@ def _timestamp(value: datetime) -> str:
 
 
 def _validate_record(record: Mapping[str, object], fields: set[str]) -> None:
-    if record.keys() != fields or record.get("schema_version") != 1 or record.get("raw_output") != "not_returned":
+    if (
+        record.keys() != fields
+        or record.get("schema_version") != 1
+        or record.get("raw_output") != "not_returned"
+    ):
         raise HiveEventError("hive_event_log_invalid")
 
 

@@ -27,7 +27,9 @@ CAPABILITIES = (
 
 
 def test_transport_identifier_redacts_validation_details() -> None:
-    assert transport_principal._identifier("principal-one", "principal") == "principal-one"
+    assert (
+        transport_principal._identifier("principal-one", "principal") == "principal-one"
+    )
     with pytest.raises(TransportPrincipalError, match="resource_access_denied"):
         transport_principal._identifier("bad principal", "principal")
 
@@ -70,7 +72,9 @@ class CountingClock:
         return self.now
 
 
-def _principal(principal_id: str, class_id: str, parent_id: str | None, repo_id: str | None) -> Principal:
+def _principal(
+    principal_id: str, class_id: str, parent_id: str | None, repo_id: str | None
+) -> Principal:
     return Principal(
         principal_id,
         class_id,
@@ -89,9 +93,13 @@ def _registry(class_id: str) -> PrincipalRegistry:
     registry.create(_principal("godbee-main", "gottbiene", None, None))
     if class_id == "teamleiterin":
         registry.create(_principal("queen-repo", "koenigin", "godbee-main", "repo-one"))
-        registry.create(_principal("resource-reader", class_id, "queen-repo", "repo-one"))
+        registry.create(
+            _principal("resource-reader", class_id, "queen-repo", "repo-one")
+        )
     else:
-        registry.create(_principal("resource-reader", class_id, "godbee-main", "repo-one"))
+        registry.create(
+            _principal("resource-reader", class_id, "godbee-main", "repo-one")
+        )
     registry.bind_execution(
         ExecutionBinding(
             "binding-one",
@@ -110,11 +118,17 @@ def _registry(class_id: str) -> PrincipalRegistry:
     return registry
 
 
-def _authority(tmp_path: Path, registry: PrincipalRegistry, capabilities: frozenset[str]) -> AuthorityEngine:
+def _authority(
+    tmp_path: Path, registry: PrincipalRegistry, capabilities: frozenset[str]
+) -> AuthorityEngine:
     root = tmp_path / "repo"
     root.mkdir()
     repositories = RepositoryRegistry(
-        (RepositoryBinding("repo-one", "https://example.invalid/repo.git", root, "main", DIGEST),)
+        (
+            RepositoryBinding(
+                "repo-one", "https://example.invalid/repo.git", root, "main", DIGEST
+            ),
+        )
     )
     return AuthorityEngine(
         AuthorityContext(registry, repositories, {"resource-reader": capabilities})
@@ -154,7 +168,9 @@ def _adapter(
     clock: CountingClock | None = None,
 ) -> tuple[TransportPrincipalAdapter, PrincipalRegistry, FakeVerifier, CountingClock]:
     registry = _registry(class_id)
-    verifier = FakeVerifier(claims if claims is not None else _claims(class_id=class_id))
+    verifier = FakeVerifier(
+        claims if claims is not None else _claims(class_id=class_id)
+    )
     used_clock = clock or CountingClock()
     return (
         TransportPrincipalAdapter(
@@ -200,9 +216,19 @@ def test_attests_only_exact_allowed_principal_classes_and_fixed_resource_capabil
 
 @pytest.mark.parametrize(
     "class_id",
-    ("teamleader-v1", "teamleader", "teamlead", "worker", "arbeitsbiene", "specialist", "spezialistin"),
+    (
+        "teamleader-v1",
+        "teamleader",
+        "teamlead",
+        "worker",
+        "arbeitsbiene",
+        "specialist",
+        "spezialistin",
+    ),
 )
-def test_denies_legacy_alias_and_worker_class_claims(tmp_path: Path, class_id: str) -> None:
+def test_denies_legacy_alias_and_worker_class_claims(
+    tmp_path: Path, class_id: str
+) -> None:
     adapter, _, _, _ = _adapter(tmp_path, claims=_claims(class_id=class_id))
 
     _denies(adapter, object(), capability=CAPABILITIES[0])
@@ -220,7 +246,9 @@ def test_denies_legacy_alias_and_worker_class_claims(tmp_path: Path, class_id: s
         _claims(issued_at_utc=NOW - timedelta(seconds=30), expires_at_utc=NOW),
     ),
 )
-def test_denies_unverified_or_nonmatching_transport_claims(tmp_path: Path, claims: object) -> None:
+def test_denies_unverified_or_nonmatching_transport_claims(
+    tmp_path: Path, claims: object
+) -> None:
     adapter, _, _, _ = _adapter(tmp_path, claims=claims)
 
     _denies(adapter, object(), capability=CAPABILITIES[0])
@@ -242,7 +270,10 @@ def test_revalidates_binding_after_live_revocation(tmp_path: Path) -> None:
     adapter, registry, _, _ = _adapter(tmp_path)
     evidence = object()
 
-    assert adapter.attest(evidence, capability=CAPABILITIES[0]).execution_binding_id == "binding-one"
+    assert (
+        adapter.attest(evidence, capability=CAPABILITIES[0]).execution_binding_id
+        == "binding-one"
+    )
     registry.release_execution("binding-one")
 
     _denies(adapter, evidence, capability=CAPABILITIES[0])
@@ -263,11 +294,15 @@ def test_denies_missing_or_caller_supplied_capability(
     _denies(adapter, object(), capability=capability)
 
 
-def test_constructor_denies_authority_with_different_principal_registry(tmp_path: Path) -> None:
+def test_constructor_denies_authority_with_different_principal_registry(
+    tmp_path: Path,
+) -> None:
     principals = _registry("teamleiterin")
     authority_principals = _registry("teamleiterin")
 
-    with pytest.raises(TransportPrincipalError, match="resource_access_denied") as caught:
+    with pytest.raises(
+        TransportPrincipalError, match="resource_access_denied"
+    ) as caught:
         TransportPrincipalAdapter(
             principals,
             _authority(tmp_path, authority_principals, frozenset(CAPABILITIES)),
@@ -278,7 +313,9 @@ def test_constructor_denies_authority_with_different_principal_registry(tmp_path
     assert caught.value.__cause__ is None
 
 
-def test_denies_verifier_failure_without_leaking_transport_markers(tmp_path: Path) -> None:
+def test_denies_verifier_failure_without_leaking_transport_markers(
+    tmp_path: Path,
+) -> None:
     registry = _registry("teamleiterin")
     marker = "secret-home-/home/forbidden-session-123-pid-999-account-private"
     adapter = TransportPrincipalAdapter(
@@ -341,7 +378,9 @@ def test_denies_invalid_clock_time(tmp_path: Path) -> None:
         {"attested_transport_digest": "not-a-digest"},
     ),
 )
-def test_attested_principal_rejects_invalid_public_shape(kwargs: dict[str, object]) -> None:
+def test_attested_principal_rejects_invalid_public_shape(
+    kwargs: dict[str, object],
+) -> None:
     valid = AttestedPrincipalV1(
         attestation_schema_version=1,
         principal_id="resource-reader",
@@ -367,12 +406,18 @@ def test_attested_principal_rejects_invalid_public_shape(kwargs: dict[str, objec
         {"issued_at_utc": datetime(2026, 8, 16, 12)},
     ),
 )
-def test_verified_transport_claims_reject_invalid_time_bounds(kwargs: dict[str, object]) -> None:
+def test_verified_transport_claims_reject_invalid_time_bounds(
+    kwargs: dict[str, object],
+) -> None:
     with pytest.raises(TransportPrincipalError, match="resource_access_denied"):
         replace(_claims(), **kwargs)
 
 
-def _denies(adapter: TransportPrincipalAdapter, evidence: object, *, capability: str) -> None:
-    with pytest.raises(TransportPrincipalError, match="resource_access_denied") as caught:
+def _denies(
+    adapter: TransportPrincipalAdapter, evidence: object, *, capability: str
+) -> None:
+    with pytest.raises(
+        TransportPrincipalError, match="resource_access_denied"
+    ) as caught:
         adapter.attest(evidence, capability=capability)
     assert caught.value.__cause__ is None

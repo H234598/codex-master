@@ -3,5 +3,10 @@
   "mode": "shadow",
   "repositories": [],
   "principals": [],
-  "feature_flags": {"sp0_passive": false, "sp1_deadline": false, "sp2_secondary_model": false, "sp3_fairness": false}
+  "feature_flags": {
+    "sp0_passive": false,
+    "sp1_deadline": false,
+    "sp2_secondary_model": false,
+    "sp3_fairness": false
+  }
 }

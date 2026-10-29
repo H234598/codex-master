@@ -9,7 +9,11 @@ import hashlib
 import re
 
 from the_hive.hive.principals import Principal
-from the_hive.hive.types import HiveValidationError, validate_identifier, validate_utc_datetime
+from the_hive.hive.types import (
+    HiveValidationError,
+    validate_identifier,
+    validate_utc_datetime,
+)
 
 
 _SECRET_RE = re.compile(r"(?i)(?:sk|api[_-]?key|token|secret)[=:][^\s,;]+")
@@ -31,7 +35,11 @@ def _id(value: object, field: str) -> str:
 
 
 def _safe_text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= MAX_MEMORY_TEXT or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= MAX_MEMORY_TEXT
+        or any(ord(char) < 32 for char in value)
+    ):
         raise MemoryError(f"invalid_{field}")
     return _ABSOLUTE_PATH_RE.sub("<path-redacted>", _SECRET_RE.sub("<redacted>", value))
 
@@ -75,7 +83,9 @@ class MemoryEntry:
             validate_utc_datetime(self.created_at_utc, field="memory_timestamp")
         except HiveValidationError as exc:
             raise MemoryError(str(exc)) from exc
-        if not isinstance(self.content_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.content_digest):
+        if not isinstance(self.content_digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", self.content_digest
+        ):
             raise MemoryError("invalid_memory_digest")
 
     def public(self) -> dict[str, object]:
@@ -95,20 +105,49 @@ class MemoryEntry:
 
 
 def _entry(
-    *, memory_id: str, scope_kind: str, repo_id: str | None, summary: str, provenance_refs: tuple[str, ...],
-    trust_level: str, source_principal_id: str, actor: Principal, now: datetime,
+    *,
+    memory_id: str,
+    scope_kind: str,
+    repo_id: str | None,
+    summary: str,
+    provenance_refs: tuple[str, ...],
+    trust_level: str,
+    source_principal_id: str,
+    actor: Principal,
+    now: datetime,
 ) -> MemoryEntry:
     redacted = _safe_text(summary, "summary")
     digest = "sha256:" + hashlib.sha256(redacted.encode("utf-8")).hexdigest()
-    return MemoryEntry(memory_id, scope_kind, repo_id, redacted, provenance_refs, trust_level, source_principal_id, actor.principal_id, now, digest)
+    return MemoryEntry(
+        memory_id,
+        scope_kind,
+        repo_id,
+        redacted,
+        provenance_refs,
+        trust_level,
+        source_principal_id,
+        actor.principal_id,
+        now,
+        digest,
+    )
 
 
 def promote_teamlead_report(
-    report: Mapping[str, object], *, actor: Principal, memory_id: str, repo_id: str, now: datetime
+    report: Mapping[str, object],
+    *,
+    actor: Principal,
+    memory_id: str,
+    repo_id: str,
+    now: datetime,
 ) -> MemoryEntry:
     if not isinstance(report, Mapping):
         raise MemoryError("invalid_teamlead_report")
-    if not isinstance(actor, Principal) or actor.state != "active" or actor.class_id not in _ROLES_TEAMLEAD or actor.repo_id != repo_id:
+    if (
+        not isinstance(actor, Principal)
+        or actor.state != "active"
+        or actor.class_id not in _ROLES_TEAMLEAD
+        or actor.repo_id != repo_id
+    ):
         raise MemoryError("teamlead_promotion_unauthorized")
     source = report.get("source_principal_id")
     if not isinstance(source, str):
@@ -131,7 +170,12 @@ def promote_queen_memory_to_global(
 ) -> MemoryEntry:
     if not isinstance(memory, MemoryEntry) or memory.scope_kind != "repository":
         raise MemoryError("invalid_queen_memory")
-    if not isinstance(actor, Principal) or actor.state != "active" or actor.class_id not in _ROLES_QUEEN or actor.repo_id != memory.repo_id:
+    if (
+        not isinstance(actor, Principal)
+        or actor.state != "active"
+        or actor.class_id not in _ROLES_QUEEN
+        or actor.repo_id != memory.repo_id
+    ):
         raise MemoryError("queen_promotion_unauthorized")
     return _entry(
         memory_id=memory_id,
@@ -146,4 +190,9 @@ def promote_queen_memory_to_global(
     )
 
 
-__all__ = ["MemoryEntry", "MemoryError", "promote_queen_memory_to_global", "promote_teamlead_report"]
+__all__ = [
+    "MemoryEntry",
+    "MemoryError",
+    "promote_queen_memory_to_global",
+    "promote_teamlead_report",
+]

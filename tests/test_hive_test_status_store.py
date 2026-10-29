@@ -53,7 +53,9 @@ def test_store_round_trips_receipt_with_private_permissions(tmp_path: Path) -> N
     value = matching_receipt()
 
     store.put(value)
-    loaded = store.latest(value.repository_id, value.executor_fingerprint, value.test_id)
+    loaded = store.latest(
+        value.repository_id, value.executor_fingerprint, value.test_id
+    )
 
     assert loaded == value
     assert stat.S_IMODE(os.stat(tmp_path / "test-evidence" / "v1").st_mode) == 0o700
@@ -70,12 +72,16 @@ def test_invalidation_prevents_reuse_without_deleting_receipt(tmp_path: Path) ->
     store.put(value)
 
     store.invalidate(value.repository_id, value.executor_fingerprint, value.evidence_id)
-    loaded = store.latest(value.repository_id, value.executor_fingerprint, value.test_id)
+    loaded = store.latest(
+        value.repository_id, value.executor_fingerprint, value.test_id
+    )
     decision = evaluate_evidence_reuse(
         loaded,
         context,
         now_monotonic_ns=2_000_000_000,
-        revoked=store.is_revoked(value.repository_id, value.executor_fingerprint, value.evidence_id),
+        revoked=store.is_revoked(
+            value.repository_id, value.executor_fingerprint, value.evidence_id
+        ),
     )
 
     assert loaded == value
@@ -107,7 +113,10 @@ def test_corrupt_record_is_never_used_as_evidence(tmp_path: Path) -> None:
 
     store.put(value)
 
-    assert store.latest(value.repository_id, value.executor_fingerprint, value.test_id) == value
+    assert (
+        store.latest(value.repository_id, value.executor_fingerprint, value.test_id)
+        == value
+    )
 
 
 def test_running_attempt_is_projected_then_cancelled_or_expired(tmp_path: Path) -> None:

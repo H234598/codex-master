@@ -1,0 +1,7 @@
+# Canonical serializer contracts: runtime_layout and runtime_migration_policy
+# validate the exact compact bytes, not merely the parsed JSON values.
+src/the_hive/markdown/runtime-release-compatibility-v1.json
+src/the_hive/markdown/runtime-migration-policy-v1.json
+
+# The v1 home-broker installer and its test require exact compact canonical JSON bytes.
+systemd/manifest/the-hive-home-broker-manifest-v1.json

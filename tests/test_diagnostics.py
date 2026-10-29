@@ -422,19 +422,24 @@ def test_diagnostic_for_rejects_bad_types_unsafe_tokens_and_unknown_codes(
     ],
 )
 def test_retry_delay_is_optional_but_only_valid_for_retryable_values(
-    changes: dict[str, object]
+    changes: dict[str, object],
 ) -> None:
     with pytest.raises(ValueError):
         make_diagnostic(**changes)
 
 
 def test_retry_delay_bounds_accept_builtin_int_endpoints_only() -> None:
-    assert make_diagnostic(retryable=True, retry_after_seconds=1).retry_after_seconds == 1
+    assert (
+        make_diagnostic(retryable=True, retry_after_seconds=1).retry_after_seconds == 1
+    )
     assert (
         make_diagnostic(retryable=True, retry_after_seconds=86400).retry_after_seconds
         == 86400
     )
-    assert make_diagnostic(retryable=True, retry_after_seconds=None).retry_after_seconds is None
+    assert (
+        make_diagnostic(retryable=True, retry_after_seconds=None).retry_after_seconds
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -456,7 +461,7 @@ def test_retry_delay_bounds_accept_builtin_int_endpoints_only() -> None:
     ],
 )
 def test_choice_pair_and_fallback_are_exactly_consistent(
-    changes: dict[str, object]
+    changes: dict[str, object],
 ) -> None:
     with pytest.raises(ValueError):
         make_diagnostic(**changes)
@@ -482,7 +487,9 @@ def test_equal_choices_without_fallback_are_valid() -> None:
         (["resolver.class_unknown"],),
     ],
 )
-def test_causes_are_registered_unique_nonself_and_bounded(causes: tuple[object, ...]) -> None:
+def test_causes_are_registered_unique_nonself_and_bounded(
+    causes: tuple[object, ...],
+) -> None:
     with pytest.raises(ValueError):
         make_diagnostic(causes=causes)
 
@@ -520,7 +527,10 @@ def test_serializer_has_the_exact_canonical_wire_order_and_is_deterministic() ->
         "causes": ["resolver.class_unknown"],
         "legacy_code": None,
     }
-    assert len(json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode()) <= 4096
+    assert (
+        len(json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode())
+        <= 4096
+    )
 
 
 def test_parse_and_serialize_round_trip_exactly() -> None:
@@ -568,7 +578,11 @@ def test_parser_rejects_wrong_builtin_types_and_invalid_values(
         {"retryable": False, "retry_after_seconds": 1},
         {"retryable": True, "retry_after_seconds": 0},
         {"requested_choice": "one", "effective_choice": None},
-        {"requested_choice": "one", "effective_choice": "two", "fallback_applied": False},
+        {
+            "requested_choice": "one",
+            "effective_choice": "two",
+            "fallback_applied": False,
+        },
         {"causes": ["resolver.request_invalid"]},
         {"causes": ["resolver.class_unknown"] * 9},
         {"causes": ["unknown.code"]},
@@ -576,7 +590,7 @@ def test_parser_rejects_wrong_builtin_types_and_invalid_values(
     ],
 )
 def test_parser_rejects_cross_field_and_cause_violations(
-    changes: dict[str, object]
+    changes: dict[str, object],
 ) -> None:
     with pytest.raises(ValueError):
         parse_diagnostic_v2(make_wire(**changes))
@@ -594,7 +608,10 @@ def test_parser_rejects_missing_extra_and_noncanonical_field_order() -> None:
     with pytest.raises(ValueError):
         parse_diagnostic_v2(extra)
 
-    reordered = {"code": wire["code"], **{key: value for key, value in wire.items() if key != "code"}}
+    reordered = {
+        "code": wire["code"],
+        **{key: value for key, value in wire.items() if key != "code"},
+    }
     with pytest.raises(ValueError):
         parse_diagnostic_v2(reordered)
 
@@ -613,12 +630,24 @@ def test_module_is_stdlib_only_and_has_no_forbidden_owner_imports() -> None:
     source = Path(diagnostics.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     imports = [
-        node.module or ""
+        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    ] + [
+        alias.name
         for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-    ] + [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    ]
 
-    forbidden = ("admin", "fleet", "server", "runtime", "bus", "s2", "authority", "codex_master")
+    forbidden = (
+        "admin",
+        "fleet",
+        "server",
+        "runtime",
+        "bus",
+        "s2",
+        "authority",
+        "codex_master",
+    )
     assert not any(
         any(part in imported.lower() for part in forbidden) for imported in imports
     )

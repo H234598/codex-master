@@ -537,7 +537,10 @@ def rollback_remote_queen_mcp(
         _validate_fact(restored)
     except RemoteQueenBootstrapError:
         _rollback_drift()
-    if remote_mcp_fact_digest(restored) != plan.before_digest or restored != plan.before:
+    if (
+        remote_mcp_fact_digest(restored) != plan.before_digest
+        or restored != plan.before
+    ):
         _rollback_drift()
     return RemoteQueenMcpRollbackResultV1(True, restored)
 
@@ -588,7 +591,10 @@ def _validate_generation(value: object) -> None:
     if type(value) is not ManifestGenerationV1:
         _inconsistent()
     _validate_generation_token(value.generation)
-    if type(value.sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", value.sha256) is None:
+    if (
+        type(value.sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value.sha256) is None
+    ):
         _inconsistent()
 
 
@@ -608,7 +614,10 @@ def _validate_name(value: object, kind: str) -> None:
         separators = "_.:-"
     if re.fullmatch(pattern, value) is None:
         _inconsistent()
-    if any(first in separators and second in separators for first, second in zip(value, value[1:])):
+    if any(
+        first in separators and second in separators
+        for first, second in zip(value, value[1:])
+    ):
         _inconsistent()
 
 
@@ -671,10 +680,13 @@ def _validate_endpoint(value: object) -> None:
         _inconsistent()
     if host in {"local", "localhost"} or host.endswith(".local"):
         _inconsistent()
-    if re.fullmatch(
-        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*",
-        host,
-    ) is None:
+    if (
+        re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*",
+            host,
+        )
+        is None
+    ):
         _inconsistent()
     labels = host.split(".")
     if len(labels) <= 4 and all(
@@ -700,7 +712,9 @@ def _validate_tool(value: CanonicalMcpToolBindingV1, *, check_digest: bool) -> N
         _validate_name(value.admin_operation, "operation")
 
 
-def _validate_authority(value: CentralAdminAuthorityRefV1, *, check_digest: bool) -> None:
+def _validate_authority(
+    value: CentralAdminAuthorityRefV1, *, check_digest: bool
+) -> None:
     if type(value) is not CentralAdminAuthorityRefV1:
         _inconsistent()
     _validate_exact_text(value.authority_id, ADMIN_AUTHORITY_ID)
@@ -709,7 +723,9 @@ def _validate_authority(value: CentralAdminAuthorityRefV1, *, check_digest: bool
     _validate_generation(value.contract_generation)
     _validate_sorted_names(value.operation_names, "operation", allow_empty=False)
     _validate_digest(value.authority_digest)
-    if check_digest and value.authority_digest != _digest_dataclass(value, "authority_digest"):
+    if check_digest and value.authority_digest != _digest_dataclass(
+        value, "authority_digest"
+    ):
         _inconsistent()
 
 
@@ -723,7 +739,9 @@ def _validate_principal(value: McpPrincipalBindingV1, *, check_digest: bool) -> 
     _validate_generation(value.authority_generation)
     _validate_sorted_names(value.scopes, "scope", allow_empty=False)
     _validate_digest(value.binding_digest)
-    if check_digest and value.binding_digest != _digest_dataclass(value, "binding_digest"):
+    if check_digest and value.binding_digest != _digest_dataclass(
+        value, "binding_digest"
+    ):
         _inconsistent()
 
 
@@ -738,7 +756,9 @@ def _validate_credentials(value: McpCredentialBindingV1, *, check_digest: bool) 
     if value.max_ttl_seconds != MCP_CAPABILITY_MAX_TTL_SECONDS:
         _inconsistent()
     _validate_digest(value.binding_digest)
-    if check_digest and value.binding_digest != _digest_dataclass(value, "binding_digest"):
+    if check_digest and value.binding_digest != _digest_dataclass(
+        value, "binding_digest"
+    ):
         _inconsistent()
 
 
@@ -777,7 +797,10 @@ def _validate_fact(value: RemoteMcpFactV1) -> None:
     ):
         if item is not None:
             _validate_digest(item)
-    _validate_digest_tuple(value.tool_schema_digests, allow_empty=value.state is RemoteMcpStateKindV1.ABSENT)
+    _validate_digest_tuple(
+        value.tool_schema_digests,
+        allow_empty=value.state is RemoteMcpStateKindV1.ABSENT,
+    )
     _validate_attestation(value.attestation)
     optional_values = (
         value.generation,
@@ -790,12 +813,21 @@ def _validate_fact(value: RemoteMcpFactV1) -> None:
         value.admin_authority_digest,
     )
     if value.state is RemoteMcpStateKindV1.ABSENT:
-        if any(item is not None for item in optional_values) or value.tool_schema_digests:
+        if (
+            any(item is not None for item in optional_values)
+            or value.tool_schema_digests
+        ):
             _foreign_state()
-        if any(getattr(value.attestation, field.name) for field in fields(value.attestation)):
+        if any(
+            getattr(value.attestation, field.name)
+            for field in fields(value.attestation)
+        ):
             _foreign_state()
     else:
-        if any(item is None for item in optional_values) or not value.tool_schema_digests:
+        if (
+            any(item is None for item in optional_values)
+            or not value.tool_schema_digests
+        ):
             _foreign_state()
 
 
@@ -814,7 +846,9 @@ def _validate_manifest_components(
         _validate_tool(tool, check_digest=False)
     if len({tool.tool_name for tool in tools}) != len(tools):
         _inconsistent()
-    if tuple(tool.tool_name for tool in tools) != tuple(sorted(tool.tool_name for tool in tools)):
+    if tuple(tool.tool_name for tool in tools) != tuple(
+        sorted(tool.tool_name for tool in tools)
+    ):
         _inconsistent()
     principal_scopes = set(principal.scopes)
     required_scopes = {scope for tool in tools for scope in tool.required_scopes}
@@ -899,9 +933,13 @@ def _validate_manifest(value: RemoteQueenMcpManifestV1, *, check_digest: bool) -
         _validate_bool(flag)
         if not flag:
             _inconsistent()
-    _validate_manifest_components(value.principal, value.credentials, value.tools, value.admin_authority)
+    _validate_manifest_components(
+        value.principal, value.credentials, value.tools, value.admin_authority
+    )
     _validate_digest(value.manifest_digest)
-    if check_digest and value.manifest_digest != _digest_dataclass(value, "manifest_digest"):
+    if check_digest and value.manifest_digest != _digest_dataclass(
+        value, "manifest_digest"
+    ):
         _inconsistent()
 
 
@@ -919,10 +957,15 @@ def _validate_plan(value: RemoteQueenMcpPlanV1, *, check_digest: bool) -> None:
         _inconsistent()
     _validate_bool(value.remove_own_configuration_on_rollback)
     if value.action is None:
-        if value.remove_own_configuration_on_rollback or not _fact_is_desired(value.before, value.manifest):
+        if value.remove_own_configuration_on_rollback or not _fact_is_desired(
+            value.before, value.manifest
+        ):
             _inconsistent()
     elif value.action is RemoteMcpActionV1.CREATE_CONFIGURATION:
-        if not value.remove_own_configuration_on_rollback or value.before.state is not RemoteMcpStateKindV1.ABSENT:
+        if (
+            not value.remove_own_configuration_on_rollback
+            or value.before.state is not RemoteMcpStateKindV1.ABSENT
+        ):
             _inconsistent()
     elif value.action is RemoteMcpActionV1.REPLACE_OWNED_CONFIGURATION:
         if (
@@ -963,7 +1006,10 @@ def _validate_rollback_request(request: RollbackRemoteQueenMcpRequestV1) -> None
     if type(request) is not RollbackRemoteQueenMcpRequestV1:
         _inconsistent()
     _validate_request(request.plan, request.expected_plan_digest)
-    if request.journal is not None and type(request.journal) is not RemoteQueenMcpApplyJournalV1:
+    if (
+        request.journal is not None
+        and type(request.journal) is not RemoteQueenMcpApplyJournalV1
+    ):
         _inconsistent()
 
 
@@ -979,11 +1025,15 @@ def _desired_fact(manifest: RemoteQueenMcpManifestV1) -> RemoteMcpFactV1:
         manifest.credentials.binding_digest,
         manifest.admin_authority.authority_digest,
         tuple(tool.input_schema_sha256 for tool in manifest.tools),
-        McpGatewayAttestationV1(True, True, True, True, True, True, True, True, True, True),
+        McpGatewayAttestationV1(
+            True, True, True, True, True, True, True, True, True, True
+        ),
     )
 
 
-def _fact_configuration_matches(fact: RemoteMcpFactV1, desired: RemoteMcpFactV1) -> bool:
+def _fact_configuration_matches(
+    fact: RemoteMcpFactV1, desired: RemoteMcpFactV1
+) -> bool:
     return (
         fact.state is desired.state
         and fact.generation == desired.generation
@@ -1000,7 +1050,10 @@ def _fact_configuration_matches(fact: RemoteMcpFactV1, desired: RemoteMcpFactV1)
 
 def _fact_is_desired(fact: RemoteMcpFactV1, manifest: RemoteQueenMcpManifestV1) -> bool:
     desired = _desired_fact(manifest)
-    return _fact_configuration_matches(fact, desired) and fact.attestation == desired.attestation
+    return (
+        _fact_configuration_matches(fact, desired)
+        and fact.attestation == desired.attestation
+    )
 
 
 def _require_attestation(attestation: McpGatewayAttestationV1) -> None:
@@ -1015,12 +1068,18 @@ def _require_attestation(attestation: McpGatewayAttestationV1) -> None:
     )
     if any(not getattr(attestation, field) for field in unavailable_fields):
         _unavailable()
-    scoped_fields = ("replay_rejected", "retry_classification_enforced", "revocation_enforced")
+    scoped_fields = (
+        "replay_rejected",
+        "retry_classification_enforced",
+        "revocation_enforced",
+    )
     if any(not getattr(attestation, field) for field in scoped_fields):
         _scope()
 
 
-def _require_desired_fact(fact: RemoteMcpFactV1, manifest: RemoteQueenMcpManifestV1) -> None:
+def _require_desired_fact(
+    fact: RemoteMcpFactV1, manifest: RemoteQueenMcpManifestV1
+) -> None:
     desired = _desired_fact(manifest)
     if not _fact_configuration_matches(fact, desired):
         _unavailable()
@@ -1104,7 +1163,13 @@ def _sha256_canonical(value: object) -> str:
 
 
 def _canonicalize(value: object, *, omit_field: str | None = None) -> object:
-    if value is None or type(value) is bool or type(value) is int or type(value) is float or type(value) is str:
+    if (
+        value is None
+        or type(value) is bool
+        or type(value) is int
+        or type(value) is float
+        or type(value) is str
+    ):
         return value
     if type(value) in (
         RemoteMcpStateKindV1,

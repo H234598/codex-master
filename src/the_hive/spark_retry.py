@@ -19,14 +19,12 @@ _CAPACITY_RETRY_LIMIT: Final = 50
 _ACTIVE_WINDOW_MS: Final = 300_000
 _ACCOUNT_BINDING_RE: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SPARK_REQUIREMENT_TOKEN: Final = "explicit_spark"
-_ACTIVE_EVENT_TYPES: Final[frozenset[str]] = frozenset(
-    {"provider", "tool", "progress"}
-)
+_ACTIVE_EVENT_TYPES: Final[frozenset[str]] = frozenset({"provider", "tool", "progress"})
 _ZERO_DURATION_EVENTS: Final[frozenset[str]] = frozenset(
     {"wait", "backoff", "poll", "liveness"}
 )
-_KNOWN_EVENT_TYPES: Final[frozenset[str]] = _ACTIVE_EVENT_TYPES | _ZERO_DURATION_EVENTS | frozenset(
-    {"capacity"}
+_KNOWN_EVENT_TYPES: Final[frozenset[str]] = (
+    _ACTIVE_EVENT_TYPES | _ZERO_DURATION_EVENTS | frozenset({"capacity"})
 )
 _CAPSULE_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -125,7 +123,9 @@ def _require_binding(raw: Mapping[str, Any]) -> Mapping[str, str]:
     return {
         "bee_id": _require_str(raw, "bee_id"),
         "session_id": _require_str(raw, "session_id"),
-        "spark_requirement": _require_explicit_spark_requirement(raw, "spark_requirement"),
+        "spark_requirement": _require_explicit_spark_requirement(
+            raw, "spark_requirement"
+        ),
         "model": _require_str(raw, "model"),
         "provider": _require_str(raw, "provider"),
         "effort": _require_str(raw, "effort"),
@@ -183,7 +183,9 @@ def _validate_capsule(capsule: ResumeCapsuleV1) -> None:
     normalize_resume_capsule(validate)
 
 
-def serialize_resume_capsule(capsule: ResumeCapsuleV1 | Mapping[str, Any]) -> dict[str, Any]:
+def serialize_resume_capsule(
+    capsule: ResumeCapsuleV1 | Mapping[str, Any],
+) -> dict[str, Any]:
     """Serialize V1 capsule as data-minimal, non-sensitive dict."""
 
     if isinstance(capsule, Mapping):
@@ -227,7 +229,10 @@ def _normalize_event(payload: Mapping[str, Any]) -> _ResumeEvent:
     event_sequence = _require_non_negative_int(payload, "event_sequence")
 
     if event_type == "capacity":
-        _require_exact_keys(payload, frozenset({"event_sequence", "event_type", "binding", "error_code"}))
+        _require_exact_keys(
+            payload,
+            frozenset({"event_sequence", "event_type", "binding", "error_code"}),
+        )
         _require_str(payload, "error_code")
         _require_binding(payload["binding"])  # noqa: B018
         return _ResumeEvent(
@@ -238,7 +243,12 @@ def _normalize_event(payload: Mapping[str, Any]) -> _ResumeEvent:
         )
 
     if event_type in _ACTIVE_EVENT_TYPES:
-        _require_exact_keys(payload, frozenset({"event_sequence", "event_type", "binding", "active_duration_ms"}))
+        _require_exact_keys(
+            payload,
+            frozenset(
+                {"event_sequence", "event_type", "binding", "active_duration_ms"}
+            ),
+        )
         active_duration_ms = _require_non_negative_int(payload, "active_duration_ms")
         _require_binding(payload["binding"])  # noqa: B018
         return _ResumeEvent(
@@ -249,12 +259,19 @@ def _normalize_event(payload: Mapping[str, Any]) -> _ResumeEvent:
         )
 
     if event_type in _ZERO_DURATION_EVENTS:
-        allowed_with_duration = {"event_sequence", "event_type", "binding", "active_duration_ms"}
+        allowed_with_duration = {
+            "event_sequence",
+            "event_type",
+            "binding",
+            "active_duration_ms",
+        }
         allowed_without_duration = {"event_sequence", "event_type", "binding"}
         if set(payload.keys()) not in (allowed_with_duration, allowed_without_duration):
             raise ValueError("unexpected fields present")
         if "active_duration_ms" in payload:
-            active_duration_ms = _require_non_negative_int(payload, "active_duration_ms")
+            active_duration_ms = _require_non_negative_int(
+                payload, "active_duration_ms"
+            )
             if active_duration_ms < 0:
                 raise ValueError("negative active_duration_ms")
         _require_binding(payload["binding"])  # noqa: B018
@@ -319,7 +336,9 @@ def apply_resume_event(
 
     if event_state.event_type in _ACTIVE_EVENT_TYPES:
         active_window_ms += event_state.active_duration_ms
-        active_window_ms, retry_count = _apply_active_window(active_window_ms, retry_count)
+        active_window_ms, retry_count = _apply_active_window(
+            active_window_ms, retry_count
+        )
 
     return ResumeCapsuleV1(
         bee_id=capsule.bee_id,

@@ -65,8 +65,7 @@ def test_runner_module_exports_only_data_permit_and_operations_protocol() -> Non
     )
     assert inspect.isclass(module.DynamicTeamleadRunnerOperations)
     assert not any(
-        "executor" in name.lower() and not name.startswith("_")
-        for name in vars(module)
+        "executor" in name.lower() and not name.startswith("_") for name in vars(module)
     )
 
 
@@ -183,11 +182,7 @@ def test_no_production_callable_accepts_injected_authority_capability() -> None:
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            arguments = (
-                node.args.posonlyargs
-                + node.args.args
-                + node.args.kwonlyargs
-            )
+            arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
             names = [argument.arg.lower() for argument in arguments]
             assert not any(term in name for name in names for term in forbidden), (
                 relative,

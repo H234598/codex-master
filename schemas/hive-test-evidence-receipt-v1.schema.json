@@ -29,7 +29,10 @@
     "expires_monotonic_ns"
   ],
   "properties": {
-    "repository_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "repository_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
     "index_digest": { "$ref": "#/$defs/digest" },
     "function_ids": {
       "type": "array",
@@ -48,14 +51,32 @@
     "runner_version_digest": { "$ref": "#/$defs/digest" },
     "environment_digest": { "$ref": "#/$defs/digest" },
     "attempt_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-    "started_at": { "type": "string", "minLength": 20, "maxLength": 40, "pattern": "Z$" },
-    "finished_at": { "type": "string", "minLength": 20, "maxLength": 40, "pattern": "Z$" },
+    "started_at": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 40,
+      "pattern": "Z$"
+    },
+    "finished_at": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 40,
+      "pattern": "Z$"
+    },
     "started_monotonic_ns": { "type": "integer", "minimum": 0 },
     "finished_monotonic_ns": { "type": "integer", "minimum": 0 },
     "result": { "enum": ["passed", "failed", "blocked", "cancelled"] },
     "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
     "duration_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 },
-    "cooldown_class": { "enum": ["deterministic", "integration", "environmental", "external", "mandatory"] },
+    "cooldown_class": {
+      "enum": [
+        "deterministic",
+        "integration",
+        "environmental",
+        "external",
+        "mandatory"
+      ]
+    },
     "expires_monotonic_ns": { "type": "integer", "minimum": 0 }
   },
   "$defs": {

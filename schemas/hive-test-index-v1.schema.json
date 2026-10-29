@@ -73,7 +73,13 @@
       "pattern": "^(pytest|node_test|repository_adapter):[^:]+:.+$"
     },
     "cooldown_class": {
-      "enum": ["deterministic", "integration", "environmental", "external", "mandatory"]
+      "enum": [
+        "deterministic",
+        "integration",
+        "environmental",
+        "external",
+        "mandatory"
+      ]
     },
     "function": {
       "type": "object",
@@ -94,7 +100,11 @@
         "function_id": { "$ref": "#/$defs/function_id" },
         "language": { "enum": ["python", "javascript", "typescript"] },
         "path": { "$ref": "#/$defs/path" },
-        "qualified_name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "qualified_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
         "source_digest": { "$ref": "#/$defs/digest" },
         "dependency_digest": { "$ref": "#/$defs/digest" },
         "test_ids": {
@@ -105,7 +115,15 @@
           "items": { "$ref": "#/$defs/test_id" }
         },
         "cooldown_class": { "$ref": "#/$defs/cooldown_class" },
-        "risk": { "enum": ["read_only", "mutating", "credential_boundary", "lifecycle", "release"] },
+        "risk": {
+          "enum": [
+            "read_only",
+            "mutating",
+            "credential_boundary",
+            "lifecycle",
+            "release"
+          ]
+        },
         "generated": { "type": "boolean" }
       }
     },
@@ -140,14 +158,33 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/function_id" }
         },
-        "kind": { "enum": ["unit", "boundary", "integration", "regression", "packaging", "external", "gate"] },
+        "kind": {
+          "enum": [
+            "unit",
+            "boundary",
+            "integration",
+            "regression",
+            "packaging",
+            "external",
+            "gate"
+          ]
+        },
         "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
         "hermeticity": { "enum": ["hermetic", "executor_bound", "external"] },
         "required_resources": {
           "type": "array",
           "maxItems": 16,
           "uniqueItems": true,
-          "items": { "enum": ["network", "database", "browser", "gpu", "system_bus", "external_api"] }
+          "items": {
+            "enum": [
+              "network",
+              "database",
+              "browser",
+              "gpu",
+              "system_bus",
+              "external_api"
+            ]
+          }
         },
         "cooldown_class": { "$ref": "#/$defs/cooldown_class" }
       }
@@ -155,7 +192,13 @@
     "gate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["gate_id", "phase", "test_ids", "cooldown_allowed", "required"],
+      "required": [
+        "gate_id",
+        "phase",
+        "test_ids",
+        "cooldown_allowed",
+        "required"
+      ],
       "properties": {
         "gate_id": { "type": "string", "minLength": 1, "maxLength": 128 },
         "phase": { "enum": ["change", "branch", "merge", "release"] },

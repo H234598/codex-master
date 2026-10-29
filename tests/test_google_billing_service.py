@@ -241,7 +241,11 @@ def _inventory(
     path = root / "api-token.yaml"
     path.write_text(
         yaml.safe_dump(
-            {"schema_version": 3, "authority_generation": 1, "google_accounts": accounts},
+            {
+                "schema_version": 3,
+                "authority_generation": 1,
+                "google_accounts": accounts,
+            },
             sort_keys=False,
         ),
         encoding="utf-8",

@@ -87,7 +87,9 @@ def signal_process_group(process: object, signum: int) -> None:
 
 
 class HeadlessJobRegistry:
-    def __init__(self, *, signal_group: Callable[[object, int], None] = signal_process_group) -> None:
+    def __init__(
+        self, *, signal_group: Callable[[object, int], None] = signal_process_group
+    ) -> None:
         self._lock = threading.RLock()
         self._jobs: dict[str, HeadlessJob] = {}
         self._last: dict[str, dict[str, object]] = {}
@@ -107,11 +109,16 @@ class HeadlessJobRegistry:
         with self._lock:
             job = self._jobs.get(agent)
             if job is None:
-                return dict(self._last.get(agent, {
-                    "agent": agent,
-                    "status": "not_running",
-                    "raw_output": "not_returned",
-                }))
+                return dict(
+                    self._last.get(
+                        agent,
+                        {
+                            "agent": agent,
+                            "status": "not_running",
+                            "raw_output": "not_returned",
+                        },
+                    )
+                )
             self._begin_cancel_locked(job, time.monotonic(), force=force)
             return self._public_running(job)
 
@@ -156,7 +163,9 @@ class HeadlessJobRegistry:
             if self._signal_locked(job, signal.SIGKILL):
                 job.kill_sent_monotonic = now
 
-    def _begin_cancel_locked(self, job: HeadlessJob, now: float, *, force: bool) -> None:
+    def _begin_cancel_locked(
+        self, job: HeadlessJob, now: float, *, force: bool
+    ) -> None:
         job.cancel_requested = True
         job.force_cancel = job.force_cancel or force
         if force:
@@ -173,9 +182,14 @@ class HeadlessJobRegistry:
                 "assignment_id": job.assignment_id,
                 "generation": job.generation,
                 "status": (
-                    "timeout" if result.timed_out
-                    else "cancelled" if result.cancelled
-                    else "completed" if result.returncode == 0 and not result.stdout_truncated and not result.stderr_truncated
+                    "timeout"
+                    if result.timed_out
+                    else "cancelled"
+                    if result.cancelled
+                    else "completed"
+                    if result.returncode == 0
+                    and not result.stdout_truncated
+                    and not result.stderr_truncated
                     else "failed"
                 ),
                 "returncode": result.returncode,
@@ -191,11 +205,16 @@ class HeadlessJobRegistry:
             job = self._jobs.get(agent)
             if job is not None:
                 return self._public_running(job)
-            return dict(self._last.get(agent, {
-                "agent": agent,
-                "status": "not_running",
-                "raw_output": "not_returned",
-            }))
+            return dict(
+                self._last.get(
+                    agent,
+                    {
+                        "agent": agent,
+                        "status": "not_running",
+                        "raw_output": "not_returned",
+                    },
+                )
+            )
 
     @staticmethod
     def _public_running(job: HeadlessJob) -> dict[str, object]:
@@ -285,13 +304,26 @@ def run_bounded_process(
         stderr = bytearray()
         truncated_flags = {"stdout": False, "stderr": False}
         for pipe, limit, target, label in (
-            (getattr(process, "stdout", None), MAX_HEADLESS_STDOUT_BYTES, stdout, "stdout"),
-            (getattr(process, "stderr", None), MAX_HEADLESS_STDERR_BYTES, stderr, "stderr"),
+            (
+                getattr(process, "stdout", None),
+                MAX_HEADLESS_STDOUT_BYTES,
+                stdout,
+                "stdout",
+            ),
+            (
+                getattr(process, "stderr", None),
+                MAX_HEADLESS_STDERR_BYTES,
+                stderr,
+                "stderr",
+            ),
         ):
             if pipe is None:
                 raise HeadlessJobError(f"headless_{label}_unavailable")
             thread = threading.Thread(
-                target=lambda p=pipe, byte_limit=limit, o=target, name=label: truncated_flags.__setitem__(
+                target=lambda p=pipe,
+                byte_limit=limit,
+                o=target,
+                name=label: truncated_flags.__setitem__(
                     name, _read_pipe(p, byte_limit, shared, shared_lock, o)
                 ),
                 name=f"codex-headless-{job.agent}-{label}",
@@ -318,7 +350,12 @@ def run_bounded_process(
                 registry.request_timeout(job.agent, now)
             if registry.cancel_requested(job.agent):
                 if cancel_deadline is None:
-                    cancel_deadline = now + HEADLESS_CANCEL_GRACE_SECONDS + HEADLESS_TERM_GRACE_SECONDS + 1.0
+                    cancel_deadline = (
+                        now
+                        + HEADLESS_CANCEL_GRACE_SECONDS
+                        + HEADLESS_TERM_GRACE_SECONDS
+                        + 1.0
+                    )
                 registry.advance_cancel(job.agent, now)
             if cancel_deadline is not None and now >= cancel_deadline:
                 registry.request_cancel(job.agent, force=True)

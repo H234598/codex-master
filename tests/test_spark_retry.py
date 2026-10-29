@@ -70,7 +70,9 @@ def test_normalization_is_strict_roundtrip_and_rejects_unknown_fields() -> None:
     raise AssertionError("unknown fields were accepted")
 
 
-def test_normalization_rejects_invalid_account_binding_spark_requirement_or_window_shape() -> None:
+def test_normalization_rejects_invalid_account_binding_spark_requirement_or_window_shape() -> (
+    None
+):
     raw = base_capsule_payload() | {"schema_version": True}
     try:
         normalize_resume_capsule(raw)
@@ -215,7 +217,11 @@ def test_retry_counter_caps_at_fifty_retries() -> None:
     at_cap = apply_resume_event(
         near_cap,
         base_event_payload()
-        | {"event_sequence": 2, "event_type": "capacity", "error_code": "server_overloaded"},
+        | {
+            "event_sequence": 2,
+            "event_type": "capacity",
+            "error_code": "server_overloaded",
+        },
     )
     blocked = apply_resume_event(
         at_cap,
@@ -233,19 +239,23 @@ def test_active_events_count_and_inactive_events_are_zeroed() -> None:
     capsule = normalize_resume_capsule(base_capsule_payload())
     after_wait = apply_resume_event(
         capsule,
-        base_event_payload() | {"event_sequence": 1, "event_type": "wait", "active_duration_ms": 120000},
+        base_event_payload()
+        | {"event_sequence": 1, "event_type": "wait", "active_duration_ms": 120000},
     )
     after_backoff = apply_resume_event(
         after_wait,
-        base_event_payload() | {"event_sequence": 2, "event_type": "backoff", "active_duration_ms": 120000},
+        base_event_payload()
+        | {"event_sequence": 2, "event_type": "backoff", "active_duration_ms": 120000},
     )
     after_poll = apply_resume_event(
         after_backoff,
-        base_event_payload() | {"event_sequence": 3, "event_type": "poll", "active_duration_ms": 120000},
+        base_event_payload()
+        | {"event_sequence": 3, "event_type": "poll", "active_duration_ms": 120000},
     )
     after_liveness = apply_resume_event(
         after_poll,
-        base_event_payload() | {"event_sequence": 4, "event_type": "liveness", "active_duration_ms": 120000},
+        base_event_payload()
+        | {"event_sequence": 4, "event_type": "liveness", "active_duration_ms": 120000},
     )
     assert after_wait.active_window_ms == 0
     assert after_backoff.active_window_ms == 0
@@ -255,15 +265,15 @@ def test_active_events_count_and_inactive_events_are_zeroed() -> None:
 
     after_provider = apply_resume_event(
         after_liveness,
-        base_event_payload() | {"event_sequence": 5, "event_type": "provider", "active_duration_ms": 500},
+        base_event_payload()
+        | {"event_sequence": 5, "event_type": "provider", "active_duration_ms": 500},
     )
     assert after_provider.active_window_ms == 500
 
 
 def test_capacity_event_starts_new_activity_epoch_before_retry_reset() -> None:
     capsule = normalize_resume_capsule(
-        base_capsule_payload()
-        | {"retry_count": 12, "active_window_ms": 299_900}
+        base_capsule_payload() | {"retry_count": 12, "active_window_ms": 299_900}
     )
     after_capacity = apply_resume_event(
         capsule,
@@ -284,7 +294,11 @@ def test_capacity_event_starts_new_activity_epoch_before_retry_reset() -> None:
     after_reset = apply_resume_event(
         after_small_provider,
         base_event_payload()
-        | {"event_sequence": 3, "event_type": "provider", "active_duration_ms": 299_900},
+        | {
+            "event_sequence": 3,
+            "event_type": "provider",
+            "active_duration_ms": 299_900,
+        },
     )
     assert after_reset.retry_count == 0
     assert after_reset.active_window_ms == 299_900
@@ -335,7 +349,11 @@ def test_noncanonical_capacity_and_inactive_events_do_not_open_new_epoch() -> No
     liveness = apply_resume_event(
         poll,
         base_event_payload()
-        | {"event_sequence": 6, "event_type": "liveness", "active_duration_ms": 120_000},
+        | {
+            "event_sequence": 6,
+            "event_type": "liveness",
+            "active_duration_ms": 120_000,
+        },
     )
 
     assert backoff.retry_count == 7
@@ -344,21 +362,27 @@ def test_noncanonical_capacity_and_inactive_events_do_not_open_new_epoch() -> No
     assert poll.active_window_ms == 200_000
     assert liveness.active_window_ms == 200_000
 
+
 def test_active_window_reset_and_capacity_before_and_after_boundary() -> None:
-    base = normalize_resume_capsule(base_capsule_payload() | {"retry_count": 12, "active_window_ms": 299_900})
+    base = normalize_resume_capsule(
+        base_capsule_payload() | {"retry_count": 12, "active_window_ms": 299_900}
+    )
     before_reset = apply_resume_event(
         base,
-        base_event_payload() | {"event_sequence": 1, "event_type": "capacity", "error_code": "at_capacity"},
+        base_event_payload()
+        | {"event_sequence": 1, "event_type": "capacity", "error_code": "at_capacity"},
     )
     after_reset_boundary = apply_resume_event(
         normalize_resume_capsule(
             base_capsule_payload() | {"retry_count": 12, "active_window_ms": 299_500}
         ),
-        base_event_payload() | {"event_sequence": 1, "event_type": "provider", "active_duration_ms": 500},
+        base_event_payload()
+        | {"event_sequence": 1, "event_type": "provider", "active_duration_ms": 500},
     )
     after_capacity = apply_resume_event(
         after_reset_boundary,
-        base_event_payload() | {"event_sequence": 2, "event_type": "capacity", "error_code": "at_capacity"},
+        base_event_payload()
+        | {"event_sequence": 2, "event_type": "capacity", "error_code": "at_capacity"},
     )
 
     assert before_reset.retry_count == 12

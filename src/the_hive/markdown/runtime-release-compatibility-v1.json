@@ -1,0 +1,1 @@
+{"profile_id":"runtime-release-compatibility-v2","requirements":{"client_argv":["--no-daemon","features","list"],"client_config_key":"features.daemon_auto_start","client_probe_schema_revision":1,"manager_api_schema_revision":1,"predecessor_required":true,"runtime_criteria":["runtime_canary","runtime_features"]},"schema_version":2,"status":"structural_requirements"}

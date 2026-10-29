@@ -178,9 +178,7 @@ def _load_d73_ingress_policy_v1() -> D73IngressPolicyV1:
             raise D73IngressPolicyError("D73_POLICY_E_DIR_TRUST")
 
         try:
-            policy_directory_fd = os.open(
-                "the-hive", directory_flags, dir_fd=root_fd
-            )
+            policy_directory_fd = os.open("the-hive", directory_flags, dir_fd=root_fd)
         except OSError:
             raise D73IngressPolicyError("D73_POLICY_E_OPEN_DIR") from None
 

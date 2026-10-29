@@ -6,9 +6,14 @@ import hashlib
 import json
 import os
 import runpy
+import shutil
+import socket
 import subprocess
 import sys
 import fcntl
+import multiprocessing
+import stat
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -38,6 +43,7 @@ _CANARY_STAGE_CODES = (
     "command_native_spawn_unavailable",
     "command_cgroup_bind_unavailable",
 )
+_CUTOVER_TEST_PROFILE = b"synthetic stage profile for lifecycle mechanics only\n"
 
 
 def _canary_service() -> bytes:
@@ -189,6 +195,57 @@ def _fake_canary_image(root: Path, code: str) -> object:
     )
 
 
+def _manager_api_contract_fixture() -> dict[str, object]:
+    unit_paths = [
+        {
+            "dev": None,
+            "ino": None,
+            "mode": None,
+            "path": "/fixture/systemd/user",
+            "uid": None,
+        }
+    ]
+    return {
+        "api_sha256": "d" * 64,
+        "bus": {"dev": 1, "ino": 2, "mode": 0o600, "uid": os.geteuid()},
+        "manager": {"features_sha256": "b" * 64, "version": "systemd fixture"},
+        "owner": {
+            "CGroup": "/user.slice/user-1000.slice/user@1000.service",
+            "OwnerUID": str(os.geteuid()),
+            "PID": "123",
+            "Unit": "user@1000.service",
+            "UID": str(os.geteuid()),
+            "UniqueName": ":1.23",
+        },
+        "unit_paths": unit_paths,
+        "unit_path_sha256": hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(unit_paths)
+        ).hexdigest(),
+    }
+
+
+def _client_metadata_fixture(
+    artifact_sha256: str = "a" * 64,
+    features_sha256: str = "b" * 64,
+    version: str = "codex fixture",
+) -> dict[str, object]:
+    return {
+        "artifact_sha256": artifact_sha256,
+        "compatibility_probe": {
+            "argv": ["--no-daemon", "features", "list"],
+            "config_sha256": {"false": "c" * 64, "true": "d" * 64},
+            "exit_codes": {"false": 0, "true": 0},
+            "expected": {"false": False, "true": True},
+            "observed": {"false": False, "true": True},
+            "readback_line_sha256": {"false": "e" * 64, "true": "f" * 64},
+            "response_sha256": {"false": "1" * 64, "true": "2" * 64},
+            "schema_revision": 1,
+        },
+        "features_sha256": features_sha256,
+        "version": version,
+    }
+
+
 class _CanaryManager:
     def __init__(
         self,
@@ -276,6 +333,12 @@ def _patch_canary_source(
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir(mode=0o700)
     monkeypatch.setattr(runtime_lifecycle, "_canary_runtime_root", lambda: runtime_root)
+    monkeypatch.setattr(runtime_lifecycle, "_canonical_codex_client_path", lambda: None)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_manager_api_contract_snapshot",
+        _manager_api_contract_fixture,
+    )
     monkeypatch.setattr(
         runtime_lifecycle,
         "_source_tree_binding",
@@ -348,7 +411,13 @@ def test_live_canary_fixture_is_digest_bound_and_secret_free() -> None:
     raw = _LIVE_CANARY_FIXTURE.read_bytes()
     assert all(
         marker not in raw
-        for marker in (b"/home/", b"teladi", b"Bearer ", b'"api_key"', b'"access_token"')
+        for marker in (
+            b"/home/",
+            b"teladi",
+            b"Bearer ",
+            b'"api_key"',
+            b'"access_token"',
+        )
     )
     payload = json.loads(raw)
     digest = payload.pop("fixture_digest")
@@ -435,7 +504,10 @@ def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
 
     assert unit.name == "the-hive-runtime-canary-" + "d" * 32 + ".service"
     assert f"RuntimeDirectory=the-hive-runtime-canary-{'d' * 32}" in properties
-    assert f"BindReadOnlyPaths={image.release_root}:{image.release_root}:norbind" in properties
+    assert (
+        f"BindReadOnlyPaths={image.release_root}:{image.release_root}:norbind"
+        in properties
+    )
     assert f"BindPaths={image.state_root}:{canonical_state}:norbind" in properties
     assert f"ReadWritePaths={canonical_state}" in properties
     assert "ProtectHome=tmpfs" in properties
@@ -476,9 +548,7 @@ def test_canary_uses_absolute_manager_sockets_without_runtime_bridge(
     user_runtime = runtime_root / str(os.geteuid())
     user_runtime.mkdir(parents=True, mode=0o700)
     user_runtime.chmod(0o700)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_USER_RUNTIME_DIRECTORY_ROOT", runtime_root
-    )
+    monkeypatch.setattr(runtime_lifecycle, "_USER_RUNTIME_DIRECTORY_ROOT", runtime_root)
     monkeypatch.setattr(runtime_process, "_RUNTIME_DIRECTORY_ROOT", runtime_root)
     monkeypatch.setattr(
         runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", user_runtime
@@ -499,14 +569,10 @@ def test_canary_uses_absolute_manager_sockets_without_runtime_bridge(
     assert f"RuntimeDirectory={first_name}" in first.properties
     assert f"RuntimeDirectory={second_name}" in second.properties
     assert not any(
-        first_name in value
-        for value in first.properties
-        if value.startswith("Bind")
+        first_name in value for value in first.properties if value.startswith("Bind")
     )
     assert not any(
-        second_name in value
-        for value in second.properties
-        if value.startswith("Bind")
+        second_name in value for value in second.properties if value.startswith("Bind")
     )
     assert (
         f"BindReadOnlyPaths={user_runtime / 'bus'}:{user_runtime / 'bus'}:norbind"
@@ -515,8 +581,7 @@ def test_canary_uses_absolute_manager_sockets_without_runtime_bridge(
     assert (
         "BindReadOnlyPaths="
         f"{user_runtime / 'systemd' / 'private'}:"
-        f"{user_runtime / 'systemd' / 'private'}:norbind"
-        in first.properties
+        f"{user_runtime / 'systemd' / 'private'}:norbind" in first.properties
     )
     assert all("%t" not in value for value in first.properties)
     environment = runtime_process.minimal_environment(
@@ -540,9 +605,7 @@ def test_canary_uses_absolute_manager_sockets_without_runtime_bridge(
         lambda value: value.replace(b"ExecStart=", b"ExecStart=/foreign\nExecStart="),
     ),
 )
-def test_canary_unit_rejects_sandbox_drift(
-    tmp_path: Path, mutation
-) -> None:
+def test_canary_unit_rejects_sandbox_drift(tmp_path: Path, mutation) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     invocation = tmp_path / "invocation"
@@ -561,9 +624,7 @@ def test_canary_unit_rejects_sandbox_drift(
         runtime_lifecycle.RuntimeLifecycleError,
         match="runtime_canary_sandbox_invalid",
     ):
-        runtime_lifecycle._canary_unit_binding(
-            image=image, home=home, nonce="d" * 32
-        )
+        runtime_lifecycle._canary_unit_binding(image=image, home=home, nonce="d" * 32)
 
 
 def test_canary_unit_rejects_a_path_that_systemd_could_reparse(tmp_path: Path) -> None:
@@ -577,9 +638,7 @@ def test_canary_unit_rejects_a_path_that_systemd_could_reparse(tmp_path: Path) -
         runtime_lifecycle.RuntimeLifecycleError,
         match="runtime_canary_sandbox_invalid",
     ):
-        runtime_lifecycle._canary_unit_binding(
-            image=image, home=home, nonce="d" * 32
-        )
+        runtime_lifecycle._canary_unit_binding(image=image, home=home, nonce="d" * 32)
 
 
 @pytest.mark.parametrize("code", _CANARY_STAGE_CODES)
@@ -688,7 +747,7 @@ def test_canary_green_result_is_bounded_and_quiescent(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    runtime_root = _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
 
     def prepare(*, repository: Path, invocation_root: Path, source_commit: str):
         image = _fake_canary_image(invocation_root, _CANARY_STAGE_CODES[0])
@@ -711,9 +770,509 @@ def test_canary_green_result_is_bounded_and_quiescent(
         "manifest_digest": _CANARY_DIGEST,
         "raw_output": "not_returned",
     }
+    record = runtime_lifecycle._read_canary_qualification_record(runtime_root)
+    assert record is not None
+    assert record["status"] == "unqualified"
+    assert record["criteria"]["runtime_canary"] == "pass"
+    assert record["criteria"]["runtime_features"] == "pass"
+    assert record["criteria"]["client_behavior"] == "unknown"
+    assert record["criteria"]["manager_actions"] == "unknown"
     assert len(manager.run_calls) == 1
     assert manager.stopped is True
     assert manager.reset is True
+
+
+def test_client_metadata_probe_executes_pinned_fd_after_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "neutral-home"
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
+    code_home = home / ".codex"
+    code_home.mkdir(mode=0o700)
+    code_home.chmod(0o700)
+    executable = tmp_path / "codex-probe"
+    original = (
+        b"#!/bin/sh\n"
+        b"if [ \"$1\" = --version ]; then printf 'codex 0.fixture\\n'; "
+        b'elif [ "$1" = --no-daemon ] && [ "$2" = features ] '
+        b'&& [ "$3" = list ]; then '
+        b"grep -q '^daemon_auto_start = false$' \"$CODEX_HOME/config.toml\" "
+        b"&& { printf 'daemon_auto_start stable false\\n'; exit 0; }; "
+        b"grep -q '^daemon_auto_start = true$' \"$CODEX_HOME/config.toml\" "
+        b"&& { printf 'daemon_auto_start stable true\\n'; exit 0; }; "
+        b"exit 3; else exit 2; fi\n"
+    )
+    replacement = tmp_path / "codex-replacement"
+    replacement.write_bytes(b"#!/bin/sh\nprintf 'replacement\\n'\n")
+    replacement.chmod(0o755)
+    executable.write_bytes(original)
+    executable.chmod(0o755)
+
+    real_popen = runtime_lifecycle.subprocess.Popen
+    replaced = False
+
+    def replace_before_exec(*args: object, **kwargs: object) -> subprocess.Popen:
+        nonlocal replaced
+        if not replaced:
+            os.replace(replacement, executable)
+            replaced = True
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "Popen", replace_before_exec)
+    result = runtime_lifecycle._probe_codex_client_metadata(
+        executable=executable, home=home, codex_home=code_home
+    )
+
+    assert replaced
+    assert result["version"] == "codex 0.fixture"
+    assert result["artifact_sha256"] == hashlib.sha256(original).hexdigest()
+    assert result["compatibility_probe"]["observed"] == {
+        "false": False,
+        "true": True,
+    }
+    assert result["compatibility_probe"]["argv"] == [
+        "--no-daemon",
+        "features",
+        "list",
+    ]
+    assert result["compatibility_probe"]["exit_codes"] == {"false": 0, "true": 0}
+    assert result["features_status"] == "observed"
+
+
+def test_client_probe_binds_no_daemon_parser_and_effective_config_readback(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "neutral-home"
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
+    code_home = home / ".codex"
+    code_home.mkdir(mode=0o700)
+    code_home.chmod(0o700)
+    executable = tmp_path / "codex-config-probe"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then printf 'codex fixture\\n'; exit 0; fi\n"
+        'if [ "$1" = --no-daemon ] && [ "$2" = features ] '
+        '&& [ "$3" = list ]; then '
+        "grep -q '^daemon_auto_start = false$' \"$CODEX_HOME/config.toml\" "
+        "&& { printf 'daemon_auto_start stable false\\n'; exit 0; }; "
+        "grep -q '^daemon_auto_start = true$' \"$CODEX_HOME/config.toml\" "
+        "&& { printf 'daemon_auto_start stable true\\n'; exit 0; }; "
+        "exit 3; fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    result = runtime_lifecycle._probe_codex_client_metadata(
+        executable=executable, home=home, codex_home=code_home
+    )
+
+    assert result["compatibility_probe"]["observed"] == {
+        "false": False,
+        "true": True,
+    }
+    assert result["compatibility_probe"]["expected"] == {
+        "false": False,
+        "true": True,
+    }
+    assert result["compatibility_probe"]["config_sha256"] == {
+        "false": hashlib.sha256(b"[features]\ndaemon_auto_start = false\n").hexdigest(),
+        "true": hashlib.sha256(b"[features]\ndaemon_auto_start = true\n").hexdigest(),
+    }
+
+
+def test_client_probe_rejects_non_differential_config_readback(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "neutral-home"
+    home.mkdir(mode=0o700)
+    code_home = home / ".codex"
+    code_home.mkdir(mode=0o700)
+    executable = tmp_path / "codex-static-config-probe"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then printf 'codex fixture\\n'; exit 0; fi\n"
+        'if [ "$1" = --no-daemon ] && [ "$2" = features ] '
+        '&& [ "$3" = list ]; then '
+        "printf 'daemon_auto_start stable false\\n'; exit 0; fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    result = runtime_lifecycle._probe_codex_client_metadata(
+        executable=executable, home=home, codex_home=code_home
+    )
+
+    assert result["compatibility_probe"] is None
+    assert result["no_daemon_status"] == "unknown"
+    assert result["config_readback_status"] == "unknown"
+
+
+def test_client_probe_rejects_cli_that_only_accepts_features_without_no_daemon(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "neutral-home"
+    home.mkdir(mode=0o700)
+    code_home = home / ".codex"
+    code_home.mkdir(mode=0o700)
+    executable = tmp_path / "codex-flag-reject-probe"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then printf 'codex fixture\\n'; exit 0; fi\n"
+        'if [ "$1" = features ] && [ "$2" = list ]; then '
+        "printf 'daemon_auto_start stable false\\n'; exit 0; fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    result = runtime_lifecycle._probe_codex_client_metadata(
+        executable=executable, home=home, codex_home=code_home
+    )
+
+    assert result["compatibility_probe"] is None
+    assert result["no_daemon_status"] == "unknown"
+
+
+def test_client_probe_rejects_codex_home_rebind_during_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "neutral-home"
+    home.mkdir(mode=0o700)
+    code_home = home / ".codex"
+    code_home.mkdir(mode=0o700)
+    executable = tmp_path / "codex-config-probe"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then printf 'codex fixture\\n'; exit 0; fi\n"
+        'if [ "$1" = --no-daemon ] && [ "$2" = features ] '
+        '&& [ "$3" = list ]; then '
+        "grep -q '^daemon_auto_start = false$' \"$CODEX_HOME/config.toml\" "
+        "&& { printf 'daemon_auto_start stable false\\n'; exit 0; }; "
+        "grep -q '^daemon_auto_start = true$' \"$CODEX_HOME/config.toml\" "
+        "&& { printf 'daemon_auto_start stable true\\n'; exit 0; }; "
+        "exit 3; fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    real_run = runtime_lifecycle._run_pinned_client_command
+    replaced = False
+
+    def replace_codex_home_after_command(executable_fd, arguments, **kwargs):
+        nonlocal replaced
+        output = real_run(executable_fd, arguments, **kwargs)
+        if arguments == ("--no-daemon", "features", "list") and not replaced:
+            os.rename(code_home, home / ".codex-old")
+            code_home.mkdir(mode=0o700)
+            replaced = True
+        return output
+
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_run_pinned_client_command",
+        replace_codex_home_after_command,
+    )
+
+    result = runtime_lifecycle._probe_codex_client_metadata(
+        executable=executable, home=home, codex_home=code_home
+    )
+
+    assert replaced
+    assert result["compatibility_probe"] is None
+    assert result["config_readback_status"] == "unknown"
+
+
+def test_installed_client_reads_back_private_daemon_config_when_available(
+    tmp_path: Path,
+) -> None:
+    executable = runtime_lifecycle._canonical_codex_client_path()
+    if executable is None:
+        pytest.skip("fixed canonical Codex executable is unavailable")
+    tmp_path.chmod(0o700)
+    home = tmp_path / "neutral-home"
+    home.mkdir(mode=0o700)
+    code_home = home / ".codex"
+    code_home.mkdir(mode=0o700)
+
+    observation = runtime_lifecycle._probe_codex_client_metadata(
+        executable=executable, home=home, codex_home=code_home
+    )
+
+    assert observation["version_status"] == "observed"
+    assert observation["features_status"] == "observed"
+    assert runtime_lifecycle._valid_client_compatibility_probe(
+        observation["compatibility_probe"]
+    )
+    assert observation["compatibility_probe"]["observed"] == {
+        "false": False,
+        "true": True,
+    }
+
+
+def test_canary_records_client_metadata_without_claiming_client_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime_root = _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+
+    def prepare(*, repository: Path, invocation_root: Path, source_commit: str):
+        image = _fake_canary_image(invocation_root, _CANARY_STAGE_CODES[0])
+        health = image.state_root / "hive-hourly-health.json"
+        health.write_bytes(_canary_green_health())
+        health.chmod(0o600)
+        return image
+
+    monkeypatch.setattr(runtime_lifecycle, "_prepare_canary_image", prepare)
+    executable = tmp_path / "codex-fixture"
+    source = (
+        b"#!/bin/sh\n"
+        b"if [ \"$1\" = --version ]; then printf 'codex fixture\\n'; "
+        b'elif [ "$1" = --no-daemon ] && [ "$2" = features ] '
+        b'&& [ "$3" = list ]; then '
+        b"grep -q '^daemon_auto_start = false$' \"$CODEX_HOME/config.toml\" "
+        b"&& { printf 'daemon_auto_start stable false\\n'; exit 0; }; "
+        b"grep -q '^daemon_auto_start = true$' \"$CODEX_HOME/config.toml\" "
+        b"&& { printf 'daemon_auto_start stable true\\n'; exit 0; }; "
+        b"exit 3; else exit 2; fi\n"
+    )
+    executable.write_bytes(source)
+    executable.chmod(0o755)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canonical_codex_client_path", lambda: executable
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_canonical_codex_client_digest",
+        lambda: hashlib.sha256(source).hexdigest(),
+    )
+
+    manager = _CanaryManager(success=True)
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result["status"] == "runtime_canary_green", result
+    record = runtime_lifecycle._read_canary_qualification_record(runtime_root)
+    assert record is not None
+    false_config_sha = hashlib.sha256(
+        b"[features]\ndaemon_auto_start = false\n"
+    ).hexdigest()
+    true_config_sha = hashlib.sha256(
+        b"[features]\ndaemon_auto_start = true\n"
+    ).hexdigest()
+    false_line_sha = hashlib.sha256(b"daemon_auto_start stable false").hexdigest()
+    true_line_sha = hashlib.sha256(b"daemon_auto_start stable true").hexdigest()
+    false_response_sha = hashlib.sha256(b"daemon_auto_start stable false").hexdigest()
+    true_response_sha = hashlib.sha256(b"daemon_auto_start stable true").hexdigest()
+    assert record["bindings"]["client"] == {
+        "artifact_sha256": hashlib.sha256(source).hexdigest(),
+        "compatibility_probe": {
+            "argv": ["--no-daemon", "features", "list"],
+            "config_sha256": {"false": false_config_sha, "true": true_config_sha},
+            "exit_codes": {"false": 0, "true": 0},
+            "expected": {"false": False, "true": True},
+            "observed": {"false": False, "true": True},
+            "readback_line_sha256": {
+                "false": false_line_sha,
+                "true": true_line_sha,
+            },
+            "response_sha256": {
+                "false": false_response_sha,
+                "true": true_response_sha,
+            },
+            "schema_revision": 1,
+        },
+        "features_sha256": hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(
+                {"false": false_response_sha, "true": true_response_sha}
+            )
+        ).hexdigest(),
+        "version": "codex fixture",
+    }
+    assert record["criteria"]["client_probe"] == "pass"
+    assert record["criteria"]["client_compatibility"] == "pass"
+    assert record["status"] == "unqualified"
+    assert record["criteria"]["client_behavior"] == "unknown"
+    assert record["status"] == "unqualified"
+
+
+def test_canary_does_not_publish_record_after_manager_api_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime_root = _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+
+    def prepare(*, repository: Path, invocation_root: Path, source_commit: str):
+        image = _fake_canary_image(invocation_root, _CANARY_STAGE_CODES[0])
+        health = image.state_root / "hive-hourly-health.json"
+        health.write_bytes(_canary_green_health())
+        health.chmod(0o600)
+        return image
+
+    monkeypatch.setattr(runtime_lifecycle, "_prepare_canary_image", prepare)
+    original = _manager_api_contract_fixture()
+    changed = dict(original)
+    changed["api_sha256"] = "e" * 64
+    observations = iter((original, changed))
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_manager_api_contract_snapshot",
+        lambda: next(observations),
+    )
+
+    manager = _CanaryManager(success=True)
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result["status"] == "runtime_canary_green"
+    assert runtime_lifecycle._read_canary_qualification_record(runtime_root) is None
+
+
+@pytest.mark.parametrize("scenario", ["valid", "signature_drift", "unitpath_rebind"])
+def test_manager_api_contract_pins_bus_and_requires_expected_methods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    unit_path = tmp_path / "units"
+    unit_path.mkdir(mode=0o700)
+    bus = runtime / "bus"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(bus))
+    monkeypatch.setattr(runtime_lifecycle, "_user_runtime_directory", lambda: runtime)
+    methods = {
+        "Reload": ("-", "-"),
+        "StartUnit": ("ss", "o"),
+        "StopUnit": ("ss", "o"),
+        "EnableUnitFiles": ("asbb", "ba(sss)"),
+        "DisableUnitFiles": ("asb", "a(sss)"),
+        "GetUnitFileState": ("s", "s"),
+    }
+    introspection = "NAME TYPE SIGNATURE RESULT/VALUE FLAGS\n" + "".join(
+        f".{name} method {('s' if scenario == 'signature_drift' and name == 'StopUnit' else signature)} {result} -\n"
+        for name, (signature, result) in methods.items()
+    )
+    outputs = {
+        "systemctl": (
+            f"Version=systemd fixture\nFeatures=+PAM -GCRYPT\nUnitPath={unit_path}\n"
+        ).encode(),
+        "status": (
+            f"PID=123\nUID={os.geteuid()}\nOwnerUID={os.geteuid()}\n"
+            "UniqueName=:1.23\nUnit=user@1000.service\n"
+            "CGroup=/user.slice/user-1000.slice/user@1000.service\n"
+        ).encode(),
+        "introspect": introspection.encode(),
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(arguments, **kwargs):
+        calls.append(tuple(arguments))
+        assert kwargs["pass_fds"] and kwargs["env"][
+            "DBUS_SESSION_BUS_ADDRESS"
+        ].endswith(f"/proc/self/fd/{kwargs['pass_fds'][0]}")
+        if arguments[0].endswith("systemctl"):
+            key = "systemctl"
+        elif "status" in arguments:
+            key = "status"
+        else:
+            key = "introspect"
+            if scenario == "unitpath_rebind":
+                os.rename(unit_path, tmp_path / "units-old")
+                unit_path.mkdir(mode=0o700)
+        return subprocess.CompletedProcess(arguments, 0, outputs[key], b"")
+
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", fake_run)
+    try:
+        result = runtime_lifecycle._manager_api_contract_snapshot()
+    finally:
+        listener.close()
+    if scenario != "valid":
+        assert result is None
+    else:
+        assert runtime_lifecycle._valid_manager_api_contract(result)
+        assert result["owner"]["UniqueName"] == ":1.23"
+        assert len(calls) == 3
+
+
+def test_manager_api_contract_rejects_runtime_directory_rebind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(runtime / "bus"))
+    moved = tmp_path / "runtime-old"
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    outputs = {
+        "systemctl": b"Version=fixture\nFeatures=+PAM\nUnitPath=/run/user/1000/systemd/user\n",
+        "status": (
+            f"PID=123\nUID={os.geteuid()}\nOwnerUID={os.geteuid()}\n"
+            "UniqueName=:1.23\nUnit=user@1000.service\n"
+            "CGroup=/user.slice/user-1000.slice/user@1000.service\n"
+        ).encode(),
+        "introspect": (
+            "NAME TYPE SIGNATURE RESULT/VALUE FLAGS\n"
+            ".Reload method - - -\n.StartUnit method ss o -\n"
+            ".StopUnit method ss o -\n.EnableUnitFiles method asbb ba(sss) -\n"
+            ".DisableUnitFiles method asb a(sss) -\n"
+            ".GetUnitFileState method s s -\n"
+        ).encode(),
+    }
+    calls = 0
+
+    def fake_run(arguments, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            os.rename(runtime, moved)
+            runtime.mkdir(mode=0o700)
+            replacement.bind(os.fspath(runtime / "bus"))
+        if arguments[0].endswith("systemctl"):
+            key = "systemctl"
+        elif "status" in arguments:
+            key = "status"
+        else:
+            key = "introspect"
+        return subprocess.CompletedProcess(arguments, 0, outputs[key], b"")
+
+    monkeypatch.setattr(runtime_lifecycle, "_user_runtime_directory", lambda: runtime)
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", fake_run)
+    try:
+        assert runtime_lifecycle._manager_api_contract_snapshot() is None
+    finally:
+        listener.close()
+        replacement.close()
+
+
+def test_client_metadata_probe_bounds_child_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "neutral-home"
+    home.mkdir(mode=0o700)
+    code_home = home / ".codex"
+    code_home.mkdir(mode=0o700)
+    executable = tmp_path / "codex-sleeper"
+    executable.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setattr(runtime_lifecycle, "_CANARY_CLIENT_COMMAND_SECONDS", 0.1)
+
+    started = time.monotonic()
+    result = runtime_lifecycle._probe_codex_client_metadata(
+        executable=executable, home=home, codex_home=code_home
+    )
+
+    assert result["version_status"] == "unknown"
+    assert result["features_status"] == "unknown"
+    assert time.monotonic() - started < 1.0
 
 
 def test_canary_accepts_exact_fail_closed_empty_private_state(
@@ -721,7 +1280,7 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    runtime_root = _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
 
     def prepare(*, repository: Path, invocation_root: Path, source_commit: str):
         image = _fake_canary_image(invocation_root, _CANARY_STAGE_CODES[0])
@@ -744,6 +1303,29 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
         "manifest_digest": _CANARY_DIGEST,
         "raw_output": "not_returned",
     }
+    record = runtime_lifecycle._read_canary_qualification_record(runtime_root)
+    assert record is not None
+    assert record["status"] == "unqualified"
+    assert record["criteria"] == {
+        "client_behavior": "unknown",
+        "client_probe": "unknown",
+        "client_compatibility": "unknown",
+        "manager_api_contract": "pass",
+        "manager_actions": "unknown",
+        "runtime_canary": "unknown",
+        "runtime_features": "unknown",
+    }
+    tampered = dict(record)
+    tampered["criteria"] = {**record["criteria"], "unreviewed": "pass"}
+    with runtime_lifecycle._canary_lock(runtime_root):
+        qualification_path = runtime_root / "qualification-v1.json"
+        qualification_path.write_bytes(runtime_lifecycle._d320_canonical_json(tampered))
+        qualification_path.chmod(0o600)
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_qualification_record_invalid",
+    ):
+        runtime_lifecycle._read_canary_qualification_record(runtime_root)
     assert manager.stopped is True
     assert manager.reset is True
 
@@ -768,17 +1350,48 @@ def test_canary_accepts_a_valid_fail_closed_live_usage_state(tmp_path: Path) -> 
     )
     health.chmod(0o600)
 
+    manager_state = {
+        "ActiveState": "failed",
+        "Result": "exit-code",
+        "ExecMainStatus": "1",
+    }
     assert runtime_lifecycle._canary_evidence_result(
-        image=image,
-        manager_state={
-            "ActiveState": "failed",
-            "Result": "exit-code",
-            "ExecMainStatus": "1",
-        },
+        image=image, manager_state=manager_state
     ) == ("runtime_canary_green", None)
+    assert (
+        runtime_lifecycle._canary_runtime_qualification_status(
+            image=image, manager_state=manager_state
+        )
+        == "unknown"
+    )
 
 
-def test_canary_rejects_a_malformed_fail_closed_readiness_reason(tmp_path: Path) -> None:
+def test_strict_canary_runtime_execution_qualifies_its_runtime_criterion(
+    tmp_path: Path,
+) -> None:
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+    health = image.state_root / "hive-hourly-health.json"
+    health.write_bytes(_canary_green_health())
+    health.chmod(0o600)
+
+    assert (
+        runtime_lifecycle._canary_runtime_qualification_status(
+            image=image,
+            manager_state={
+                "ActiveState": "active",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        )
+        == "pass"
+    )
+
+
+def test_canary_rejects_a_malformed_fail_closed_readiness_reason(
+    tmp_path: Path,
+) -> None:
     invocation = tmp_path / "invocation"
     invocation.mkdir(mode=0o700)
     image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
@@ -844,9 +1457,7 @@ def test_canary_concurrency_is_rejected_before_image_or_manager_mutation(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    runtime_root = _patch_canary_source(
-        monkeypatch, tmp_path, _CANARY_STAGE_CODES[0]
-    )
+    runtime_root = _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
     manager = _CanaryManager()
 
     with runtime_lifecycle._canary_lock(runtime_root):
@@ -867,7 +1478,8 @@ def test_canary_never_changes_canonical_runtime_state_or_pricing_paths(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     canonical = {
-        home / ".local/lib/the-hive-runtime/.the-hive-release-pointers.json": b"pointer\n",
+        home
+        / ".local/lib/the-hive-runtime/.the-hive-release-pointers.json": b"pointer\n",
         home / ".local/state/codex-master-mcp/hive-hourly-health.json": b"health\n",
         home / ".local/state/the-hive/openai-pricing/current.json": b"pricing\n",
         home / ".config/systemd/user/the-hive-hive-hourly-probe.service": b"unit\n",
@@ -1100,8 +1712,7 @@ def test_systemd_run_default_classifies_only_fixed_installed_error_forms(
         (
             1,
             "",
-            "Failed to start transient service unit: Invalid argument\n"
-            "secret-token\n",
+            "Failed to start transient service unit: Invalid argument\nsecret-token\n",
         ),
         (
             1,
@@ -1285,7 +1896,9 @@ def test_lifecycle_attestation_rejects_missing_protected_home_runtime_contract(
         .read_bytes()
         .replace(old, new)
     )
-    timer = (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.timer").read_bytes()
+    timer = (
+        ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.timer"
+    ).read_bytes()
 
     class AttestedLayout:
         def read_attested_file(self, relative: str) -> bytes:
@@ -1476,7 +2089,9 @@ def test_bind_cutover_inputs_snapshots_pricing_artifacts(
         path.write_bytes(content)
         path.chmod(mode)
     monkeypatch.setattr(
-        runtime_lifecycle, "_source_tree_binding", lambda _repository: ("a" * 40, "b" * 64)
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
     )
     monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
 
@@ -1521,7 +2136,9 @@ def test_bind_cutover_inputs_rejects_unsafe_pricing_targets(
     else:
         target.hardlink_to(source)
     monkeypatch.setattr(
-        runtime_lifecycle, "_source_tree_binding", lambda _repository: ("a" * 40, "b" * 64)
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
     )
     monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
 
@@ -1545,6 +2162,1578 @@ def test_public_runtime_lifecycle_surface_exposes_canary_cutover_status_and_veri
     assert "status" in completed.stdout
     assert "verify" in completed.stdout
     assert "rollback" not in completed.stdout
+
+
+def test_public_cutover_without_bound_v2_plan_stops_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    bound, states = _bound_failure_fixture(tmp_path)
+    _lifecycle_state(bound.home)
+    lock = bound.state_root / "hive" / ".runtime-lifecycle.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
+    )
+
+    manager_calls: list[tuple[str, ...]] = []
+    effects: list[str] = []
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        manager_calls.append(arguments)
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    current_cutover = runtime_lifecycle.cutover
+
+    def cli_cutover(*, home: Path, **kwargs: object) -> dict[str, object]:
+        return current_cutover(home=home, systemctl=systemctl, **kwargs)
+
+    monkeypatch.setattr(runtime_lifecycle, "cutover", cli_cutover)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_install_attested_runtime",
+        lambda _home: effects.append("installer"),
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_cutover_systemctl_mutate",
+        lambda *_args, **_kwargs: effects.append("manager_mutation"),
+    )
+    before = {
+        str(path.relative_to(bound.home)): (
+            path.lstat().st_mode & 0o777,
+            path.read_bytes(),
+        )
+        for path in bound.home.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(SCRIPT), "cutover", "--home", str(bound.home)],
+    )
+
+    assert runtime_lifecycle.main() == 1
+
+    result = json.loads(capsys.readouterr().out)
+    assert effects == []
+    assert result == {
+        "raw_output": "not_returned",
+        "status": "runtime_lifecycle_plan_required",
+    }
+    assert manager_calls == []
+    after = {
+        str(path.relative_to(bound.home)): (
+            path.lstat().st_mode & 0o777,
+            path.read_bytes(),
+        )
+        for path in bound.home.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("lock_kind", "expected_status"),
+    (
+        ("held", "runtime_lifecycle_busy"),
+        ("symlink", "runtime_lifecycle_store_unavailable"),
+    ),
+)
+def test_public_install_rejects_unavailable_or_untrusted_lifecycle_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lock_kind: str,
+    expected_status: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    hive = home / ".local/state/codex-master-mcp/hive"
+    hive.mkdir(mode=0o700, parents=True)
+    for directory in (
+        home / ".local",
+        home / ".local/state",
+        home / ".local/state/codex-master-mcp",
+        hive,
+    ):
+        directory.chmod(0o700)
+    lock = hive / ".runtime-lifecycle.lock"
+    if lock_kind == "held":
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+    else:
+        target = tmp_path / "foreign-lock-target"
+        target.write_bytes(b"unmodified\n")
+        target.chmod(0o600)
+        lock.symlink_to(target)
+
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "plan",
+        lambda **_kwargs: {
+            "status": "runtime_lifecycle_plan_ready",
+            "reason_codes": [],
+            "plan_sha256": "a" * 64,
+            "plan": {"predecessor": {}},
+        },
+    )
+    manager_calls: list[tuple[str, ...]] = []
+    installer_calls: list[Path] = []
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_install_attested_runtime",
+        lambda received, **_kwargs: installer_calls.append(received),
+    )
+    if lock_kind == "held":
+        # A second open file description must not acquire the same transaction lock.
+        with lock.open("rb") as owner:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = runtime_lifecycle.cutover(
+                home=home,
+                plan_sha256="a" * 64,
+                phase="install",
+                systemctl=lambda arguments: manager_calls.append(arguments) or {},
+            )
+            fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
+    else:
+        result = runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256="a" * 64,
+            phase="install",
+            systemctl=lambda arguments: manager_calls.append(arguments) or {},
+        )
+    assert result["status"] == expected_status
+    assert manager_calls == []
+    assert installer_calls == []
+    if lock_kind == "symlink":
+        assert lock.is_symlink()
+        assert target.read_bytes() == b"unmodified\n"
+    assert not (hive / "runtime-lifecycle-journal-v2.json").exists()
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    [
+        None,
+        "after_setup",
+        "actual_preseal",
+        "before_setup_callback",
+        "before_setup_reservation",
+        "after_hook_pin_publish",
+        "after_hook_pin_publish_lock_rebind",
+        "after_stage_seal",
+        "after_publish",
+        "after_manager_reload_before_activation",
+        "after_legacy_service_stop",
+        "after_legacy_timer_disable",
+        "after_new_timer_enable",
+        "after_manager_reload_after_legacy_removal",
+        "observe_failure",
+        "root_receipt_missing",
+        "plugin_receipt_missing",
+        "candidate_manifest_mismatch",
+    ],
+)
+def test_public_install_persists_intent_before_installer_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_point: str | None,
+) -> None:
+    bound, old_states = _bound_failure_fixture(tmp_path)
+    home = bound.home
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
+    )
+    if crash_point != "actual_preseal":
+        source_digest = runtime_lifecycle._source_digest
+        profile_path = (
+            Path(runtime_lifecycle.__file__).resolve().parents[2]
+            / "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+        )
+
+        def fixture_source_digest(path: Path) -> str:
+            if path == profile_path:
+                return source_digest(path)
+            return "c" * 64
+
+        monkeypatch.setattr(runtime_lifecycle, "_source_digest", fixture_source_digest)
+    runtime_identity = {
+        "generation": "e" * 40,
+        "manifest_digest": "sha256:" + "f" * 64,
+        "consumer_pin": True,
+        "consumer_sha256": "1" * 64,
+    }
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_runtime_identity",
+        lambda _release_root: dict(runtime_identity),
+    )
+    qualification_record: dict[str, object] | None = None
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_canary_client_metadata",
+        lambda _invocation: _client_metadata_fixture(),
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canonical_codex_client_digest", lambda: "a" * 64
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_manager_api_contract_snapshot",
+        _manager_api_contract_fixture,
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_read_canary_qualification_record",
+        lambda _root: qualification_record,
+    )
+    states = dict(old_states)
+    foreign_unit = "unrelated-user-maintenance.service"
+    foreign_state = {
+        "LoadState": "loaded",
+        "UnitFileState": "enabled",
+        "ActiveState": "active",
+    }
+    states[foreign_unit] = dict(foreign_state)
+    for unit in runtime_lifecycle._PRICING_UNITS:
+        states[unit] = {
+            "LoadState": "loaded",
+            "UnitFileState": "disabled",
+            "ActiveState": "inactive",
+        }
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        return states[arguments[1]] if arguments[0] == "show" else {}
+
+    lifecycle_hive = home / ".local" / "state" / "codex-master-mcp" / "hive"
+    assert not lifecycle_hive.exists()
+    public_plan = runtime_lifecycle.plan(home=home, systemctl=systemctl)
+    assert public_plan["status"] == "runtime_lifecycle_plan_blocked"
+    assert not lifecycle_hive.exists()
+    public_plan["plan"]["compatibility"] = {
+        "status": "qualified",
+        "sha256": hashlib.sha256(_CUTOVER_TEST_PROFILE).hexdigest(),
+    }
+    qualification_record = {
+        "bindings": {
+            "candidate_generation": "a" * 40,
+            "candidate_manifest_digest": "sha256:"
+            + ("2" if crash_point == "candidate_manifest_mismatch" else "1") * 64,
+            "client": _client_metadata_fixture(),
+            "manager_states_sha256": hashlib.sha256(
+                runtime_lifecycle._d320_canonical_json(
+                    public_plan["plan"]["manager_states"]
+                )
+            ).hexdigest(),
+            "manager_api_contract": _manager_api_contract_fixture(),
+            "predecessor": {
+                "consumer_sha256": "1" * 64,
+                "generation": "e" * 40,
+                "manifest_digest": "sha256:" + "f" * 64,
+            },
+            "profile_sha256": hashlib.sha256(_CUTOVER_TEST_PROFILE).hexdigest(),
+            "source_commit": "a" * 40,
+            "source_tree_sha256": "b" * 64,
+            "target": dict(public_plan["plan"]["target"]),
+        },
+        "criteria": {
+            "client_behavior": "pass",
+            "client_probe": "pass",
+            "client_compatibility": "pass",
+            "manager_api_contract": "pass",
+            "manager_actions": "unknown",
+            "runtime_canary": "pass",
+            "runtime_features": "pass",
+        },
+        "issued_at_unix_ns": time.time_ns(),
+        "owner_uid": os.geteuid(),
+        "schema_version": 1,
+        "status": "qualified",
+    }
+    fixture_qualification_record = qualification_record
+    public_plan["plan"]["qualification"] = {
+        "status": "qualified",
+        "issued_at_unix_ns": qualification_record["issued_at_unix_ns"],
+        "sha256": hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(qualification_record)
+        ).hexdigest(),
+    }
+    public_plan["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(public_plan["plan"])
+    ).hexdigest()
+    public_plan["status"] = "runtime_lifecycle_plan_ready"
+    public_plan["reason_codes"] = []
+    real_plan = runtime_lifecycle.plan
+
+    def ready_fixture_plan(**kwargs: object) -> dict[str, object]:
+        refreshed = real_plan(**kwargs)
+        refreshed["plan"]["compatibility"] = {
+            "status": "qualified",
+            "sha256": hashlib.sha256(_CUTOVER_TEST_PROFILE).hexdigest(),
+        }
+        refreshed["plan"]["qualification"] = {
+            "status": "qualified",
+            "issued_at_unix_ns": qualification_record["issued_at_unix_ns"],
+            "sha256": hashlib.sha256(
+                runtime_lifecycle._d320_canonical_json(qualification_record)
+            ).hexdigest(),
+        }
+        refreshed["plan_sha256"] = hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(refreshed["plan"])
+        ).hexdigest()
+        if refreshed.get("plan_sha256") == public_plan["plan_sha256"]:
+            refreshed["status"] = "runtime_lifecycle_plan_ready"
+            refreshed["reason_codes"] = []
+        return refreshed
+
+    monkeypatch.setattr(runtime_lifecycle, "plan", ready_fixture_plan)
+
+    observed: list[tuple[str, str]] = []
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def assert_persisted_intent() -> None:
+        journal_path = (
+            home
+            / ".local"
+            / "state"
+            / "codex-master-mcp"
+            / "hive"
+            / "runtime-lifecycle-journal-v2.json"
+        )
+        journal = runtime_lifecycle.D320CutoverJournalV2.from_bytes(
+            journal_path.read_bytes()
+        )
+        assert journal.payload["phase"] == "INTENT"
+        observed.append(("intent", journal.payload["phase"]))
+
+    def fake_install(
+        install_home: Path,
+        *,
+        stage_name: str,
+        record_setup,
+        reserve_setup,
+        before_publish,
+    ) -> dict[str, str]:
+        assert_persisted_intent()
+        probe_lock = (
+            install_home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+        )
+        lock_temp = runtime_lifecycle._v2_setup_temp_path(
+            runtime_lifecycle._v2_load_journal(install_home).payload, probe_lock
+        )
+        lock_temp.write_bytes(b"")
+        lock_temp.chmod(0o600)
+        reserve_setup(
+            probe_lock,
+            lock_temp,
+            runtime_lifecycle._v2_setup_reservation_digest(lock_temp, probe_lock),
+        )
+        lock_temp.rename(probe_lock)
+        stage = install_home / ".local" / "lib" / stage_name
+        stage_temp = runtime_lifecycle._v2_setup_temp_path(
+            runtime_lifecycle._v2_load_journal(install_home).payload, stage
+        )
+        stage_temp.mkdir(mode=0o700)
+        reserve_setup(
+            stage,
+            stage_temp,
+            runtime_lifecycle._v2_setup_reservation_digest(stage_temp, stage),
+        )
+        stage_temp.rename(stage)
+        record_setup(stage)
+        if crash_point == "after_setup":
+            raise runtime_lifecycle.RuntimeLifecycleError("simulated_setup_crash")
+
+        class Layout:
+            manifest_digest = "sha256:" + "1" * 64
+
+            @staticmethod
+            def read_attested_file(relative_path: str) -> bytes:
+                assert relative_path == (
+                    "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+                )
+                return _CUTOVER_TEST_PROFILE
+
+        outputs = {
+            "mcp_launcher": b"new-mcp\n",
+            "hourly_service": b"new-service\n",
+            "hourly_timer": b"new-timer\n",
+            "pricing_launcher": b"new-pricing-launcher\n",
+            "pricing_service": b"new-pricing-service\n",
+            "pricing_timer": b"new-pricing-timer\n",
+            "legacy_launcher": b"new-legacy-launcher\n",
+        }
+        generation = (
+            install_home
+            / ".local"
+            / "lib"
+            / "the-hive-runtime"
+            / "generations"
+            / ("a" * 40)
+        )
+        generation.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        before_publish(
+            stage,
+            Layout(),
+            {key: hashlib.sha256(value).hexdigest() for key, value in outputs.items()},
+        )
+        if crash_point == "after_stage_seal":
+            raise runtime_lifecycle.RuntimeLifecycleError("simulated_stage_crash")
+        os.replace(stage, generation)
+        targets = {
+            "mcp_launcher": install_home
+            / ".local"
+            / "lib"
+            / "the-hive-runtime"
+            / "the-hive-mcp",
+            "hourly_service": install_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / runtime_lifecycle._NEW_SERVICE,
+            "hourly_timer": install_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / runtime_lifecycle._NEW_TIMER,
+            "pricing_launcher": install_home
+            / ".local"
+            / "bin"
+            / runtime_lifecycle._PRICING_LAUNCHER,
+            "pricing_service": install_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / runtime_lifecycle._PRICING_UNITS[0],
+            "pricing_timer": install_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / runtime_lifecycle._PRICING_UNITS[1],
+            "legacy_launcher": install_home
+            / ".local"
+            / "libexec"
+            / "codex_master_hive_hourly_probe.py",
+        }
+        for name, path in targets.items():
+            path.write_bytes(outputs[name])
+            path.chmod(0o644 if name.endswith(("service", "timer")) else 0o755)
+        runtime_identity.update(
+            generation="a" * 40,
+            manifest_digest="sha256:" + "1" * 64,
+            consumer_sha256="2" * 64,
+        )
+        if crash_point == "after_publish":
+            raise runtime_lifecycle.RuntimeLifecycleError("simulated_publish_crash")
+        return {
+            "status": "installed",
+            "generation": "a" * 40,
+            "manifest_digest": "sha256:" + "1" * 64,
+        }
+
+    if crash_point in {
+        "actual_preseal",
+        "before_setup_callback",
+        "before_setup_reservation",
+        "after_hook_pin_publish",
+        "after_hook_pin_publish_lock_rebind",
+    }:
+        real_run_path = runpy.run_path
+        installer_loads: list[str] = []
+
+        def load_failing_real_installer(path: str, *args: object, **kwargs: object):
+            namespace = real_run_path(path, *args, **kwargs)
+            if os.fspath(path).startswith("/proc/self/fd/") and callable(
+                namespace.get("_install_attested_runtime")
+            ):
+                installer_loads.append(os.fspath(path))
+                globals_map = namespace["_install_attested_runtime"].__globals__
+                globals_map["_verified_release_commit"] = lambda _repository: "a" * 40
+
+                if crash_point == "actual_preseal":
+
+                    def fail_after_setup(**_kwargs: object) -> None:
+                        raise globals_map["InstallError"](
+                            "simulated_preseal_build_failure"
+                        )
+
+                    globals_map["_build_runtime_image"] = fail_after_setup
+                elif crash_point in {
+                    "before_setup_callback",
+                    "after_hook_pin_publish",
+                    "after_hook_pin_publish_lock_rebind",
+                }:
+                    original_rename_noreplace = globals_map["_rename_noreplace"]
+
+                    def fail_after_lock_reservation(
+                        directory: Path,
+                        source: str,
+                        target: str,
+                        **kwargs: object,
+                    ) -> None:
+                        if target == ".hive-hourly-probe.lock":
+                            if crash_point == "before_setup_callback":
+                                raise globals_map["InstallError"](
+                                    "simulated_pre_callback_crash"
+                                )
+                        original_rename_noreplace(directory, source, target, **kwargs)
+                        if target == "hook-session-pins-v1" and crash_point in {
+                            "after_hook_pin_publish",
+                            "after_hook_pin_publish_lock_rebind",
+                        }:
+                            if crash_point == "after_hook_pin_publish_lock_rebind":
+                                lock_path = (
+                                    Path(directory)
+                                    / target
+                                    / ".hook-session-pins-v1.lock"
+                                )
+                                lock_path.unlink()
+                                lock_path.write_bytes(b"")
+                                lock_path.chmod(0o600)
+                            raise SimulatedProcessCrash()
+
+                    globals_map["_rename_noreplace"] = fail_after_lock_reservation
+                else:
+                    original_setup_directory = globals_map["_setup_directory"]
+
+                    def fail_before_reservation(
+                        path: Path,
+                        *,
+                        mode: int,
+                        stage_name: str,
+                        reserve_setup,
+                    ):
+                        def crash_before_record(
+                            _path: Path, _temporary: Path, _digest: str
+                        ) -> None:
+                            raise globals_map["InstallError"](
+                                "simulated_unreserved_temp_crash"
+                            )
+
+                        return original_setup_directory(
+                            path,
+                            mode=mode,
+                            stage_name=stage_name,
+                            reserve_setup=crash_before_record,
+                        )
+
+                    globals_map["_setup_directory"] = fail_before_reservation
+            return namespace
+
+        monkeypatch.setattr(
+            runtime_lifecycle.runpy, "run_path", load_failing_real_installer
+        )
+    else:
+        monkeypatch.setattr(
+            runtime_lifecycle, "_install_attested_runtime", fake_install
+        )
+    launcher_path = home / ".local/lib/the-hive-runtime/the-hive-mcp"
+    launcher_before = launcher_path.lstat()
+    launcher_bytes_before = launcher_path.read_bytes()
+    try:
+        result = runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256=public_plan["plan_sha256"],
+            phase="install",
+            systemctl=systemctl,
+        )
+    except SimulatedProcessCrash:
+        assert crash_point in {
+            "after_hook_pin_publish",
+            "after_hook_pin_publish_lock_rebind",
+        }
+        result = {"status": "simulated_hook_pin_publish_crash"}
+
+    if crash_point == "candidate_manifest_mismatch":
+        assert result["status"] == "runtime_lifecycle_qualification_record_changed", (
+            result
+        )
+        assert not (
+            home / ".local/lib/the-hive-runtime/generations" / ("a" * 40)
+        ).exists()
+        launcher_after = launcher_path.lstat()
+        assert (launcher_after.st_dev, launcher_after.st_ino) == (
+            launcher_before.st_dev,
+            launcher_before.st_ino,
+        )
+        assert launcher_path.read_bytes() == launcher_bytes_before
+        return
+
+    if crash_point == "after_setup":
+        assert result["status"] == "simulated_setup_crash", result
+        interrupted = runtime_lifecycle._v2_load_journal(home)
+        assert interrupted.payload["phase"] == "INTENT"
+        setup_paths = {
+            step["effect"]
+            for step in interrupted.payload["steps"]
+            if step["action"] == "effect_created"
+        }
+        stage_path = home / ".local/lib" / interrupted.payload["stage_name"]
+        assert (
+            str(runtime_lifecycle._v2_setup_temp_path(interrupted.payload, stage_path))
+            in setup_paths
+        )
+        if crash_point in {"actual_preseal", "after_setup"}:
+            lock_path = home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+            assert (
+                str(
+                    runtime_lifecycle._v2_setup_temp_path(
+                        interrupted.payload, lock_path
+                    )
+                )
+                in setup_paths
+            )
+        else:
+            lock_path = home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+            assert (
+                str(
+                    runtime_lifecycle._v2_setup_temp_path(
+                        interrupted.payload, lock_path
+                    )
+                )
+                not in setup_paths
+            )
+        result = runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256=public_plan["plan_sha256"],
+            phase="recover",
+            systemctl=systemctl,
+        )
+        assert result["status"] == "runtime_lifecycle_recovery_complete", result
+        assert not (home / ".local/lib" / interrupted.payload["stage_name"]).exists()
+        assert not (
+            home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+        ).exists()
+        return
+
+    if crash_point in {
+        "actual_preseal",
+        "before_setup_callback",
+        "before_setup_reservation",
+        "after_hook_pin_publish",
+        "after_hook_pin_publish_lock_rebind",
+    }:
+        if crash_point in {
+            "after_hook_pin_publish",
+            "after_hook_pin_publish_lock_rebind",
+        }:
+            assert result["status"] == "simulated_hook_pin_publish_crash"
+        else:
+            assert result["status"] == "runtime_lifecycle_install_failed", result
+        assert installer_loads
+        interrupted = runtime_lifecycle._v2_load_journal(home)
+        assert interrupted.payload["phase"] == "INTENT"
+        setup_paths = {
+            step["effect"]
+            for step in interrupted.payload["steps"]
+            if step["action"] == "effect_created"
+        }
+        if crash_point == "before_setup_reservation":
+            assert not setup_paths
+        elif crash_point in {
+            "after_hook_pin_publish",
+            "after_hook_pin_publish_lock_rebind",
+        }:
+            for pin_path in (
+                home / ".local/state/the-hive",
+                home / ".local/state/the-hive/hook-session-pins-v1",
+                home
+                / ".local/state/the-hive/hook-session-pins-v1/.hook-session-pins-v1.lock",
+            ):
+                assert (
+                    str(
+                        runtime_lifecycle._v2_setup_temp_path(
+                            interrupted.payload, pin_path
+                        )
+                    )
+                    in setup_paths
+                )
+        elif crash_point == "actual_preseal":
+            lock_path = home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+            stage_path = home / ".local/lib" / interrupted.payload["stage_name"]
+            assert (
+                str(
+                    runtime_lifecycle._v2_setup_temp_path(
+                        interrupted.payload, lock_path
+                    )
+                )
+                in setup_paths
+            )
+            assert (
+                str(
+                    runtime_lifecycle._v2_setup_temp_path(
+                        interrupted.payload, stage_path
+                    )
+                )
+                in setup_paths
+            )
+            for pin_path in (
+                home / ".local/state/the-hive",
+                home / ".local/state/the-hive/hook-session-pins-v1",
+                home
+                / ".local/state/the-hive/hook-session-pins-v1/.hook-session-pins-v1.lock",
+            ):
+                assert (
+                    str(
+                        runtime_lifecycle._v2_setup_temp_path(
+                            interrupted.payload, pin_path
+                        )
+                    )
+                    in setup_paths
+                )
+        elif crash_point == "before_setup_callback":
+            lock_path = home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+            stage_path = home / ".local/lib" / interrupted.payload["stage_name"]
+            assert (
+                str(
+                    runtime_lifecycle._v2_setup_temp_path(
+                        interrupted.payload, lock_path
+                    )
+                )
+                in setup_paths
+            )
+            assert (
+                str(
+                    runtime_lifecycle._v2_setup_temp_path(
+                        interrupted.payload, stage_path
+                    )
+                )
+                not in setup_paths
+            )
+        result = runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256=public_plan["plan_sha256"],
+            phase="recover",
+            systemctl=systemctl,
+        )
+        if crash_point == "after_hook_pin_publish_lock_rebind":
+            assert result["status"] == "runtime_lifecycle_recovery_hold", result
+            assert (
+                home
+                / ".local/state/the-hive/hook-session-pins-v1/.hook-session-pins-v1.lock"
+            ).is_file()
+            assert (home / ".local/state/the-hive/hook-session-pins-v1").is_dir()
+            return
+        if crash_point == "before_setup_reservation":
+            assert result["status"] == "runtime_lifecycle_recovery_hold", result
+            assert list(home.rglob(".*.hive-v2-setup-*"))
+            return
+        assert result["status"] == "runtime_lifecycle_recovery_complete", result
+        assert not (
+            home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+        ).exists()
+        assert not (
+            home
+            / ".local/state/the-hive/hook-session-pins-v1/.hook-session-pins-v1.lock"
+        ).exists()
+        assert not (home / ".local/state/the-hive/hook-session-pins-v1").exists()
+        assert not (home / ".local/state/the-hive").exists()
+        if crash_point == "actual_preseal":
+            assert not (
+                home / ".local/lib" / interrupted.payload["stage_name"]
+            ).exists()
+        return
+
+    if crash_point in {"after_stage_seal", "after_publish"}:
+        assert result["status"] == (
+            "simulated_stage_crash"
+            if crash_point == "after_stage_seal"
+            else "simulated_publish_crash"
+        ), result
+        interrupted = runtime_lifecycle._v2_load_journal(home)
+        assert interrupted.payload["phase"] == "SEALED"
+        stage = home / ".local/lib" / interrupted.payload["stage_name"]
+        generation = home / ".local/lib/the-hive-runtime/generations" / ("a" * 40)
+        assert stage.is_dir() is (crash_point == "after_stage_seal")
+        assert generation.is_dir() is (crash_point == "after_publish")
+        return
+
+    assert result["status"] == "runtime_lifecycle_install_complete"
+    assert (lifecycle_hive / ".runtime-lifecycle.lock").is_file()
+    assert observed == [("intent", "INTENT")]
+    monkeypatch.setattr(runtime_lifecycle, "plan", real_plan)
+    qualification_record = None
+    resumed_plan = runtime_lifecycle.plan(home=home, systemctl=systemctl)
+    assert resumed_plan["status"] == "runtime_lifecycle_plan_blocked", resumed_plan
+    assert (
+        "runtime_lifecycle_qualification_record_missing" in resumed_plan["reason_codes"]
+    )
+    qualification_record = fixture_qualification_record
+    monkeypatch.setattr(runtime_lifecycle, "plan", ready_fixture_plan)
+
+    def verified_root_receipt(**kwargs):
+        digest = "c" * 64
+        if kwargs.get("hold_lock"):
+            lock = home / "fixture-root-owner.lock"
+            descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            return digest, descriptor
+        return digest
+
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_verify_root_hook_effect_receipt",
+        verified_root_receipt,
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_verify_plugin_release_effect_receipt",
+        lambda **_kwargs: "d" * 64,
+    )
+    if crash_point == "root_receipt_missing":
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "_verify_root_hook_effect_receipt",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                runtime_lifecycle.RuntimeLifecycleError(
+                    "runtime_lifecycle_root_hook_effect_unverified"
+                )
+            ),
+        )
+
+    manager_effects: list[tuple[str, ...]] = []
+
+    def mutate_manager(_systemctl, arguments: tuple[str, ...], *, phase: str) -> None:
+        journal_before_effect = runtime_lifecycle._v2_load_journal(home)
+        assert journal_before_effect.payload["phase"] == "ACTIVATED"
+        assert (
+            journal_before_effect.payload["steps"][-1]["action"] == "manager_mutation"
+        )
+        manager_effects.append(arguments)
+        if arguments[:2] == ("stop", runtime_lifecycle._LEGACY_SERVICE):
+            states[runtime_lifecycle._LEGACY_SERVICE]["ActiveState"] = "inactive"
+        elif arguments[:2] == ("disable", "--now"):
+            states[runtime_lifecycle._LEGACY_TIMER]["UnitFileState"] = "disabled"
+            states[runtime_lifecycle._LEGACY_TIMER]["ActiveState"] = "inactive"
+        elif arguments[:2] == ("enable", "--now"):
+            states[runtime_lifecycle._NEW_TIMER]["UnitFileState"] = "enabled"
+            states[runtime_lifecycle._NEW_TIMER]["ActiveState"] = "active"
+        if crash_point == f"after_{phase}":
+            raise runtime_lifecycle.RuntimeLifecycleError("simulated_manager_crash")
+
+    monkeypatch.setattr(runtime_lifecycle, "_cutover_systemctl_mutate", mutate_manager)
+    activation = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=public_plan["plan_sha256"],
+        phase="activate",
+        systemctl=systemctl,
+    )
+    if crash_point == "root_receipt_missing":
+        assert activation["status"] == "runtime_lifecycle_root_hook_effect_unverified"
+        assert manager_effects == []
+        assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "INSTALLED"
+        return
+
+    def restore_manager(_systemctl, arguments: tuple[str, ...]) -> None:
+        operation, unit = arguments[0], arguments[-1]
+        if operation == "stop":
+            states[unit]["ActiveState"] = "inactive"
+        elif operation == "start":
+            states[unit]["ActiveState"] = "active"
+        elif operation == "enable":
+            states[unit]["UnitFileState"] = "enabled"
+            states[unit]["ActiveState"] = "active"
+        elif operation == "disable":
+            states[unit]["UnitFileState"] = "disabled"
+            states[unit]["ActiveState"] = "inactive"
+
+    monkeypatch.setattr(runtime_lifecycle, "_systemctl_mutate", restore_manager)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_discard_new_generation",
+        lambda _bound, **_kwargs: (
+            home / ".local/lib/the-hive-runtime/generations" / ("a" * 40)
+        ).rmdir(),
+    )
+    if crash_point not in {None, "observe_failure"}:
+        manager_crash_effects = {
+            "after_manager_reload_before_activation": "manager:"
+            + runtime_lifecycle._NEW_SERVICE,
+            "after_legacy_service_stop": "manager:" + runtime_lifecycle._LEGACY_SERVICE,
+            "after_legacy_timer_disable": "manager:" + runtime_lifecycle._LEGACY_TIMER,
+            "after_new_timer_enable": "manager:" + runtime_lifecycle._NEW_TIMER,
+            "after_manager_reload_after_legacy_removal": "manager:"
+            + runtime_lifecycle._PRICING_UNITS[0],
+        }
+        if crash_point in manager_crash_effects:
+            assert activation["status"] == "simulated_manager_crash", activation
+            interrupted = runtime_lifecycle._v2_load_journal(home)
+            assert interrupted.payload["phase"] == "ACTIVATED"
+            assert interrupted.payload["steps"][-1]["action"] == "manager_mutation"
+            assert (
+                interrupted.payload["steps"][-1]["effect"]
+                == manager_crash_effects[crash_point]
+            )
+            expected_commands = {
+                "after_manager_reload_before_activation": [("daemon-reload",)],
+                "after_legacy_service_stop": [
+                    ("daemon-reload",),
+                    ("stop", runtime_lifecycle._LEGACY_SERVICE),
+                ],
+                "after_legacy_timer_disable": [
+                    ("daemon-reload",),
+                    ("stop", runtime_lifecycle._LEGACY_SERVICE),
+                    ("disable", "--now", runtime_lifecycle._LEGACY_TIMER),
+                ],
+                "after_new_timer_enable": [
+                    ("daemon-reload",),
+                    ("stop", runtime_lifecycle._LEGACY_SERVICE),
+                    ("disable", "--now", runtime_lifecycle._LEGACY_TIMER),
+                    ("enable", "--now", runtime_lifecycle._NEW_TIMER),
+                ],
+                "after_manager_reload_after_legacy_removal": [
+                    ("daemon-reload",),
+                    ("stop", runtime_lifecycle._LEGACY_SERVICE),
+                    ("disable", "--now", runtime_lifecycle._LEGACY_TIMER),
+                    ("enable", "--now", runtime_lifecycle._NEW_TIMER),
+                    ("daemon-reload",),
+                ],
+            }
+            assert manager_effects == expected_commands[crash_point]
+            assert all(foreign_unit not in command for command in manager_effects)
+
+        recovery = runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256=public_plan["plan_sha256"],
+            phase="recover",
+            systemctl=systemctl,
+        )
+        assert recovery["status"] == "runtime_lifecycle_recovery_complete", recovery
+        assert (
+            runtime_lifecycle._v2_load_journal(home).payload["phase"] == "ROLLED_BACK"
+        )
+        assert not (
+            home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock"
+        ).exists()
+        assert states == old_states | {
+            unit: states[unit] for unit in runtime_lifecycle._PRICING_UNITS
+        } | {foreign_unit: foreign_state}
+        return
+    assert activation["status"] == "runtime_lifecycle_activation_complete", activation
+    assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "ACTIVATED"
+    activation_steps = runtime_lifecycle._v2_load_journal(home).payload["steps"]
+    assert any(
+        step["phase"] == "ACTIVATED"
+        and step["action"] == "owner_evidence_readback"
+        and step["effect"]
+        == str(
+            runtime_lifecycle._ROOT_HOOK_ABI_PARENT
+            / runtime_lifecycle._ROOT_HOOK_EFFECT_RECEIPT
+        )
+        and step["sha256"] == "c" * 64
+        for step in activation_steps
+    )
+    assert manager_effects == [
+        ("daemon-reload",),
+        ("stop", runtime_lifecycle._LEGACY_SERVICE),
+        ("disable", "--now", runtime_lifecycle._LEGACY_TIMER),
+        ("enable", "--now", runtime_lifecycle._NEW_TIMER),
+        ("daemon-reload",),
+    ]
+    assert all(foreign_unit not in command for command in manager_effects)
+
+    if crash_point == "observe_failure":
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "_observe_argumentless_installed_probe",
+            lambda _home: (_ for _ in ()).throw(
+                runtime_lifecycle.RuntimeLifecycleError(
+                    "runtime_lifecycle_probe_observation_failed"
+                )
+            ),
+        )
+        observation = runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256=public_plan["plan_sha256"],
+            phase="observe",
+            systemctl=systemctl,
+        )
+        assert observation["status"] == "runtime_lifecycle_probe_observation_failed"
+        assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "ACTIVATED"
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "_discard_new_generation",
+            lambda _bound, **_kwargs: (
+                home / ".local/lib/the-hive-runtime/generations" / ("a" * 40)
+            ).rmdir(),
+        )
+        recovery = runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256=public_plan["plan_sha256"],
+            phase="recover",
+            systemctl=systemctl,
+        )
+        assert recovery["status"] == "runtime_lifecycle_recovery_complete"
+        assert (
+            runtime_lifecycle._v2_load_journal(home).payload["phase"] == "ROLLED_BACK"
+        )
+        assert states == old_states | {
+            unit: states[unit] for unit in runtime_lifecycle._PRICING_UNITS
+        } | {foreign_unit: foreign_state}
+        return
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
+    )
+    observation = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=public_plan["plan_sha256"],
+        phase="observe",
+        systemctl=systemctl,
+    )
+    assert observation["status"] == "runtime_lifecycle_observation_complete", (
+        observation
+    )
+    observed_journal = runtime_lifecycle._v2_load_journal(home)
+    assert observed_journal.payload["phase"] == "OBSERVED"
+    assert observed_journal.payload["post"]["manager_states"] == {
+        unit: states[unit] for unit in runtime_lifecycle._V2_MANAGER_UNITS
+    }
+    assert len(observed_journal.payload["post"]["files"]) == len(
+        runtime_lifecycle._V2_FILE_PATHS
+    )
+    assert len(observed_journal.payload["post"]["extra_effects"]) == len(
+        runtime_lifecycle._v2_expected_effects(
+            home, "a" * 40, observed_journal.payload["stage_name"]
+        )
+    )
+    assert len(observed_journal.payload["post"]["manager_states"]) == 6
+    assert sum(
+        step["phase"] == "OBSERVED" for step in observed_journal.payload["steps"]
+    ) == len(runtime_lifecycle._V2_FILE_PATHS) + len(
+        observed_journal.payload["post"]["extra_effects"]
+    ) + len(runtime_lifecycle._V2_MANAGER_UNITS)
+    if crash_point == "plugin_receipt_missing":
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "_verify_plugin_release_effect_receipt",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                runtime_lifecycle.RuntimeLifecycleError(
+                    "runtime_lifecycle_plugin_effect_unverified"
+                )
+            ),
+        )
+    committed = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=public_plan["plan_sha256"],
+        phase="commit",
+        systemctl=systemctl,
+    )
+    if crash_point == "plugin_receipt_missing":
+        assert committed["status"] == "runtime_lifecycle_plugin_effect_unverified"
+        assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "OBSERVED"
+        assert not any(
+            step["phase"] == "OBSERVED" and step["action"] == "owner_evidence_readback"
+            for step in runtime_lifecycle._v2_load_journal(home).payload["steps"]
+        )
+        return
+    assert committed["status"] == "runtime_lifecycle_commit_complete", committed
+    assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "COMMITTED"
+    committed_steps = runtime_lifecycle._v2_load_journal(home).payload["steps"]
+    assert (
+        sum(
+            step["phase"] == "OBSERVED" and step["action"] == "owner_evidence_readback"
+            for step in committed_steps
+        )
+        == 2
+    )
+
+
+def test_public_plan_is_deterministic_and_reports_missing_profile_without_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    HookSessionPinStoreV1.create_at(
+        home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    )
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    install_globals = installer["_install_attested_runtime"].__globals__
+    install_globals["_verified_release_commit"] = lambda _repository: "a" * 40
+    install_globals["_validate_runtime_image_stage"] = lambda **_kwargs: None
+    installer["_install_attested_runtime"](
+        home=home,
+        stage_name=".the-hive-runtime.stage.plan-fixture",
+        reserve_setup=lambda _target, _temporary, _digest: None,
+        record_setup=lambda _stage: None,
+        before_publish=lambda _stage, _layout, _outputs: None,
+    )
+    _lifecycle_state(home)
+    source_root = tmp_path / "source-without-profile"
+    for relative in (
+        "scripts/the-hive-hive-hourly-probe-install",
+        "src/the_hive/usage_snapshot.py",
+        "src/the_hive/limit_tracker.py",
+        "src/the_hive/runtime_lifecycle.py",
+    ):
+        source = source_root / relative
+        source.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        source.write_text("test source\n", encoding="utf-8")
+        source.chmod(0o644)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "__file__",
+        str(source_root / "src/the_hive/runtime_lifecycle.py"),
+    )
+    lock = (
+        home
+        / ".local"
+        / "state"
+        / "codex-master-mcp"
+        / "hive"
+        / ".runtime-lifecycle.lock"
+    )
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
+    )
+
+    manager_calls: list[tuple[str, ...]] = []
+    manager_drift = {"enabled": False}
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        manager_calls.append(arguments)
+        if arguments[0] == "show":
+            return {
+                "LoadState": "loaded",
+                "UnitFileState": (
+                    "enabled"
+                    if manager_drift["enabled"]
+                    and arguments[1] == "the-hive-hive-hourly-probe.timer"
+                    else "disabled"
+                ),
+                "ActiveState": "inactive",
+            }
+        return {}
+
+    monkeypatch.setattr(runtime_lifecycle, "_systemctl_default", systemctl)
+    before = {
+        str(path.relative_to(home)): (
+            path.lstat().st_mode & 0o777,
+            path.read_bytes(),
+        )
+        for path in home.rglob("*")
+        if path.is_file()
+    }
+
+    plans: list[dict[str, object]] = []
+    for _ in range(2):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [str(SCRIPT), "plan", "--home", str(home)],
+        )
+        assert runtime_lifecycle.main() == 0
+        plans.append(json.loads(capsys.readouterr().out))
+
+    assert plans[0] == plans[1]
+    assert plans[0]["status"] == "runtime_lifecycle_plan_blocked"
+    assert plans[0]["reason_codes"] == [
+        "runtime_release_compatibility_profile_missing",
+        "runtime_lifecycle_qualification_record_missing",
+    ]
+    assert len(plans[0]["plan_sha256"]) == 64
+    assert all("bytes_b64" not in snapshot for snapshot in plans[0]["plan"]["files"])
+    plan_payload = plans[0]["plan"]
+    assert len(plan_payload["files"]) == 11
+    assert (
+        plan_payload["predecessor"]["consumer_sha256"]
+        == hashlib.sha256(
+            (
+                home
+                / ".local"
+                / "lib"
+                / "the-hive-runtime"
+                / "generations"
+                / plan_payload["predecessor"]["generation"]
+                / "src"
+                / "the_hive"
+                / "usage_snapshot.py"
+            ).read_bytes()
+        ).hexdigest()
+    )
+    assert set(plan_payload["manager_states"]) == set(
+        runtime_lifecycle._V2_MANAGER_UNITS
+    )
+    effects = {effect["kind"]: effect for effect in plan_payload["extra_effects"]}
+    assert set(effects) == {
+        "hook_pin_parent",
+        "hook_pin_authority",
+        "hook_pin_lock",
+        "probe_lock",
+        "state_parent",
+        "install_state",
+        "local_bin",
+        "local_libexec",
+        "config",
+        "config_systemd",
+        "units",
+        "library",
+        "release_root",
+        "generations",
+        "stage",
+        "generation",
+        "publish_lock",
+        "lifecycle_lock",
+        "journal",
+    }
+    assert effects["stage"] == {
+        "kind": "stage",
+        "path_template": str(
+            home / ".local" / "lib" / ".the-hive-runtime.stage.<transaction-id>"
+        ),
+    }
+    assert effects["generation"]["path"] == str(
+        home / ".local" / "lib" / "the-hive-runtime" / "generations" / ("a" * 40)
+    )
+    predecessor = plan_payload["predecessor"]
+    consumer_path = (
+        home
+        / ".local"
+        / "lib"
+        / "the-hive-runtime"
+        / "generations"
+        / predecessor["generation"]
+        / "src"
+        / "the_hive"
+        / "usage_snapshot.py"
+    )
+    consumer_bytes = consumer_path.read_bytes()
+    consumer_path.write_bytes(consumer_bytes + b"\n# fixture drift\n")
+    try:
+        with pytest.raises(
+            runtime_lifecycle.RuntimeLifecycleError,
+            match="^runtime_lifecycle_predecessor_changed$",
+        ):
+            runtime_lifecycle._revalidate_v2_predecessor(
+                home / ".local" / "lib" / "the-hive-runtime", predecessor
+            )
+    finally:
+        consumer_path.write_bytes(consumer_bytes)
+
+    manager_drift["enabled"] = True
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "cutover",
+            "--home",
+            str(home),
+            "--plan-sha256",
+            plans[0]["plan_sha256"],
+            "--phase",
+            "install",
+        ],
+    )
+    assert runtime_lifecycle.main() == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "raw_output": "not_returned",
+        "status": "runtime_lifecycle_plan_changed",
+    }
+
+    manager_drift["enabled"] = False
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "cutover",
+            "--home",
+            str(home),
+            "--plan-sha256",
+            plans[0]["plan_sha256"],
+            "--phase",
+            "install",
+        ],
+    )
+    assert runtime_lifecycle.main() == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "raw_output": "not_returned",
+        "reason_codes": [
+            "runtime_release_compatibility_profile_missing",
+            "runtime_lifecycle_qualification_record_missing",
+        ],
+        "status": "runtime_lifecycle_plan_blocked",
+    }
+    assert all(call[0] == "show" for call in manager_calls)
+    after = {
+        str(path.relative_to(home)): (
+            path.lstat().st_mode & 0o777,
+            path.read_bytes(),
+        )
+        for path in home.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_public_plan_holds_for_present_unvalidated_profile_without_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    qualification_root = tmp_path / "uncreated-canary-root"
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canary_runtime_root", lambda: qualification_root
+    )
+    HookSessionPinStoreV1.create_at(
+        home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    )
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    install_globals = installer["_install_attested_runtime"].__globals__
+    install_globals["_verified_release_commit"] = lambda _repository: "a" * 40
+    install_globals["_validate_runtime_image_stage"] = lambda **_kwargs: None
+
+    source_root = tmp_path / "source"
+    for relative in (
+        "scripts/the-hive-hive-hourly-probe-install",
+        "src/the_hive/usage_snapshot.py",
+        "src/the_hive/limit_tracker.py",
+        "src/the_hive/runtime_lifecycle.py",
+    ):
+        source = source_root / relative
+        source.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        source.write_text("test source\n", encoding="utf-8")
+        source.chmod(0o644)
+    candidate_profile = (
+        source_root / "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+    )
+    candidate_profile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = {
+        "observations": [
+            {
+                "client": {
+                    "artifact_sha256": "a" * 64,
+                    "features": ["hooks", "resume"],
+                    "version": "0.161.0",
+                },
+                "evidence": {
+                    "expires_at_unix_ns": 20,
+                    "fixture_sha256": "b" * 64,
+                    "observed_at_unix_ns": 10,
+                    "source_commit": "c" * 40,
+                    "source_tree_sha256": "d" * 64,
+                },
+                "manager": {"features": ["scopes"], "version": "257.8"},
+                "predecessor": {
+                    "consumer_sha256": "e" * 64,
+                    "generation": "f" * 40,
+                    "manifest_digest": "sha256:" + "1" * 64,
+                },
+                "runtime": {
+                    "features": ["resource-gate"],
+                    "generation": "2" * 40,
+                    "manifest_digest": "sha256:" + "3" * 64,
+                },
+            }
+        ],
+        "profile_id": "runtime-release-compatibility-v1",
+        "schema_version": 1,
+        "status": "unvalidated",
+    }
+    candidate_profile.write_text(
+        json.dumps(profile, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="ascii",
+    )
+    candidate_profile.chmod(0o644)
+
+    build_runtime_image = install_globals["_build_runtime_image"]
+    write_runtime_image_manifest = install_globals["_write_runtime_image_manifest"]
+
+    def build_predecessor_without_profile(**kwargs: object) -> None:
+        build_runtime_image(**kwargs)  # type: ignore[operator]
+        stage = kwargs["stage"]
+        profile_path = (
+            stage / "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+        )
+        profile_path.unlink()  # type: ignore[union-attr]
+        manifest_path = stage / str(install_globals["_MANIFEST_NAME"])
+        manifest_path.unlink()  # type: ignore[union-attr]
+        write_runtime_image_manifest(  # type: ignore[operator]
+            root=stage,
+            generation=kwargs["generation"],
+            commit=kwargs["commit"],
+        )
+
+    install_globals["_build_runtime_image"] = build_predecessor_without_profile
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "__file__",
+        str(source_root / "src/the_hive/runtime_lifecycle.py"),
+    )
+
+    installer["_install_attested_runtime"](
+        home=home,
+        stage_name=".the-hive-runtime.stage.unvalidated-profile",
+        reserve_setup=lambda _target, _temporary, _digest: None,
+        record_setup=lambda _stage: None,
+        before_publish=lambda _stage, _layout, _outputs: None,
+    )
+    install_globals["_build_runtime_image"] = build_runtime_image
+    _lifecycle_state(home)
+    lock = (
+        home
+        / ".local"
+        / "state"
+        / "codex-master-mcp"
+        / "hive"
+        / ".runtime-lifecycle.lock"
+    )
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
+    )
+
+    manager_calls: list[tuple[str, ...]] = []
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        manager_calls.append(arguments)
+        if arguments[0] == "show":
+            return {
+                "LoadState": "loaded",
+                "UnitFileState": "disabled",
+                "ActiveState": "inactive",
+            }
+        return {}
+
+    monkeypatch.setattr(runtime_lifecycle, "_systemctl_default", systemctl)
+    before = {
+        str(path.relative_to(home)): (path.lstat().st_mode & 0o777, path.read_bytes())
+        for path in home.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "plan", "--home", str(home)])
+
+    assert runtime_lifecycle.main() == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "runtime_lifecycle_plan_blocked"
+    assert result["reason_codes"] == [
+        "runtime_release_compatibility_profile_unvalidated",
+        "runtime_lifecycle_qualification_record_missing",
+    ]
+    assert result["plan"]["compatibility"]["status"] == "present_unvalidated"
+    assert len(result["plan"]["compatibility"]["sha256"]) == 64
+    current = runtime_lifecycle._runtime_identity(home / ".local/lib/the-hive-runtime")
+    assert isinstance(current, dict)
+    predecessor_profile = (
+        home
+        / ".local/lib/the-hive-runtime/generations"
+        / current["generation"]
+        / "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+    )
+    assert not predecessor_profile.exists()
+    assert all(call[0] == "show" for call in manager_calls)
+    assert not qualification_root.exists()
+    plan_source = result["plan"]["source"]
+    plan_predecessor = result["plan"]["predecessor"]
+    stale_record = {
+        "bindings": {
+            "candidate_generation": plan_source["commit"],
+            "candidate_manifest_digest": "sha256:" + "c" * 64,
+            "client": None,
+            "manager_states_sha256": hashlib.sha256(
+                runtime_lifecycle._d320_canonical_json(result["plan"]["manager_states"])
+            ).hexdigest(),
+            "manager_api_contract": _manager_api_contract_fixture(),
+            "predecessor": {
+                key: plan_predecessor[key]
+                for key in ("consumer_sha256", "generation", "manifest_digest")
+            },
+            "profile_sha256": result["plan"]["compatibility"]["sha256"],
+            "source_commit": plan_source["commit"],
+            "source_tree_sha256": plan_source["tree_sha256"],
+            "target": dict(result["plan"]["target"]),
+        },
+        "criteria": {
+            "client_behavior": "unknown",
+            "client_probe": "unknown",
+            "client_compatibility": "unknown",
+            "manager_api_contract": "unknown",
+            "manager_actions": "unknown",
+            "runtime_canary": "pass",
+            "runtime_features": "unknown",
+        },
+        "issued_at_unix_ns": time.time_ns()
+        - runtime_lifecycle._OWNER_RECEIPT_FRESHNESS_NS
+        - 1,
+        "owner_uid": os.geteuid(),
+        "schema_version": 1,
+        "status": "unqualified",
+    }
+    qualification_root.mkdir(mode=0o700)
+    with runtime_lifecycle._canary_lock(qualification_root) as canary_lock_fd:
+        runtime_lifecycle._publish_canary_qualification_record(
+            root=qualification_root, lock_fd=canary_lock_fd, value=stale_record
+        )
+    assert runtime_lifecycle.main() == 0
+    stale_result = json.loads(capsys.readouterr().out)
+    assert stale_result["reason_codes"] == [
+        "runtime_release_compatibility_profile_unvalidated",
+        "runtime_lifecycle_qualification_record_expired",
+    ]
+    after = {
+        str(path.relative_to(home)): (path.lstat().st_mode & 0o777, path.read_bytes())
+        for path in home.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_stage_profile_member_must_match_bound_plan_digest(tmp_path: Path) -> None:
+    from the_hive.runtime_layout import RuntimeLayout
+
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    stage = tmp_path / "stage"
+    stage.mkdir(mode=0o700)
+    installer["_build_runtime_image"](
+        repository=ROOT,
+        stage=stage,
+        generation="a" * 40,
+        commit="a" * 40,
+    )
+    profile_path = stage / "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+    profile_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    raw = b"candidate profile bytes\n"
+    profile_path.write_bytes(raw)
+    profile_path.chmod(0o644)
+    (stage / installer["_MANIFEST_NAME"]).unlink()
+    installer["_write_runtime_image_manifest"](
+        root=stage, generation="a" * 40, commit="a" * 40
+    )
+    layout = RuntimeLayout.from_runtime_root(stage)
+
+    runtime_lifecycle._verify_candidate_compatibility_profile_stage(
+        layout, hashlib.sha256(raw).hexdigest()
+    )
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="^runtime_lifecycle_compatibility_profile_changed$",
+    ):
+        runtime_lifecycle._verify_candidate_compatibility_profile_stage(
+            layout, hashlib.sha256(b"different candidate bytes\n").hexdigest()
+        )
 
 
 def test_legacy_installer_cli_rejects_a_second_mutating_operator_route(
@@ -1693,17 +3882,13 @@ def test_d296_accepts_attested_mixed_availability_without_granting_authority(
         )
         for index, account in enumerate(accounts)
     )
-    evidence = usage_snapshot.UsageEvidenceV2(
-        (), "stale", None, None, authorities
-    )
+    evidence = usage_snapshot.UsageEvidenceV2((), "stale", None, None, authorities)
     monkeypatch.setattr(usage_snapshot, "read_usage_evidence_v2", lambda: evidence)
 
     assert runtime_lifecycle._d296_and_v2_accepted() is True
 
     inconsistent = list(authorities)
-    inconsistent[1] = replace(
-        inconsistent[1], persistent_leadership_eligible=True
-    )
+    inconsistent[1] = replace(inconsistent[1], persistent_leadership_eligible=True)
     monkeypatch.setattr(
         usage_snapshot,
         "read_usage_evidence_v2",
@@ -1890,7 +4075,9 @@ def test_verify_rejects_units_not_exactly_derived_from_attested_runtime(
         runtime_lifecycle, "_parse_health", lambda _root: (True, True, True)
     )
     monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: True)
-    monkeypatch.setattr(runtime_lifecycle, "_observation_matches", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observation_matches", lambda **_kwargs: True
+    )
     calls: list[tuple[str, ...]] = []
 
     result = runtime_lifecycle.verify(
@@ -1915,76 +4102,9 @@ def test_not_found_systemd_unit_accepts_empty_unit_file_state() -> None:
     )
 
 
-def test_cutover_rejects_parallel_lifecycle_lock_before_systemd(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    (home / ".local" / "state" / "codex-master-mcp" / "hive").mkdir(
-        parents=True, mode=0o700
-    )
-    for directory in (
-        home / ".local",
-        home / ".local" / "state",
-        home / ".local" / "state" / "codex-master-mcp",
-        home / ".local" / "state" / "codex-master-mcp" / "hive",
-    ):
-        directory.chmod(0o700)
-    lock = (
-        home
-        / ".local"
-        / "state"
-        / "codex-master-mcp"
-        / "hive"
-        / ".runtime-lifecycle.lock"
-    )
-    lock.write_text("held", encoding="utf-8")
-    lock.chmod(0o600)
-    calls: list[tuple[str, ...]] = []
-
-    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
-        calls.append(arguments)
-        return {}
-
-    with lock.open("r", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        result = runtime_lifecycle.cutover(home=home, systemctl=systemctl)
-
-    assert result == {
-        "status": "runtime_lifecycle_busy",
-        "raw_output": "not_returned",
-    }
-    assert calls == []
-
-
-def test_cutover_rejects_a_symlinked_lifecycle_lock_before_any_mutation(
+def test_lifecycle_lock_creates_only_the_missing_private_hive_leaf(
     tmp_path: Path,
 ) -> None:
-    home = tmp_path / "home"
-    lock_root = home / ".local" / "state" / "codex-master-mcp" / "hive"
-    lock_root.mkdir(parents=True, mode=0o700)
-    for directory in (
-        home / ".local",
-        home / ".local" / "state",
-        home / ".local" / "state" / "codex-master-mcp",
-        lock_root,
-    ):
-        directory.chmod(0o700)
-    target = tmp_path / "target"
-    target.write_text("target", encoding="utf-8")
-    (lock_root / ".runtime-lifecycle.lock").symlink_to(target)
-    calls: list[tuple[str, ...]] = []
-
-    result = runtime_lifecycle.cutover(
-        home=home,
-        systemctl=lambda arguments: calls.append(arguments) or {},
-    )
-
-    assert result == {
-        "status": "runtime_lifecycle_lock_invalid",
-        "raw_output": "not_returned",
-    }
-    assert calls == []
-
-
-def test_lifecycle_lock_creates_only_the_missing_private_hive_leaf(tmp_path: Path) -> None:
     home = tmp_path / "home"
     parent = home / ".local" / "state" / "codex-master-mcp"
     parent.mkdir(parents=True, mode=0o700)
@@ -2033,7 +4153,9 @@ def test_verify_never_derives_observation_from_systemd_health_or_gate(
         runtime_lifecycle, "_parse_health", lambda _root: (True, True, True)
     )
     monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: True)
-    monkeypatch.setattr(runtime_lifecycle, "_observation_matches", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observation_matches", lambda **_kwargs: False
+    )
 
     result = runtime_lifecycle.verify(
         home=home,
@@ -2091,7 +4213,9 @@ def test_verify_separates_green_runtime_from_blocked_product_authority(
         runtime_lifecycle, "_parse_health", lambda _root: (True, False, False)
     )
     monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: False)
-    monkeypatch.setattr(runtime_lifecycle, "_observation_matches", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observation_matches", lambda **_kwargs: True
+    )
 
     def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
         if arguments[1].startswith("codex-master-"):
@@ -2117,55 +4241,6 @@ def test_verify_separates_green_runtime_from_blocked_product_authority(
         "queen_alarm_cleared": False,
         "probe_gate_allowed": False,
     }
-
-
-def test_cutover_rolls_back_when_argumentless_probe_observation_is_invalid(
-    tmp_path: Path, monkeypatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    snapshot = object()
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _snapshot: None)
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", lambda _home: None)
-    _allow_postinstall_attestation(monkeypatch)
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _snapshot: True)
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_legacy_units", lambda _snapshot: None)
-    monkeypatch.setattr(runtime_lifecycle, "_remove_legacy_hourly_units", lambda _snapshot: None)
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "verify",
-        lambda **_kwargs: {
-            "status": "runtime_lifecycle_red",
-            "raw_output": "not_returned",
-        },
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_observe_argumentless_installed_probe",
-        lambda _home: (_ for _ in ()).throw(
-            runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_probe_failed")
-        ),
-    )
-    restored: list[object] = []
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_restore_bound_state_result",
-        lambda received, _systemctl: restored.append(received) or _rollback_restored(),
-    )
-
-    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
-
-    assert result == {
-        "status": "runtime_lifecycle_probe_failed",
-        "raw_output": "not_returned",
-    }
-    assert restored == [snapshot]
 
 
 def test_observation_receipt_accepts_only_a_fresh_consistent_launcher_result(
@@ -2318,9 +4393,12 @@ def test_observation_receipt_remains_valid_for_its_unchanged_runtime_identity(
     )
     receipt.chmod(0o600)
 
-    assert runtime_lifecycle._observation_matches(
-        home=home, state_root=state_root, identity=identity
-    ) is True
+    assert (
+        runtime_lifecycle._observation_matches(
+            home=home, state_root=state_root, identity=identity
+        )
+        is True
+    )
 
 
 def test_status_and_verify_are_read_only_even_when_all_postconditions_are_red(
@@ -2348,6 +4426,7 @@ def test_status_and_verify_are_read_only_even_when_all_postconditions_are_red(
         path.write_text("[Unit]\n", encoding="utf-8")
         path.chmod(0o644)
     before = {path: _identity(path) for path in home.rglob("*") if path.is_file()}
+
     def systemctl(_arguments: tuple[str, ...]) -> dict[str, str]:
         return {
             "LoadState": "not-found",
@@ -2361,314 +4440,9 @@ def test_status_and_verify_are_read_only_even_when_all_postconditions_are_red(
     assert runtime_lifecycle.verify(home=home, systemctl=systemctl)["status"] == (
         "runtime_lifecycle_red"
     )
-    assert {path: _identity(path) for path in home.rglob("*") if path.is_file()} == before
-
-
-def test_cutover_uses_one_bound_transaction_and_never_touches_foreign_units(
-    tmp_path: Path, monkeypatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    calls: list[tuple[str, ...]] = []
-    snapshot = object()
-
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_revalidate_cutover_inputs", lambda _snapshot: None
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_install_attested_runtime", lambda _home: None
-    )
-    post_install = object()
-    revalidations: list[object] = []
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_post_install", lambda _home: post_install
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_revalidate_post_install",
-        lambda received, _home: revalidations.append(received),
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_legacy_requires_migration", lambda _snapshot: True
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_legacy_units", lambda _snapshot: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_remove_legacy_hourly_units", lambda _snapshot: None
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
-    )
-    verification = ["runtime_lifecycle_red", "runtime_lifecycle_green"]
-
-    def verify(**_kwargs):
-        status = verification.pop(0)
-        return {
-            "status": status,
-            "installed": True,
-            "enabled": True,
-            "active": True,
-            "observed": True,
-            "checks": {},
-            "raw_output": "not_returned",
-        }
-
-    monkeypatch.setattr(runtime_lifecycle, "verify", verify)
-
-    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
-        calls.append(arguments)
-        return {}
-
-    result = runtime_lifecycle.cutover(home=home, systemctl=systemctl)
-
-    assert result["status"] == "runtime_lifecycle_green"
-    assert calls == [
-        ("daemon-reload",),
-        ("stop", "codex-master-hive-hourly-probe.service"),
-        ("disable", "--now", "codex-master-hive-hourly-probe.timer"),
-        ("enable", "--now", "the-hive-hive-hourly-probe.timer"),
-        ("daemon-reload",),
-    ]
-    # Five user-manager mutations plus the bounded probe observation are each
-    # preceded by a fresh binding check of the post-installer Runtime/unit pair.
-    assert revalidations == [post_install] * (len(calls) + 1)
-    assert all("codex-usage" not in call and "watchdog" not in call for call in calls)
-
-
-def test_cutover_is_idempotent_when_verify_is_already_green(
-    tmp_path: Path, monkeypatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    source_commit = "a" * 40
-    snapshot = SimpleNamespace(source_commit=source_commit)
-    green = {
-        "status": "runtime_lifecycle_green",
-        "installed": True,
-        "enabled": True,
-        "active": True,
-        "observed": True,
-        "runtime_identity": {"generation": source_commit},
-        "checks": {},
-        "raw_output": "not_returned",
-    }
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "verify", lambda **_kwargs: green)
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_install_attested_runtime",
-        lambda _home: (_ for _ in ()).throw(AssertionError("installer must not run")),
-    )
-
-    result = runtime_lifecycle.cutover(
-        home=home,
-        systemctl=lambda _arguments: (_ for _ in ()).throw(
-            AssertionError("systemctl must not run")
-        ),
-    )
-
-    assert result is green
-
-
-def test_cutover_updates_a_green_but_stale_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    source_commit = "b" * 40
-    bound = SimpleNamespace(source_commit=source_commit)
-    stale_green = {
-        "status": "runtime_lifecycle_green",
-        "runtime_identity": {"generation": "a" * 40},
-    }
-    current_green = {
-        "status": "runtime_lifecycle_green",
-        "runtime_identity": {"generation": source_commit},
-    }
-    verification = iter((stale_green, current_green))
-    installs: list[Path] = []
-
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "verify", lambda **_kwargs: next(verification))
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_install_attested_runtime", lambda received: installs.append(received)
-    )
-    post_install = object()
-    monkeypatch.setattr(runtime_lifecycle, "_bind_post_install", lambda _home: post_install)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_revalidate_post_install", lambda _binding, _home: None
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_remove_legacy_hourly_units", lambda _bound: None
-    )
-
-    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
-
-    assert result is current_green
-    assert installs == [home]
-
-
-def test_cutover_provisions_hook_pin_authority_before_runtime_install(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    source_commit = "b" * 40
-    bound = SimpleNamespace(source_commit=source_commit)
-    stale_green = {
-        "status": "runtime_lifecycle_green",
-        "runtime_identity": {"generation": "a" * 40},
-    }
-    current_green = {
-        "status": "runtime_lifecycle_green",
-        "runtime_identity": {"generation": source_commit},
-    }
-    verification = iter((stale_green, current_green))
-    pin_root = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
-    installs: list[Path] = []
-
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "verify", lambda **_kwargs: next(verification))
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-
-    def install(received: Path) -> None:
-        HookSessionPinStoreV1.open_at(pin_root)
-        installs.append(received)
-
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", install)
-    post_install = object()
-    monkeypatch.setattr(runtime_lifecycle, "_bind_post_install", lambda _home: post_install)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_revalidate_post_install", lambda _binding, _home: None
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_remove_legacy_hourly_units", lambda _bound: None
-    )
-
-    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
-
-    assert result is current_green
-    assert installs == [home]
-    assert (pin_root / ".hook-session-pins-v1.lock").stat().st_mode & 0o777 == 0o600
-
-
-def test_cutover_never_repairs_a_preexisting_invalid_hook_pin_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    pin_root = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
-    pin_root.mkdir(parents=True, mode=0o700)
-    pin_root.chmod(0o700)
-    bound = SimpleNamespace(source_commit="b" * 40)
-
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "verify",
-        lambda **_kwargs: {
-            "status": "runtime_lifecycle_green",
-            "runtime_identity": {"generation": "a" * 40},
-        },
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_install_attested_runtime",
-        lambda _home: (_ for _ in ()).throw(AssertionError("installer must not run")),
-    )
-
-    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
-
-    assert result == {
-        "status": "runtime_lifecycle_hook_pin_authority_invalid",
-        "raw_output": "not_returned",
-    }
-    assert not (pin_root / ".hook-session-pins-v1.lock").exists()
-
-
-def test_cutover_rebind_before_installer_fails_without_systemd_or_rollback_mutation(
-    tmp_path: Path, monkeypatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    snapshot = object()
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "verify",
-        lambda **_kwargs: {"status": "runtime_lifecycle_red"},
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_revalidate_cutover_inputs",
-        lambda _snapshot: (_ for _ in ()).throw(
-            runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_input_changed")
-        ),
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_install_attested_runtime",
-        lambda _home: (_ for _ in ()).throw(AssertionError("installer must not run")),
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_restore_bound_state_result",
-        lambda _snapshot, _systemctl: (_ for _ in ()).throw(
-            AssertionError("rollback must not run")
-        ),
-    )
-
-    result = runtime_lifecycle.cutover(
-        home=home,
-        systemctl=lambda _arguments: (_ for _ in ()).throw(
-            AssertionError("systemctl must not run")
-        ),
-    )
-
-    assert result == {
-        "status": "runtime_lifecycle_input_changed",
-        "raw_output": "not_returned",
-    }
+    assert {
+        path: _identity(path) for path in home.rglob("*") if path.is_file()
+    } == before
 
 
 def test_installer_source_entry_rebind_rejects_before_runpy_loader(
@@ -2676,11 +4450,15 @@ def test_installer_source_entry_rebind_rejects_before_runpy_loader(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    monkeypatch.setattr(runtime_lifecycle, "_source_tree_binding", lambda _repo: ("a" * 40, "b" * 64))
+    monkeypatch.setattr(
+        runtime_lifecycle, "_source_tree_binding", lambda _repo: ("a" * 40, "b" * 64)
+    )
 
     @runtime_lifecycle.contextmanager
     def broken_entry(_repository: Path):
-        raise runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_source_entry_changed")
+        raise runtime_lifecycle.RuntimeLifecycleError(
+            "runtime_lifecycle_source_entry_changed"
+        )
         yield  # pragma: no cover
 
     monkeypatch.setattr(runtime_lifecycle, "_bound_installer_entry", broken_entry)
@@ -2689,7 +4467,8 @@ def test_installer_source_entry_rebind_rejects_before_runpy_loader(
         "runpy",
         type(
             "NoRunpy",
-            (), {
+            (),
+            {
                 "run_path": staticmethod(
                     lambda _path: (_ for _ in ()).throw(AssertionError("must not load"))
                 )
@@ -2698,91 +4477,82 @@ def test_installer_source_entry_rebind_rejects_before_runpy_loader(
     )
 
     try:
-        runtime_lifecycle._install_attested_runtime(home)
+        runtime_lifecycle._install_attested_runtime(
+            home,
+            record_setup=lambda _stage: None,
+            reserve_setup=lambda _path, _temporary, _digest: None,
+            before_publish=lambda _stage, _layout, _outputs: None,
+        )
     except runtime_lifecycle.RuntimeLifecycleError as exc:
         assert str(exc) == "runtime_lifecycle_source_entry_changed"
     else:
         raise AssertionError("a rebound installer entry must be rejected")
 
 
-def test_cutover_postinstall_rebind_fails_before_any_user_manager_mutation(
-    tmp_path: Path, monkeypatch
+def test_internal_installer_without_v2_journal_stops_before_filesystem_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    snapshot = object()
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", lambda _home: None)
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
-    monkeypatch.setattr(runtime_lifecycle, "_bind_post_install", lambda _home: object())
+    entry_calls: list[str] = []
     monkeypatch.setattr(
         runtime_lifecycle,
-        "_revalidate_post_install",
-        lambda _post, _home: (_ for _ in ()).throw(
-            runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_postinstall_changed")
-        ),
-    )
-    restored: list[object] = []
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_restore_bound_state_result",
-        lambda received, _systemctl: restored.append(received) or _rollback_restored(),
-    )
-    calls: list[tuple[str, ...]] = []
-
-    result = runtime_lifecycle.cutover(
-        home=home, systemctl=lambda arguments: calls.append(arguments) or {}
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
     )
 
-    assert result["status"] == "runtime_lifecycle_postinstall_changed"
-    assert calls == []
-    assert restored == [snapshot]
+    @runtime_lifecycle.contextmanager
+    def entry(_repository: Path):
+        entry_calls.append("opened")
+        raise runtime_lifecycle.RuntimeLifecycleError("unexpected_entry_open")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(runtime_lifecycle, "_bound_installer_entry", entry)
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_v2_journal_unavailable",
+    ):
+        runtime_lifecycle._install_attested_runtime(home)
+    assert entry_calls == []
+    assert list(home.iterdir()) == []
 
 
-def test_cutover_legacy_rebind_fails_before_any_user_manager_mutation(
-    tmp_path: Path, monkeypatch
+def test_legacy_executor_cannot_create_probe_lock_or_stage_without_v2_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    snapshot = object()
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", lambda _home: None)
-    _allow_postinstall_attestation(monkeypatch)
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: True)
+    bound, states = _bound_failure_fixture(tmp_path)
+    home = bound.home
     monkeypatch.setattr(
         runtime_lifecycle,
-        "_revalidate_legacy_units",
-        lambda _bound: (_ for _ in ()).throw(
-            runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_legacy_changed")
-        ),
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "b" * 64),
     )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_restore_bound_state_result", lambda *_args: _rollback_restored()
-    )
-    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+    for unit in runtime_lifecycle._PRICING_UNITS:
+        states[unit] = {
+            "LoadState": "loaded",
+            "UnitFileState": "disabled",
+            "ActiveState": "inactive",
+        }
 
-    result = runtime_lifecycle.cutover(
-        home=home, systemctl=lambda arguments: calls.append(arguments) or {}
-    )
+    manager_mutations: list[tuple[str, ...]] = []
 
-    assert result["status"] == "runtime_lifecycle_legacy_changed"
-    assert calls == []
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        manager_mutations.append(arguments)
+        return {}
+
+    result = runtime_lifecycle._execute_cutover(home=home, systemctl=systemctl)
+
+    assert result == {
+        "status": "runtime_lifecycle_v2_journal_unavailable",
+        "raw_output": "not_returned",
+    }
+    assert not (home / ".local/state/codex-master-mcp/.hive-hourly-probe.lock").exists()
+    assert list((home / ".local/lib").glob(".the-hive-runtime.stage.*")) == []
+    assert not (home / ".local/state/the-hive/hook-session-pins-v1").exists()
+    assert manager_mutations == []
 
 
 def test_postinstall_binding_rejects_syntactically_eight_term_malicious_units(
@@ -2796,9 +4566,7 @@ def test_postinstall_binding_rejects_syntactically_eight_term_malicious_units(
     service = units / "the-hive-hive-hourly-probe.service"
     timer = units / "the-hive-hive-hourly-probe.timer"
     service.write_bytes(b"[Service]\nExecStart=/malicious\n")
-    timer.write_bytes(
-        b"[Timer]\nOnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 UTC\n"
-    )
+    timer.write_bytes(b"[Timer]\nOnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 UTC\n")
     service.chmod(0o644)
     timer.chmod(0o644)
     identity = {
@@ -2821,98 +4589,6 @@ def test_postinstall_binding_rejects_syntactically_eight_term_malicious_units(
         match="runtime_lifecycle_postinstall_invalid",
     ):
         runtime_lifecycle._bind_post_install(home)
-
-
-def test_failed_cutover_restores_bound_state_and_reports_rollback_failure(
-    tmp_path: Path, monkeypatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    snapshot = object()
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_revalidate_cutover_inputs", lambda _snapshot: None
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle, "_install_attested_runtime", lambda _home: None
-    )
-    _allow_postinstall_attestation(monkeypatch)
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_systemctl_mutate",
-        lambda _systemctl, _arguments: (_ for _ in ()).throw(
-            runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_systemd_failed")
-        ),
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_restore_bound_state_result",
-        lambda _snapshot, _systemctl: runtime_lifecycle._RollbackResult(
-            False, "new_service_verify", "unit_verify_mismatch"
-        ),
-    )
-    published: list[object] = []
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_publish_rollback_failure",
-        lambda received: published.append(received) or True,
-    )
-
-    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
-
-    assert result == {
-        "status": "runtime_lifecycle_rollback_failed",
-        "raw_output": "not_returned",
-        "rollback_phase": "new_service_verify",
-        "rollback_error": "unit_verify_mismatch",
-    }
-    assert published == [snapshot]
-
-
-def test_rollback_alarm_publication_failure_is_never_silently_swallowed(
-    tmp_path: Path, monkeypatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _lifecycle_state(home)
-    snapshot = object()
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: snapshot)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"})
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_install_attested_runtime",
-        lambda _home: (_ for _ in ()).throw(
-            runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_install_failed")
-        ),
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_restore_bound_state_result",
-        lambda *_args: runtime_lifecycle._RollbackResult(
-            False, "new_service_verify", "unit_verify_mismatch"
-        ),
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_publish_rollback_failure", lambda _bound: False)
-
-    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
-
-    assert result == {
-        "status": "runtime_lifecycle_rollback_alarm_failed",
-        "raw_output": "not_returned",
-        "rollback_phase": "new_service_verify",
-        "rollback_error": "unit_verify_mismatch",
-    }
 
 
 def test_restore_bound_state_restores_preexisting_runtime_pointer_units_and_receipt(
@@ -2946,7 +4622,10 @@ def test_restore_bound_state_restores_preexisting_runtime_pointer_units_and_rece
         state / "runtime-lifecycle-probe-observation.json": (b'{"old":true}\n', 0o600),
         units / "the-hive-hive-hourly-probe.service": (b"old-new-service\n", 0o644),
         units / "the-hive-hive-hourly-probe.timer": (b"old-new-timer\n", 0o644),
-        units / "codex-master-hive-hourly-probe.service": (b"old-legacy-service\n", 0o644),
+        units / "codex-master-hive-hourly-probe.service": (
+            b"old-legacy-service\n",
+            0o644,
+        ),
         units / "codex-master-hive-hourly-probe.timer": (b"old-legacy-timer\n", 0o644),
     }
     for path, (content, mode) in originals.items():
@@ -2979,7 +4658,9 @@ def test_restore_bound_state_restores_preexisting_runtime_pointer_units_and_rece
         release_root=release,
         units=units,
         state_root=state,
-        files=tuple((path, content, mode) for path, (content, mode) in originals.items()),
+        files=tuple(
+            (path, content, mode) for path, (content, mode) in originals.items()
+        ),
         source_digests=(),
         source_commit="a" * 40,
         generations_before=frozenset({"a" * 40}),
@@ -3070,11 +4751,11 @@ def test_restore_bound_state_removes_new_runtime_units_pointer_and_receipt(
         states=tuple(
             (
                 name,
-                    {
-                        "LoadState": "not-found",
-                        "UnitFileState": "disabled",
-                        "ActiveState": "inactive",
-                    },
+                {
+                    "LoadState": "not-found",
+                    "UnitFileState": "disabled",
+                    "ActiveState": "inactive",
+                },
             )
             for name in (
                 "the-hive-hive-hourly-probe.service",
@@ -3129,7 +4810,11 @@ def test_restore_does_not_operate_on_units_bound_as_not_found(tmp_path: Path) ->
     assert calls == [
         ("daemon-reload",),
         *(
-            ("show", name, "--property=LoadState,UnitFileState,ActiveState,Result,ExecMainStatus")
+            (
+                "show",
+                name,
+                "--property=LoadState,UnitFileState,ActiveState,Result,ExecMainStatus",
+            )
             for name in absent
         ),
     ]
@@ -3154,6 +4839,7 @@ def test_restore_bound_failed_oneshot_resets_the_manager_failed_state_before_ver
     }
     bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
     calls: list[tuple[str, ...]] = []
+
     def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
         calls.append(arguments)
         if arguments == ("reset-failed", service):
@@ -3414,7 +5100,10 @@ def test_restore_bound_inactive_service_keeps_its_action_phase_on_failure(
         (("daemon-reload",), "restore_daemon_reload"),
         (("disable", "--now", "the-hive-hive-hourly-probe.timer"), "new_timer_action"),
         (("stop", "the-hive-hive-hourly-probe.service"), "new_service_action"),
-        (("enable", "--now", "codex-master-hive-hourly-probe.timer"), "legacy_timer_action"),
+        (
+            ("enable", "--now", "codex-master-hive-hourly-probe.timer"),
+            "legacy_timer_action",
+        ),
         (("start", "codex-master-hive-hourly-probe.service"), "legacy_service_action"),
     ),
 )
@@ -3535,72 +5224,6 @@ def test_rollback_failure_result_rejects_unbounded_telemetry() -> None:
     }
 
 
-def test_cutover_installer_failure_restores_the_bound_preexisting_state(
-    tmp_path: Path, monkeypatch
-) -> None:
-    bound, states = _bound_failure_fixture(tmp_path)
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
-    )
-
-    def fail_installer(_home: Path) -> None:
-        _mutate_bound_files(bound)
-        raise runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_install_failed")
-
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", fail_installer)
-    result = runtime_lifecycle.cutover(
-        home=bound.home,
-        systemctl=lambda arguments: states[arguments[1]] if arguments[0] == "show" else {},
-    )
-
-    assert result["status"] == "runtime_lifecycle_install_failed"
-    _assert_bound_files_restored(bound)
-
-
-def test_cutover_new_timer_enable_failure_reports_bounded_primary_phase_after_restore(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A restored manager failure exposes only its fixed primary phase fields."""
-
-    bound, states = _bound_failure_fixture(tmp_path)
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", lambda _home: None)
-    _allow_postinstall_attestation(monkeypatch)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
-    )
-
-    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
-        if arguments == ("enable", "--now", "the-hive-hive-hourly-probe.timer"):
-            raise OSError("untrusted-command-detail")
-        if arguments[0] == "show":
-            return states[arguments[1]]
-        return {}
-
-    result = runtime_lifecycle.cutover(home=bound.home, systemctl=systemctl)
-
-    assert result == {
-        "status": "runtime_lifecycle_systemd_failed",
-        "raw_output": "not_returned",
-        "failure_phase": "new_timer_enable",
-        "failure_error": "systemd_mutation_failed",
-    }
-    assert "untrusted-command-detail" not in repr(result)
-    _assert_bound_files_restored(bound)
-
-
 def test_cutover_mutation_failure_result_rejects_unbounded_telemetry() -> None:
     """Unexpected carrier data fails closed without publishing exception text."""
 
@@ -3620,7 +5243,9 @@ def test_cutover_mutation_failure_result_rejects_unbounded_telemetry() -> None:
     assert "untrusted" not in repr(result)
 
 
-def test_cutover_mutation_failure_result_rejects_unknown_status_for_valid_phase() -> None:
+def test_cutover_mutation_failure_result_rejects_unknown_status_for_valid_phase() -> (
+    None
+):
     """A known phase cannot make an unknown underlying failure telemetricly valid."""
 
     result = runtime_lifecycle._cutover_mutation_failure_result(
@@ -3667,174 +5292,6 @@ def test_cutover_mutation_failure_result_accepts_each_whitelisted_status(
     }
 
 
-@pytest.mark.parametrize(
-    ("stage", "failing_call"),
-    (
-        ("before_activation_reload", ("daemon-reload",)),
-        ("legacy_service_stop", ("stop", "codex-master-hive-hourly-probe.service")),
-        (
-            "legacy_timer_disable",
-            ("disable", "--now", "codex-master-hive-hourly-probe.timer"),
-        ),
-        ("new_timer_enable", ("enable", "--now", "the-hive-hive-hourly-probe.timer")),
-        ("after_unit_removal_reload", ("daemon-reload",)),
-    ),
-    ids=(
-        "before-activation-reload",
-        "legacy-service-stop",
-        "legacy-timer-disable",
-        "new-timer-enable",
-        "after-unit-removal-reload",
-    ),
-)
-def test_cutover_each_user_manager_phase_failure_restores_bound_state(
-    tmp_path: Path, monkeypatch, stage: str, failing_call: tuple[str, ...]
-) -> None:
-    bound, states = _bound_failure_fixture(tmp_path)
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
-    )
-
-    def install(_home: Path) -> None:
-        for path, _content, mode in bound.files:
-            if path.parent != bound.units:
-                path.write_bytes(b"installer-mutated\n")
-                path.chmod(mode)
-
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", install)
-    _allow_postinstall_attestation(monkeypatch)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
-    )
-    injected = False
-    reloads = 0
-
-    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
-        nonlocal injected, reloads
-        if arguments[0] == "show":
-            return states[arguments[1]]
-        if arguments == ("daemon-reload",):
-            reloads += 1
-        matches = arguments == failing_call and (
-            failing_call != ("daemon-reload",)
-            or (stage == "before_activation_reload" and reloads == 1)
-            or (stage == "after_unit_removal_reload" and reloads == 2)
-        )
-        if matches and not injected:
-            injected = True
-            raise runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_systemd_failed")
-        return {}
-
-    result = runtime_lifecycle.cutover(home=bound.home, systemctl=systemctl)
-
-    assert injected is True
-    assert result == {
-        "status": "runtime_lifecycle_systemd_failed",
-        "raw_output": "not_returned",
-        "failure_phase": stage,
-        "failure_error": "systemd_mutation_failed",
-    }
-    _assert_bound_files_restored(bound)
-
-
-@pytest.mark.parametrize("preexisting", [True, False], ids=("present", "absent"))
-def test_cutover_postinstall_failure_restores_pricing_and_discards_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preexisting: bool
-) -> None:
-    """Pricing publication rolls back with Hourly before its image is discarded."""
-
-    bound, states = _bound_failure_fixture(tmp_path)
-    pricing_paths = {
-        bound.home / ".local" / "bin" / "the-hive-openai-pricing-inventory",
-        bound.units / "the-hive-openai-pricing.service",
-        bound.units / "the-hive-openai-pricing.timer",
-    }
-    expected = {
-        path: content for path, content, _mode in bound.files if path in pricing_paths
-    }
-    if not preexisting:
-        for path in pricing_paths:
-            path.unlink()
-        bound = runtime_lifecycle.replace(
-            bound,
-            files=tuple(
-                (path, None if path in pricing_paths else content, mode)
-                for path, content, mode in bound.files
-            ),
-        )
-    generation = "b" * 40
-    bound = runtime_lifecycle.replace(
-        bound,
-        source_commit=generation,
-        generations_before=frozenset({"a" * 40}),
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
-    )
-
-    def install(_home: Path) -> None:
-        candidate = bound.release_root / "generations" / generation
-        candidate.parent.mkdir(mode=0o700)
-        candidate.mkdir(mode=0o700)
-        installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
-        installer["_build_runtime_image"](  # type: ignore[operator]
-            repository=ROOT, stage=candidate, generation=generation, commit=generation
-        )
-        for path, _content, mode in bound.files:
-            if path in pricing_paths:
-                path.write_bytes(b"new-pricing-state\n")
-                path.chmod(mode)
-
-    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", install)
-    _allow_postinstall_attestation(monkeypatch)
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
-    )
-    discard = runtime_lifecycle._discard_new_generation
-
-    def discard_after_pricing_restore(received: runtime_lifecycle._BoundCutover) -> None:
-        for path in pricing_paths:
-            if preexisting:
-                assert path.read_bytes() == expected[path]
-            else:
-                assert not path.exists()
-        discard(received)
-
-    monkeypatch.setattr(
-        runtime_lifecycle, "_discard_new_generation", discard_after_pricing_restore
-    )
-    failed = {"value": False}
-
-    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
-        if arguments[0] == "show":
-            return states[arguments[1]]
-        if arguments == ("daemon-reload",) and not failed["value"]:
-            failed["value"] = True
-            raise runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_systemd_failed")
-        return {}
-
-    result = runtime_lifecycle.cutover(home=bound.home, systemctl=systemctl)
-
-    assert result["status"] == "runtime_lifecycle_systemd_failed"
-    assert not (bound.release_root / "generations" / generation).exists()
-    for path in pricing_paths:
-        if preexisting:
-            assert path.read_bytes() == expected[path]
-        else:
-            assert not path.exists()
-
-
 def test_generation_discard_accepts_installer_self_cleanup(tmp_path: Path) -> None:
     release_root = tmp_path / "the-hive-runtime"
     (release_root / "generations").mkdir(mode=0o700, parents=True)
@@ -3845,44 +5302,6 @@ def test_generation_discard_accepts_installer_self_cleanup(tmp_path: Path) -> No
     )
 
     runtime_lifecycle._discard_new_generation(bound)
-
-
-def test_cutover_bounded_probe_failure_restores_bound_state(tmp_path: Path, monkeypatch) -> None:
-    bound, states = _bound_failure_fixture(tmp_path)
-    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
-    monkeypatch.setattr(
-        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
-    )
-    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
-    monkeypatch.setattr(
-        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
-    )
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_install_attested_runtime",
-        lambda _home: _mutate_bound_files(bound),
-    )
-    _allow_postinstall_attestation(monkeypatch)
-    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "_observe_argumentless_installed_probe",
-        lambda _home: (_ for _ in ()).throw(
-            runtime_lifecycle.RuntimeLifecycleError(
-                "runtime_lifecycle_probe_observation_failed"
-            )
-        ),
-    )
-    result = runtime_lifecycle.cutover(
-        home=bound.home,
-        systemctl=lambda arguments: states[arguments[1]] if arguments[0] == "show" else {},
-    )
-
-    assert result["status"] == "runtime_lifecycle_probe_observation_failed"
-    _assert_bound_files_restored(bound)
-
-
-# D332: pure D320CutoverJournalV1 source-only contract tests.
 
 
 def _d332_digest(raw: bytes) -> str:
@@ -4144,9 +5563,7 @@ def _d332_new_snapshots(
         "timer",
         "config_binding",
     ):
-        result[name] = runtime_lifecycle.ByteSnapshotV1.from_mapping(
-            postcutover[name]
-        )
+        result[name] = runtime_lifecycle.ByteSnapshotV1.from_mapping(postcutover[name])
     result["unit_status"] = runtime_lifecycle.EvidenceBlobV1.from_mapping(
         postcutover["unit_status"]
     )
@@ -4182,8 +5599,7 @@ def test_d332_evidence_blob_and_snapshot_are_purely_validated() -> None:
 
     assert runtime_lifecycle.EvidenceBlobV1.from_mapping(blob).to_mapping() == blob
     assert (
-        runtime_lifecycle.ByteSnapshotV1.from_mapping(snapshot).to_mapping()
-        == snapshot
+        runtime_lifecycle.ByteSnapshotV1.from_mapping(snapshot).to_mapping() == snapshot
     )
 
     malformed = copy.deepcopy(blob)
@@ -4221,8 +5637,7 @@ def test_d332_transition_and_step_require_exact_phase_data() -> None:
 
     inverse_intent = _d332_step(status="INVERSE_INTENT", inverse=True)
     assert (
-        runtime_lifecycle.StepV1.from_mapping(inverse_intent).status
-        == "INVERSE_INTENT"
+        runtime_lifecycle.StepV1.from_mapping(inverse_intent).status == "INVERSE_INTENT"
     )
 
 
@@ -4382,7 +5797,9 @@ def test_d337_successor_revalidates_carriers_and_exact_recovery_entry() -> None:
         match="d320_recovery_entry_invalid",
     ):
         runtime_lifecycle.validate_d320_journal_successor(
-            previous, successor, recovery_entry=ExplodingRecoveryEntry()  # type: ignore[arg-type]
+            previous,
+            successor,
+            recovery_entry=ExplodingRecoveryEntry(),  # type: ignore[arg-type]
         )
 
 
@@ -4408,9 +5825,12 @@ def test_d338_journal_factories_reject_subclass_dispatch() -> None:
     assert runtime_lifecycle.D320CutoverJournalV1.from_payload(payload).to_bytes() == (
         expected.to_bytes()
     )
-    assert runtime_lifecycle.D320CutoverJournalV1.from_bytes(
-        expected.to_bytes()
-    ).payload_bytes == expected.payload_bytes
+    assert (
+        runtime_lifecycle.D320CutoverJournalV1.from_bytes(
+            expected.to_bytes()
+        ).payload_bytes
+        == expected.payload_bytes
+    )
 
 
 def test_d338_carrier_base_views_ignore_subclass_accessor_overrides() -> None:
@@ -4471,8 +5891,7 @@ def test_d338_carrier_base_views_ignore_subclass_accessor_overrides() -> None:
     assert journal.payload_bytes == expected_journal.payload_bytes
     assert journal.to_bytes() == expected_journal.to_bytes()
     assert (
-        runtime_lifecycle.D320CutoverJournalV1.payload.fget(journal)
-        == journal_mapping
+        runtime_lifecycle.D320CutoverJournalV1.payload.fget(journal) == journal_mapping
     )
 
 
@@ -4591,14 +6010,10 @@ def test_d339_wrapper_base_factories_emit_revalidated_canonical_carriers(
 
 
 def test_d340_recovery_revalidates_forged_carriers_without_dispatch() -> None:
-    payload = _d332_payload_with_history(
-        runtime_lifecycle._D320_NORMAL_STATES[1:]
-    )
+    payload = _d332_payload_with_history(runtime_lifecycle._D320_NORMAL_STATES[1:])
     journal = runtime_lifecycle.D320CutoverJournalV1.from_payload(payload)
     observed = _d332_new_snapshots(payload)
-    snapshot_mapping = runtime_lifecycle.ByteSnapshotV1.to_mapping(
-        observed["pointer"]
-    )
+    snapshot_mapping = runtime_lifecycle.ByteSnapshotV1.to_mapping(observed["pointer"])
     evidence_mapping = runtime_lifecycle.EvidenceBlobV1.to_mapping(
         observed["unit_status"]
     )
@@ -4645,9 +6060,7 @@ def test_d340_recovery_revalidates_forged_carriers_without_dispatch() -> None:
     assert calls == {"snapshot": 0, "evidence": 0, "journal": 0}
 
     previous_payload = _d334_normal_payload("PREFLIGHTED")
-    previous = runtime_lifecycle.D320CutoverJournalV1.from_payload(
-        previous_payload
-    )
+    previous = runtime_lifecycle.D320CutoverJournalV1.from_payload(previous_payload)
     blocked = runtime_lifecycle.D320CutoverJournalV1.from_payload(
         _d334_blocked_successor(previous_payload, reason="unreadable")
     )
@@ -4669,9 +6082,10 @@ def test_d341_d320_byte_entries_ignore_forged_bytes_dispatch() -> None:
     envelope_bytes = journal.to_bytes()
     payload_bytes = journal.payload_bytes
     observed = _d332_new_snapshots(payload)
-    assert runtime_lifecycle.classify_d320_recovery(
-        journal, observed=observed
-    ).kind == "ALL_NEW_VERIFIED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(journal, observed=observed).kind
+        == "ALL_NEW_VERIFIED"
+    )
 
     calls = {
         "envelope": 0,
@@ -4690,9 +6104,12 @@ def test_d341_d320_byte_entries_ignore_forged_bytes_dispatch() -> None:
     forged_envelope = bytes.__new__(ForgedEnvelope, b"{}")
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.D320CutoverJournalV1.from_bytes(forged_envelope)
-    assert runtime_lifecycle.classify_d320_recovery(
-        forged_envelope, observed=observed
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(
+            forged_envelope, observed=observed
+        ).kind
+        == "UNREADABLE_BLOCKED"
+    )
     restored = runtime_lifecycle.D320CutoverJournalV1.from_bytes(envelope_bytes)
     assert type(restored) is runtime_lifecycle.D320CutoverJournalV1
     assert restored.payload == journal.payload
@@ -4737,6 +6154,7 @@ def test_d341_d320_byte_entries_ignore_forged_bytes_dispatch() -> None:
         ),
     )
     for name, constructor, replacement in constructors:
+
         class ForgedCarrier(bytes):
             def __bytes__(self) -> bytes:
                 calls[name] += 1
@@ -4944,8 +6362,7 @@ def test_d332_model_never_calls_existing_mutators(monkeypatch) -> None:
         monkeypatch.setattr(runtime_lifecycle, name, forbidden)
 
     assert (
-        runtime_lifecycle.D320CutoverJournalV1.from_bytes(journal.to_bytes())
-        == journal
+        runtime_lifecycle.D320CutoverJournalV1.from_bytes(journal.to_bytes()) == journal
     )
     assert runtime_lifecycle.D320CutoverJournalV1.from_payload(payload) == journal
     successor = runtime_lifecycle.D320CutoverJournalV1.from_payload(
@@ -4955,14 +6372,16 @@ def test_d332_model_never_calls_existing_mutators(monkeypatch) -> None:
     runtime_lifecycle.validate_d324_lock_order(
         payload["lock_trace"], state="ABSENT", sequence=0, history=[]
     )
-    assert runtime_lifecycle.classify_d320_recovery(
-        journal, observed=old
-    ).kind == "ALL_OLD_VERIFIED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(journal, observed=old).kind
+        == "ALL_OLD_VERIFIED"
+    )
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.D320CutoverJournalV1.from_payload({"invalid": None})
-    assert runtime_lifecycle.classify_d320_recovery(
-        b"invalid\n", observed=old
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(b"invalid\n", observed=old).kind
+        == "UNREADABLE_BLOCKED"
+    )
 
 
 @pytest.mark.parametrize(
@@ -4973,16 +6392,10 @@ def test_d332_model_never_calls_existing_mutators(monkeypatch) -> None:
             "native_bee_event", "a" * 63
         ),
         lambda payload: payload["abi"].__setitem__("version", 2),
-        lambda payload: payload["abi"]["root_receipt"].__setitem__(
-            "parent_chain", []
-        ),
+        lambda payload: payload["abi"]["root_receipt"].__setitem__("parent_chain", []),
         lambda payload: payload["native"].__setitem__("disabled", 1),
-        lambda payload: payload["native"].__setitem__(
-            "adapter_version", "a" * 129
-        ),
-        lambda payload: payload["precutover"]["pointer"].__setitem__(
-            "mode", 0o10000
-        ),
+        lambda payload: payload["native"].__setitem__("adapter_version", "a" * 129),
+        lambda payload: payload["precutover"]["pointer"].__setitem__("mode", 0o10000),
         lambda payload: payload["pins"].__setitem__(
             "current", ["generation-1", "generation-1"]
         ),
@@ -5109,9 +6522,7 @@ def test_d332_history_covers_bound_graph_and_rejects_a_gap() -> None:
         _d332_payload_with_history(normal)
     )
     runtime_lifecycle.D320CutoverJournalV1.from_payload(
-        _d332_payload_with_history(
-            normal[:7] + ("ABORTING", "ROLLED_BACK")
-        )
+        _d332_payload_with_history(normal[:7] + ("ABORTING", "ROLLED_BACK"))
     )
     runtime_lifecycle.D320CutoverJournalV1.from_payload(
         _d332_payload_with_history(("PREFLIGHTED", "BLOCKED"))
@@ -5160,9 +6571,12 @@ def test_d332_each_bound_transition_is_valid(before: str, after: str) -> None:
     ("INTENT", "EFFECT_STARTED", "VERIFIED", "INVERSE_INTENT", "INVERSE_VERIFIED"),
 )
 def test_d332_each_step_phase_is_individually_validated(status: str) -> None:
-    assert runtime_lifecycle.StepV1.from_mapping(
-        _d332_step(status=status, inverse=True)
-    ).status == status
+    assert (
+        runtime_lifecycle.StepV1.from_mapping(
+            _d332_step(status=status, inverse=True)
+        ).status
+        == status
+    )
 
 
 @pytest.mark.parametrize("index", range(len(_d333_complete_lock_trace())))
@@ -5197,31 +6611,37 @@ def test_d333_postcutover_and_unit_status_are_bound_recovery_inputs() -> None:
     )
     journal = runtime_lifecycle.D320CutoverJournalV1.from_payload(payload)
     observed = _d332_new_snapshots(payload)
-    assert runtime_lifecycle.classify_d320_recovery(
-        journal, observed=observed
-    ).kind == "ALL_NEW_VERIFIED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(journal, observed=observed).kind
+        == "ALL_NEW_VERIFIED"
+    )
 
     unit_drift = dict(observed)
     unit_drift["unit_status"] = runtime_lifecycle.EvidenceBlobV1.from_mapping(
         _d332_blob("unit_status", b"unit-drift")
     )
-    assert runtime_lifecycle.classify_d320_recovery(
-        journal, observed=unit_drift
-    ).kind == "MIXED_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(journal, observed=unit_drift).kind
+        == "MIXED_BLOCKED"
+    )
     missing_unit = dict(observed)
     del missing_unit["unit_status"]
-    assert runtime_lifecycle.classify_d320_recovery(
-        journal, observed=missing_unit
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(journal, observed=missing_unit).kind
+        == "UNREADABLE_BLOCKED"
+    )
 
     substituted = copy.deepcopy(payload)
     substituted["postcutover"]["pointer"] = _d332_snapshot(
         "pointer", b"substituted-new"
     )
-    assert runtime_lifecycle.classify_d320_recovery(
-        runtime_lifecycle.D320CutoverJournalV1.from_payload(substituted),
-        observed=observed,
-    ).kind == "MIXED_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(
+            runtime_lifecycle.D320CutoverJournalV1.from_payload(substituted),
+            observed=observed,
+        ).kind
+        == "MIXED_BLOCKED"
+    )
     missing_postcutover = copy.deepcopy(payload)
     del missing_postcutover["postcutover"]
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
@@ -5269,19 +6689,23 @@ def test_d333_wrappers_and_exported_paths_revalidate_fail_closed() -> None:
     forged = bytes.__new__(runtime_lifecycle.D320CutoverJournalV1, b"{}")
     payload = _d332_payload()
     observed = _d332_old_snapshots(payload)
-    assert runtime_lifecycle.classify_d320_recovery(
-        forged, observed=observed
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(forged, observed=observed).kind
+        == "UNREADABLE_BLOCKED"
+    )
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.validate_d320_journal_successor(forged, forged)
 
     forged_snapshot = bytes.__new__(runtime_lifecycle.ByteSnapshotV1, b"{}")
     observed_with_forgery = dict(observed)
     observed_with_forgery["pointer"] = forged_snapshot
-    assert runtime_lifecycle.classify_d320_recovery(
-        runtime_lifecycle.D320CutoverJournalV1.from_payload(payload),
-        observed=observed_with_forgery,
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(
+            runtime_lifecycle.D320CutoverJournalV1.from_payload(payload),
+            observed=observed_with_forgery,
+        ).kind
+        == "UNREADABLE_BLOCKED"
+    )
 
     forged_evidence = bytes.__new__(runtime_lifecycle.EvidenceBlobV1, b"{}")
     forged_step = bytes.__new__(runtime_lifecycle.StepV1, b"{}")
@@ -5291,10 +6715,13 @@ def test_d333_wrappers_and_exported_paths_revalidate_fail_closed() -> None:
             wrapper.to_mapping()
     observed_with_forged_unit = dict(observed)
     observed_with_forged_unit["unit_status"] = forged_evidence
-    assert runtime_lifecycle.classify_d320_recovery(
-        runtime_lifecycle.D320CutoverJournalV1.from_payload(payload),
-        observed=observed_with_forged_unit,
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(
+            runtime_lifecycle.D320CutoverJournalV1.from_payload(payload),
+            observed=observed_with_forged_unit,
+        ).kind
+        == "UNREADABLE_BLOCKED"
+    )
 
 
 @pytest.mark.parametrize("wrapper", ("evidence", "snapshot", "transition", "step"))
@@ -5633,9 +7060,7 @@ def test_d335_json_and_foreign_mapping_inputs_fail_closed() -> None:
     )
     assert len(oversized_integer_envelope) < runtime_lifecycle._D320_MAX_ENVELOPE_BYTES
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
-        runtime_lifecycle.D320CutoverJournalV1.from_bytes(
-            oversized_integer_envelope
-        )
+        runtime_lifecycle.D320CutoverJournalV1.from_bytes(oversized_integer_envelope)
 
     class ExplodingMapping(dict):
         def items(self):
@@ -5850,9 +7275,12 @@ def test_d336_journal_from_bytes_copies_foreign_bytes_before_checks() -> None:
     payload = _d332_payload()
     raw = runtime_lifecycle.D320CutoverJournalV1.from_payload(payload).to_bytes()
 
-    assert runtime_lifecycle.D320CutoverJournalV1.from_bytes(
-        ExplodingEnvelopeBytes(raw)
-    ).payload == payload
+    assert (
+        runtime_lifecycle.D320CutoverJournalV1.from_bytes(
+            ExplodingEnvelopeBytes(raw)
+        ).payload
+        == payload
+    )
 
 
 @pytest.mark.parametrize(
@@ -5947,9 +7375,10 @@ def test_d335_successor_rejects_cyclic_observed_artifact() -> None:
         runtime_lifecycle.validate_d320_journal_successor(
             previous, successor, observed=observed
         )
-    assert runtime_lifecycle.classify_d320_recovery(
-        previous, observed=observed
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(previous, observed=observed).kind
+        == "UNREADABLE_BLOCKED"
+    )
 
 
 def test_d333_successor_is_append_only_and_phase_ordered() -> None:
@@ -6210,9 +7639,7 @@ def test_d333_rollback_inverts_only_the_last_uninverted_step() -> None:
     first_inverse_verified = copy.deepcopy(first_inverse)
     first_inverse_verified["sequence"] = 4
     first_inverse_verified["updated_unix_ms"] = 104
-    first_inverse_verified["steps"][1] = _d332_step(
-        index=1, status="INVERSE_VERIFIED"
-    )
+    first_inverse_verified["steps"][1] = _d332_step(index=1, status="INVERSE_VERIFIED")
     second_inverse = copy.deepcopy(first_inverse_verified)
     second_inverse["sequence"] = 5
     second_inverse["updated_unix_ms"] = 105
@@ -6220,9 +7647,7 @@ def test_d333_rollback_inverts_only_the_last_uninverted_step() -> None:
     second_inverse_verified = copy.deepcopy(second_inverse)
     second_inverse_verified["sequence"] = 6
     second_inverse_verified["updated_unix_ms"] = 106
-    second_inverse_verified["steps"][0] = _d332_step(
-        index=0, status="INVERSE_VERIFIED"
-    )
+    second_inverse_verified["steps"][0] = _d332_step(index=0, status="INVERSE_VERIFIED")
     rolled_back = copy.deepcopy(second_inverse_verified)
     rolled_back["sequence"] = 7
     rolled_back["updated_unix_ms"] = 107
@@ -6320,9 +7745,7 @@ def test_d334_each_nonlive_normal_state_blocks_only_with_bound_evidence(
         previous_payload["steps"][0]["inverse"] = None
     previous = runtime_lifecycle.D320CutoverJournalV1.from_payload(previous_payload)
     successor_payload = _d334_blocked_successor(previous_payload, reason=reason)
-    successor = runtime_lifecycle.D320CutoverJournalV1.from_payload(
-        successor_payload
-    )
+    successor = runtime_lifecycle.D320CutoverJournalV1.from_payload(successor_payload)
     observed = _d332_old_snapshots(previous_payload)
     if kind == "UNREADABLE_BLOCKED":
         observed["unit_status"] = {"invalid": None}
@@ -6460,9 +7883,7 @@ def test_d334_step_phases_are_bound_to_rollback_states() -> None:
         _d332_step(index=2, status="INVERSE_VERIFIED"),
     ]
     runtime_lifecycle.D320CutoverJournalV1.from_payload(aborting)
-    blocked = _d334_blocked_successor(
-        aborting, reason="mixed_without_complete_inverse"
-    )
+    blocked = _d334_blocked_successor(aborting, reason="mixed_without_complete_inverse")
     runtime_lifecycle.D320CutoverJournalV1.from_payload(blocked)
 
     malformed = copy.deepcopy(aborting)
@@ -6470,9 +7891,7 @@ def test_d334_step_phases_are_bound_to_rollback_states() -> None:
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.D320CutoverJournalV1.from_payload(malformed)
 
-    rolled_back = _d332_payload_with_history(
-        ("PREFLIGHTED", "ABORTING", "ROLLED_BACK")
-    )
+    rolled_back = _d332_payload_with_history(("PREFLIGHTED", "ABORTING", "ROLLED_BACK"))
     rolled_back["steps"] = [_d332_step(status="INVERSE_VERIFIED")]
     runtime_lifecycle.D320CutoverJournalV1.from_payload(rolled_back)
     rolled_back["steps"][0] = _d332_step(status="VERIFIED")
@@ -6489,9 +7908,7 @@ def test_d334_rejects_an_effectless_cutover_record() -> None:
 
 
 def test_d334_lock_events_bind_to_history_and_current_terminal_record() -> None:
-    payload = _d332_payload_with_history(
-        ("PREFLIGHTED", "ABORTING", "ROLLED_BACK")
-    )
+    payload = _d332_payload_with_history(("PREFLIGHTED", "ABORTING", "ROLLED_BACK"))
     runtime_lifecycle.D320CutoverJournalV1.from_payload(payload)
     history = payload["history"]
     assert isinstance(history, list)
@@ -6542,13 +7959,7 @@ def test_d333_digest_precedes_payload_semantics() -> None:
 
 def test_d335_digest_precedes_finite_float_semantics() -> None:
     float_payload = b'{"sequence":1.0}'
-    raw = (
-        b'{"content_sha256":"'
-        + b"0" * 64
-        + b'","payload":'
-        + float_payload
-        + b"}\n"
-    )
+    raw = b'{"content_sha256":"' + b"0" * 64 + b'","payload":' + float_payload + b"}\n"
 
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError) as raised:
         runtime_lifecycle.D320CutoverJournalV1.from_bytes(raw)
@@ -6590,15 +8001,11 @@ def test_d335_record_generation_binds_history_and_appended_lockevents() -> None:
             "sequence": 2,
         }
     )
-    successor = runtime_lifecycle.D320CutoverJournalV1.from_payload(
-        successor_payload
-    )
+    successor = runtime_lifecycle.D320CutoverJournalV1.from_payload(successor_payload)
     runtime_lifecycle.validate_d320_journal_successor(previous, successor)
 
     stale_lockevent = copy.deepcopy(successor_payload)
-    stale_lockevent["lock_trace"][-1].update(
-        {"state": "PREFLIGHTED", "sequence": 1}
-    )
+    stale_lockevent["lock_trace"][-1].update({"state": "PREFLIGHTED", "sequence": 1})
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.validate_d320_journal_successor(
             previous,
@@ -6635,9 +8042,10 @@ def test_d335_observed_shape_stops_after_one_surplus_key() -> None:
 
     observed = OverlongObservedMapping()
     journal = runtime_lifecycle.D320CutoverJournalV1.from_payload(_d332_payload())
-    assert runtime_lifecycle.classify_d320_recovery(
-        journal, observed=observed
-    ).kind == "UNREADABLE_BLOCKED"
+    assert (
+        runtime_lifecycle.classify_d320_recovery(journal, observed=observed).kind
+        == "UNREADABLE_BLOCKED"
+    )
     assert observed.key_visits == len(runtime_lifecycle._D320_ARTIFACT_NAMES) + 1
 
 
@@ -6789,7 +8197,2098 @@ def test_d335_step_and_history_times_are_record_bound() -> None:
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.D320CutoverJournalV1.from_payload(payload)
 
+
+def _runtime_v2_payload(home: Path) -> dict[str, object]:
+    home.mkdir(mode=0o700)
+    target = home.stat()
+    commit = "a" * 40
+    stage_name = ".the-hive-runtime.stage.fixture"
+    absent = {
+        "type": "absent",
+        "dev": None,
+        "ino": None,
+        "uid": None,
+        "gid": None,
+        "mode": None,
+        "nlink": None,
+        "children": [],
+    }
+    files = [
+        {
+            "name": Path(relative).name,
+            "path": str(home / relative),
+            "present": False,
+            "bytes_b64": None,
+            "sha256": None,
+            "dev": None,
+            "ino": None,
+            "uid": None,
+            "gid": None,
+            "mode": None,
+            "nlink": None,
+            "size": None,
+        }
+        for relative in runtime_lifecycle._V2_FILE_PATHS
+    ]
+    effects = [
+        {
+            "kind": kind,
+            "path": path,
+            "present": False,
+            "identity": dict(absent),
+        }
+        for path, kind in runtime_lifecycle._v2_expected_effects(
+            home, commit, stage_name
+        ).items()
+    ]
+    manager = {
+        unit: {
+            "LoadState": "loaded",
+            "UnitFileState": "disabled",
+            "ActiveState": "inactive",
+        }
+        for unit in runtime_lifecycle._V2_MANAGER_UNITS
+    }
+    target_binding = {
+        "realpath": str(home.resolve()),
+        "dev": target.st_dev,
+        "ino": target.st_ino,
+        "uid": target.st_uid,
+        "gid": target.st_gid,
+        "mode": target.st_mode & 0o777,
+    }
+    predecessor = {
+        "generation": "e" * 40,
+        "manifest_digest": "sha256:" + "f" * 64,
+        "consumer_pin": True,
+        "consumer_sha256": "1" * 64,
+    }
+    plan = {
+        "schema": "D320RuntimeCutoverPlanV2",
+        "mode": "runtime_lifecycle",
+        "source": {"commit": commit, "tree_sha256": "d" * 64},
+        "target": target_binding,
+        "owner_uid": target.st_uid,
+        "predecessor": predecessor,
+        "compatibility": {"status": "qualified", "sha256": "2" * 64},
+        "qualification": {
+            "status": "qualified",
+            "issued_at_unix_ns": 1,
+            "sha256": "3" * 64,
+        },
+        "files": [
+            {key: item[key] for key in ("name", "path", "present")} for item in files
+        ],
+        "extra_effects": runtime_lifecycle._v2_plan_effects(home, commit),
+        "manager_states": manager,
+        "actions": ["install", "activate", "observe", "commit"],
+        "inverse_actions": ["restore_manager", "restore_files", "discard_generation"],
+        "output_manifest_digest": "pending",
+    }
+    plan_sha256 = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(plan)
+    ).hexdigest()
+    return {
+        "schema": "D320CutoverJournalV2",
+        "mode": "runtime_lifecycle",
+        "journal_id": "journal-fixture-1",
+        "transaction_id": 1,
+        "lock_generation": 1,
+        "sequence": 1,
+        "phase": "INTENT",
+        "plan_sha256": plan_sha256,
+        "plan": plan,
+        "source": {"commit": commit, "tree_sha256": "d" * 64},
+        "target": target_binding,
+        "owner_uid": target.st_uid,
+        "predecessor": {
+            "generation": "e" * 40,
+            "manifest_digest": "sha256:" + "f" * 64,
+            "consumer_sha256": "1" * 64,
+        },
+        "stage_name": stage_name,
+        "files": files,
+        "extra_effects": effects,
+        "manager_pre": manager,
+        "inverse_actions": [
+            "restore_manager",
+            "restore_files",
+            "discard_generation",
+        ],
+        "sealed": None,
+        "post": None,
+        "recovery_count": 0,
+        "steps": [
+            {
+                "sequence": 1,
+                "phase": "INTENT",
+                "action": "intent_persisted",
+                "effect": next(
+                    effect["path"] for effect in effects if effect["kind"] == "journal"
+                ),
+                "sha256": plan_sha256,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("post", {"files": [{"path": "/unbound/foreign"}]}),
+        ("steps", [{"phase": "COMMITTED", "path": "/unbound/foreign"}]),
+    ),
+)
+def test_runtime_lifecycle_v2_rejects_unbound_post_and_step_evidence(
+    tmp_path: Path, field: str, invalid_value: object
+) -> None:
+    payload = _runtime_v2_payload(tmp_path / field)
+    payload[field] = invalid_value
+
+    with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
+        runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+
+
+def test_runtime_lifecycle_v2_intent_round_trips_without_v1_fallback(
+    tmp_path: Path,
+) -> None:
+    journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(
+        _runtime_v2_payload(tmp_path / "roundtrip")
+    )
+    raw = journal.to_bytes()
+
+    assert (
+        runtime_lifecycle.D320CutoverJournalV2.from_bytes(raw).payload
+        == journal.payload
+    )
+    with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
+        runtime_lifecycle.D320CutoverJournalV1.from_bytes(raw)
+
+
+@pytest.mark.parametrize("decoder", ("from_payload", "from_bytes"))
+def test_runtime_lifecycle_v2_rejects_fixture_only_qualification(
+    tmp_path: Path, decoder: str
+) -> None:
+    payload = _runtime_v2_payload(tmp_path / decoder)
+    payload["plan"]["qualification"] = {"status": "test_fixture_only"}
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+    with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
+        if decoder == "from_payload":
+            runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+        else:
+            raw = runtime_lifecycle._d320_journal_envelope(
+                runtime_lifecycle._d320_canonical_json(payload)
+            )
+            runtime_lifecycle.D320CutoverJournalV2.from_bytes(raw)
+
+
+def test_public_resume_requires_current_qualification_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "resume-home"
+    payload = _runtime_v2_payload(home)
+    _lifecycle_state(home)
+    runtime_lifecycle._v2_journal_path(home).write_bytes(
+        runtime_lifecycle._d320_journal_envelope(
+            runtime_lifecycle._d320_canonical_json(payload)
+        )
+    )
+    runtime_lifecycle._v2_journal_path(home).chmod(0o600)
+    qualification_root = tmp_path / "missing-qualification-root"
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canary_runtime_root", lambda: qualification_root
+    )
+    phase_calls: list[str] = []
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_v2_phase_plan",
+        lambda **_kwargs: phase_calls.append("phase") or {"status": "ready"},
+    )
+
+    result = runtime_lifecycle.plan(home=home, systemctl=lambda _args: {})
+
+    assert result["status"] == "runtime_lifecycle_plan_blocked"
+    assert "runtime_lifecycle_qualification_record_missing" in result["reason_codes"]
+    assert phase_calls == []
+    assert not qualification_root.exists()
+
+
+def test_public_plan_accepts_current_owner_qualified_structural_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_bound, _fixture_states = _bound_failure_fixture(tmp_path)
+    source_root = tmp_path / "owner-source"
+    source_root.mkdir(mode=0o700)
+    installer_source = ROOT / "scripts" / "the-hive-hive-hourly-probe-install"
+    installer = runpy.run_path(str(installer_source))
+    for source_name, _target_name, _mode in installer["_RUNTIME_IMAGE_FILES"]:
+        source = ROOT / source_name
+        target = source_root / source_name
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    for source_name, target_name in installer["_RUNTIME_IMAGE_TREES"]:
+        shutil.copytree(ROOT / source_name, source_root / target_name)
+    private_installer_source = (
+        source_root / "scripts" / "the-hive-hive-hourly-probe-install"
+    )
+    private_installer_source.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    shutil.copy2(installer_source, private_installer_source)
+    git_home = tmp_path / "git-home"
+    git_home.mkdir(mode=0o700)
+    git_env = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": str(git_home),
+        "LANG": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+    subprocess.run(
+        ["git", "-C", str(source_root), "init", "--quiet", "--initial-branch=main"],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_env,
+    )
+    subprocess.run(
+        ["git", "-C", str(source_root), "add", "--all"],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_env,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_root),
+            "-c",
+            "user.name=Private Fixture",
+            "-c",
+            "user.email=private-fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--quiet",
+            "-m",
+            "private owner fixture",
+        ],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_env,
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "__file__",
+        str(source_root / "src" / "the_hive" / "runtime_lifecycle.py"),
+    )
+    profile = (
+        source_root
+        / "src"
+        / "the_hive"
+        / "markdown"
+        / "runtime-release-compatibility-v1.json"
+    )
+    raw_profile = profile.read_bytes()
+    profile_digest = hashlib.sha256(raw_profile).hexdigest()
+    source_commit, source_tree = runtime_lifecycle._source_tree_binding(source_root)
+    assert (
+        subprocess.run(
+            ["git", "-C", str(source_root), "status", "--porcelain=v1"],
+            check=True,
+            capture_output=True,
+            env=git_env,
+        ).stdout
+        == b""
+    )
+    release_root = fixture_bound.release_root
+    (release_root / ".the-hive-release-pointers.json").unlink()
+    HookSessionPinStoreV1.create_at(
+        fixture_bound.home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    )
+    predecessor_stage = tmp_path / "predecessor-stage"
+    predecessor_stage.mkdir(mode=0o700)
+    with runtime_lifecycle._bound_installer_entry(source_root) as entry:
+        private_installer = runpy.run_path(f"/proc/self/fd/{entry.descriptor}")
+        private_installer["_build_runtime_image"](
+            repository=source_root,
+            stage=predecessor_stage,
+            generation="e" * 40,
+            commit=source_commit,
+        )
+        private_installer["_publish_runtime_generation"](
+            stage=predecessor_stage,
+            release_root=release_root,
+        )
+    predecessor = runtime_lifecycle._runtime_identity(release_root)
+    assert isinstance(predecessor, Mapping) and predecessor["consumer_pin"] is True
+    runtime_lifecycle._revalidate_v2_predecessor(release_root, predecessor)
+    bound = runtime_lifecycle._bind_cutover_inputs(fixture_bound.home)
+    assert (bound.source_commit, bound.source_tree_digest) == (
+        source_commit,
+        source_tree,
+    )
+    qualification_root = tmp_path / "qualification-owner"
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canary_runtime_root", lambda: qualification_root
+    )
+    prepared_images: list[runtime_lifecycle._CanaryImage] = []
+    prepare_canary_image = runtime_lifecycle._prepare_canary_image
+
+    def capture_canary_image(**kwargs: object) -> runtime_lifecycle._CanaryImage:
+        image = prepare_canary_image(**kwargs)
+        prepared_images.append(image)
+        return image
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_prepare_canary_image", capture_canary_image
+    )
+    transient_manager = _CanaryManager(success=True)
+    manager_observations: list[str] = []
+
+    def private_systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if (
+            arguments[0] == "show"
+            and arguments[1] in runtime_lifecycle._V2_MANAGER_UNITS
+        ):
+            unit = arguments[1]
+            manager_observations.append(unit)
+            unit_path = fixture_bound.units / unit
+            try:
+                info = unit_path.lstat()
+            except FileNotFoundError:
+                return {
+                    "LoadState": "not-found",
+                    "UnitFileState": "",
+                    "ActiveState": "inactive",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                }
+            assert stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            return {
+                "LoadState": "loaded",
+                "UnitFileState": "disabled",
+                "ActiveState": "inactive",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            }
+        return transient_manager.systemctl(arguments)
+
+    def private_systemd_run(arguments: tuple[str, ...]) -> dict[str, str]:
+        result = transient_manager.run(arguments)
+        assert len(prepared_images) == 1
+        health = prepared_images[0].state_root / "hive-hourly-health.json"
+        assert not health.exists()
+        health.write_bytes(_canary_green_health())
+        health.chmod(0o600)
+        return result
+
+    canary_result = runtime_lifecycle.canary(
+        home=bound.home,
+        systemctl=private_systemctl,
+        systemd_run=private_systemd_run,
+    )
+    assert canary_result["status"] == "runtime_canary_green", canary_result
+    assert set(manager_observations) == set(runtime_lifecycle._V2_MANAGER_UNITS)
+    record = runtime_lifecycle._read_canary_qualification_record(qualification_root)
+    assert isinstance(record, Mapping) and record["status"] == "qualified"
+    assert record["criteria"]["runtime_canary"] == "pass"
+    assert record["criteria"]["runtime_features"] == "pass"
+
+    def reject_client_exec(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("public plan attempted client execution")
+
+    def reject_temp_home(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("public plan attempted temporary home creation")
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_run_pinned_client_command", reject_client_exec
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle.tempfile, "TemporaryDirectory", reject_temp_home
+    )
+
+    result = runtime_lifecycle.plan(
+        home=bound.home,
+        systemctl=private_systemctl,
+    )
+
+    assert result["status"] == "runtime_lifecycle_plan_ready", result
+    assert result["reason_codes"] == []
+    assert result["plan"]["compatibility"] == {
+        "status": "qualified",
+        "sha256": profile_digest,
+    }
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canonical_codex_client_digest", lambda: "e" * 64
+    )
+    changed = runtime_lifecycle.plan(
+        home=bound.home,
+        systemctl=private_systemctl,
+    )
+    assert changed["status"] == "runtime_lifecycle_plan_blocked", changed
+    assert "runtime_lifecycle_qualification_record_changed" in changed["reason_codes"]
+
+
+def test_public_recover_rejects_persisted_fixture_only_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "recover-home"
+    payload = _runtime_v2_payload(home)
+    payload["plan"]["qualification"] = {"status": "test_fixture_only"}
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+    _lifecycle_state(home)
+    path = runtime_lifecycle._v2_journal_path(home)
+    path.write_bytes(
+        runtime_lifecycle._d320_journal_envelope(
+            runtime_lifecycle._d320_canonical_json(payload)
+        )
+    )
+    path.chmod(0o600)
+    recovery_calls: list[str] = []
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_v2_recover_phase",
+        lambda **_kwargs: recovery_calls.append("recover") or {"status": "recovered"},
+    )
+
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=payload["plan_sha256"],
+        phase="recover",
+        systemctl=lambda _args: {},
+    )
+
+    assert result["status"] == "runtime_lifecycle_journal_invalid"
+    assert recovery_calls == []
+    assert path.exists()
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    (
+        ("expired", "runtime_lifecycle_qualification_record_expired"),
+        ("binding", "runtime_lifecycle_qualification_record_changed"),
+        ("profile_binding", "runtime_lifecycle_qualification_record_changed"),
+        ("client_binding", "runtime_lifecycle_qualification_record_changed"),
+        ("target_binding", "runtime_lifecycle_qualification_record_changed"),
+        ("manager_binding", "runtime_lifecycle_qualification_record_changed"),
+        ("manager_api_binding", "runtime_lifecycle_qualification_record_changed"),
+        ("manager_actions_unknown", ""),
+        ("client_behavior_unknown", ""),
+        (
+            "client_compatibility_unknown",
+            "runtime_lifecycle_qualification_record_unverified",
+        ),
+    ),
+)
+def test_public_resume_rebinds_qualification_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    reason: str,
+) -> None:
+    home = tmp_path / change
+    payload = _runtime_v2_payload(home)
+    source = payload["plan"]["source"]
+    predecessor = payload["plan"]["predecessor"]
+    compatibility = payload["plan"]["compatibility"]
+    issued_at = time.time_ns()
+    client_metadata = _client_metadata_fixture()
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_canary_client_metadata",
+        lambda _invocation: client_metadata,
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canonical_codex_client_digest", lambda: "a" * 64
+    )
+    current_manager_contract = _manager_api_contract_fixture()
+    if change == "manager_api_binding":
+        current_manager_contract = dict(current_manager_contract)
+        current_manager_contract["api_sha256"] = "e" * 64
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_manager_api_contract_snapshot",
+        lambda: current_manager_contract,
+    )
+    if change == "expired":
+        issued_at -= runtime_lifecycle._OWNER_RECEIPT_FRESHNESS_NS + 1
+    record = {
+        "bindings": {
+            "candidate_generation": source["commit"],
+            "candidate_manifest_digest": "sha256:" + "a" * 64,
+            "client": _client_metadata_fixture(),
+            "manager_states_sha256": hashlib.sha256(
+                runtime_lifecycle._d320_canonical_json(
+                    payload["plan"]["manager_states"]
+                )
+            ).hexdigest(),
+            "manager_api_contract": _manager_api_contract_fixture(),
+            "predecessor": {
+                key: predecessor[key]
+                for key in ("consumer_sha256", "generation", "manifest_digest")
+            },
+            "profile_sha256": compatibility["sha256"],
+            "source_commit": source["commit"],
+            "source_tree_sha256": source["tree_sha256"],
+            "target": dict(payload["plan"]["target"]),
+        },
+        "criteria": {
+            "client_behavior": (
+                "unknown"
+                if change in {"manager_actions_unknown", "client_behavior_unknown"}
+                else "pass"
+            ),
+            "client_probe": "pass",
+            "client_compatibility": (
+                "unknown" if change == "client_compatibility_unknown" else "pass"
+            ),
+            "manager_api_contract": "pass",
+            "manager_actions": "unknown",
+            "runtime_canary": "pass",
+            "runtime_features": "pass",
+        },
+        "issued_at_unix_ns": issued_at,
+        "owner_uid": os.geteuid(),
+        "schema_version": 1,
+        "status": "qualified",
+    }
+    if change == "binding":
+        record["bindings"]["source_commit"] = "f" * 40
+    elif change == "profile_binding":
+        record["bindings"]["profile_sha256"] = "f" * 64
+    elif change == "client_binding":
+        record["bindings"]["client"]["artifact_sha256"] = "f" * 64
+    elif change == "target_binding":
+        payload["plan"]["target"]["ino"] += 1
+        payload["target"] = dict(payload["plan"]["target"])
+    elif change == "manager_binding":
+        payload["plan"]["manager_states"][runtime_lifecycle._NEW_TIMER][
+            "ActiveState"
+        ] = "active"
+        payload["manager_pre"] = dict(payload["plan"]["manager_states"])
+    payload["plan"]["qualification"] = {
+        "status": "qualified",
+        "issued_at_unix_ns": issued_at,
+        "sha256": hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(record)
+        ).hexdigest(),
+    }
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+    _lifecycle_state(home)
+    path = runtime_lifecycle._v2_journal_path(home)
+    path.write_bytes(
+        runtime_lifecycle._d320_journal_envelope(
+            runtime_lifecycle._d320_canonical_json(payload)
+        )
+    )
+    path.chmod(0o600)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_read_canary_qualification_record", lambda _root: record
+    )
+    phase_calls: list[str] = []
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_v2_phase_plan",
+        lambda **_kwargs: phase_calls.append("phase") or {"status": "ready"},
+    )
+
+    result = runtime_lifecycle.plan(home=home, systemctl=lambda _args: {})
+
+    if change in {"manager_actions_unknown", "client_behavior_unknown"}:
+        assert result == {"status": "ready"}
+        assert phase_calls == ["phase"]
+        assert path.exists()
+        return
+    assert result["status"] == "runtime_lifecycle_plan_blocked"
+    assert result["reason_codes"] == [reason]
+    assert phase_calls == []
+    assert path.exists()
+
+
+def test_public_recovery_does_not_require_unexpired_forward_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "recovery-home"
+    payload = _runtime_v2_payload(home)
+    _lifecycle_state(home)
+    path = runtime_lifecycle._v2_journal_path(home)
+    path.write_bytes(
+        runtime_lifecycle._d320_journal_envelope(
+            runtime_lifecycle._d320_canonical_json(payload)
+        )
+    )
+    path.chmod(0o600)
+    recovery_calls: list[str] = []
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_v2_recover_phase",
+        lambda **_kwargs: recovery_calls.append("recover")
+        or {"status": "runtime_lifecycle_recovery_complete"},
+    )
+
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=payload["plan_sha256"],
+        phase="recover",
+        systemctl=lambda _args: {},
+    )
+
+    assert result["status"] == "runtime_lifecycle_recovery_complete"
+    assert recovery_calls == ["recover"]
+    assert path.exists()
+
+
+@pytest.mark.parametrize("decoder", ("from_payload", "from_bytes"))
+@pytest.mark.parametrize(
+    "invalid_compatibility",
+    (
+        {"status": "test_fixture_only", "sha256": "2" * 64},
+        {"status": "present_unvalidated", "sha256": "2" * 64},
+        {"status": "qualified", "sha256": "2" * 64, "extra": "field"},
+    ),
+)
+def test_runtime_lifecycle_v2_rejects_unqualified_compatibility(
+    tmp_path: Path, decoder: str, invalid_compatibility: dict[str, str]
+) -> None:
+    payload = _runtime_v2_payload(tmp_path / decoder)
+    payload["plan"]["compatibility"] = invalid_compatibility
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+
+    with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
+        if decoder == "from_payload":
+            runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+        else:
+            raw = runtime_lifecycle._d320_journal_envelope(
+                runtime_lifecycle._d320_canonical_json(payload)
+            )
+            runtime_lifecycle.D320CutoverJournalV2.from_bytes(raw)
+
+
+def test_public_resume_rejects_persisted_fixture_only_compatibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "compatibility-resume-home"
+    payload = _runtime_v2_payload(home)
+    compatibility_sha = payload["plan"]["compatibility"]["sha256"]
+    payload["plan"]["compatibility"] = {
+        "status": "test_fixture_only",
+        "sha256": compatibility_sha,
+    }
+    record = {
+        "bindings": {
+            "candidate_generation": payload["plan"]["source"]["commit"],
+            "candidate_manifest_digest": "sha256:" + "a" * 64,
+            "client": _client_metadata_fixture(),
+            "manager_states_sha256": hashlib.sha256(
+                runtime_lifecycle._d320_canonical_json(
+                    payload["plan"]["manager_states"]
+                )
+            ).hexdigest(),
+            "manager_api_contract": _manager_api_contract_fixture(),
+            "predecessor": {
+                key: payload["plan"]["predecessor"][key]
+                for key in ("consumer_sha256", "generation", "manifest_digest")
+            },
+            "profile_sha256": compatibility_sha,
+            "source_commit": payload["plan"]["source"]["commit"],
+            "source_tree_sha256": payload["plan"]["source"]["tree_sha256"],
+            "target": dict(payload["plan"]["target"]),
+        },
+        "criteria": {
+            "client_behavior": "pass",
+            "client_probe": "pass",
+            "client_compatibility": "pass",
+            "manager_api_contract": "pass",
+            "manager_actions": "unknown",
+            "runtime_canary": "pass",
+            "runtime_features": "pass",
+        },
+        "issued_at_unix_ns": 1,
+        "owner_uid": os.geteuid(),
+        "schema_version": 1,
+        "status": "qualified",
+    }
+    payload["plan"]["qualification"] = {
+        "status": "qualified",
+        "issued_at_unix_ns": 1,
+        "sha256": hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(record)
+        ).hexdigest(),
+    }
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+    _lifecycle_state(home)
+    journal_path = runtime_lifecycle._v2_journal_path(home)
+    journal_path.write_bytes(
+        runtime_lifecycle._d320_journal_envelope(
+            runtime_lifecycle._d320_canonical_json(payload)
+        )
+    )
+    journal_path.chmod(0o600)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_read_canary_qualification_record", lambda _root: record
+    )
+    monkeypatch.setattr(runtime_lifecycle.time, "time_ns", lambda: 2)
+    phase_calls: list[str] = []
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_v2_phase_plan",
+        lambda **_kwargs: phase_calls.append("phase") or {"status": "ready"},
+    )
+
+    result = runtime_lifecycle.plan(home=home, systemctl=lambda _args: {})
+
+    assert result["status"] == "runtime_lifecycle_journal_invalid"
+    assert phase_calls == []
+    assert journal_path.exists()
+
+
+def test_public_recover_rejects_persisted_fixture_only_compatibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "compatibility-recover-home"
+    payload = _runtime_v2_payload(home)
+    payload["plan"]["compatibility"]["status"] = "test_fixture_only"
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+    _lifecycle_state(home)
+    journal_path = runtime_lifecycle._v2_journal_path(home)
+    journal_path.write_bytes(
+        runtime_lifecycle._d320_journal_envelope(
+            runtime_lifecycle._d320_canonical_json(payload)
+        )
+    )
+    journal_path.chmod(0o600)
+    recovery_calls: list[str] = []
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_v2_recover_phase",
+        lambda **_kwargs: recovery_calls.append("recover") or {"status": "recovered"},
+    )
+
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=payload["plan_sha256"],
+        phase="recover",
+        systemctl=lambda _args: {},
+    )
+
+    assert result["status"] == "runtime_lifecycle_journal_invalid"
+    assert recovery_calls == []
+    assert journal_path.exists()
+
+
+def test_runtime_lifecycle_v2_store_uses_digest_fenced_atomic_successors(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "store-home"
+    first = runtime_lifecycle.D320CutoverJournalV2.from_payload(
+        _runtime_v2_payload(home)
+    )
+    _lifecycle_state(home)
+
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home, first, expected_digest=None, lease=lease
+        )
+
+    path = runtime_lifecycle._v2_journal_path(home)
+    assert runtime_lifecycle._v2_load_journal(home) == first
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_nlink == 1
+    next_payload = first.payload
+    next_payload["sequence"] = 2
+    next_payload["phase"] = "BLOCKED"
+    next_payload["steps"].append(
+        {
+            "sequence": 2,
+            "phase": "BLOCKED",
+            "action": "blocked",
+            "effect": str(path),
+            "sha256": "2" * 64,
+        }
+    )
+    successor = runtime_lifecycle.D320CutoverJournalV2.from_payload(next_payload)
+    current_digest = hashlib.sha256(first.to_bytes()).hexdigest()
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        with pytest.raises(
+            runtime_lifecycle.RuntimeLifecycleError,
+            match="^runtime_lifecycle_journal_changed$",
+        ):
+            runtime_lifecycle._v2_store_journal(
+                home, successor, expected_digest="0" * 64, lease=lease
+            )
+    assert runtime_lifecycle._v2_load_journal(home) == first
+
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home,
+            successor,
+            expected_digest=current_digest,
+            previous=first,
+            lease=lease,
+        )
+    assert runtime_lifecycle._v2_load_journal(home) == successor
+
+
+def test_runtime_lifecycle_v2_store_serializes_stale_writers_across_processes(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "multiprocess-home"
+    initial = runtime_lifecycle.D320CutoverJournalV2.from_payload(
+        _runtime_v2_payload(home)
+    )
+    _lifecycle_state(home)
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home, initial, expected_digest=None, lease=lease
+        )
+    next_payload = initial.payload
+    next_payload["sequence"] = 2
+    next_payload["phase"] = "BLOCKED"
+    next_payload["steps"].append(
+        {
+            "sequence": 2,
+            "phase": "BLOCKED",
+            "action": "blocked",
+            "effect": str(runtime_lifecycle._v2_journal_path(home)),
+            "sha256": "2" * 64,
+        }
+    )
+    successor = runtime_lifecycle.D320CutoverJournalV2.from_payload(next_payload)
+    expected = hashlib.sha256(initial.to_bytes()).hexdigest()
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    results = context.Queue()
+
+    def writer() -> None:
+        start.wait()
+        for _attempt in range(100):
+            try:
+                with runtime_lifecycle._lifecycle_lock(home) as lease:
+                    runtime_lifecycle._v2_store_journal(
+                        home,
+                        successor,
+                        expected_digest=expected,
+                        previous=initial,
+                        lease=lease,
+                    )
+            except runtime_lifecycle.RuntimeLifecycleError as exc:
+                if str(exc) == "runtime_lifecycle_busy":
+                    time.sleep(0.01)
+                    continue
+                results.put(str(exc))
+            else:
+                results.put("written")
+            return
+        results.put("runtime_lifecycle_busy")
+
+    writers = [context.Process(target=writer) for _ in range(2)]
+    for process in writers:
+        process.start()
+    start.set()
+    for process in writers:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    outcomes = sorted([results.get(timeout=2), results.get(timeout=2)])
+    assert outcomes == ["runtime_lifecycle_journal_changed", "written"]
+    assert runtime_lifecycle._v2_load_journal(home) == successor
+
+
+@pytest.mark.parametrize("hive_exists", [False, True])
+def test_runtime_lifecycle_v2_bootstrap_recovers_first_lock_creation(
+    tmp_path: Path, hive_exists: bool
+) -> None:
+    home = tmp_path / ("first-home-hive" if hive_exists else "first-home-clean")
+    home.mkdir(mode=0o700)
+    state_parent = home / ".local" / "state" / "codex-master-mcp"
+    for directory in (
+        home / ".local",
+        home / ".local" / "state",
+        state_parent,
+    ):
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+    if hive_exists:
+        (state_parent / "hive").mkdir(mode=0o700)
+
+    runtime_lifecycle._v2_bootstrap_store(home)
+
+    lock = state_parent / "hive" / ".runtime-lifecycle.lock"
+    assert lock.is_file() and lock.stat().st_mode & 0o777 == 0o600
+    assert lock.stat().st_nlink == 1
+    assert runtime_lifecycle._v2_load_journal(home) is None
+    assert not (home / ".local" / "lib").exists()
+    assert not (home / ".config" / "systemd" / "user").exists()
+
+
+def test_public_recover_holds_on_unjournaled_file_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "recover-drift-home"
+    payload = _runtime_v2_payload(home)
+    _lifecycle_state(home)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "d" * 64),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+    states = {
+        unit: {
+            "LoadState": "loaded",
+            "UnitFileState": "disabled",
+            "ActiveState": "inactive",
+        }
+        for unit in runtime_lifecycle._V2_MANAGER_UNITS
+    }
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home, journal, expected_digest=None, lease=lease
+        )
+    snapshot = payload["files"][0]
+    changed_path = Path(snapshot["path"])
+    changed_path.parent.mkdir(mode=0o700, parents=True)
+    changed_path.write_bytes(b"unrecorded change\n")
+    recorded_journal_bytes = runtime_lifecycle._v2_journal_path(home).read_bytes()
+
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=journal.payload["plan_sha256"],
+        phase="recover",
+        systemctl=systemctl,
+    )
+
+    assert result["status"] == "runtime_lifecycle_recovery_hold", result
+    assert (
+        runtime_lifecycle._v2_journal_path(home).read_bytes() == recorded_journal_bytes
+    )
+    assert changed_path.read_bytes() == b"unrecorded change\n"
+
+
+def test_public_recover_holds_on_same_bytes_replaced_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "recover-inode-home"
+    payload = _runtime_v2_payload(home)
+    _lifecycle_state(home)
+    snapshot = payload["files"][0]
+    path = Path(snapshot["path"])
+    path.parent.mkdir(mode=0o700, parents=True)
+    for directory in (home / ".local", home / ".local/lib", path.parent):
+        directory.chmod(0o700)
+    original = b'{"schema_version":1,"current":null,"previous":null}\n'
+    path.write_bytes(original)
+    path.chmod(0o644)
+    info = path.lstat()
+    snapshot.update(
+        present=True,
+        bytes_b64=base64.b64encode(original).decode("ascii"),
+        sha256=hashlib.sha256(original).hexdigest(),
+        dev=info.st_dev,
+        ino=info.st_ino,
+        uid=info.st_uid,
+        gid=info.st_gid,
+        mode=0o644,
+        nlink=info.st_nlink,
+        size=len(original),
+    )
+    payload["plan"]["files"][0].update(
+        present=True,
+        sha256=snapshot["sha256"],
+        mode=0o644,
+        dev=info.st_dev,
+        ino=info.st_ino,
+        uid=info.st_uid,
+        gid=info.st_gid,
+        nlink=info.st_nlink,
+    )
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+    payload["steps"][0]["sha256"] = payload["plan_sha256"]
+    payload["extra_effects"] = runtime_lifecycle._v2_capture_effects(
+        home, payload["source"]["commit"], payload["stage_name"]
+    )
+    journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home, journal, expected_digest=None, lease=lease
+        )
+    inode_before = path.lstat().st_ino
+    path.unlink()
+    path.write_bytes(original)
+    path.chmod(0o644)
+    assert path.lstat().st_ino != inode_before
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "d" * 64),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+
+    states = payload["manager_pre"]
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=journal.payload["plan_sha256"],
+        phase="recover",
+        systemctl=systemctl,
+    )
+    assert result["status"] == "runtime_lifecycle_recovery_hold", result
+    assert path.read_bytes() == original
+    assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "INTENT"
+
+
+def test_v2_file_snapshot_identity_rejects_same_bytes_with_another_inode(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "attested-file"
+    content = b"same content, different physical object\n"
+    path.write_bytes(content)
+    path.chmod(0o644)
+    before = path.lstat()
+    snapshot = {
+        "present": True,
+        "dev": before.st_dev,
+        "ino": before.st_ino,
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "mode": 0o644,
+        "nlink": before.st_nlink,
+        "size": before.st_size,
+    }
+    assert runtime_lifecycle._v2_file_snapshot_identity_matches(path, snapshot)
+
+    path.unlink()
+    path.write_bytes(content)
+    path.chmod(0o644)
+    assert path.lstat().st_ino != before.st_ino
+    assert not runtime_lifecycle._v2_file_snapshot_identity_matches(path, snapshot)
+
+
+def test_public_recover_does_not_remove_unbound_preexisting_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "recover-stage-home"
+    payload = _runtime_v2_payload(home)
+    _lifecycle_state(home)
+    library = home / ".local/lib"
+    library.mkdir(mode=0o700, parents=True)
+    (home / ".local").chmod(0o700)
+    library.chmod(0o700)
+    stage = library / payload["stage_name"]
+    stage.mkdir(mode=0o700)
+    marker = stage / "foreign-marker"
+    marker.write_bytes(b"retain me\n")
+    marker.chmod(0o600)
+    payload["extra_effects"] = runtime_lifecycle._v2_capture_effects(
+        home, payload["source"]["commit"], payload["stage_name"]
+    )
+    journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home, journal, expected_digest=None, lease=lease
+        )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "d" * 64),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+
+    states = payload["manager_pre"]
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=journal.payload["plan_sha256"],
+        phase="recover",
+        systemctl=systemctl,
+    )
+    assert result["status"] == "runtime_lifecycle_recovery_hold", result
+    assert marker.read_bytes() == b"retain me\n"
+    assert runtime_lifecycle._v2_journal_path(home).read_bytes() == journal.to_bytes()
+
+
+@pytest.mark.parametrize("replace_with_foreign_inode", [False, True])
+def test_public_recover_sealed_stage_requires_reserved_physical_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_with_foreign_inode: bool,
+) -> None:
+    home, payload, journal, stage, generation, installer = _sealed_v2_recovery_fixture(
+        tmp_path / "sealed", published=False
+    )
+    if replace_with_foreign_inode:
+        replacement = stage.with_name(stage.name + ".replacement")
+        shutil.copytree(stage, replacement)
+        original_inode = stage.lstat().st_ino
+        shutil.rmtree(stage)
+        replacement.rename(stage)
+        assert stage.lstat().st_ino != original_inode
+        from the_hive.runtime_layout import RuntimeLayout
+
+        assert (
+            RuntimeLayout.from_runtime_root(stage).manifest_digest
+            == payload["sealed"]["manifest_digest"]
+        )
+    stage_inode = stage.lstat().st_ino
+    _patch_recovery_runtime_validation(monkeypatch, installer)
+    _patch_recovery_bindings(monkeypatch)
+
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=journal.payload["plan_sha256"],
+        phase="recover",
+        systemctl=_recovery_systemctl(payload),
+    )
+
+    if replace_with_foreign_inode:
+        assert result["status"] == "runtime_lifecycle_recovery_hold", result
+        assert stage.lstat().st_ino == stage_inode
+        from the_hive.runtime_layout import RuntimeLayout
+
+        assert (
+            RuntimeLayout.from_runtime_root(stage).manifest_digest
+            == payload["sealed"]["manifest_digest"]
+        )
+        assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "SEALED"
+    else:
+        assert result["status"] == "runtime_lifecycle_recovery_complete", result
+        assert not stage.exists()
+
+
+@pytest.mark.parametrize("replace_with_foreign_inode", [False, True])
+def test_public_recover_published_generation_requires_stage_inode_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_with_foreign_inode: bool,
+) -> None:
+    home, payload, journal, stage, generation, installer = _sealed_v2_recovery_fixture(
+        tmp_path / "published", published=True
+    )
+    if replace_with_foreign_inode:
+        replacement = generation.with_name(generation.name + ".replacement")
+        shutil.copytree(generation, replacement)
+        original_inode = generation.lstat().st_ino
+        shutil.rmtree(generation)
+        replacement.rename(generation)
+        assert generation.lstat().st_ino != original_inode
+        from the_hive.runtime_layout import RuntimeLayout
+
+        assert (
+            RuntimeLayout.from_runtime_root(generation).manifest_digest
+            == payload["sealed"]["manifest_digest"]
+        )
+    generation_inode = generation.lstat().st_ino
+    _patch_recovery_runtime_validation(monkeypatch, installer)
+    _patch_recovery_bindings(
+        monkeypatch,
+        generation=payload["source"]["commit"],
+        manifest_digest=payload["sealed"]["manifest_digest"],
+    )
+    result = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=journal.payload["plan_sha256"],
+        phase="recover",
+        systemctl=_recovery_systemctl(payload),
+    )
+
+    if replace_with_foreign_inode:
+        assert result["status"] == "runtime_lifecycle_recovery_hold", result
+        assert generation.lstat().st_ino == generation_inode
+        from the_hive.runtime_layout import RuntimeLayout
+
+        assert (
+            RuntimeLayout.from_runtime_root(generation).manifest_digest
+            == payload["sealed"]["manifest_digest"]
+        )
+        assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "INSTALLED"
+    else:
+        assert result["status"] == "runtime_lifecycle_recovery_complete", result
+        assert not generation.exists()
+
+
+def _sealed_v2_recovery_fixture(
+    root: Path, *, published: bool
+) -> tuple[Path, dict[str, object], object, Path, Path, dict[str, object]]:
+    home = root / "home"
+    root.mkdir(mode=0o700)
+    payload = _runtime_v2_payload(home)
+    _lifecycle_state(home)
+    library = home / ".local/lib"
+    release = library / "the-hive-runtime"
+    generations = release / "generations"
+    library.mkdir(mode=0o700, parents=True)
+    release.mkdir(mode=0o700)
+    generations.mkdir(mode=0o700)
+    stage = library / payload["stage_name"]
+    temporary = runtime_lifecycle._v2_setup_temp_path(payload, stage)
+    temporary.mkdir(mode=0o700)
+    generation = generations / payload["source"]["commit"]
+    installer = runpy.run_path(
+        os.fspath(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+        runtime_lifecycle._v2_store_journal(
+            home, journal, expected_digest=None, lease=lease
+        )
+        installer["_build_runtime_image"](
+            repository=ROOT,
+            stage=temporary,
+            generation=payload["source"]["commit"],
+            commit=payload["source"]["commit"],
+        )
+        reservation = runtime_lifecycle._v2_setup_reservation_digest(temporary, stage)
+        journal = runtime_lifecycle._v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="INTENT",
+            action="effect_created",
+            effect=str(temporary),
+            digest=reservation,
+        )
+        os.replace(temporary, stage)
+        from the_hive.runtime_layout import RuntimeLayout
+
+        layout = RuntimeLayout.from_runtime_root(stage)
+        hourly_service, hourly_timer = installer["_staged_hourly_probe_unit_bytes"](
+            layout=layout, generation=payload["source"]["commit"]
+        )
+        pricing_service, pricing_timer = installer[
+            "_staged_pricing_inventory_unit_bytes"
+        ](layout=layout)
+        output_bytes = {
+            "mcp_launcher": installer["_attested_stable_mcp_launcher_bytes"](layout),
+            "hourly_service": hourly_service,
+            "hourly_timer": hourly_timer,
+            "pricing_launcher": installer["_attested_pricing_inventory_launcher_bytes"](
+                layout
+            ),
+            "pricing_service": pricing_service,
+            "pricing_timer": pricing_timer,
+            "legacy_launcher": installer["_attested_legacy_probe_launcher_bytes"](
+                layout
+            ),
+        }
+        sealed = {
+            "generation": payload["source"]["commit"],
+            "manifest_digest": layout.manifest_digest,
+            "output_sha256": {
+                name: hashlib.sha256(content).hexdigest()
+                for name, content in output_bytes.items()
+            },
+            "stage_identity_sha256": runtime_lifecycle._v2_setup_reservation_digest(
+                stage, stage
+            ),
+            "generation_identity_sha256": runtime_lifecycle._v2_setup_reservation_digest(
+                stage, generation, parent_path=generation.parent
+            ),
+        }
+        journal = runtime_lifecycle._v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="SEALED",
+            action="stage_sealed",
+            effect=str(stage),
+            digest=layout.manifest_digest.removeprefix("sha256:"),
+            updates={"sealed": sealed},
+        )
+        if published:
+            os.replace(stage, generation)
+            journal = runtime_lifecycle._v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="INSTALLED",
+                action="generation_published",
+                effect=str(generation),
+                digest=layout.manifest_digest.removeprefix("sha256:"),
+            )
+    return home, journal.payload, journal, stage, generation, installer
+
+
+def _patch_recovery_runtime_validation(
+    monkeypatch: pytest.MonkeyPatch, installer: dict[str, object]
+) -> None:
+    installer["_validate_runtime_image_stage"] = lambda **_kwargs: None
+    real_run_path = runpy.run_path
+
+    def fixture_run_path(path: str, *args: object, **kwargs: object):
+        if os.fspath(path).endswith("the-hive-hive-hourly-probe-install"):
+            return installer
+        return real_run_path(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_lifecycle.runpy, "run_path", fixture_run_path)
+
+
+def _patch_recovery_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    generation: str | None = None,
+    manifest_digest: str = "sha256:" + "0" * 64,
+) -> None:
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "d" * 64),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+    if generation is not None:
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "_runtime_identity",
+            lambda _release_root: {
+                "generation": generation,
+                "manifest_digest": manifest_digest,
+            },
+        )
+
+
+def _recovery_systemctl(payload: dict[str, object]):
+    states = payload["manager_pre"]
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    return systemctl
+
+
+def test_public_recover_resumes_after_own_atomic_file_restore_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "recover-own-restore-home"
+    payload = _runtime_v2_observed_payload(home)
+    _lifecycle_state(home)
+    original = b'{"schema_version":1,"current":null,"previous":null}\n'
+    current = b'{"schema_version":1,"current":"new","previous":null}\n'
+    snapshot = payload["files"][0]
+    path = Path(snapshot["path"])
+    path.parent.mkdir(mode=0o700, parents=True)
+    for directory in (home / ".local", home / ".local/lib", path.parent):
+        directory.chmod(0o700)
+    path.write_bytes(original)
+    path.chmod(0o644)
+    before = path.lstat()
+    snapshot.update(
+        present=True,
+        bytes_b64=base64.b64encode(original).decode("ascii"),
+        sha256=hashlib.sha256(original).hexdigest(),
+        dev=before.st_dev,
+        ino=before.st_ino,
+        uid=before.st_uid,
+        gid=before.st_gid,
+        mode=0o644,
+        nlink=before.st_nlink,
+        size=len(original),
+    )
+    planned = payload["plan"]["files"][0]
+    planned.update(
+        present=True,
+        sha256=snapshot["sha256"],
+        mode=0o644,
+        dev=before.st_dev,
+        ino=before.st_ino,
+        uid=before.st_uid,
+        gid=before.st_gid,
+        nlink=before.st_nlink,
+    )
+    payload["plan_sha256"] = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(payload["plan"])
+    ).hexdigest()
+    payload["steps"][0]["sha256"] = payload["plan_sha256"]
+
+    path.write_bytes(current)
+    path.chmod(0o644)
+    after = path.lstat()
+    post_snapshot = copy.deepcopy(snapshot)
+    post_snapshot.update(
+        bytes_b64=base64.b64encode(current).decode("ascii"),
+        sha256=hashlib.sha256(current).hexdigest(),
+        dev=after.st_dev,
+        ino=after.st_ino,
+        uid=after.st_uid,
+        gid=after.st_gid,
+        nlink=after.st_nlink,
+        size=len(current),
+    )
+    payload["post"]["files"][0] = post_snapshot
+    payload["extra_effects"] = runtime_lifecycle._v2_capture_effects(
+        home, payload["source"]["commit"], payload["stage_name"]
+    )
+    payload["post"]["extra_effects"] = copy.deepcopy(payload["extra_effects"])
+    for step in payload["steps"]:
+        if step["phase"] != "OBSERVED" or step["action"] != "effect_readback":
+            continue
+        observed = next(
+            item
+            for item in payload["post"]["files"] + payload["post"]["extra_effects"]
+            if item["path"] == step["effect"]
+        )
+        step["sha256"] = hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(observed)
+        ).hexdigest()
+    observed_journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+
+    initial_payload = copy.deepcopy(payload)
+    initial_payload.update(phase="INTENT", sequence=1, sealed=None, post=None)
+    initial_payload["steps"] = [copy.deepcopy(payload["steps"][0])]
+    initial_journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(
+        initial_payload
+    )
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home, initial_journal, expected_digest=None, lease=lease
+        )
+        journal = runtime_lifecycle._v2_transition(
+            home,
+            initial_journal,
+            lease=lease,
+            phase="SEALED",
+            action="stage_sealed",
+            effect=next(
+                item["path"]
+                for item in payload["extra_effects"]
+                if item["kind"] == "stage"
+            ),
+            digest=payload["sealed"]["manifest_digest"][7:],
+            updates={"sealed": payload["sealed"]},
+        )
+        journal = runtime_lifecycle._v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="INSTALLED",
+            action="generation_published",
+            effect=next(
+                item["path"]
+                for item in payload["extra_effects"]
+                if item["kind"] == "generation"
+            ),
+            digest=payload["sealed"]["manifest_digest"][7:],
+        )
+        journal = runtime_lifecycle._v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="ACTIVATED",
+            action="manager_mutation",
+            effect="manager:" + runtime_lifecycle._NEW_TIMER,
+            digest="2" * 64,
+        )
+        readbacks = [
+            (
+                "effect_readback",
+                item["path"],
+                hashlib.sha256(
+                    runtime_lifecycle._d320_canonical_json(item)
+                ).hexdigest(),
+            )
+            for item in payload["post"]["files"] + payload["post"]["extra_effects"]
+        ] + [
+            (
+                "manager_readback",
+                "manager:" + unit,
+                hashlib.sha256(
+                    runtime_lifecycle._d320_canonical_json(state)
+                ).hexdigest(),
+            )
+            for unit, state in payload["post"]["manager_states"].items()
+        ]
+        first, *rest = readbacks
+        runtime_lifecycle._v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="OBSERVED",
+            action=first[0],
+            effect=first[1],
+            digest=first[2],
+            updates={"post": payload["post"]},
+            additional_steps=tuple(rest),
+        )
+
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "d" * 64),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_runtime_identity",
+        lambda _release_root: {
+            "generation": observed_journal.payload["sealed"]["generation"],
+            "manifest_digest": observed_journal.payload["sealed"]["manifest_digest"],
+        },
+    )
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        return payload["manager_pre"][arguments[1]] if arguments[0] == "show" else {}
+
+    atomic_restore = runtime_lifecycle._atomic_restore
+
+    class SimulatedProcessDeath(BaseException):
+        pass
+
+    def die_after_replace(
+        target: Path, content: bytes, mode: int, **kwargs: object
+    ) -> None:
+        atomic_restore(target, content, mode, **kwargs)
+        if target == path:
+            raise SimulatedProcessDeath
+
+    monkeypatch.setattr(runtime_lifecycle, "_atomic_restore", die_after_replace)
+    with pytest.raises(SimulatedProcessDeath):
+        runtime_lifecycle.cutover(
+            home=home,
+            plan_sha256=observed_journal.payload["plan_sha256"],
+            phase="recover",
+            systemctl=systemctl,
+        )
+    assert path.read_bytes() == original
+    assert path.lstat().st_ino != before.st_ino
+    assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "RECOVERING"
+
+    monkeypatch.setattr(runtime_lifecycle, "_atomic_restore", atomic_restore)
+    resumed = runtime_lifecycle.cutover(
+        home=home,
+        plan_sha256=observed_journal.payload["plan_sha256"],
+        phase="recover",
+        systemctl=systemctl,
+    )
+    assert resumed["status"] == "runtime_lifecycle_recovery_complete", resumed
+
+
+def test_public_recover_rolls_back_durable_intent_without_product_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    home = tmp_path / "recover-home"
+    payload = _runtime_v2_payload(home)
+    _lifecycle_state(home)
+    payload["extra_effects"] = runtime_lifecycle._v2_capture_effects(
+        home, payload["source"]["commit"], payload["stage_name"]
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: ("a" * 40, "d" * 64),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_runtime_identity",
+        lambda _release_root: {
+            "generation": "e" * 40,
+            "manifest_digest": "sha256:" + "f" * 64,
+            "consumer_pin": True,
+            "consumer_sha256": "1" * 64,
+        },
+    )
+    states = {
+        unit: {
+            "LoadState": "loaded",
+            "UnitFileState": "disabled",
+            "ActiveState": "inactive",
+        }
+        for unit in runtime_lifecycle._V2_MANAGER_UNITS
+    }
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+    with runtime_lifecycle._lifecycle_lock(home) as lease:
+        runtime_lifecycle._v2_store_journal(
+            home, journal, expected_digest=None, lease=lease
+        )
+    monkeypatch.setattr(runtime_lifecycle, "_systemctl_default", systemctl)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "cutover",
+            "--home",
+            str(home),
+            "--plan-sha256",
+            journal.payload["plan_sha256"],
+            "--phase",
+            "recover",
+        ],
+    )
+    assert runtime_lifecycle.main() == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "runtime_lifecycle_recovery_complete", result
+    final = runtime_lifecycle._v2_load_journal(home)
+    assert final.payload["phase"] == "ROLLED_BACK"
+    assert final.payload["recovery_count"] == 1
+    assert not (home / ".local" / "lib").exists()
+    assert not (home / ".config" / "systemd" / "user").exists()
+
+
+def test_runtime_lifecycle_v2_rejects_boolean_only_consumer_pin(
+    tmp_path: Path,
+) -> None:
+    payload = _runtime_v2_payload(tmp_path / "consumer-pin")
+    payload["predecessor"] = {
+        "generation": "e" * 40,
+        "manifest_digest": "sha256:" + "f" * 64,
+        "consumer_pin": True,
+    }
+
+    with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
+        runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+
+
+def test_runtime_lifecycle_v2_successor_is_monotone_and_post_is_single_assignment(
+    tmp_path: Path,
+) -> None:
+    initial = runtime_lifecycle.D320CutoverJournalV2.from_payload(
+        _runtime_v2_payload(tmp_path / "successor")
+    )
+    next_payload = initial.payload
+    next_payload["sequence"] = 2
+    next_payload["phase"] = "SEALED"
+    next_payload["sealed"] = {
+        "generation": "a" * 40,
+        "manifest_digest": "sha256:" + "1" * 64,
+        "stage_identity_sha256": "2" * 64,
+        "generation_identity_sha256": "3" * 64,
+        "output_sha256": {
+            key: "c" * 64
+            for key in (
+                "mcp_launcher",
+                "hourly_service",
+                "hourly_timer",
+                "pricing_launcher",
+                "pricing_service",
+                "pricing_timer",
+                "legacy_launcher",
+            )
+        },
+    }
+    stage_path = next(
+        effect["path"]
+        for effect in next_payload["extra_effects"]
+        if effect["kind"] == "stage"
+    )
+    next_payload["steps"].append(
+        {
+            "sequence": 2,
+            "phase": "SEALED",
+            "action": "stage_sealed",
+            "effect": stage_path,
+            "sha256": "1" * 64,
+        }
+    )
+    sealed = runtime_lifecycle.D320CutoverJournalV2.from_payload(next_payload)
+    successor_validator = getattr(
+        runtime_lifecycle, "validate_d320_v2_journal_successor", None
+    )
+    assert callable(successor_validator)
+    assert successor_validator(initial, sealed) is None
+
+    with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
+        successor_validator(sealed, initial)
+
+
+def _runtime_v2_observed_payload(home: Path) -> dict[str, object]:
+    payload = _runtime_v2_payload(home)
+    sequence = 1
+
+    def append_step(
+        phase: str, action: str, effect: str, digest: str = "2" * 64
+    ) -> None:
+        nonlocal sequence
+        sequence += 1
+        payload["steps"].append(
+            {
+                "sequence": sequence,
+                "phase": phase,
+                "action": action,
+                "effect": effect,
+                "sha256": digest,
+            }
+        )
+        payload["phase"] = phase
+        payload["sequence"] = sequence
+
+    payload["sealed"] = {
+        "generation": "a" * 40,
+        "manifest_digest": "sha256:" + "1" * 64,
+        "stage_identity_sha256": "2" * 64,
+        "generation_identity_sha256": "3" * 64,
+        "output_sha256": {
+            key: "c" * 64
+            for key in (
+                "mcp_launcher",
+                "hourly_service",
+                "hourly_timer",
+                "pricing_launcher",
+                "pricing_service",
+                "pricing_timer",
+                "legacy_launcher",
+            )
+        },
+    }
+    stage_path = next(
+        effect["path"]
+        for effect in payload["extra_effects"]
+        if effect["kind"] == "stage"
+    )
+    generation_path = next(
+        effect["path"]
+        for effect in payload["extra_effects"]
+        if effect["kind"] == "generation"
+    )
+    append_step("SEALED", "stage_sealed", stage_path, "1" * 64)
+    append_step("INSTALLED", "generation_published", generation_path, "1" * 64)
+    append_step(
+        "ACTIVATED",
+        "manager_mutation",
+        "manager:" + runtime_lifecycle._NEW_TIMER,
+    )
+    payload["post"] = {
+        "files": copy.deepcopy(payload["files"]),
+        "extra_effects": copy.deepcopy(payload["extra_effects"]),
+        "manager_states": copy.deepcopy(payload["manager_pre"]),
+    }
+    for item in payload["files"]:
+        append_step(
+            "OBSERVED",
+            "effect_readback",
+            item["path"],
+            hashlib.sha256(runtime_lifecycle._d320_canonical_json(item)).hexdigest(),
+        )
+    for item in payload["extra_effects"]:
+        append_step(
+            "OBSERVED",
+            "effect_readback",
+            item["path"],
+            hashlib.sha256(runtime_lifecycle._d320_canonical_json(item)).hexdigest(),
+        )
+    for unit in runtime_lifecycle._V2_MANAGER_UNITS:
+        state = payload["manager_pre"][unit]
+        append_step(
+            "OBSERVED",
+            "manager_readback",
+            "manager:" + unit,
+            hashlib.sha256(runtime_lifecycle._d320_canonical_json(state)).hexdigest(),
+        )
+    return payload
+
+
+def test_runtime_lifecycle_v2_rejects_observed_post_drift(
+    tmp_path: Path,
+) -> None:
+    observed = runtime_lifecycle.D320CutoverJournalV2.from_payload(
+        _runtime_v2_observed_payload(tmp_path / "observed")
+    )
+    changed = observed.payload
+    changed["sequence"] += 1
+    changed["phase"] = "COMMITTED"
+    changed["steps"].append(
+        {
+            "sequence": changed["sequence"],
+            "phase": "COMMITTED",
+            "action": "commit_verified",
+            "effect": next(
+                effect["path"]
+                for effect in changed["extra_effects"]
+                if effect["kind"] == "journal"
+            ),
+            "sha256": "3" * 64,
+        }
+    )
+    changed["post"]["manager_states"][runtime_lifecycle._NEW_TIMER]["ActiveState"] = (
+        "failed"
+    )
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError,
+        match="^d320_v2_post_readback_incomplete$",
+    ):
+        runtime_lifecycle.D320CutoverJournalV2.from_payload(changed)
+
     payload = _d332_payload(state="ROOT_ABI_VERIFIED", sequence=2)
     payload["history"][1]["at_unix_ms"] = 103
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.D320CutoverJournalV1.from_payload(payload)
+
+
+def test_runtime_lifecycle_v2_owner_evidence_uses_only_fixed_receipt_paths(
+    tmp_path: Path,
+) -> None:
+    payload = _runtime_v2_observed_payload(tmp_path / "owner-evidence")
+    payload["sequence"] += 1
+    payload["steps"].append(
+        {
+            "sequence": payload["sequence"],
+            "phase": "OBSERVED",
+            "action": "owner_evidence_readback",
+            "effect": str(tmp_path / "foreign-receipt.json"),
+            "sha256": "4" * 64,
+        }
+    )
+
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError,
+        match="d320_v2_step_binding_invalid",
+    ):
+        runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+
+
+def _root_hook_effect_fixture(root: Path, *, issued_at_unix_ns: int) -> tuple[str, str]:
+    lock = root / ".root-hook-abi-owner.lock"
+    lock.write_bytes(b"\n")
+    lock.chmod(0o644)
+    target = root / "v1"
+    (target / "allowlists").mkdir(parents=True, mode=0o755)
+    files = {
+        "launcher": (b"#!/bin/sh\n", 0o755),
+        "hook_session_pin_store.py": (b"PIN_STORE = 1\n", 0o644),
+        "hook_abi_v1_core.py": (b"CORE = 1\n", 0o644),
+    }
+    allowlist = b'{"allow":true}\n'
+    files["allowlists/" + hashlib.sha256(allowlist).hexdigest() + ".json"] = (
+        allowlist,
+        0o644,
+    )
+    payload = {}
+    for name, (content, mode) in files.items():
+        path = target / name
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        path.write_bytes(content)
+        path.chmod(mode)
+        payload[name] = {
+            "mode": mode,
+            "nlink": 1,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+    generation = "a" * 40
+    manifest_digest = "sha256:" + "b" * 64
+    receipt = {
+        "effect": "root_hook_abi_verified_present",
+        "files": payload,
+        "generation": generation,
+        "issued_at_unix_ns": issued_at_unix_ns,
+        "manifest_digest": manifest_digest,
+        "owner": "root_hook_abi_v1",
+        "root_uid": os.geteuid(),
+        "schema_version": 1,
+        "source_uid": os.geteuid(),
+        "target": str(target),
+    }
+    (root / "root-hook-effect-receipt-v1.json").write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    return generation, manifest_digest
+
+
+def test_root_hook_receipt_consumer_binds_fresh_physical_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(
+        parent, issued_at_unix_ns=time.time_ns()
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    receipt_digest = runtime_lifecycle._verify_root_hook_effect_receipt(
+        generation=generation, manifest_digest=manifest_digest
+    )
+
+    assert len(receipt_digest) == 64
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_effect_unverified",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation="c" * 40, manifest_digest=manifest_digest
+        )
+    unexpected = parent / "v1/unexpected"
+    unexpected.write_bytes(b"extra root member\n")
+    unexpected.chmod(0o644)
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_effect_unverified",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+    unexpected.unlink()
+    (parent / "v1/hook_abi_v1_core.py").write_bytes(b"CORE = changed\n")
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_root_hook_effect_unverified",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def test_root_hook_receipt_consumer_holds_expired_or_wrong_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root-owner"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    generation, manifest_digest = _root_hook_effect_fixture(parent, issued_at_unix_ns=1)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.geteuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getegid())
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_owner_receipt_expired",
+    ):
+        runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def _plugin_release_effect_fixture(
+    home: Path, *, issued_at_unix_ns: int
+) -> tuple[str, str]:
+    generation = "a" * 40
+    manifest_digest = "sha256:" + "b" * 64
+    state_root = home / ".local/state/codex-master-mcp/hive"
+    plugin = home / "plugins/the-hive"
+    marketplace_path = home / ".agents/plugins/marketplace.json"
+    for directory in (state_root, plugin, marketplace_path.parent):
+        directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+    descriptor = b'{"release":"fixture"}\n'
+    marketplace = b'{"name":"personal","plugins":[]}\n'
+    target = plugin / "release-binding.json"
+    target.write_bytes(descriptor)
+    target.chmod(0o644)
+    marketplace_path.write_bytes(marketplace)
+    marketplace_path.chmod(0o644)
+    target_info = target.stat()
+    plugin_info = plugin.stat()
+    receipt = {
+        "descriptor_sha256": "sha256:" + hashlib.sha256(descriptor).hexdigest(),
+        "effect": "plugin_release_descriptor_verified_present",
+        "generation": generation,
+        "issued_at_unix_ns": issued_at_unix_ns,
+        "manifest_digest": manifest_digest,
+        "marketplace_sha256": hashlib.sha256(marketplace).hexdigest(),
+        "owner": "plugin_release_publisher",
+        "plugin_identity": {"dev": plugin_info.st_dev, "ino": plugin_info.st_ino},
+        "schema_version": 1,
+        "target": "plugins/the-hive/release-binding.json",
+        "target_identity": {
+            "dev": target_info.st_dev,
+            "gid": target_info.st_gid,
+            "ino": target_info.st_ino,
+            "mode": stat.S_IMODE(target_info.st_mode),
+            "nlink": target_info.st_nlink,
+            "size": target_info.st_size,
+            "uid": target_info.st_uid,
+        },
+    }
+    receipt_path = state_root / "plugin-release-effect-receipt-v1.json"
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    receipt_path.chmod(0o600)
+    return generation, manifest_digest
+
+
+def test_plugin_release_receipt_consumer_binds_fresh_physical_effect(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    generation, manifest_digest = _plugin_release_effect_fixture(
+        home, issued_at_unix_ns=time.time_ns()
+    )
+
+    receipt_digest = runtime_lifecycle._verify_plugin_release_effect_receipt(
+        home=home, generation=generation, manifest_digest=manifest_digest
+    )
+
+    assert len(receipt_digest) == 64
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_plugin_effect_unverified",
+    ):
+        runtime_lifecycle._verify_plugin_release_effect_receipt(
+            home=home,
+            generation="c" * 40,
+            manifest_digest=manifest_digest,
+        )
+    (home / "plugins/the-hive/release-binding.json").write_bytes(b"changed\n")
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_plugin_effect_unverified",
+    ):
+        runtime_lifecycle._verify_plugin_release_effect_receipt(
+            home=home, generation=generation, manifest_digest=manifest_digest
+        )
+
+
+def test_plugin_release_receipt_consumer_holds_expired_or_wrong_generation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    generation, manifest_digest = _plugin_release_effect_fixture(
+        home, issued_at_unix_ns=1
+    )
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_owner_receipt_expired",
+    ):
+        runtime_lifecycle._verify_plugin_release_effect_receipt(
+            home=home, generation=generation, manifest_digest=manifest_digest
+        )

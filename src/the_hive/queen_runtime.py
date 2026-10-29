@@ -136,9 +136,16 @@ class QueenRuntimeHomeManager:
         generation: int,
     ) -> QueenRuntimeHome:
         """Create one new numbered home, atomically bound to its lease."""
-        if not all(_valid_identifier(item) for item in (principal_id, repository_id, lease_id, fence)):
+        if not all(
+            _valid_identifier(item)
+            for item in (principal_id, repository_id, lease_id, fence)
+        ):
             raise QueenRuntimeError("invalid_queen_runtime_binding")
-        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
             raise QueenRuntimeError("invalid_queen_runtime_generation")
         with self._locked():
             _private_directory(self.root)
@@ -149,7 +156,9 @@ class QueenRuntimeHomeManager:
             path = self.root / f"Queen{ordinal}"
             if path.exists() or path.is_symlink():
                 raise QueenRuntimeError("queen_runtime_home_collision")
-            runtime = QueenRuntimeHome(ordinal, principal_id, repository_id, lease_id, fence, generation, path)
+            runtime = QueenRuntimeHome(
+                ordinal, principal_id, repository_id, lease_id, fence, generation, path
+            )
             registry["next_ordinal"] = ordinal + 1
             registry["homes"][str(ordinal)] = self._entry(runtime, state="allocating")
             self._save_registry(registry)
@@ -159,13 +168,19 @@ class QueenRuntimeHomeManager:
                 codex_home = staging / "codex-home"
                 codex_home.mkdir(mode=0o700)
                 metadata = staging / ".queen-runtime.json"
-                metadata.write_text(json.dumps(self._entry(runtime, state="active"), sort_keys=True) + "\n", encoding="utf-8")
+                metadata.write_text(
+                    json.dumps(self._entry(runtime, state="active"), sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
                 os.chmod(metadata, 0o600)
                 os.replace(staging, path)
                 registry["homes"][str(ordinal)] = self._entry(runtime, state="active")
                 self._save_registry(registry)
             except Exception as exc:
-                registry["homes"][str(ordinal)] = self._entry(runtime, state="quarantined")
+                registry["homes"][str(ordinal)] = self._entry(
+                    runtime, state="quarantined"
+                )
                 self._save_registry(registry)
                 if staging.exists():
                     shutil.rmtree(staging, ignore_errors=True)
@@ -177,27 +192,52 @@ class QueenRuntimeHomeManager:
         with self._locked():
             registry = self._load_registry()
             entry = registry["homes"].get(str(runtime.ordinal))
-            if not isinstance(entry, dict) or entry != self._entry(runtime, state="active"):
+            if not isinstance(entry, dict) or entry != self._entry(
+                runtime, state="active"
+            ):
                 raise QueenRuntimeError("queen_runtime_binding_mismatch")
-            if runtime.path.parent != self.root or not _HOME_RE.fullmatch(runtime.path.name):
+            if runtime.path.parent != self.root or not _HOME_RE.fullmatch(
+                runtime.path.name
+            ):
                 raise QueenRuntimeError("queen_runtime_path_invalid")
             try:
-                metadata = json.loads((runtime.path / ".queen-runtime.json").read_text(encoding="utf-8"))
+                metadata = json.loads(
+                    (runtime.path / ".queen-runtime.json").read_text(encoding="utf-8")
+                )
             except (OSError, TypeError, ValueError):
                 metadata = None
             if metadata != self._entry(runtime, state="active"):
-                registry["homes"][str(runtime.ordinal)] = self._entry(runtime, state="quarantined")
+                registry["homes"][str(runtime.ordinal)] = self._entry(
+                    runtime, state="quarantined"
+                )
                 self._save_registry(registry)
-                return {"released": False, "quarantined": True, "reason": "queen_runtime_metadata_mismatch"}
+                return {
+                    "released": False,
+                    "quarantined": True,
+                    "reason": "queen_runtime_metadata_mismatch",
+                }
             try:
                 shutil.rmtree(runtime.path)
             except OSError:
-                registry["homes"][str(runtime.ordinal)] = self._entry(runtime, state="quarantined")
+                registry["homes"][str(runtime.ordinal)] = self._entry(
+                    runtime, state="quarantined"
+                )
                 self._save_registry(registry)
-                return {"released": False, "quarantined": True, "reason": "queen_runtime_cleanup_failed"}
-            registry["homes"][str(runtime.ordinal)] = self._entry(runtime, state="released")
+                return {
+                    "released": False,
+                    "quarantined": True,
+                    "reason": "queen_runtime_cleanup_failed",
+                }
+            registry["homes"][str(runtime.ordinal)] = self._entry(
+                runtime, state="released"
+            )
             self._save_registry(registry)
             return {"released": True, "quarantined": False, "reason": None}
 
 
-__all__ = ["DEFAULT_QUEEN_HOME_ROOT", "QueenRuntimeError", "QueenRuntimeHome", "QueenRuntimeHomeManager"]
+__all__ = [
+    "DEFAULT_QUEEN_HOME_ROOT",
+    "QueenRuntimeError",
+    "QueenRuntimeHome",
+    "QueenRuntimeHomeManager",
+]

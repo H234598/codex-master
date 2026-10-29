@@ -126,7 +126,9 @@ EXPECTED_RISKS = {
 
 def test_field_description_defaults_and_rejects_non_text() -> None:
     assert control_catalog._field_description({}, "field") == ""
-    with unittest.TestCase().assertRaisesRegex(SchemaError, "field description must be a string"):
+    with unittest.TestCase().assertRaisesRegex(
+        SchemaError, "field description must be a string"
+    ):
         control_catalog._field_description({"description": 1}, "field")
 
 
@@ -156,7 +158,9 @@ class ControlCatalogTest(unittest.TestCase):
         self.assertEqual(dict(RISK_BY_TOOL), EXPECTED_RISKS)
         self.assertEqual(published_names, set(EXPECTED_RISKS))
 
-    def test_current_server_catalog_compiles_with_immutable_bounded_descriptors(self) -> None:
+    def test_current_server_catalog_compiles_with_immutable_bounded_descriptors(
+        self,
+    ) -> None:
         catalog = compile_catalog(TOOLS)
 
         self.assertEqual(len(catalog), len(TOOLS))
@@ -176,7 +180,9 @@ class ControlCatalogTest(unittest.TestCase):
         )
         self.assertEqual(len(catalog[0].description), MAX_DESCRIPTOR_TEXT_CHARS)
 
-        oversized = [tool_fixture(f"unknown_{index}") for index in range(MAX_CATALOG_TOOLS + 1)]
+        oversized = [
+            tool_fixture(f"unknown_{index}") for index in range(MAX_CATALOG_TOOLS + 1)
+        ]
         with self.assertRaisesRegex(CatalogError, "too many tools"):
             compile_catalog(oversized)
 
@@ -184,7 +190,10 @@ class ControlCatalogTest(unittest.TestCase):
         known = tool_fixture()
         catalog = compile_catalog([known, tool_fixture("future_tool"), known])
 
-        self.assertEqual([tool.name for tool in catalog], ["agent_status", "future_tool", "agent_status"])
+        self.assertEqual(
+            [tool.name for tool in catalog],
+            ["agent_status", "future_tool", "agent_status"],
+        )
         self.assertFalse(catalog[0].enabled)
         self.assertIn("duplicate", catalog[0].disabled_reason)
         self.assertFalse(catalog[1].enabled)
@@ -225,7 +234,10 @@ class ControlCatalogTest(unittest.TestCase):
                 FieldKind.STRING_ARRAY,
             ],
         )
-        self.assertEqual([field.required for field in compiled], [True, False, True, False, True, True])
+        self.assertEqual(
+            [field.required for field in compiled],
+            [True, False, True, False, True, True],
+        )
         self.assertEqual(compiled[1].enum, ("one", "two"))
 
     def test_schema_compiler_rejects_unknown_or_nested_schema_forms(self) -> None:
@@ -270,7 +282,9 @@ class ControlCatalogTest(unittest.TestCase):
             },
             "non-string array": {
                 "type": "object",
-                "properties": {"values": {"type": "array", "items": {"type": "integer"}}},
+                "properties": {
+                    "values": {"type": "array", "items": {"type": "integer"}}
+                },
                 "additionalProperties": False,
             },
             "non-boolean unique items": {
@@ -291,7 +305,9 @@ class ControlCatalogTest(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(SchemaError):
                 compile_input_schema(schema)
 
-    def test_invalid_known_schema_is_visible_disabled_without_raw_fallback(self) -> None:
+    def test_invalid_known_schema_is_visible_disabled_without_raw_fallback(
+        self,
+    ) -> None:
         catalog = compile_catalog(
             [
                 tool_fixture(
@@ -329,12 +345,20 @@ class ControlCatalogTest(unittest.TestCase):
 
         for name, arguments in cases:
             with self.subTest(name=name, arguments=arguments):
-                self.assertEqual(effective_risk(catalog[name], arguments), Risk.DESTRUCTIVE)
+                self.assertEqual(
+                    effective_risk(catalog[name], arguments), Risk.DESTRUCTIVE
+                )
 
-        self.assertEqual(effective_risk(catalog["agent_claim"], {"force": False}), Risk.MUTATING)
-        self.assertEqual(effective_risk(catalog["agent_pool_install"], {"yes": True}), Risk.BROAD)
+        self.assertEqual(
+            effective_risk(catalog["agent_claim"], {"force": False}), Risk.MUTATING
+        )
+        self.assertEqual(
+            effective_risk(catalog["agent_pool_install"], {"yes": True}), Risk.BROAD
+        )
 
-    def test_argument_serialization_is_strict_and_does_not_inject_defaults(self) -> None:
+    def test_argument_serialization_is_strict_and_does_not_inject_defaults(
+        self,
+    ) -> None:
         schema = {
             "type": "object",
             "required": ["agent", "count", "paths"],
@@ -353,12 +377,16 @@ class ControlCatalogTest(unittest.TestCase):
         }
         descriptor = compile_catalog([tool_fixture(schema=schema)])[0]
 
-        result = serialize_arguments(descriptor, {"agent": "a1", "count": 2, "paths": ("src",)})
+        result = serialize_arguments(
+            descriptor, {"agent": "a1", "count": 2, "paths": ("src",)}
+        )
 
         self.assertEqual(result, {"agent": "a1", "count": 2, "paths": ["src"]})
         self.assertNotIn("enabled", result)
 
-    def test_argument_serialization_rejects_missing_unknown_and_invalid_values(self) -> None:
+    def test_argument_serialization_rejects_missing_unknown_and_invalid_values(
+        self,
+    ) -> None:
         schema = {
             "type": "object",
             "required": ["agent"],
@@ -392,7 +420,10 @@ class ControlCatalogTest(unittest.TestCase):
         ]
 
         for arguments, message in invalid:
-            with self.subTest(arguments=arguments), self.assertRaisesRegex(CatalogError, message):
+            with (
+                self.subTest(arguments=arguments),
+                self.assertRaisesRegex(CatalogError, message),
+            ):
                 serialize_arguments(descriptor, arguments)
 
 

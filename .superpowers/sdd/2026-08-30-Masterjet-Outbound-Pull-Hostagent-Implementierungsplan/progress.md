@@ -13,50 +13,50 @@
 
 ## Preflight task self-consistency
 
-| Task | Files/tests/code internally aligned | Finding |
-|---|---|---|
-| 1 | Yes | Contract DTOs, exact parser tests, Ruff and commit scope agree. |
-| 2 | Yes | Queue states, cancel, lease/recovery tests and Store API agree. |
-| 3 | Yes | SPKI binding, HostRegistry migration, identity tests and composition files agree. |
-| 4 | Yes | Two routes, TLS listener, daemon entrypoint and focused tests agree. |
-| 5 | Yes | Journal states, effect fence, executor allowlist and poll-loop tests agree. |
-| 6 | Yes | Local/remote adapters, Admin/CLI/MCP surface and all named test files agree after preflight correction. |
-| 7 | Yes | Master projection, Usage parser, exact reason codes and cross-repo Wire tests agree after preflight correction. |
-| 8 | Yes | Local/remote split, async Ollama flow, daemon test and Usage consumer agree after preflight correction. |
-| 9 | Yes | Units, credential paths, installer behavior and static/runtime tests agree. |
-| 10 | Yes | E2E fixture covers identity, probe, Ollama, recovery and drain requirements. |
-| 11 | Yes | Test index, focused suites, mandatory gates, review, merge and push sequence agree. |
+| Task | Files/tests/code internally aligned | Finding                                                                                                         |
+| ---- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 1    | Yes                                 | Contract DTOs, exact parser tests, Ruff and commit scope agree.                                                 |
+| 2    | Yes                                 | Queue states, cancel, lease/recovery tests and Store API agree.                                                 |
+| 3    | Yes                                 | SPKI binding, HostRegistry migration, identity tests and composition files agree.                               |
+| 4    | Yes                                 | Two routes, TLS listener, daemon entrypoint and focused tests agree.                                            |
+| 5    | Yes                                 | Journal states, effect fence, executor allowlist and poll-loop tests agree.                                     |
+| 6    | Yes                                 | Local/remote adapters, Admin/CLI/MCP surface and all named test files agree after preflight correction.         |
+| 7    | Yes                                 | Master projection, Usage parser, exact reason codes and cross-repo Wire tests agree after preflight correction. |
+| 8    | Yes                                 | Local/remote split, async Ollama flow, daemon test and Usage consumer agree after preflight correction.         |
+| 9    | Yes                                 | Units, credential paths, installer behavior and static/runtime tests agree.                                     |
+| 10   | Yes                                 | E2E fixture covers identity, probe, Ollama, recovery and drain requirements.                                    |
+| 11   | Yes                                 | Test index, focused suites, mandatory gates, review, merge and push sequence agree.                             |
 
 ## Preflight shared-file/interface matrix
 
-| Tasks | Shared file or producer → consumer | Finding |
-|---|---|---|
-| 1 → 2 | Agent DTOs → `AgentOperationStore` | Clean; Task 2 starts after Task 1. |
-| 1 → 4 | Poll/receipt parsers → Agent HTTP routes | Clean. |
-| 1 → 5 | Lease/receipt DTOs → host agent journal/client | Clean. |
-| 2 → 4 | `AgentOperationStore` → Agent HTTP routes | Clean. |
-| 2 → 6 | `AgentOperationStore` → remote host probe | Clean. |
-| 2 → 7 | `AgentOperationViewV1` → public operation projection | Clean. |
-| 2 → 8 | `AgentOperationStore` → remote Ollama port | Clean. |
-| 3 → 4 | `AgentPrincipalV1`/resolver → TLS listener | Clean. |
-| 3 ↔ 6 | `admin_assembly.py` composition | Serialized by task order; no conflict. |
-| 3 ↔ 8 | `admin_assembly.py`, `test_admin_daemon.py` | Serialized by task order; Task 8 preserves identity wiring. |
-| 3 → 9 | credential binding → systemd credentials | Clean. |
-| 4 ↔ 5 | `pyproject.toml`; wire protocol → client | Serialized by task order; entrypoints remain distinct. |
-| 4 → 6 | Agent route/store → remote probe completion | Clean. |
-| 4 → 9 | Agent API CLI → API unit | Clean. |
-| 5 → 6 | executor dispatch → `host.probe collect` | Clean. |
-| 5 → 8 | agent Ollama executor → remote Ollama owner | Clean. |
-| 5 → 9 | host-agent CLI → host-agent unit | Clean. |
-| 6 ↔ 7 | `admin_contracts.py`, `admin_service.py`, `test_admin_service.py` | Serialized; Task 7 extends Task-6 operation projection. |
-| 6 ↔ 8 | `admin_service.py`, `admin_assembly.py`, `test_admin_service.py` | Serialized; Task 8 consumes probe-era composition. |
-| 6 → 10 | host probe adapters/results → E2E | Clean. |
-| 7 ↔ 8 | `admin_service.py`, `test_admin_service.py`; async result contract → Ollama UI | Serialized; Task 8 consumes exact Task-7 wire. |
-| 7 → 10 | bounded public result → E2E assertions | Clean. |
-| 8 → 10 | remote Ollama queue flow → E2E | Clean. |
-| 9 → 10 | units/credentials → drain and identity E2E | Clean. |
-| 1–9 → 10 | all production interfaces → integrated E2E | Clean; Task 10 starts only after Task 9 review. |
-| 1–10 → 11 | production functions/tests → test index and release gates | Clean; no Evidence-Reuse for release gates. |
+| Tasks     | Shared file or producer → consumer                                             | Finding                                                     |
+| --------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| 1 → 2     | Agent DTOs → `AgentOperationStore`                                             | Clean; Task 2 starts after Task 1.                          |
+| 1 → 4     | Poll/receipt parsers → Agent HTTP routes                                       | Clean.                                                      |
+| 1 → 5     | Lease/receipt DTOs → host agent journal/client                                 | Clean.                                                      |
+| 2 → 4     | `AgentOperationStore` → Agent HTTP routes                                      | Clean.                                                      |
+| 2 → 6     | `AgentOperationStore` → remote host probe                                      | Clean.                                                      |
+| 2 → 7     | `AgentOperationViewV1` → public operation projection                           | Clean.                                                      |
+| 2 → 8     | `AgentOperationStore` → remote Ollama port                                     | Clean.                                                      |
+| 3 → 4     | `AgentPrincipalV1`/resolver → TLS listener                                     | Clean.                                                      |
+| 3 ↔ 6    | `admin_assembly.py` composition                                                | Serialized by task order; no conflict.                      |
+| 3 ↔ 8    | `admin_assembly.py`, `test_admin_daemon.py`                                    | Serialized by task order; Task 8 preserves identity wiring. |
+| 3 → 9     | credential binding → systemd credentials                                       | Clean.                                                      |
+| 4 ↔ 5    | `pyproject.toml`; wire protocol → client                                       | Serialized by task order; entrypoints remain distinct.      |
+| 4 → 6     | Agent route/store → remote probe completion                                    | Clean.                                                      |
+| 4 → 9     | Agent API CLI → API unit                                                       | Clean.                                                      |
+| 5 → 6     | executor dispatch → `host.probe collect`                                       | Clean.                                                      |
+| 5 → 8     | agent Ollama executor → remote Ollama owner                                    | Clean.                                                      |
+| 5 → 9     | host-agent CLI → host-agent unit                                               | Clean.                                                      |
+| 6 ↔ 7    | `admin_contracts.py`, `admin_service.py`, `test_admin_service.py`              | Serialized; Task 7 extends Task-6 operation projection.     |
+| 6 ↔ 8    | `admin_service.py`, `admin_assembly.py`, `test_admin_service.py`               | Serialized; Task 8 consumes probe-era composition.          |
+| 6 → 10    | host probe adapters/results → E2E                                              | Clean.                                                      |
+| 7 ↔ 8    | `admin_service.py`, `test_admin_service.py`; async result contract → Ollama UI | Serialized; Task 8 consumes exact Task-7 wire.              |
+| 7 → 10    | bounded public result → E2E assertions                                         | Clean.                                                      |
+| 8 → 10    | remote Ollama queue flow → E2E                                                 | Clean.                                                      |
+| 9 → 10    | units/credentials → drain and identity E2E                                     | Clean.                                                      |
+| 1–9 → 10  | all production interfaces → integrated E2E                                     | Clean; Task 10 starts only after Task 9 review.             |
+| 1–10 → 11 | production functions/tests → test index and release gates                      | Clean; no Evidence-Reuse for release gates.                 |
 
 Preflight conflicts: none. Independent plan review corrected cancellation,
 reason-code names, three task file lists and canonical HostProbe return type

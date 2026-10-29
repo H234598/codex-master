@@ -37,9 +37,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     _write(root, "bin/the-hive-plugin-hook-stable", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
-    _write(
-        root, "bin/the-hive-openai-pricing-inventory", "#!/bin/sh\nexit 0\n", 0o755
-    )
+    _write(root, "bin/the-hive-openai-pricing-inventory", "#!/bin/sh\nexit 0\n", 0o755)
     _write(
         root,
         "bin/the-hive-openai-pricing-inventory-stable",

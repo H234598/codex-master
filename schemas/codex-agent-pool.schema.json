@@ -3,10 +3,7 @@
   "$id": "https://github.com/H234598/codex-master/schemas/codex-agent-pool.schema.json",
   "title": "codex-master Agentinnen Pool",
   "type": "object",
-  "required": [
-    "schema_version",
-    "series"
-  ],
+  "required": ["schema_version", "series"],
   "additionalProperties": false,
   "properties": {
     "$schema": {
@@ -29,10 +26,7 @@
       "maxItems": 26,
       "items": {
         "type": "object",
-        "required": [
-          "prefix",
-          "count"
-        ],
+        "required": ["prefix", "count"],
         "additionalProperties": false,
         "properties": {
           "prefix": {
@@ -104,10 +98,7 @@
       "properties": {
         "policy": {
           "type": "string",
-          "enum": [
-            "preserve_existing_only",
-            "copy_explicit_only"
-          ],
+          "enum": ["preserve_existing_only", "copy_explicit_only"],
           "default": "preserve_existing_only"
         },
         "copy": {

@@ -8,7 +8,9 @@ from the_hive.hive.indexed_tests import TestIndexV1 as IndexV1, combine_test_ind
 from test_hive_test_index import valid_index
 
 
-def test_javascript_builder_indexes_functions_methods_arrows_and_node_assertions(tmp_path: Path) -> None:
+def test_javascript_builder_indexes_functions_methods_arrows_and_node_assertions(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()
     (tmp_path / "src/example.js").write_text(
@@ -49,7 +51,9 @@ def test_javascript_builder_indexes_functions_methods_arrows_and_node_assertions
     assert [item.test_id for item in index.tests] == sorted(tests.values())
 
 
-def test_javascript_builder_ignores_unbound_tests_in_selected_files(tmp_path: Path) -> None:
+def test_javascript_builder_ignores_unbound_tests_in_selected_files(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()
     (tmp_path / "src/example.js").write_text(
@@ -81,7 +85,9 @@ def test_javascript_builder_ignores_unbound_tests_in_selected_files(tmp_path: Pa
     ]
 
 
-def test_typescript_inventory_uses_pinned_grammar_and_stable_function_ids(tmp_path: Path) -> None:
+def test_typescript_inventory_uses_pinned_grammar_and_stable_function_ids(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src/example.ts").write_text(
         "export function identity(value: number): number { return value; }\n",

@@ -52,17 +52,34 @@ class HiveTestHttpAdapter:
             return self._service.status(request, now_monotonic_ns=time.monotonic_ns())
         body = self._body(payload)
         if path.endswith("test-plan"):
-            self._closed(body, {"changed_paths", "function_ids", "phase", "base_revision", "target_revision"})
+            self._closed(
+                body,
+                {
+                    "changed_paths",
+                    "function_ids",
+                    "phase",
+                    "base_revision",
+                    "target_revision",
+                },
+            )
             request = self._service.request(
                 changed_paths=self._paths(body.get("changed_paths", ())),
                 function_ids=self._texts(body.get("function_ids", ())),
                 requested_phase=self._optional_text(body, "phase", "change"),
-                base_revision=self._optional_text(body, "base_revision", "working-tree"),
-                target_revision=self._optional_text(body, "target_revision", "working-tree"),
+                base_revision=self._optional_text(
+                    body, "base_revision", "working-tree"
+                ),
+                target_revision=self._optional_text(
+                    body, "target_revision", "working-tree"
+                ),
             )
-            return self._service.plan(request, now_monotonic_ns=time.monotonic_ns()).public()
+            return self._service.plan(
+                request, now_monotonic_ns=time.monotonic_ns()
+            ).public()
         if path.endswith("test-run"):
-            self._closed(body, {"test_id", "index_digest"}, required={"test_id", "index_digest"})
+            self._closed(
+                body, {"test_id", "index_digest"}, required={"test_id", "index_digest"}
+            )
             if not self._execution_host_local:
                 return {
                     "accepted": False,
@@ -74,7 +91,11 @@ class HiveTestHttpAdapter:
                 expected_index_digest=self._required_text(body, "index_digest"),
             )
             return {"evidence_id": receipt.evidence_id, "receipt": receipt.public()}
-        self._closed(body, {"evidence_id", "index_digest"}, required={"evidence_id", "index_digest"})
+        self._closed(
+            body,
+            {"evidence_id", "index_digest"},
+            required={"evidence_id", "index_digest"},
+        )
         evidence_id = self._required_text(body, "evidence_id")
         self._service.invalidate(
             evidence_id,
@@ -116,7 +137,9 @@ class HiveTestHttpAdapter:
         if not isinstance(value, (list, tuple)) or len(value) > 1000:
             raise ValueError("test.index_invalid")
         items = tuple(value)
-        if any(not isinstance(item, str) or not item or len(item) > 2048 for item in items):
+        if any(
+            not isinstance(item, str) or not item or len(item) > 2048 for item in items
+        ):
             raise ValueError("test.index_invalid")
         return items
 

@@ -12,7 +12,9 @@ import the_hive.server as server
 
 class FleetDesktopEntryTest(unittest.TestCase):
     def test_uses_the_hive_desktop_application_id(self) -> None:
-        assert server.FLEET_DESKTOP_ENTRY_NAME == "de.teladi.TheHive.ControlCenter.desktop"
+        assert (
+            server.FLEET_DESKTOP_ENTRY_NAME == "de.teladi.TheHive.ControlCenter.desktop"
+        )
 
     def test_serializes_fixed_control_center_command(self) -> None:
         content = server.fleet_desktop_entry_bytes(
@@ -352,7 +354,9 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("the_hive.server._runtime_mcp_entrypoint", return_value=install_path),
+                patch(
+                    "the_hive.server._runtime_mcp_entrypoint", return_value=install_path
+                ),
                 patch(
                     "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
@@ -429,7 +433,9 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("the_hive.server._runtime_mcp_entrypoint", return_value=entrypoint),
+                patch(
+                    "the_hive.server._runtime_mcp_entrypoint", return_value=entrypoint
+                ),
                 patch(
                     "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
@@ -482,7 +488,9 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("the_hive.server._runtime_mcp_entrypoint", return_value=entrypoint),
+                patch(
+                    "the_hive.server._runtime_mcp_entrypoint", return_value=entrypoint
+                ),
                 patch(
                     "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,

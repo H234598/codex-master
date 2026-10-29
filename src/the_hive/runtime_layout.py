@@ -19,6 +19,7 @@ class LayoutError(ValueError):
 
 _MAX_IMAGE_FILE_BYTES = 2 * 1024 * 1024
 _MAX_METADATA_BYTES = 256 * 1024
+_MAX_COMPATIBILITY_PROFILE_BYTES = 64 * 1024
 _ROOT_MODE = 0o700
 _MANIFEST_NAME = ".the-hive-runtime-manifest.json"
 _RELEASE_BINDING_NAME = "release-binding.json"
@@ -397,6 +398,181 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError("duplicate JSON member")
         value[key] = item
     return value
+
+
+def validate_runtime_release_compatibility_profile(
+    raw: bytes,
+) -> dict[str, Any]:
+    """Validate the closed, unvalidated profile envelope without granting support."""
+
+    def invalid() -> None:
+        raise _invalid()
+
+    def exact_object(value: object, keys: set[str]) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != keys:
+            invalid()
+        return value
+
+    def text(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and 0 < len(value) <= 64
+            and value.isascii()
+            and value[0].isalnum()
+            and all(character.isalnum() or character in "._+-" for character in value)
+        )
+
+    def features(value: object) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) <= 32
+            and all(text(item) for item in value)
+            and value == sorted(set(value))
+        )
+
+    def digest(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def generation(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 40
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    if (
+        not isinstance(raw, bytes)
+        or not 0 < len(raw) <= _MAX_COMPATIBILITY_PROFILE_BYTES
+    ):
+        invalid()
+    try:
+        profile = json.loads(raw.decode("ascii"), object_pairs_hook=_unique_json_object)
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise _invalid() from exc
+    if not isinstance(profile, dict):
+        invalid()
+    if profile.get("schema_version") == 2:
+        profile = exact_object(
+            profile, {"profile_id", "requirements", "schema_version", "status"}
+        )
+        requirements = exact_object(
+            profile["requirements"],
+            {
+                "client_argv",
+                "client_config_key",
+                "client_probe_schema_revision",
+                "manager_api_schema_revision",
+                "predecessor_required",
+                "runtime_criteria",
+            },
+        )
+        if (
+            type(profile["schema_version"]) is not int
+            or profile["schema_version"] != 2
+            or profile["profile_id"] != "runtime-release-compatibility-v2"
+            or profile["status"] != "structural_requirements"
+            or requirements
+            != {
+                "client_argv": ["--no-daemon", "features", "list"],
+                "client_config_key": "features.daemon_auto_start",
+                "client_probe_schema_revision": 1,
+                "manager_api_schema_revision": 1,
+                "predecessor_required": True,
+                "runtime_criteria": ["runtime_canary", "runtime_features"],
+            }
+            or type(requirements["client_probe_schema_revision"]) is not int
+            or type(requirements["manager_api_schema_revision"]) is not int
+            or type(requirements["predecessor_required"]) is not bool
+        ):
+            invalid()
+        canonical = (
+            json.dumps(
+                profile, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("ascii")
+        if canonical != raw:
+            invalid()
+        return profile
+    profile = exact_object(
+        profile, {"observations", "profile_id", "schema_version", "status"}
+    )
+    if (
+        type(profile["schema_version"]) is not int
+        or profile["schema_version"] != 1
+        or profile["profile_id"] != "runtime-release-compatibility-v1"
+        or profile["status"] != "unvalidated"
+        or not isinstance(profile["observations"], list)
+        or not 1 <= len(profile["observations"]) <= 32
+    ):
+        invalid()
+    identities: set[tuple[str, str, str]] = set()
+    for observation_value in profile["observations"]:
+        observation = exact_object(
+            observation_value,
+            {"client", "evidence", "manager", "predecessor", "runtime"},
+        )
+        client = exact_object(
+            observation["client"], {"artifact_sha256", "features", "version"}
+        )
+        manager = exact_object(observation["manager"], {"features", "version"})
+        runtime = exact_object(
+            observation["runtime"], {"features", "generation", "manifest_digest"}
+        )
+        predecessor = exact_object(
+            observation["predecessor"],
+            {"consumer_sha256", "generation", "manifest_digest"},
+        )
+        evidence = exact_object(
+            observation["evidence"],
+            {
+                "expires_at_unix_ns",
+                "fixture_sha256",
+                "observed_at_unix_ns",
+                "source_commit",
+                "source_tree_sha256",
+            },
+        )
+        if (
+            not text(client["version"])
+            or not digest(client["artifact_sha256"])
+            or not features(client["features"])
+            or not text(manager["version"])
+            or not features(manager["features"])
+            or not generation(runtime["generation"])
+            or not _is_sha256_digest(runtime["manifest_digest"])
+            or not features(runtime["features"])
+            or not generation(predecessor["generation"])
+            or not _is_sha256_digest(predecessor["manifest_digest"])
+            or not digest(predecessor["consumer_sha256"])
+            or not generation(evidence["source_commit"])
+            or not digest(evidence["source_tree_sha256"])
+            or not digest(evidence["fixture_sha256"])
+            or type(evidence["observed_at_unix_ns"]) is not int
+            or type(evidence["expires_at_unix_ns"]) is not int
+            or evidence["observed_at_unix_ns"] <= 0
+            or evidence["expires_at_unix_ns"] <= evidence["observed_at_unix_ns"]
+        ):
+            invalid()
+        identity = (
+            manager["version"],
+            runtime["generation"],
+            client["artifact_sha256"],
+        )
+        if identity in identities:
+            invalid()
+        identities.add(identity)
+    canonical = (
+        json.dumps(profile, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+    if canonical != raw:
+        invalid()
+    return profile
 
 
 def _read_json_object(root: Path, relative_path: str) -> dict[str, Any]:
@@ -992,7 +1168,9 @@ def attest_pre_pricing_legacy_runtime(
     if manifest_digest != expected_digest:
         raise _invalid()
     try:
-        manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+        manifest = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
     except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise _invalid() from exc
     if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
@@ -1330,7 +1508,6 @@ class RuntimeLayout:
         *,
         pointer_name: str,
     ) -> RuntimeLayout:
-
         if (
             not isinstance(release_root, Path)
             or not isinstance(generation, str)
@@ -1504,9 +1681,7 @@ def _normalized_runtime_layout_values(
         )
     ):
         raise _invalid()
-    if not isinstance(spawn_helper_digest, str) or not isinstance(
-        manifest_digest, str
-    ):
+    if not isinstance(spawn_helper_digest, str) or not isinstance(manifest_digest, str):
         raise _invalid()
     try:
         spawn_helper_digest = str(spawn_helper_digest)

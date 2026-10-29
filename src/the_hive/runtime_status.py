@@ -259,9 +259,7 @@ def runtime_status(
             layout=active_layout,
             home=Path.home() if home is None else home,
             bound_runtime_directory=(
-                _PROTECTED_HOME_RUNTIME_DIRECTORY
-                if protected_home_runtime
-                else None
+                _PROTECTED_HOME_RUNTIME_DIRECTORY if protected_home_runtime else None
             ),
         )
     except TimeoutError as exc:

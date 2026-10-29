@@ -391,10 +391,7 @@ class HostAgentState:
                     accepted["deadline_clock"]
                 ):
                     _fail("host.effect_claim_active")
-            elif (
-                type(claim_token) is not str
-                or claim.get("token") != claim_token
-            ):
+            elif type(claim_token) is not str or claim.get("token") != claim_token:
                 _fail("host.effect_claim_mismatch")
         elif claim_token is not None:
             _fail("host.effect_claim_mismatch")
@@ -574,9 +571,7 @@ class HostAgentState:
         if required <= 0:
             return
         candidates = sorted(
-            key
-            for key, value in receipts.items()
-            if value["generation"] < generation
+            key for key, value in receipts.items() if value["generation"] < generation
         )
         for key in candidates[:required]:
             del receipts[key]
@@ -606,14 +601,23 @@ class HostAgentState:
             _fail("host.state_unavailable")
         migrated = False
         if type(value) is dict and value.get("schema_version") == 2:
-            if set(value) != {
-                "schema_version", "highest_lease_epoch",
-                "highest_registry_generation", "accepted", "receipts",
-            } or type(value.get("accepted")) is not dict:
+            if (
+                set(value)
+                != {
+                    "schema_version",
+                    "highest_lease_epoch",
+                    "highest_registry_generation",
+                    "accepted",
+                    "receipts",
+                }
+                or type(value.get("accepted")) is not dict
+            ):
                 _fail("host.state_unavailable")
             for operation_id, record in tuple(value["accepted"].items()):
                 if type(record) is not dict or set(record) != {
-                    "fence", "lease", "effect_claim"
+                    "fence",
+                    "lease",
+                    "effect_claim",
                 }:
                     _fail("host.state_unavailable")
                 wire = record["lease"]
@@ -660,15 +664,16 @@ class HostAgentState:
                 for operation_id, record in tuple(records.items()):
                     if not isinstance(record, Mapping):
                         continue
-                    wire = record.get("lease") if collection == "accepted" else record.get("receipt")
-                    if (
-                        isinstance(wire, Mapping)
-                        and (
-                            wire.get("kind") == "ollama.instance"
-                            or (
-                                isinstance(wire.get("result"), Mapping)
-                                and wire["result"].get("kind") == "ollama.instance"
-                            )
+                    wire = (
+                        record.get("lease")
+                        if collection == "accepted"
+                        else record.get("receipt")
+                    )
+                    if isinstance(wire, Mapping) and (
+                        wire.get("kind") == "ollama.instance"
+                        or (
+                            isinstance(wire.get("result"), Mapping)
+                            and wire["result"].get("kind") == "ollama.instance"
                         )
                     ):
                         del records[operation_id]
@@ -748,12 +753,12 @@ class HostAgentState:
                 or fence[9] != receipt.arguments_digest
                 or (
                     fence[10] is not None
-                    and (type(fence[10]) is not str or _DIGEST.fullmatch(fence[10]) is None)
+                    and (
+                        type(fence[10]) is not str
+                        or _DIGEST.fullmatch(fence[10]) is None
+                    )
                 )
-                or (
-                    fence[11] is not None
-                    and not _bounded_integer(fence[11])
-                )
+                or (fence[11] is not None and not _bounded_integer(fence[11]))
                 or fence[12] != receipt.envelope_digest
             ):
                 _fail("host.state_unavailable")
@@ -816,9 +821,8 @@ class HostAgentState:
 
     def _clock_expired(self, value: Mapping[str, object]) -> bool:
         self._validate_deadline_clock(value)
-        return (
-            value["boot_id"] != self._boot_id
-            or _monotonic() >= cast(float, value["monotonic_deadline"])
+        return value["boot_id"] != self._boot_id or _monotonic() >= cast(
+            float, value["monotonic_deadline"]
         )
 
     @staticmethod
@@ -828,27 +832,27 @@ class HostAgentState:
         doc = cast(dict[str, object], value)
         try:
             required = {
-                    "schema_version",
-                    "operation_id",
-                    "lease_id",
-                    "host_ref",
-                    "kind",
-                    "action",
-                    "registry_generation",
-                    "lease_epoch",
-                    "attempt",
-                    "plan_digest",
-                    "arguments_digest",
-                    "deadline",
-                    "arguments",
-                }
+                "schema_version",
+                "operation_id",
+                "lease_id",
+                "host_ref",
+                "kind",
+                "action",
+                "registry_generation",
+                "lease_epoch",
+                "attempt",
+                "plan_digest",
+                "arguments_digest",
+                "deadline",
+                "arguments",
+            }
             remote_fields = (
                 {"plan_precondition_digest", "resource_generation", "envelope_digest"}
-                if doc.get("kind") == "ollama.instance" else set()
+                if doc.get("kind") == "ollama.instance"
+                else set()
             )
-            if (
-                set(doc) != required | remote_fields
-                or doc["schema_version"] != (2 if doc.get("kind") == "ollama.instance" else 1)
+            if set(doc) != required | remote_fields or doc["schema_version"] != (
+                2 if doc.get("kind") == "ollama.instance" else 1
             ):
                 _fail("host.state_unavailable")
             deadline = datetime.strptime(

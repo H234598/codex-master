@@ -120,10 +120,11 @@ def _wait_for_fifo_eof(
     pytest.fail("manager lifetime did not close the live child event")
 
 
-@pytest.mark.parametrize("slice_path", ("/the-hive.slice", "/user.slice/the-hive.slice"))
+@pytest.mark.parametrize(
+    "slice_path", ("/the-hive.slice", "/user.slice/the-hive.slice")
+)
 def test_g5_scope_reference_requires_same_invocation_and_empty_bound_cgroup(
-    slice_path: str,
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    slice_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import the_hive.runtime_process as runtime_process
 
@@ -176,9 +177,7 @@ def test_g5_scope_reference_requires_same_invocation_and_empty_bound_cgroup(
     (cgroup / "cgroup.events").unlink()
     (cgroup / "cgroup.procs").unlink()
     cgroup.rmdir()
-    snapshot.update(
-        {"ControlGroup": "", "InvocationID": "", "LoadState": "not-found"}
-    )
+    snapshot.update({"ControlGroup": "", "InvocationID": "", "LoadState": "not-found"})
     assert runtime_process.g5_scope_is_empty(identity)
 
 
@@ -1029,7 +1028,9 @@ def test_protected_home_runtime_directory_is_fixed_validated_and_not_environment
     assert unsafe.value.code == "command_group_unavailable"
 
 
-def test_protected_home_runtime_directory_is_the_managed_user_runtime_destination() -> None:
+def test_protected_home_runtime_directory_is_the_managed_user_runtime_destination() -> (
+    None
+):
     """Protected probes use only the canonical UID runtime root."""
 
     import the_hive.runtime_process as runtime_process

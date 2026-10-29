@@ -14,7 +14,15 @@ from the_hive.dynamic_pool import (
     DynamicPoolInventoryV1,
     resolve_dynamic_pool_selection,
 )
-from the_hive.hive.messages import HiveMessage, HiveMessageError, _mapping, _text, _texts, _id, record_child_report
+from the_hive.hive.messages import (
+    HiveMessage,
+    HiveMessageError,
+    _mapping,
+    _text,
+    _texts,
+    _id,
+    record_child_report,
+)
 from the_hive.hive.types import DispatchPriority, TaskComplexity, validate_utc_datetime
 from the_hive.selection import SelectionResult
 
@@ -31,7 +39,11 @@ _SAGA_MODES = frozenset({"shadow", "enforced"})
 
 
 def _version(value: object) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 10**12:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= 10**12
+    ):
         raise HiveDispatchError("invalid_dispatch_version")
 
 
@@ -55,19 +67,61 @@ def _time(value: object, field: str) -> datetime:
         raise HiveDispatchError(str(exc)) from exc
 
 
-REQUEST_STATES = frozenset({
-    "received", "classified", "planned", "gated", "delegated", "executing", "integrating", "completed",
-    "blocked", "cancelled", "failed", "compensating", "partially_completed",
-})
-DISPATCH_STATES = frozenset({
-    "planned", "queen_accepted", "workpackages_ready", "queued", "executing", "integrating", "reporting",
-    "completed", "decision_required", "blocked", "cooperative_pause_requested", "paused", "failed",
-    "compensating", "failed_final",
-})
-WORKPACKAGE_STATES = frozenset({
-    "planned", "ready", "queued", "admission_planned", "conflict", "admitted", "executing", "integrating",
-    "completed", "blocked", "decision_required", "failed", "compensating", "failed_final", "paused",
-})
+REQUEST_STATES = frozenset(
+    {
+        "received",
+        "classified",
+        "planned",
+        "gated",
+        "delegated",
+        "executing",
+        "integrating",
+        "completed",
+        "blocked",
+        "cancelled",
+        "failed",
+        "compensating",
+        "partially_completed",
+    }
+)
+DISPATCH_STATES = frozenset(
+    {
+        "planned",
+        "queen_accepted",
+        "workpackages_ready",
+        "queued",
+        "executing",
+        "integrating",
+        "reporting",
+        "completed",
+        "decision_required",
+        "blocked",
+        "cooperative_pause_requested",
+        "paused",
+        "failed",
+        "compensating",
+        "failed_final",
+    }
+)
+WORKPACKAGE_STATES = frozenset(
+    {
+        "planned",
+        "ready",
+        "queued",
+        "admission_planned",
+        "conflict",
+        "admitted",
+        "executing",
+        "integrating",
+        "completed",
+        "blocked",
+        "decision_required",
+        "failed",
+        "compensating",
+        "failed_final",
+        "paused",
+    }
+)
 
 _REQUEST_TRANSITIONS = {
     "received": {"classified", "cancelled", "failed"},
@@ -86,7 +140,14 @@ _DISPATCH_TRANSITIONS = {
     "queen_accepted": {"workpackages_ready", "blocked", "failed"},
     "workpackages_ready": {"queued", "blocked", "failed"},
     "queued": {"executing", "blocked", "cooperative_pause_requested", "failed"},
-    "executing": {"integrating", "decision_required", "blocked", "cooperative_pause_requested", "failed", "compensating"},
+    "executing": {
+        "integrating",
+        "decision_required",
+        "blocked",
+        "cooperative_pause_requested",
+        "failed",
+        "compensating",
+    },
     "integrating": {"reporting", "failed"},
     "reporting": {"completed", "failed", "compensating"},
     "decision_required": {"executing", "blocked", "failed"},
@@ -103,7 +164,14 @@ _WORKPACKAGE_TRANSITIONS = {
     "admission_planned": {"admitted", "conflict", "queued", "failed"},
     "conflict": {"queued", "failed"},
     "admitted": {"executing", "conflict", "failed"},
-    "executing": {"integrating", "blocked", "decision_required", "failed", "paused", "compensating"},
+    "executing": {
+        "integrating",
+        "blocked",
+        "decision_required",
+        "failed",
+        "paused",
+        "compensating",
+    },
     "integrating": {"completed", "failed"},
     "blocked": {"queued", "failed"},
     "decision_required": {"executing", "blocked", "failed"},
@@ -138,7 +206,9 @@ class GlobalRequest:
         _id(self.requested_by, "requested_by")
         for value in (*self.repositories_requested, *self.repositories_resolved):
             _id(value, "repo")
-        if not isinstance(self.repositories_requested, tuple) or not isinstance(self.repositories_resolved, tuple):
+        if not isinstance(self.repositories_requested, tuple) or not isinstance(
+            self.repositories_resolved, tuple
+        ):
             raise HiveDispatchError("invalid_repository_list")
         if not isinstance(self.dispatch_priority, DispatchPriority):
             raise HiveDispatchError("invalid_dispatch_priority")
@@ -166,16 +236,26 @@ class RepoDispatch:
     version: int = 1
 
     def __post_init__(self) -> None:
-        for value, field in ((self.dispatch_id, "dispatch"), (self.request_id, "request"), (self.repo_id, "repo"), (self.queen_principal_id, "queen")):
+        for value, field in (
+            (self.dispatch_id, "dispatch"),
+            (self.request_id, "request"),
+            (self.repo_id, "repo"),
+            (self.queen_principal_id, "queen"),
+        ):
             _id(value, field)
         _text(self.objective, "objective")
         _texts(self.success_criteria, "success_criteria")
         _texts(self.constraints, "constraints")
-        if not isinstance(self.dispatch_priority, DispatchPriority) or not isinstance(self.effective_priority, DispatchPriority):
+        if not isinstance(self.dispatch_priority, DispatchPriority) or not isinstance(
+            self.effective_priority, DispatchPriority
+        ):
             raise HiveDispatchError("invalid_dispatch_priority")
         if self.deadline_at_utc is not None:
             _time(self.deadline_at_utc, "deadline")
-        if not isinstance(self.depends_on_dispatch_ids, tuple) or len(self.depends_on_dispatch_ids) > MAX_LIST:
+        if (
+            not isinstance(self.depends_on_dispatch_ids, tuple)
+            or len(self.depends_on_dispatch_ids) > MAX_LIST
+        ):
             raise HiveDispatchError("invalid_dispatch_dependencies")
         for value in self.depends_on_dispatch_ids:
             _id(value, "dispatch_dependency")
@@ -200,7 +280,10 @@ class GlobalRequestPlan:
     def __post_init__(self) -> None:
         if not isinstance(self.request, GlobalRequest):
             raise HiveDispatchError("invalid_global_request_plan")
-        if not isinstance(self.dispatches, tuple) or not 0 <= len(self.dispatches) <= MAX_LIST:
+        if (
+            not isinstance(self.dispatches, tuple)
+            or not 0 <= len(self.dispatches) <= MAX_LIST
+        ):
             raise HiveDispatchError("invalid_global_dispatches")
         if self.mode not in _SAGA_MODES:
             raise HiveDispatchError("invalid_saga_mode")
@@ -262,13 +345,20 @@ class GlobalSagaExecutionContext:
     def ready_for(self, plan: GlobalRequestPlan) -> bool:
         return (
             plan.ready_for_execution
-            and all(item.queen_principal_id in self.pilot_queens for item in plan.dispatches)
+            and all(
+                item.queen_principal_id in self.pilot_queens for item in plan.dispatches
+            )
             and all(item.repo_id in self.pilot_repositories for item in plan.dispatches)
             and set(plan.user_gates).issubset(self.confirmed_gates)
-            and all(callable(callback) for callback in (
-                self.create_global_request, self.create_repo_dispatch,
-                self.execute_repo_dispatch, self.compensate,
-            ))
+            and all(
+                callable(callback)
+                for callback in (
+                    self.create_global_request,
+                    self.create_repo_dispatch,
+                    self.execute_repo_dispatch,
+                    self.compensate,
+                )
+            )
         )
 
 
@@ -280,7 +370,16 @@ def _saga_request_digest(
     success_criteria: tuple[str, ...],
     constraints: tuple[str, ...],
 ) -> str:
-    material = "\x1f".join((actor_principal_id, objective, priority.value, *repositories, *success_criteria, *constraints))
+    material = "\x1f".join(
+        (
+            actor_principal_id,
+            objective,
+            priority.value,
+            *repositories,
+            *success_criteria,
+            *constraints,
+        )
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -310,7 +409,11 @@ def plan_global_request(
     if len(set(repositories)) != len(repositories):
         raise HiveDispatchError("duplicate_global_repository")
     try:
-        priority = priority if isinstance(priority, DispatchPriority) else DispatchPriority(priority)
+        priority = (
+            priority
+            if isinstance(priority, DispatchPriority)
+            else DispatchPriority(priority)
+        )
     except (TypeError, ValueError) as exc:
         raise HiveDispatchError("invalid_dispatch_priority") from exc
     _texts(success_criteria, "success_criteria")
@@ -334,10 +437,23 @@ def plan_global_request(
     if "destruct" in lowered_constraints or "force-push" in lowered_constraints:
         normalized_gates.add("global_destruction")
     missing_gate = any(
-        gate not in user_gates for gate in normalized_gates if gate in {"breaking_changes", "global_destruction"}
+        gate not in user_gates
+        for gate in normalized_gates
+        if gate in {"breaking_changes", "global_destruction"}
     )
-    planning_reason = "unknown_repository" if unknown else ("user_gate_required" if missing_gate else "ready")
-    digest = _saga_request_digest(actor_principal_id, objective, repositories, priority, tuple(success_criteria), tuple(constraints))
+    planning_reason = (
+        "unknown_repository"
+        if unknown
+        else ("user_gate_required" if missing_gate else "ready")
+    )
+    digest = _saga_request_digest(
+        actor_principal_id,
+        objective,
+        repositories,
+        priority,
+        tuple(success_criteria),
+        tuple(constraints),
+    )
     request_id = f"request-{digest[:24]}"
     if now is not None and not callable(now):
         raise HiveDispatchError("invalid_planning_clock")
@@ -382,7 +498,9 @@ def plan_global_request(
         )
         for index, repo_id in enumerate(resolved)
     )
-    return GlobalRequestPlan(request, dispatches, mode, planning_reason, tuple(sorted(normalized_gates)))
+    return GlobalRequestPlan(
+        request, dispatches, mode, planning_reason, tuple(sorted(normalized_gates))
+    )
 
 
 def execute_global_request(
@@ -394,20 +512,42 @@ def execute_global_request(
         raise HiveDispatchError("invalid_global_request_plan")
     public_plan = plan.public()
     if plan.mode != "enforced":
-        return {"allowed": False, "reason_code": "shadow_only", "mutation_performed": False, "plan": public_plan, "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "shadow_only",
+            "mutation_performed": False,
+            "plan": public_plan,
+            "raw_output": "not_returned",
+        }
     if context is None or not context.ready_for(plan):
-        return {"allowed": False, "reason_code": "saga_gate_blocked", "mutation_performed": False, "plan": public_plan, "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "saga_gate_blocked",
+            "mutation_performed": False,
+            "plan": public_plan,
+            "raw_output": "not_returned",
+        }
     steps: list[tuple[str, str, object | None]] = []
     try:
         if not callable(context.create_global_request):
             raise HiveDispatchError("saga_callback_unavailable")
         steps.append(("global_request", plan.request.request_id, None))
-        steps[-1] = ("global_request", plan.request.request_id, context.create_global_request(plan.request))
+        steps[-1] = (
+            "global_request",
+            plan.request.request_id,
+            context.create_global_request(plan.request),
+        )
         for dispatch in plan.dispatches:
-            if not callable(context.create_repo_dispatch) or not callable(context.execute_repo_dispatch):
+            if not callable(context.create_repo_dispatch) or not callable(
+                context.execute_repo_dispatch
+            ):
                 raise HiveDispatchError("saga_callback_unavailable")
             steps.append(("repo_dispatch", dispatch.dispatch_id, None))
-            steps[-1] = ("repo_dispatch", dispatch.dispatch_id, context.create_repo_dispatch(dispatch))
+            steps[-1] = (
+                "repo_dispatch",
+                dispatch.dispatch_id,
+                context.create_repo_dispatch(dispatch),
+            )
             steps.append(("repo_execute", dispatch.dispatch_id, None))
             result = context.execute_repo_dispatch(dispatch)
             if not isinstance(result, Mapping):
@@ -431,7 +571,11 @@ def execute_global_request(
                 context.compensate(kind, identifier, result)
             except Exception:
                 compensation_complete = False
-        completed_dispatches = sum(1 for kind, _identifier, result in steps if kind == "repo_execute" and result is not None)
+        completed_dispatches = sum(
+            1
+            for kind, _identifier, result in steps
+            if kind == "repo_execute" and result is not None
+        )
         return {
             "allowed": False,
             "reason_code": "saga_partially_completed",
@@ -446,31 +590,67 @@ def execute_global_request(
 
 
 def retry_repo_dispatch(
-    dispatch_id: str, *, expected_version: int, context: GlobalSagaExecutionContext | None = None
+    dispatch_id: str,
+    *,
+    expected_version: int,
+    context: GlobalSagaExecutionContext | None = None,
 ) -> Mapping[str, object]:
     _id(dispatch_id, "dispatch")
     _version(expected_version)
     if context is None or not callable(context.retry_dispatch):
-        return {"allowed": False, "reason_code": "saga_gate_blocked", "dispatch_id": dispatch_id, "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "saga_gate_blocked",
+            "dispatch_id": dispatch_id,
+            "raw_output": "not_returned",
+        }
     try:
         context.retry_dispatch(dispatch_id, expected_version)
     except Exception:
-        return {"allowed": False, "reason_code": "saga_retry_unavailable", "dispatch_id": dispatch_id, "raw_output": "not_returned"}
-    return {"allowed": True, "reason_code": "repo_dispatch_retry_requested", "dispatch_id": dispatch_id, "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "saga_retry_unavailable",
+            "dispatch_id": dispatch_id,
+            "raw_output": "not_returned",
+        }
+    return {
+        "allowed": True,
+        "reason_code": "repo_dispatch_retry_requested",
+        "dispatch_id": dispatch_id,
+        "raw_output": "not_returned",
+    }
 
 
 def cancel_global_request(
-    request_id: str, *, expected_version: int, context: GlobalSagaExecutionContext | None = None
+    request_id: str,
+    *,
+    expected_version: int,
+    context: GlobalSagaExecutionContext | None = None,
 ) -> Mapping[str, object]:
     _id(request_id, "request")
     _version(expected_version)
     if context is None or not callable(context.cancel_request):
-        return {"allowed": False, "reason_code": "saga_gate_blocked", "request_id": request_id, "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "saga_gate_blocked",
+            "request_id": request_id,
+            "raw_output": "not_returned",
+        }
     try:
         context.cancel_request(request_id, expected_version)
     except Exception:
-        return {"allowed": False, "reason_code": "saga_cancel_unavailable", "request_id": request_id, "raw_output": "not_returned"}
-    return {"allowed": True, "reason_code": "global_request_cancel_requested", "request_id": request_id, "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "saga_cancel_unavailable",
+            "request_id": request_id,
+            "raw_output": "not_returned",
+        }
+    return {
+        "allowed": True,
+        "reason_code": "global_request_cancel_requested",
+        "request_id": request_id,
+        "raw_output": "not_returned",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,7 +671,11 @@ class WorkPackage:
     version: int = 1
 
     def __post_init__(self) -> None:
-        for value, field in ((self.workpackage_id, "workpackage"), (self.dispatch_id, "dispatch"), (self.owner_teamlead_principal_id, "teamlead")):
+        for value, field in (
+            (self.workpackage_id, "workpackage"),
+            (self.dispatch_id, "dispatch"),
+            (self.owner_teamlead_principal_id, "teamlead"),
+        ):
             _id(value, field)
         _text(self.objective, "objective")
         _texts(self.scope, "scope")
@@ -499,11 +683,18 @@ class WorkPackage:
         _texts(self.success_criteria, "success_criteria")
         _texts(self.test_requirements, "test_requirements")
         _text(self.release_policy, "release_policy", maximum=128)
-        if not isinstance(self.depends_on_workpackage_ids, tuple) or len(self.depends_on_workpackage_ids) > MAX_LIST:
+        if (
+            not isinstance(self.depends_on_workpackage_ids, tuple)
+            or len(self.depends_on_workpackage_ids) > MAX_LIST
+        ):
             raise HiveDispatchError("invalid_workpackage_dependencies")
         for value in self.depends_on_workpackage_ids:
             _id(value, "workpackage_dependency")
-        object.__setattr__(self, "resource_profile", _mapping_safe(self.resource_profile, "resource_profile"))
+        object.__setattr__(
+            self,
+            "resource_profile",
+            _mapping_safe(self.resource_profile, "resource_profile"),
+        )
         _state(self.state, WORKPACKAGE_STATES, "workpackage")
         if self.ready_since_utc is not None:
             _time(self.ready_since_utc, "ready_timestamp")
@@ -530,15 +721,30 @@ class AssignmentIntent:
 
     def __post_init__(self) -> None:
         for value, field in (
-            (self.assignment_intent_id, "assignment_intent"), (self.request_id, "request"), (self.dispatch_id, "dispatch"),
-            (self.workpackage_id, "workpackage"), (self.repo_id, "repo"), (self.parent_principal_id, "parent_principal"),
-            (self.grant_id, "grant"), (self.class_id, "class"),
+            (self.assignment_intent_id, "assignment_intent"),
+            (self.request_id, "request"),
+            (self.dispatch_id, "dispatch"),
+            (self.workpackage_id, "workpackage"),
+            (self.repo_id, "repo"),
+            (self.parent_principal_id, "parent_principal"),
+            (self.grant_id, "grant"),
+            (self.class_id, "class"),
         ):
             _id(value, field)
-        if not isinstance(self.dispatch_priority, DispatchPriority) or not isinstance(self.task_complexity, TaskComplexity):
+        if not isinstance(self.dispatch_priority, DispatchPriority) or not isinstance(
+            self.task_complexity, TaskComplexity
+        ):
             raise HiveDispatchError("invalid_assignment_policy")
-        object.__setattr__(self, "model_policy_constraints", _mapping_safe(self.model_policy_constraints, "model_policy"))
-        object.__setattr__(self, "scope_reservation_request", _mapping_safe(self.scope_reservation_request, "scope_reservation"))
+        object.__setattr__(
+            self,
+            "model_policy_constraints",
+            _mapping_safe(self.model_policy_constraints, "model_policy"),
+        )
+        object.__setattr__(
+            self,
+            "scope_reservation_request",
+            _mapping_safe(self.scope_reservation_request, "scope_reservation"),
+        )
         _text(self.expected_usage_bucket, "usage_bucket", maximum=128)
         _texts(self.decision_refs, "decision_refs")
         _text(self.context_digest, "context_digest", maximum=192)
@@ -574,19 +780,30 @@ class QueenAssignmentPlan:
 
     def __post_init__(self) -> None:
         for value, field in (
-            (self.queen_principal_id, "queen"), (self.dispatch_id, "dispatch"), (self.workpackage_id, "workpackage"),
-            (self.repo_id, "repo"), (self.teamlead_principal_id, "teamlead"), (self.specialist_principal_id, "specialist"),
-            (self.writer_class_id, "class"), (self.agent_id, "agent"),
+            (self.queen_principal_id, "queen"),
+            (self.dispatch_id, "dispatch"),
+            (self.workpackage_id, "workpackage"),
+            (self.repo_id, "repo"),
+            (self.teamlead_principal_id, "teamlead"),
+            (self.specialist_principal_id, "specialist"),
+            (self.writer_class_id, "class"),
+            (self.agent_id, "agent"),
         ):
             _id(value, field)
         if (
             not isinstance(self.model_id, str)
             or not 1 <= len(self.model_id) <= 128
-            or any(not (char.isalnum() or char in {".", "_", ":", "/", "-"}) for char in self.model_id)
+            or any(
+                not (char.isalnum() or char in {".", "_", ":", "/", "-"})
+                for char in self.model_id
+            )
         ):
             raise HiveDispatchError("invalid_model")
         _text(self.account_key, "account_key", maximum=256)
-        if self.queen_principal_id not in _PILOT_QUEENS or self.repo_id not in _PILOT_REPOSITORIES:
+        if (
+            self.queen_principal_id not in _PILOT_QUEENS
+            or self.repo_id not in _PILOT_REPOSITORIES
+        ):
             raise HiveDispatchError("pilot_allowlist_denied")
         if self.writer_class_id not in {"spezialistin", "specialist"}:
             raise HiveDispatchError("writer_role_denied")
@@ -599,8 +816,12 @@ class QueenAssignmentPlan:
         if self.mode not in {"shadow", "enforced"}:
             raise HiveDispatchError("invalid_assignment_mode")
         for value in (
-            self.pilot_enabled, self.account_confirmed, self.authority_verified,
-            self.repository_verified, self.scope_verified, self.lease_available,
+            self.pilot_enabled,
+            self.account_confirmed,
+            self.authority_verified,
+            self.repository_verified,
+            self.scope_verified,
+            self.lease_available,
         ):
             if not isinstance(value, bool):
                 raise HiveDispatchError("invalid_assignment_gate")
@@ -615,10 +836,16 @@ class QueenAssignmentPlan:
 
     @property
     def gates_ready(self) -> bool:
-        return all((
-            self.pilot_enabled, self.account_confirmed, self.authority_verified,
-            self.repository_verified, self.scope_verified, self.lease_available,
-        ))
+        return all(
+            (
+                self.pilot_enabled,
+                self.account_confirmed,
+                self.authority_verified,
+                self.repository_verified,
+                self.scope_verified,
+                self.lease_available,
+            )
+        )
 
     def public(self) -> dict[str, object]:
         return {
@@ -633,7 +860,10 @@ class QueenAssignmentPlan:
             "model_id": self.model_id,
             "model_role": self.model_role,
             "task_complexity": self.task_complexity.value,
-            "scope": {"path_count": len(self.scope), "write_path_count": len(self.write_paths)},
+            "scope": {
+                "path_count": len(self.scope),
+                "write_path_count": len(self.write_paths),
+            },
             "mode": self.mode,
             "pilot_enabled": self.pilot_enabled,
             "account_confirmed": self.account_confirmed,
@@ -660,7 +890,9 @@ class QueenAssignmentExecutionContext:
     create_specialist_principal: Callable[[QueenAssignmentPlan], object] | None = None
     issue_grant: Callable[[QueenAssignmentPlan], object] | None = None
     reserve_admission: Callable[[QueenAssignmentPlan], object] | None = None
-    execute_assignment: Callable[[QueenAssignmentPlan], Mapping[str, object]] | None = None
+    execute_assignment: Callable[[QueenAssignmentPlan], Mapping[str, object]] | None = (
+        None
+    )
     compensate: Callable[[str, QueenAssignmentPlan, object | None], None] | None = None
 
     def ready_for(self, plan: QueenAssignmentPlan) -> bool:
@@ -671,10 +903,17 @@ class QueenAssignmentExecutionContext:
             and plan.account_key in self.confirmed_accounts
             and plan.model_id in self.primary_models
             and plan.gates_ready
-            and all(callable(callback) for callback in (
-                self.create_teamlead_principal, self.create_specialist_principal,
-                self.issue_grant, self.reserve_admission, self.execute_assignment, self.compensate,
-            ))
+            and all(
+                callable(callback)
+                for callback in (
+                    self.create_teamlead_principal,
+                    self.create_specialist_principal,
+                    self.issue_grant,
+                    self.reserve_admission,
+                    self.execute_assignment,
+                    self.compensate,
+                )
+            )
         )
 
 
@@ -691,7 +930,9 @@ def plan_queen_assignment(
             complexity = TaskComplexity(complexity)
         scope = workpackage["scope"]
         write_paths = workpackage["write_paths"]
-        if not isinstance(scope, (tuple, list)) or not isinstance(write_paths, (tuple, list)):
+        if not isinstance(scope, (tuple, list)) or not isinstance(
+            write_paths, (tuple, list)
+        ):
             raise HiveDispatchError("invalid_workpackage_plan")
         return QueenAssignmentPlan(
             queen_id,
@@ -762,8 +1003,18 @@ def plan_queen_assignment_from_selection(
 _T = TypeVar("_T")
 
 
-def _transition(item: _T, target: str, expected_version: int, transitions: Mapping[str, set[str]], version: int) -> _T:
-    if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version != version:
+def _transition(
+    item: _T,
+    target: str,
+    expected_version: int,
+    transitions: Mapping[str, set[str]],
+    version: int,
+) -> _T:
+    if (
+        not isinstance(expected_version, int)
+        or isinstance(expected_version, bool)
+        or expected_version != version
+    ):
         raise HiveDispatchError("stale_dispatch_version")
     current = getattr(item, "state")
     if target == current:
@@ -773,22 +1024,38 @@ def _transition(item: _T, target: str, expected_version: int, transitions: Mappi
     return replace(item, state=target, version=version + 1)
 
 
-def transition_request(request: GlobalRequest, target: str, *, expected_version: int) -> GlobalRequest:
+def transition_request(
+    request: GlobalRequest, target: str, *, expected_version: int
+) -> GlobalRequest:
     if not isinstance(request, GlobalRequest):
         raise HiveDispatchError("invalid_request")
-    return _transition(request, target, expected_version, _REQUEST_TRANSITIONS, request.version)
+    return _transition(
+        request, target, expected_version, _REQUEST_TRANSITIONS, request.version
+    )
 
 
-def transition_dispatch(dispatch: RepoDispatch, target: str, *, expected_version: int) -> RepoDispatch:
+def transition_dispatch(
+    dispatch: RepoDispatch, target: str, *, expected_version: int
+) -> RepoDispatch:
     if not isinstance(dispatch, RepoDispatch):
         raise HiveDispatchError("invalid_dispatch")
-    return _transition(dispatch, target, expected_version, _DISPATCH_TRANSITIONS, dispatch.version)
+    return _transition(
+        dispatch, target, expected_version, _DISPATCH_TRANSITIONS, dispatch.version
+    )
 
 
-def transition_workpackage(workpackage: WorkPackage, target: str, *, expected_version: int) -> WorkPackage:
+def transition_workpackage(
+    workpackage: WorkPackage, target: str, *, expected_version: int
+) -> WorkPackage:
     if not isinstance(workpackage, WorkPackage):
         raise HiveDispatchError("invalid_workpackage")
-    return _transition(workpackage, target, expected_version, _WORKPACKAGE_TRANSITIONS, workpackage.version)
+    return _transition(
+        workpackage,
+        target,
+        expected_version,
+        _WORKPACKAGE_TRANSITIONS,
+        workpackage.version,
+    )
 
 
 def transition_workpackage_from_report(
@@ -804,15 +1071,31 @@ def transition_workpackage_from_report(
     target = report["status"]
     if not isinstance(target, str) or target not in WORKPACKAGE_STATES:
         raise HiveDispatchError("unsupported_report_status")
-    return transition_workpackage(workpackage, target, expected_version=expected_version)
+    return transition_workpackage(
+        workpackage, target, expected_version=expected_version
+    )
 
 
-_PAUSE_FORBIDDEN_MARKERS = frozenset({
-    "sp0", "sp1", "sp2", "sp3", "selection", "fairness", "model", "lease", "kill", "interrupt", "restart",
-})
+_PAUSE_FORBIDDEN_MARKERS = frozenset(
+    {
+        "sp0",
+        "sp1",
+        "sp2",
+        "sp3",
+        "selection",
+        "fairness",
+        "model",
+        "lease",
+        "kill",
+        "interrupt",
+        "restart",
+    }
+)
 
 
-def request_cooperative_pause(workpackage_id: str, *, reason: str) -> Mapping[str, object]:
+def request_cooperative_pause(
+    workpackage_id: str, *, reason: str
+) -> Mapping[str, object]:
     """Request a checkpointed pause; this planning adapter never stops a process."""
 
     _id(workpackage_id, "workpackage")
@@ -838,7 +1121,10 @@ def request_cooperative_pause(workpackage_id: str, *, reason: str) -> Mapping[st
 def acknowledge_checkpoint(message: HiveMessage) -> Mapping[str, object]:
     """Accept only an explicit safe checkpoint report for a requested pause."""
 
-    if not isinstance(message, HiveMessage) or message.message_type != "progress.report":
+    if (
+        not isinstance(message, HiveMessage)
+        or message.message_type != "progress.report"
+    ):
         raise HiveDispatchError("checkpoint_report_required")
     if message.workpackage_id is None:
         raise HiveDispatchError("checkpoint_workpackage_required")
@@ -846,9 +1132,17 @@ def acknowledge_checkpoint(message: HiveMessage) -> Mapping[str, object]:
     checkpoint_state = message.payload.get("checkpoint_state")
     pause_requested = message.payload.get("pause_requested")
     origin = message.payload.get("origin", "work_orchestration")
-    if checkpoint is not True or checkpoint_state != "safe" or pause_requested is not True:
+    if (
+        checkpoint is not True
+        or checkpoint_state != "safe"
+        or pause_requested is not True
+    ):
         raise HiveDispatchError("unsafe_checkpoint")
-    if not isinstance(origin, str) or origin not in {"work_orchestration", "teamlead", "queen"}:
+    if not isinstance(origin, str) or origin not in {
+        "work_orchestration",
+        "teamlead",
+        "queen",
+    }:
         raise HiveDispatchError("checkpoint_source_not_allowed")
     report = record_child_report(message)
     return {
@@ -872,7 +1166,9 @@ def transition_workpackage_at_checkpoint(
     """Move an executing workpackage to paused only after checkpoint evidence."""
 
     acknowledge_checkpoint(message)
-    return transition_workpackage(workpackage, "paused", expected_version=expected_version)
+    return transition_workpackage(
+        workpackage, "paused", expected_version=expected_version
+    )
 
 
 def resume_paused_workpackage(workpackage_id: str) -> Mapping[str, object]:

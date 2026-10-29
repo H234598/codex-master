@@ -75,7 +75,9 @@ def test_missing_attestation_keeps_headless_write_fail_closed(tmp_path: Path) ->
     repository, _worktree = _repository(tmp_path)
     store = HeadlessWriteScopeStore(tmp_path / "state")
 
-    with pytest.raises(HeadlessWriteScopeFailure, match="headless_write_scope_unenforced") as exc_info:
+    with pytest.raises(
+        HeadlessWriteScopeFailure, match="headless_write_scope_unenforced"
+    ) as exc_info:
         store.bind(
             "a",
             repository,
@@ -107,7 +109,10 @@ def test_directory_declaration_attributes_nested_changes(tmp_path: Path) -> None
     assert store.read(attestation.attestation_id).lifecycle == "consumed"
 
 
-@pytest.mark.parametrize("write_path", ["../escape.py", "/tmp/escape.py", "src/../escape.py", "src//file.py", "."])
+@pytest.mark.parametrize(
+    "write_path",
+    ["../escape.py", "/tmp/escape.py", "src/../escape.py", "src//file.py", "."],
+)
 def test_declared_write_path_rejects_ambiguous_or_absolute_target(
     tmp_path: Path, write_path: str
 ) -> None:
@@ -115,7 +120,9 @@ def test_declared_write_path_rejects_ambiguous_or_absolute_target(
     store = HeadlessWriteScopeStore(tmp_path / "state")
     store.create("a", repository, worktree, base_ref=None)
 
-    with pytest.raises(HeadlessWriteScopeFailure, match="headless_write_path_invalid") as exc_info:
+    with pytest.raises(
+        HeadlessWriteScopeFailure, match="headless_write_path_invalid"
+    ) as exc_info:
         store.bind(
             "a",
             repository,
@@ -155,9 +162,7 @@ def test_git_verification_does_not_inherit_config_override_environment(
 
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/attacker-global-config")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/tmp/attacker-system-config")
-    store = HeadlessWriteScopeStore(
-        tmp_path / "state", git_runner=recording_runner
-    )
+    store = HeadlessWriteScopeStore(tmp_path / "state", git_runner=recording_runner)
 
     store.create("a", repository, worktree, base_ref=None)
 
@@ -194,9 +199,7 @@ def test_global_excludes_file_cannot_hide_out_of_scope_change(
             captured.update(env)
         return _git_process(args, cwd, timeout, env=env)
 
-    store = HeadlessWriteScopeStore(
-        tmp_path / "state", git_runner=recording_runner
-    )
+    store = HeadlessWriteScopeStore(tmp_path / "state", git_runner=recording_runner)
     store.create("a", repository, worktree, base_ref=None)
     binding = store.bind(
         "a",
@@ -232,9 +235,7 @@ def test_git_verification_rejects_boolean_returncode(tmp_path: Path) -> None:
         del cwd, timeout, env
         return subprocess.CompletedProcess(args, False, "", "")
 
-    store = HeadlessWriteScopeStore(
-        tmp_path / "state", git_runner=malformed_runner
-    )
+    store = HeadlessWriteScopeStore(tmp_path / "state", git_runner=malformed_runner)
 
     with pytest.raises(
         HeadlessWriteScopeFailure,
@@ -319,7 +320,9 @@ def test_provider_generation_change_rejects_revalidation(tmp_path: Path) -> None
         provider_generation=4,
     )
 
-    with pytest.raises(HeadlessWriteScopeFailure, match="headless_assignment_generation_changed"):
+    with pytest.raises(
+        HeadlessWriteScopeFailure, match="headless_assignment_generation_changed"
+    ):
         store.revalidate(binding, repository, provider_generation=5)
 
 
@@ -422,7 +425,9 @@ def test_revalidation_rejects_every_persisted_worktree_field_tampering(
         store.revalidate(tampered, repository, provider_generation=4)
 
 
-@pytest.mark.parametrize("field", ["history_reflog_count", "history_reflog_digest", "history_reflog_anchor"])
+@pytest.mark.parametrize(
+    "field", ["history_reflog_count", "history_reflog_digest", "history_reflog_anchor"]
+)
 def test_revalidation_rejects_history_evidence_binding_tampering(
     tmp_path: Path, field: str
 ) -> None:
@@ -450,7 +455,9 @@ def test_revalidation_rejects_history_evidence_binding_tampering(
         )
 
 
-def test_revalidation_rejects_persisted_index_evidence_tampering(tmp_path: Path) -> None:
+def test_revalidation_rejects_persisted_index_evidence_tampering(
+    tmp_path: Path,
+) -> None:
     repository, worktree = _repository(tmp_path)
     store = HeadlessWriteScopeStore(tmp_path / "state")
     store.create("a", repository, worktree, base_ref=None)
@@ -555,8 +562,7 @@ def test_cumulative_serialized_write_path_size_is_bounded(tmp_path: Path) -> Non
     store = HeadlessWriteScopeStore(tmp_path / "state")
     store.create("a", repository, worktree, base_ref=None)
     write_paths = [
-        f"p{index:03d}/" + "/".join("x" * 220 for _ in range(3))
-        for index in range(100)
+        f"p{index:03d}/" + "/".join("x" * 220 for _ in range(3)) for index in range(100)
     ]
 
     with pytest.raises(HeadlessWriteScopeFailure, match="headless_write_path_invalid"):
@@ -593,7 +599,9 @@ def test_attestation_record_requires_private_single_link_owner_file(
         store.read(attestation.attestation_id)
 
 
-def test_attestation_lock_requires_private_single_link_owner_file(tmp_path: Path) -> None:
+def test_attestation_lock_requires_private_single_link_owner_file(
+    tmp_path: Path,
+) -> None:
     repository, worktree = _repository(tmp_path)
     store = HeadlessWriteScopeStore(tmp_path / "state")
     attestation = store.create("a", repository, worktree, base_ref=None)
@@ -649,7 +657,11 @@ def test_record_owner_failure_isolated_from_journal_directory_check(
     monkeypatch.setattr(store, "_ensure_state_dir", lambda: None)
     monkeypatch.setattr(store, "_verify_journal_directory_fd", lambda _fd: None)
     monkeypatch.setattr(store, "_verify_journal_regular_fd", lambda *_args: None)
-    actual_owner = (tmp_path / "state" / f"attestation-{attestation.attestation_id}.json").stat().st_uid
+    actual_owner = (
+        (tmp_path / "state" / f"attestation-{attestation.attestation_id}.json")
+        .stat()
+        .st_uid
+    )
     monkeypatch.setattr(headless_write_scope.os, "getuid", lambda: actual_owner + 1)
 
     with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
@@ -933,7 +945,9 @@ def test_finalize_rejects_git_replace_that_hides_malicious_commit(
     _git(worktree, "add", "outside.py")
     _git(worktree, "commit", "--quiet", "-m", "malicious commit")
     malicious = _git(worktree, "rev-parse", "HEAD").strip()
-    baseline_tree = _git(worktree, "rev-parse", f"{binding.baseline_commit}^{{tree}}").strip()
+    baseline_tree = _git(
+        worktree, "rev-parse", f"{binding.baseline_commit}^{{tree}}"
+    ).strip()
     harmless = subprocess.run(
         [
             "git",
@@ -1017,7 +1031,9 @@ def test_finalize_rejects_ignore_metadata_change_hiding_untracked_file(
         assignment_id="assignment-1",
         provider_generation=4,
     )
-    exclude_path = Path(_git(worktree, "rev-parse", "--git-path", "info/exclude").strip())
+    exclude_path = Path(
+        _git(worktree, "rev-parse", "--git-path", "info/exclude").strip()
+    )
     if not exclude_path.is_absolute():
         exclude_path = worktree / exclude_path
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1060,7 +1076,9 @@ def test_finalize_rejects_attribution_relevant_git_config_change(
 
 def test_preexisting_ignore_metadata_is_attested_and_allowed(tmp_path: Path) -> None:
     repository, worktree = _repository(tmp_path)
-    exclude_path = Path(_git(worktree, "rev-parse", "--git-path", "info/exclude").strip())
+    exclude_path = Path(
+        _git(worktree, "rev-parse", "--git-path", "info/exclude").strip()
+    )
     if not exclude_path.is_absolute():
         exclude_path = worktree / exclude_path
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1228,7 +1246,9 @@ def test_finalize_rejects_declared_directory_type_change(tmp_path: Path) -> None
     assert store.read(binding.attestation_id).lifecycle == "consumed"
 
 
-def test_finalize_rejects_malformed_git_status_and_consumes_attestation(tmp_path: Path) -> None:
+def test_finalize_rejects_malformed_git_status_and_consumes_attestation(
+    tmp_path: Path,
+) -> None:
     repository, worktree = _repository(tmp_path)
     real_store = HeadlessWriteScopeStore(tmp_path / "state")
     real_store.create("a", repository, worktree, base_ref=None)
@@ -1303,7 +1323,9 @@ def test_finalize_rejects_every_unmerged_porcelain_state(
         args: list[str], *, cwd: Path, timeout: float, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
         if len(args) > 1 and args[1] == "status":
-            return subprocess.CompletedProcess(args, 0, f"{conflict_code} README.md\0", "")
+            return subprocess.CompletedProcess(
+                args, 0, f"{conflict_code} README.md\0", ""
+            )
         return _git_process(args, cwd, timeout, env=env)
 
     store = HeadlessWriteScopeStore(tmp_path / "state", git_runner=conflict_status)
@@ -1353,7 +1375,9 @@ def test_consumed_attestation_cannot_be_reused(tmp_path: Path) -> None:
     )
     assert store.finalize(binding).ok is True
 
-    with pytest.raises(HeadlessWriteScopeFailure, match="headless_write_scope_unenforced"):
+    with pytest.raises(
+        HeadlessWriteScopeFailure, match="headless_write_scope_unenforced"
+    ):
         store.bind(
             "a",
             repository,
@@ -1420,7 +1444,9 @@ def test_pruning_removes_old_terminal_records_but_keeps_available(
     assert len(list((tmp_path / "state").glob("attestation-*.json"))) == 2
 
 
-def test_create_prunes_terminal_records_before_new_record(tmp_path: Path, monkeypatch) -> None:
+def test_create_prunes_terminal_records_before_new_record(
+    tmp_path: Path, monkeypatch
+) -> None:
     repository, worktree = _repository(tmp_path)
     store = HeadlessWriteScopeStore(tmp_path / "state")
     monkeypatch.setattr(headless_write_scope, "MAX_RECORDS", 2)

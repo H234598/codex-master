@@ -631,9 +631,7 @@ class OllamaFleet:
         ready_instance = replace(
             self.instance, lifecycle_state="running", readiness_state="ready"
         )
-        readiness = OllamaReadinessStatus(
-            True, (), True, True, True, ("provider-a",)
-        )
+        readiness = OllamaReadinessStatus(True, (), True, True, True, ("provider-a",))
         lane = OllamaHiveLaneV1(
             "ollama:quiet-runner:model-a",
             "quiet-runner",
@@ -651,9 +649,7 @@ class OllamaFleet:
 
     def probe_ollama_instance(self, instance_ref, *, expected_generation):
         self.calls.append(("probe", (instance_ref, expected_generation)))
-        return OllamaReadinessStatus(
-            True, (), True, True, True, ("provider-a",)
-        )
+        return OllamaReadinessStatus(True, (), True, True, True, ("provider-a",))
 
     def stop_ollama_instance(self, instance_ref, *, expected_generation):
         self.calls.append(("stop", (instance_ref, expected_generation)))
@@ -1009,8 +1005,11 @@ def test_host_probe_requires_its_separate_scope_before_owner_dispatch() -> None:
 
     with pytest.raises(AdminDenied, match="authority.scope_denied"):
         service.command(
-            principal("fleet.host.read"), "hosts.probe", {"host_ref": "worker-one"},
-            expected_generation=4, idempotency_key="probe-one",
+            principal("fleet.host.read"),
+            "hosts.probe",
+            {"host_ref": "worker-one"},
+            expected_generation=4,
+            idempotency_key="probe-one",
         )
 
 
@@ -1146,9 +1145,7 @@ def test_operations_get_projects_a_direct_ollama_agent_result_without_probe_bind
         AgentPrincipalV1("worker-one", 7),
         AgentPollV1(7, 3, "sha256:" + "c" * 64, 0),
     )
-    result = AgentResultV1(
-        "ollama.instance", "plan", {"plan_ref": "remote-plan-one"}
-    )
+    result = AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan-one"})
     agent_operations.complete(
         AgentPrincipalV1("worker-one", 7),
         AgentReceiptV1(
@@ -1173,9 +1170,7 @@ def test_operations_get_projects_a_direct_ollama_agent_result_without_probe_bind
         ),
     )
 
-    payload = _service_with_operation_stores(
-        admin_operations, agent_operations
-    ).query(
+    payload = _service_with_operation_stores(admin_operations, agent_operations).query(
         principal("fleet.read"), "operations.get", {"operation_id": queued.operation_id}
     )
 
@@ -1186,12 +1181,8 @@ def test_operations_get_projects_a_direct_ollama_agent_result_without_probe_bind
 
 
 def _bound_host_probe_stores(tmp_path, *, agent_clock=lambda: CREATED):
-    admin_operations = AdminOperationStore.for_test(
-        tmp_path, clock=lambda: CREATED
-    )
-    agent_operations = AgentOperationStore.for_test(
-        tmp_path, clock=agent_clock
-    )
+    admin_operations = AdminOperationStore.for_test(tmp_path, clock=lambda: CREATED)
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=agent_clock)
     plan = admin_operations.plan(
         kind="hosts.probe",
         generation=4,
@@ -1294,7 +1285,9 @@ def _finish_probe_admin_operation(admin_operations, plan, *, reason_codes=()):
     )
 
 
-def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path) -> None:
+def test_operations_get_merges_a_terminal_agent_result_from_real_stores(
+    tmp_path,
+) -> None:
     admin_operations, agent_operations, plan = _bound_host_probe_stores(tmp_path)
     _lease, probe_payload, receipt = _probe_receipt(agent_operations)
     agent_operations.complete(AgentPrincipalV1("worker-one", 7), receipt)
@@ -1317,9 +1310,7 @@ def test_operations_get_hides_agent_result_until_admin_operation_is_terminal(
     _lease, _probe_payload, receipt = _probe_receipt(agent_operations)
     agent_operations.complete(AgentPrincipalV1("worker-one", 7), receipt)
 
-    payload = _service_with_operation_stores(
-        admin_operations, agent_operations
-    ).query(
+    payload = _service_with_operation_stores(admin_operations, agent_operations).query(
         principal("fleet.read"),
         "operations.get",
         {"operation_id": plan.operation_id},
@@ -1397,9 +1388,9 @@ def test_public_agent_result_rejects_secret_shaped_values_in_allowed_fields(
 
 
 def test_public_agent_result_keeps_benign_tokens_containing_sk_letters() -> None:
-    assert public_agent_result(
-        "ollama.instance.plan", {"plan_ref": "task-one"}
-    ) == {"plan_ref": "task-one"}
+    assert public_agent_result("ollama.instance.plan", {"plan_ref": "task-one"}) == {
+        "plan_ref": "task-one"
+    }
 
 
 def test_public_agent_result_validates_generation_boole_and_reason_codes() -> None:
@@ -1461,9 +1452,7 @@ def test_operations_get_rejects_non_public_admin_reason_codes(tmp_path) -> None:
         admin_operations, plan, reason_codes=("private.agent.marker",)
     )
 
-    with pytest.raises(
-        AdminServiceError, match=r"resource\.host_response_invalid"
-    ):
+    with pytest.raises(AdminServiceError, match=r"resource\.host_response_invalid"):
         _service_with_operation_stores(admin_operations, agent_operations).query(
             principal("fleet.read"),
             "operations.get",
@@ -1520,9 +1509,7 @@ def test_operations_get_rejects_terminal_binding_without_durable_result(
 
     _finish_probe_admin_operation(admin_operations, plan)
 
-    with pytest.raises(
-        AdminServiceError, match=r"resource\.host_response_invalid"
-    ):
+    with pytest.raises(AdminServiceError, match=r"resource\.host_response_invalid"):
         _service_with_operation_stores(admin_operations, agent_operations).query(
             principal("fleet.read"),
             "operations.get",
@@ -1595,9 +1582,7 @@ def test_account_commands_delegate_once_to_account_registry(
 
     result = command(service, operation, arguments, scope)
 
-    assert result == {
-        "account": {"ref": arguments["account_ref"], "generation": 5}
-    }
+    assert result == {"account": {"ref": arguments["account_ref"], "generation": 5}}
     assert owners.account_registry.calls == [
         ("generation", operation.split(".", 1)[0]),
         expected_call,

@@ -204,9 +204,15 @@ class RemoteQueenHomeApplyResultV1:
     journal: RemoteQueenHomeApplyJournalV1 | None
 
     def __post_init__(self) -> None:
-        if type(self.changed) is not bool or type(self.snapshot) is not QueenHomeSnapshotV1:
+        if (
+            type(self.changed) is not bool
+            or type(self.snapshot) is not QueenHomeSnapshotV1
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
-        if self.journal is not None and type(self.journal) is not RemoteQueenHomeApplyJournalV1:
+        if (
+            self.journal is not None
+            and type(self.journal) is not RemoteQueenHomeApplyJournalV1
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
         if not self.changed and self.journal is not None:
             _raise("RQ_E_PLAN_INCONSISTENT")
@@ -229,7 +235,10 @@ class RemoteQueenHomeVerifyResultV1:
     snapshot: QueenHomeSnapshotV1
 
     def __post_init__(self) -> None:
-        if type(self.verified) is not bool or type(self.snapshot) is not QueenHomeSnapshotV1:
+        if (
+            type(self.verified) is not bool
+            or type(self.snapshot) is not QueenHomeSnapshotV1
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
 
 
@@ -241,7 +250,10 @@ class RollbackRemoteQueenHomeRequestV1:
 
     def __post_init__(self) -> None:
         _validate_request_plan(self.plan, self.expected_plan_digest)
-        if self.journal is not None and type(self.journal) is not RemoteQueenHomeApplyJournalV1:
+        if (
+            self.journal is not None
+            and type(self.journal) is not RemoteQueenHomeApplyJournalV1
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
 
 
@@ -251,14 +263,15 @@ class RemoteQueenHomeRollbackResultV1:
     snapshot: QueenHomeSnapshotV1
 
     def __post_init__(self) -> None:
-        if type(self.changed) is not bool or type(self.snapshot) is not QueenHomeSnapshotV1:
+        if (
+            type(self.changed) is not bool
+            or type(self.snapshot) is not QueenHomeSnapshotV1
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
 
 
 class RemoteQueenHomeOperations(Protocol):
-    def inspect(
-        self, manifest: RemoteQueenHomeManifestV1
-    ) -> QueenHomeSnapshotV1: ...
+    def inspect(self, manifest: RemoteQueenHomeManifestV1) -> QueenHomeSnapshotV1: ...
 
     def materialize_home(
         self, plan: RemoteQueenHomePlanV1
@@ -318,7 +331,9 @@ def _raise(code: str) -> None:
 
 
 def _valid_digest(value: object) -> bool:
-    return type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    return (
+        type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    )
 
 
 def _valid_generation(value: object) -> bool:
@@ -332,7 +347,11 @@ def _valid_generation(value: object) -> bool:
 
 
 def _valid_token(value: object, maximum: int | None = 128) -> bool:
-    if type(value) is not str or not 1 <= len(value) or (maximum is not None and len(value) > maximum):
+    if (
+        type(value) is not str
+        or not 1 <= len(value)
+        or (maximum is not None and len(value) > maximum)
+    ):
         return False
     return all(0x21 <= ord(char) <= 0x7E and char not in "/\\" for char in value)
 
@@ -348,11 +367,18 @@ def _valid_baseline(value: object) -> bool:
 def _valid_safe_text(value: object) -> bool:
     if type(value) is not str or not value:
         return False
-    return all(char != "\x00" and not char.isspace() and char.isprintable() for char in value)
+    return all(
+        char != "\x00" and not char.isspace() and char.isprintable() for char in value
+    )
 
 
 def _valid_remote_home(value: object) -> bool:
-    if type(value) is not str or value == "/" or not value.startswith("/") or value.endswith("/"):
+    if (
+        type(value) is not str
+        or value == "/"
+        or not value.startswith("/")
+        or value.endswith("/")
+    ):
         return False
     if "\\" in value or "~" in value or "\x00" in value:
         return False
@@ -363,26 +389,43 @@ def _valid_remote_home(value: object) -> bool:
 
 
 def _valid_relative_segment(value: object) -> bool:
-    return type(value) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) is not None
+    return (
+        type(value) is str
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) is not None
+    )
 
 
 def _valid_write_path(value: object) -> bool:
-    if type(value) is not str or not value.startswith("G18/") or not value.endswith("/**"):
+    if (
+        type(value) is not str
+        or not value.startswith("G18/")
+        or not value.endswith("/**")
+    ):
         return False
     base = value[:-3]
     segments = base.split("/")
     if len(segments) < 2 or segments[0] != "G18":
         return False
-    if any(not _valid_relative_segment(segment) or segment in (".", "..") for segment in segments[1:]):
+    if any(
+        not _valid_relative_segment(segment) or segment in (".", "..")
+        for segment in segments[1:]
+    ):
         return False
     folded = tuple(segment.casefold() for segment in segments[1:])
-    if any(segment in _BANNED_SCOPE_SEGMENTS or segment in _BANNED_PLAN_SEGMENTS for segment in folded):
+    if any(
+        segment in _BANNED_SCOPE_SEGMENTS or segment in _BANNED_PLAN_SEGMENTS
+        for segment in folded
+    ):
         return False
     return True
 
 
 def _valid_write_paths(value: object, allow_empty: bool = False) -> bool:
-    if type(value) is not tuple or (not allow_empty and not 1 <= len(value) <= 32) or (allow_empty and len(value) > 32):
+    if (
+        type(value) is not tuple
+        or (not allow_empty and not 1 <= len(value) <= 32)
+        or (allow_empty and len(value) > 32)
+    ):
         return False
     if any(type(path) is not str for path in value):
         return False
@@ -393,7 +436,11 @@ def _valid_write_paths(value: object, allow_empty: bool = False) -> bool:
     bases = [path[:-3].split("/") for path in value]
     for index, current in enumerate(bases):
         for other in bases[index + 1 :]:
-            if current == other or current[: len(other)] == other or other[: len(current)] == current:
+            if (
+                current == other
+                or current[: len(other)] == other
+                or other[: len(current)] == current
+            ):
                 return False
     return True
 
@@ -405,7 +452,9 @@ def _valid_material_path(value: object) -> bool:
         return True
     if re.fullmatch(r"skills/[a-z0-9]+(?:-[a-z0-9]+)*/SKILL\.md", value) is None:
         return False
-    return not any(segment in _BANNED_SCOPE_SEGMENTS for segment in value.split("/")[:-1])
+    return not any(
+        segment in _BANNED_SCOPE_SEGMENTS for segment in value.split("/")[:-1]
+    )
 
 
 def _valid_class_id(value: object) -> bool:
@@ -521,7 +570,11 @@ def _own_digest_field(value: object) -> str | None:
 def canonical_digest(value: object) -> str:
     try:
         _validate_top_level_domain(value)
-        return _digest_payload(value) if _own_digest_field(value) is None else _digest_payload_without_field(value)
+        return (
+            _digest_payload(value)
+            if _own_digest_field(value) is None
+            else _digest_payload_without_field(value)
+        )
     except RemoteQueenBootstrapError:
         raise
     except Exception:
@@ -530,7 +583,12 @@ def canonical_digest(value: object) -> str:
 
 
 def _digest_payload_without_field(value: object) -> str:
-    return "sha256:" + hashlib.sha256(_json_bytes(_canonicalize(value, _own_digest_field(value)))).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            _json_bytes(_canonicalize(value, _own_digest_field(value)))
+        ).hexdigest()
+    )
 
 
 def _field_payload(value: object, omit: str) -> dict[str, object]:
@@ -549,19 +607,37 @@ def _validate_material(value: object) -> None:
     if type(value) is not QueenHomeMaterialV1:
         _raise("RQ_E_PLAN_INCONSISTENT")
     expected = {
-        TOPIC_ASSIGNMENT_PATH: (QueenMaterialKindV1.TOPIC_ASSIGNMENT, "g18-topic-queen"),
+        TOPIC_ASSIGNMENT_PATH: (
+            QueenMaterialKindV1.TOPIC_ASSIGNMENT,
+            "g18-topic-queen",
+        ),
         GENERIC_RULES_PATH: (QueenMaterialKindV1.GENERIC_RULES, "generic"),
         QUEEN_RULES_PATH: (QueenMaterialKindV1.QUEEN_RULES, "queen"),
     }
-    if not _valid_material_path(value.relative_path) or not _valid_class_id(value.class_id) or not _valid_digest(value.content_sha256):
+    if (
+        not _valid_material_path(value.relative_path)
+        or not _valid_class_id(value.class_id)
+        or not _valid_digest(value.content_sha256)
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     if value.relative_path in expected:
         kind, class_id = expected[value.relative_path]
-        if type(value.kind) is not QueenMaterialKindV1 or value.kind is not kind or value.class_id != class_id:
+        if (
+            type(value.kind) is not QueenMaterialKindV1
+            or value.kind is not kind
+            or value.class_id != class_id
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
-    elif type(value.kind) is not QueenMaterialKindV1 or value.kind is not QueenMaterialKindV1.SKILL or value.class_id != "queen":
+    elif (
+        type(value.kind) is not QueenMaterialKindV1
+        or value.kind is not QueenMaterialKindV1.SKILL
+        or value.class_id != "queen"
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
-    if any(segment.casefold() in _BANNED_SCOPE_SEGMENTS for segment in value.relative_path.split("/")):
+    if any(
+        segment.casefold() in _BANNED_SCOPE_SEGMENTS
+        for segment in value.relative_path.split("/")
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
 
 
@@ -581,7 +657,12 @@ def _validate_materials(value: object) -> None:
         paths.append(item.relative_path)
         if item.kind is QueenMaterialKindV1.SKILL:
             skill_count += 1
-    if paths.count(GENERIC_RULES_PATH) != 1 or paths.count(QUEEN_RULES_PATH) != 1 or paths.count(TOPIC_ASSIGNMENT_PATH) != 1 or skill_count < 1:
+    if (
+        paths.count(GENERIC_RULES_PATH) != 1
+        or paths.count(QUEEN_RULES_PATH) != 1
+        or paths.count(TOPIC_ASSIGNMENT_PATH) != 1
+        or skill_count < 1
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
 
 
@@ -628,7 +709,12 @@ def _validate_lease_binding(value: object) -> None:
 
 
 def _validate_accepted_digests(value: object) -> None:
-    if type(value) is not tuple or any(type(item) is not str for item in value) or value != tuple(sorted(value)) or len(value) != len(set(value)):
+    if (
+        type(value) is not tuple
+        or any(type(item) is not str for item in value)
+        or value != tuple(sorted(value))
+        or len(value) != len(set(value))
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     if any(not _valid_digest(item) for item in value):
         _raise("RQ_E_PLAN_INCONSISTENT")
@@ -688,7 +774,9 @@ def _validate_manifest(value: object) -> None:
     _validate_lease_binding(value.lease_binding)
     _validate_materials(value.materials)
     _validate_resume_capsule(value.resume_capsule)
-    if value.home_path != _derive_home_path(value.remote_home, value.lease_binding.lease_id) or value.repo_path != _derive_repo_path(value.remote_home):
+    if value.home_path != _derive_home_path(
+        value.remote_home, value.lease_binding.lease_id
+    ) or value.repo_path != _derive_repo_path(value.remote_home):
         _raise("RQ_E_PLAN_INCONSISTENT")
     if (
         value.lease_binding.repo_id != value.topic_binding.repo_id
@@ -696,8 +784,10 @@ def _validate_manifest(value: object) -> None:
         or value.resume_capsule.principal_id != value.lease_binding.owner_principal_id
         or value.resume_capsule.repo_id != value.lease_binding.repo_id
         or value.resume_capsule.topic_id != value.lease_binding.topic_id
-        or value.resume_capsule.lease_binding_digest != value.lease_binding.binding_digest
-        or tuple(sorted(set(item.content_sha256 for item in value.materials))) != value.resume_capsule.accepted_artifact_digests
+        or value.resume_capsule.lease_binding_digest
+        != value.lease_binding.binding_digest
+        or tuple(sorted(set(item.content_sha256 for item in value.materials)))
+        != value.resume_capsule.accepted_artifact_digests
     ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     if _object_digest(value, "manifest_digest") != value.manifest_digest:
@@ -717,9 +807,16 @@ def _optional_digest(value: object) -> bool:
 
 
 def _validate_home_fact(value: object) -> None:
-    if type(value) is not QueenHomeFactV1 or type(value.state) is not QueenHomeStateKindV1:
+    if (
+        type(value) is not QueenHomeFactV1
+        or type(value.state) is not QueenHomeStateKindV1
+    ):
         _raise("RQ_E_FOREIGN_STATE")
-    if not _optional_generation_token(value.generation) or not _optional_identifier(value.owner_principal_id) or not _optional_identifier(value.lease_id):
+    if (
+        not _optional_generation_token(value.generation)
+        or not _optional_identifier(value.owner_principal_id)
+        or not _optional_identifier(value.lease_id)
+    ):
         _raise("RQ_E_FOREIGN_STATE")
     if value.home_path is not None and not _valid_remote_home(value.home_path):
         _raise("RQ_E_FOREIGN_STATE")
@@ -727,7 +824,14 @@ def _validate_home_fact(value: object) -> None:
         _raise("RQ_E_FOREIGN_STATE")
     if value.branch is not None and not _valid_identifier(value.branch):
         _raise("RQ_E_FOREIGN_STATE")
-    if not _optional_digest(value.manifest_digest) or not _optional_digest(value.material_tree_sha256) or not _optional_digest(value.resume_capsule_digest) or not _optional_digest(value.plan_digest) or not _optional_digest(value.lease_binding_digest) or not _optional_digest(value.bus_cursor_sha256):
+    if (
+        not _optional_digest(value.manifest_digest)
+        or not _optional_digest(value.material_tree_sha256)
+        or not _optional_digest(value.resume_capsule_digest)
+        or not _optional_digest(value.plan_digest)
+        or not _optional_digest(value.lease_binding_digest)
+        or not _optional_digest(value.bus_cursor_sha256)
+    ):
         _raise("RQ_E_FOREIGN_STATE")
     optional_values = (
         value.generation,
@@ -743,27 +847,46 @@ def _validate_home_fact(value: object) -> None:
         value.lease_binding_digest,
         value.bus_cursor_sha256,
     )
-    if value.state is QueenHomeStateKindV1.ABSENT and any(item is not None for item in optional_values):
+    if value.state is QueenHomeStateKindV1.ABSENT and any(
+        item is not None for item in optional_values
+    ):
         _raise("RQ_E_FOREIGN_STATE")
-    if value.state is QueenHomeStateKindV1.OWNED and any(item is None for item in optional_values):
+    if value.state is QueenHomeStateKindV1.OWNED and any(
+        item is None for item in optional_values
+    ):
         _raise("RQ_E_FOREIGN_STATE")
 
 
 def _validate_snapshot(value: object) -> None:
-    if type(value) is not QueenHomeSnapshotV1 or type(value.home) is not QueenHomeFactV1:
+    if (
+        type(value) is not QueenHomeSnapshotV1
+        or type(value.home) is not QueenHomeFactV1
+    ):
         _raise("RQ_E_FOREIGN_STATE")
     _validate_home_fact(value.home)
-    active = (value.active_topic_principal_id, value.active_topic_home_path, value.active_topic_lease_id)
+    active = (
+        value.active_topic_principal_id,
+        value.active_topic_home_path,
+        value.active_topic_lease_id,
+    )
     if all(item is None for item in active):
         pass
     elif all(item is not None for item in active):
-        if not _valid_identifier(value.active_topic_principal_id) or not _valid_remote_home(value.active_topic_home_path) or not _valid_identifier(value.active_topic_lease_id):
+        if (
+            not _valid_identifier(value.active_topic_principal_id)
+            or not _valid_remote_home(value.active_topic_home_path)
+            or not _valid_identifier(value.active_topic_lease_id)
+        ):
             _raise("RQ_E_FOREIGN_STATE")
     else:
         _raise("RQ_E_FOREIGN_STATE")
     if not _valid_write_paths(value.conflicting_write_paths, allow_empty=True):
         _raise("RQ_E_FOREIGN_STATE")
-    if type(value.lease_active) is not bool or type(value.bus_available) is not bool or type(value.account_available) is not bool:
+    if (
+        type(value.lease_active) is not bool
+        or type(value.bus_available) is not bool
+        or type(value.account_available) is not bool
+    ):
         _raise("RQ_E_FOREIGN_STATE")
     if value.lease_active:
         if not _valid_digest(value.observed_lease_binding_digest):
@@ -804,10 +927,20 @@ def _validate_plan(value: object) -> None:
     if queen_home_snapshot_digest(value.before) != value.before_digest:
         _raise("RQ_E_PLAN_INCONSISTENT")
     if value.action is QueenHomeActionV1.CREATE_HOME:
-        if not value.remove_own_home_on_rollback or not value.preserve_repo_on_rollback or not value.preserve_vault_on_rollback or not value.preserve_hive_state_on_rollback:
+        if (
+            not value.remove_own_home_on_rollback
+            or not value.preserve_repo_on_rollback
+            or not value.preserve_vault_on_rollback
+            or not value.preserve_hive_state_on_rollback
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
     elif value.action is None:
-        if value.remove_own_home_on_rollback or not value.preserve_repo_on_rollback or not value.preserve_vault_on_rollback or not value.preserve_hive_state_on_rollback:
+        if (
+            value.remove_own_home_on_rollback
+            or not value.preserve_repo_on_rollback
+            or not value.preserve_vault_on_rollback
+            or not value.preserve_hive_state_on_rollback
+        ):
             _raise("RQ_E_PLAN_INCONSISTENT")
     else:
         _raise("RQ_E_PLAN_INCONSISTENT")
@@ -815,7 +948,9 @@ def _validate_plan(value: object) -> None:
         _gate_snapshot(value.manifest, value.before)
     except RemoteQueenBootstrapError:
         _raise("RQ_E_PLAN_INCONSISTENT")
-    if value.action is QueenHomeActionV1.CREATE_HOME and not _fully_absent(value.manifest, value.before):
+    if value.action is QueenHomeActionV1.CREATE_HOME and not _fully_absent(
+        value.manifest, value.before
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     if value.action is None and not _fully_owned(value.manifest, value.before):
         _raise("RQ_E_PLAN_INCONSISTENT")
@@ -830,7 +965,13 @@ def _validate_request_plan(plan: object, expected_digest: object) -> None:
 
 
 def _validate_journal(value: object) -> None:
-    if type(value) is not RemoteQueenHomeApplyJournalV1 or not _valid_digest(value.before_digest) or not _valid_token(value.created_generation, None) or not _valid_remote_home(value.created_home_path) or not _valid_digest(value.resulting_snapshot_digest):
+    if (
+        type(value) is not RemoteQueenHomeApplyJournalV1
+        or not _valid_digest(value.before_digest)
+        or not _valid_token(value.created_generation, None)
+        or not _valid_remote_home(value.created_home_path)
+        or not _valid_digest(value.resulting_snapshot_digest)
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
 
 
@@ -854,7 +995,10 @@ def _validate_top_level_domain(value: object) -> None:
         _validate_snapshot(value)
     elif type(value) is RemoteQueenHomePlanV1:
         _validate_plan(value)
-    elif type(value) is ApplyRemoteQueenHomeRequestV1 or type(value) is VerifyRemoteQueenHomeRequestV1:
+    elif (
+        type(value) is ApplyRemoteQueenHomeRequestV1
+        or type(value) is VerifyRemoteQueenHomeRequestV1
+    ):
         _validate_request_plan(value.plan, value.expected_plan_digest)
     elif type(value) is RollbackRemoteQueenHomeRequestV1:
         _validate_request_plan(value.plan, value.expected_plan_digest)
@@ -895,7 +1039,13 @@ def build_queen_lease_binding(
     fence_epoch: int,
     lease_generation: ManifestGenerationV1,
 ) -> QueenLeaseBindingV1:
-    if not _valid_identifier(lease_id) or not _valid_identifier(owner_principal_id) or type(fence_epoch) is not int or fence_epoch < 1 or not _valid_generation(lease_generation):
+    if (
+        not _valid_identifier(lease_id)
+        or not _valid_identifier(owner_principal_id)
+        or type(fence_epoch) is not int
+        or fence_epoch < 1
+        or not _valid_generation(lease_generation)
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     payload = {
         "lease_id": lease_id,
@@ -959,7 +1109,13 @@ def build_remote_queen_home_manifest(
     materials: tuple[QueenHomeMaterialV1, ...],
     resume_capsule: ResumeCapsuleV1,
 ) -> RemoteQueenHomeManifestV1:
-    if not _valid_generation(desired_generation) or not _valid_remote_home(remote_home) or type(topic_binding) is not QueenTopicBindingV1 or type(lease_binding) is not QueenLeaseBindingV1 or type(resume_capsule) is not ResumeCapsuleV1:
+    if (
+        not _valid_generation(desired_generation)
+        or not _valid_remote_home(remote_home)
+        or type(topic_binding) is not QueenTopicBindingV1
+        or type(lease_binding) is not QueenLeaseBindingV1
+        or type(resume_capsule) is not ResumeCapsuleV1
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     _validate_topic_binding(topic_binding)
     _validate_lease_binding(lease_binding)
@@ -970,7 +1126,8 @@ def build_remote_queen_home_manifest(
         or lease_binding.topic_id != topic_binding.topic_id
         or resume_capsule.principal_id != lease_binding.owner_principal_id
         or resume_capsule.lease_binding_digest != lease_binding.binding_digest
-        or tuple(sorted(set(item.content_sha256 for item in materials))) != resume_capsule.accepted_artifact_digests
+        or tuple(sorted(set(item.content_sha256 for item in materials)))
+        != resume_capsule.accepted_artifact_digests
     ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     payload = {
@@ -984,7 +1141,9 @@ def build_remote_queen_home_manifest(
         "materials": materials,
         "resume_capsule": resume_capsule,
     }
-    return RemoteQueenHomeManifestV1(**payload, manifest_digest=_digest_payload(payload))
+    return RemoteQueenHomeManifestV1(
+        **payload, manifest_digest=_digest_payload(payload)
+    )
 
 
 def material_tree_digest(materials: tuple[QueenHomeMaterialV1, ...]) -> str:
@@ -997,11 +1156,21 @@ def queen_home_snapshot_digest(snapshot: QueenHomeSnapshotV1) -> str:
     return canonical_digest(snapshot)
 
 
-def _fully_absent(manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapshotV1) -> bool:
-    return snapshot.home.state is QueenHomeStateKindV1.ABSENT and snapshot.active_topic_principal_id is None and snapshot.active_topic_home_path is None and snapshot.active_topic_lease_id is None and snapshot.conflicting_write_paths == ()
+def _fully_absent(
+    manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapshotV1
+) -> bool:
+    return (
+        snapshot.home.state is QueenHomeStateKindV1.ABSENT
+        and snapshot.active_topic_principal_id is None
+        and snapshot.active_topic_home_path is None
+        and snapshot.active_topic_lease_id is None
+        and snapshot.conflicting_write_paths == ()
+    )
 
 
-def _fully_owned(manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapshotV1) -> bool:
+def _fully_owned(
+    manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapshotV1
+) -> bool:
     expected_tree = material_tree_digest(manifest.materials)
     home = snapshot.home
     return (
@@ -1018,23 +1187,35 @@ def _fully_owned(manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapsho
         and home.plan_digest == manifest.resume_capsule.plan_digest
         and home.lease_binding_digest == manifest.lease_binding.binding_digest
         and home.bus_cursor_sha256 == manifest.resume_capsule.bus_cursor_sha256
-        and snapshot.active_topic_principal_id == manifest.lease_binding.owner_principal_id
+        and snapshot.active_topic_principal_id
+        == manifest.lease_binding.owner_principal_id
         and snapshot.active_topic_home_path == manifest.home_path
         and snapshot.active_topic_lease_id == manifest.lease_binding.lease_id
         and snapshot.conflicting_write_paths == ()
         and snapshot.lease_active
-        and snapshot.observed_lease_binding_digest == manifest.lease_binding.binding_digest
+        and snapshot.observed_lease_binding_digest
+        == manifest.lease_binding.binding_digest
         and snapshot.bus_available
-        and snapshot.observed_bus_cursor_sha256 == manifest.resume_capsule.bus_cursor_sha256
+        and snapshot.observed_bus_cursor_sha256
+        == manifest.resume_capsule.bus_cursor_sha256
         and snapshot.account_available
-        and snapshot.observed_account_binding_sha256 == manifest.resume_capsule.account_binding_sha256
+        and snapshot.observed_account_binding_sha256
+        == manifest.resume_capsule.account_binding_sha256
     )
 
 
-def _gate_snapshot(manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapshotV1) -> None:
+def _gate_snapshot(
+    manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapshotV1
+) -> None:
     if type(snapshot) is QueenHomeSnapshotV1 and type(snapshot.home) is QueenHomeFactV1:
-        active = (snapshot.active_topic_principal_id, snapshot.active_topic_home_path, snapshot.active_topic_lease_id)
-        if snapshot.home.state is QueenHomeStateKindV1.ABSENT and any(item is not None for item in active):
+        active = (
+            snapshot.active_topic_principal_id,
+            snapshot.active_topic_home_path,
+            snapshot.active_topic_lease_id,
+        )
+        if snapshot.home.state is QueenHomeStateKindV1.ABSENT and any(
+            item is not None for item in active
+        ):
             _raise("RQ_E_BUS_TOPIC_CONFLICT")
     try:
         _validate_snapshot(snapshot)
@@ -1043,21 +1224,48 @@ def _gate_snapshot(manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnaps
     home = snapshot.home
     if home.state is QueenHomeStateKindV1.FOREIGN:
         _raise("RQ_E_FOREIGN_STATE")
-    if home.state is QueenHomeStateKindV1.OWNED and (home.owner_principal_id != manifest.lease_binding.owner_principal_id or home.home_path != manifest.home_path):
+    if home.state is QueenHomeStateKindV1.OWNED and (
+        home.owner_principal_id != manifest.lease_binding.owner_principal_id
+        or home.home_path != manifest.home_path
+    ):
         _raise("RQ_E_FOREIGN_STATE")
-    active = (snapshot.active_topic_principal_id, snapshot.active_topic_home_path, snapshot.active_topic_lease_id)
-    expected_active = (manifest.lease_binding.owner_principal_id, manifest.home_path, manifest.lease_binding.lease_id)
-    if snapshot.conflicting_write_paths or (any(item is not None for item in active) and active != expected_active):
+    active = (
+        snapshot.active_topic_principal_id,
+        snapshot.active_topic_home_path,
+        snapshot.active_topic_lease_id,
+    )
+    expected_active = (
+        manifest.lease_binding.owner_principal_id,
+        manifest.home_path,
+        manifest.lease_binding.lease_id,
+    )
+    if snapshot.conflicting_write_paths or (
+        any(item is not None for item in active) and active != expected_active
+    ):
         _raise("RQ_E_BUS_TOPIC_CONFLICT")
     if not snapshot.bus_available:
         _raise("RQ_E_BUS_UNAVAILABLE")
-    if not snapshot.lease_active or snapshot.observed_lease_binding_digest != manifest.lease_binding.binding_digest or snapshot.observed_bus_cursor_sha256 != manifest.resume_capsule.bus_cursor_sha256:
+    if (
+        not snapshot.lease_active
+        or snapshot.observed_lease_binding_digest
+        != manifest.lease_binding.binding_digest
+        or snapshot.observed_bus_cursor_sha256
+        != manifest.resume_capsule.bus_cursor_sha256
+    ):
         _raise("RQ_E_RESUME_STALE")
-    if not snapshot.account_available or snapshot.observed_account_binding_sha256 != manifest.resume_capsule.account_binding_sha256:
+    if (
+        not snapshot.account_available
+        or snapshot.observed_account_binding_sha256
+        != manifest.resume_capsule.account_binding_sha256
+    ):
         _raise("RQ_E_ACCOUNT_UNAVAILABLE")
 
 
-def _inspect(operations: RemoteQueenHomeOperations, manifest: RemoteQueenHomeManifestV1, error_code: str) -> QueenHomeSnapshotV1:
+def _inspect(
+    operations: RemoteQueenHomeOperations,
+    manifest: RemoteQueenHomeManifestV1,
+    error_code: str,
+) -> QueenHomeSnapshotV1:
     try:
         inspect = operations.inspect
         if not callable(inspect):
@@ -1070,7 +1278,11 @@ def _inspect(operations: RemoteQueenHomeOperations, manifest: RemoteQueenHomeMan
     raise RemoteQueenBootstrapError(error_code)
 
 
-def _make_plan(manifest: RemoteQueenHomeManifestV1, before: QueenHomeSnapshotV1, action: QueenHomeActionV1 | None) -> RemoteQueenHomePlanV1:
+def _make_plan(
+    manifest: RemoteQueenHomeManifestV1,
+    before: QueenHomeSnapshotV1,
+    action: QueenHomeActionV1 | None,
+) -> RemoteQueenHomePlanV1:
     before_digest = queen_home_snapshot_digest(before)
     payload = {
         "schema_version": REMOTE_QUEEN_HOME_PLAN_SCHEMA,
@@ -1136,7 +1348,11 @@ def apply_remote_queen_home(
         _validate_journal(journal)
     except RemoteQueenBootstrapError:
         _raise("RQ_E_PLAN_INCONSISTENT")
-    if journal.before_digest != plan.before_digest or journal.created_generation != plan.manifest.desired_generation.generation or journal.created_home_path != plan.manifest.home_path:
+    if (
+        journal.before_digest != plan.before_digest
+        or journal.created_generation != plan.manifest.desired_generation.generation
+        or journal.created_home_path != plan.manifest.home_path
+    ):
         _raise("RQ_E_PLAN_INCONSISTENT")
     _validate_request_plan(request.plan, request.expected_plan_digest)
     if request.expected_plan_digest != request.plan.plan_digest:
@@ -1146,7 +1362,10 @@ def apply_remote_queen_home(
         _validate_snapshot(resulting)
     except RemoteQueenBootstrapError:
         _raise("RQ_E_RESUME_STALE")
-    if not _fully_owned(plan.manifest, resulting) or queen_home_snapshot_digest(resulting) != journal.resulting_snapshot_digest:
+    if (
+        not _fully_owned(plan.manifest, resulting)
+        or queen_home_snapshot_digest(resulting) != journal.resulting_snapshot_digest
+    ):
         _raise("RQ_E_RESUME_STALE")
     return RemoteQueenHomeApplyResultV1(True, resulting, journal)
 
@@ -1188,14 +1407,21 @@ def rollback_remote_queen_home(
         _validate_journal(journal)
     except RemoteQueenBootstrapError:
         _raise("RQ_E_ROLLBACK_DRIFT")
-    if journal.before_digest != plan.before_digest or journal.created_generation != plan.manifest.desired_generation.generation or journal.created_home_path != plan.manifest.home_path:
+    if (
+        journal.before_digest != plan.before_digest
+        or journal.created_generation != plan.manifest.desired_generation.generation
+        or journal.created_home_path != plan.manifest.home_path
+    ):
         _raise("RQ_E_ROLLBACK_DRIFT")
     current = _inspect(operations, plan.manifest, "RQ_E_ROLLBACK_DRIFT")
     try:
         _validate_snapshot(current)
     except RemoteQueenBootstrapError:
         _raise("RQ_E_ROLLBACK_DRIFT")
-    if not _fully_owned(plan.manifest, current) or queen_home_snapshot_digest(current) != journal.resulting_snapshot_digest:
+    if (
+        not _fully_owned(plan.manifest, current)
+        or queen_home_snapshot_digest(current) != journal.resulting_snapshot_digest
+    ):
         _raise("RQ_E_ROLLBACK_DRIFT")
     try:
         _validate_request_plan(request.plan, request.expected_plan_digest)
@@ -1223,6 +1449,8 @@ def rollback_remote_queen_home(
         _validate_snapshot(after)
     except RemoteQueenBootstrapError:
         _raise("RQ_E_ROLLBACK_DRIFT")
-    if queen_home_snapshot_digest(after) != plan.before_digest or canonical_json_bytes(after) != canonical_json_bytes(plan.before):
+    if queen_home_snapshot_digest(after) != plan.before_digest or canonical_json_bytes(
+        after
+    ) != canonical_json_bytes(plan.before):
         _raise("RQ_E_ROLLBACK_DRIFT")
     return RemoteQueenHomeRollbackResultV1(True, after)

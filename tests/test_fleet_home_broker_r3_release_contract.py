@@ -95,6 +95,8 @@ def test_broker_release_spec_binds_socket_policy_and_exec_artifacts() -> None:
         filecontexts,
         re.MULTILINE,
     )
-    assert (REPO_ROOT / "systemd/libexec/the-hive-home-broker").read_text(
-        encoding="utf-8"
-    ).startswith("#!/usr/bin/python3\n")
+    assert (
+        (REPO_ROOT / "systemd/libexec/the-hive-home-broker")
+        .read_text(encoding="utf-8")
+        .startswith("#!/usr/bin/python3\n")
+    )
