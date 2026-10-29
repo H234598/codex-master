@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -15,6 +16,8 @@ import struct
 import subprocess
 import time
 from typing import Callable, Protocol
+
+from the_hive.runtime_process import BoundedProcessError, G5ScopeIdentity, bind_g5_scope, g5_scope_is_empty
 
 
 GIB = 1024**3
@@ -1978,3 +1981,237 @@ def start_verified_scope(
             raise
         raise CgroupPreflightError("cgroup_preflight_failed") from exc
     return confirm_verified_scope(adapter, scope)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectChildScopeTicket:
+    unit_name: str
+    nonce: str
+
+
+@dataclass(slots=True)
+class _OwnedDirectChildScope:
+    ticket: DirectChildScopeTicket
+    identity: G5ScopeIdentity
+    directory_fd: int
+    gate_pid: int
+    challenge: str
+    gate: HeldGateProcess
+    control: _ScopeControl
+    issued: bool = False
+    released: bool = False
+
+
+class DirectScopePreparationHold(CgroupPreflightError):
+    def __init__(self, unit_name: str, ticket: DirectChildScopeTicket | None) -> None:
+        super().__init__("direct_scope_cleanup_unverified")
+        self.unit_name = unit_name
+        self.ticket = ticket
+
+
+class SystemdDirectChildScopeOwner:
+    """Proposed G5 mechanism only; the admission owner remains its sole caller."""
+
+    def __init__(self, adapter: SystemdUserCgroupAdapter, profile: CgroupProfileV1) -> None:
+        if type(adapter) is not SystemdUserCgroupAdapter or type(profile) is not CgroupProfileV1:
+            _fail()
+        self._adapter = adapter
+        self._profile = profile
+        self._owned: dict[str, _OwnedDirectChildScope] = {}
+        self._lock = threading.RLock()
+
+    def _lookup(self, ticket: DirectChildScopeTicket) -> _OwnedDirectChildScope:
+        if type(ticket) is not DirectChildScopeTicket:
+            _fail()
+        owned = self._owned.get(ticket.unit_name)
+        if owned is None or owned.ticket is not ticket:
+            _fail()
+        return owned
+
+    def _verify(self, owned: _OwnedDirectChildScope) -> None:
+        current = bind_g5_scope(owned.identity.unit_name, owned.identity.control_group)
+        if current != owned.identity:
+            _fail()
+        if owned.directory_fd >= 0:
+            info = os.fstat(owned.directory_fd)
+            if (info.st_dev, info.st_ino) != (current.device, current.inode):
+                _fail()
+        group = owned.identity.control_group.lstrip("/")
+        parent = group.rsplit("/", 1)[0]
+        if self._adapter._show_scope(owned.identity.unit_name,
+            expected_slice_control_group=parent) != group:
+            _fail()
+        profile = self._profile
+        expected = {
+            "cpuset.cpus.effective": f"{profile.cpuset_expression}\n".encode(),
+            "cpu.max": f"{profile.cpu_quota_percent * 1000} 100000\n".encode(),
+            "memory.high": f"{profile.memory_high_bytes}\n".encode(),
+            "memory.max": f"{profile.memory_max_bytes}\n".encode(),
+            "memory.swap.max": f"{profile.memory_swap_max_bytes}\n".encode(),
+            "io.weight": f"default {profile.io_weight}\n".encode(),
+        }
+        group = owned.identity.control_group.lstrip("/")
+        for name, value in expected.items():
+            if self._adapter._read_cgroup_file(group, name) != value:
+                _fail()
+
+    def prepare(self) -> DirectChildScopeTicket:
+        with self._lock:
+            require_cgroup_preflight(self._adapter, self._profile)
+            evidence = self._adapter._target_slice_evidence()
+            if evidence is None:
+                _fail()
+            parent, _controllers, _delegated, _mask = evidence
+            unit = f"the-hive-resource-{secrets.token_hex(16)}.scope"
+            control_name = f"the-hive-resource-{secrets.token_hex(16)}"
+            collision = self._adapter._run((SYSTEMCTL_PATH, "--user", "--no-pager",
+                "show", unit, "--property=LoadState"))
+            if collision.returncode != 4 and (collision.returncode != 0
+                or collision.stdout != b"LoadState=not-found\n" or collision.stderr):
+                _fail()
+            profile = self._profile
+            argv = (SYSTEMD_RUN_PATH, "--user", "--scope", "--quiet", "--collect",
+                f"--unit={unit}", f"--slice={THE_HIVE_SLICE}",
+                "--property=Delegate=cpu cpuset memory pids io",
+                f"--property=AllowedCPUs={profile.cpuset_expression}",
+                f"--property=CPUQuota={profile.cpu_quota_percent}%",
+                f"--property=CPUWeight={profile.cpu_weight}",
+                f"--property=MemoryHigh={profile.memory_high_bytes}",
+                f"--property=MemoryMax={profile.memory_max_bytes}",
+                f"--property=MemorySwapMax={profile.memory_swap_max_bytes}",
+                f"--property=IOWeight={profile.io_weight}", RESOURCE_SCOPE_GATE_PATH,
+                "--direct-child-scope", control_name)
+            control = _ScopeControl.open(control_name)
+            gate = None
+            directory_fd = -1
+            retained = False
+            try:
+                gate = self._adapter._runner.start_held(argv,
+                    timeout_seconds=COMMAND_TIMEOUT_SECONDS,
+                    max_stdout_bytes=_GATE_OUTPUT_BYTES,
+                    max_stderr_bytes=MAX_COMMAND_STDERR_BYTES)
+                control.accept(timeout_seconds=COMMAND_TIMEOUT_SECONDS)
+                gate_pid = control.peer_pid()
+                group = self._adapter._show_scope(unit, expected_slice_control_group=parent)
+                challenge = control.read_challenge(expected_gate_pid=gate_pid,
+                    timeout_seconds=COMMAND_TIMEOUT_SECONDS)
+                identity = bind_g5_scope(unit, group)
+                ticket = DirectChildScopeTicket(unit, secrets.token_hex(16))
+                owned = _OwnedDirectChildScope(ticket, identity, -1,
+                    gate_pid, challenge, gate, control)
+                self._owned[unit] = owned
+                retained = True
+                owned.directory_fd = os.open(CGROUP_ROOT / group.lstrip("/"),
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                self._verify(owned)
+                members = _parse_pid_lines(self._adapter._read_cgroup_file(group, "cgroup.procs"))
+                if members != frozenset({gate_pid}):
+                    _fail()
+                return ticket
+            except Exception as exc:
+                raise DirectScopePreparationHold(unit, ticket if retained else None) from exc
+            finally:
+                if not retained:
+                    control.close()
+                    if directory_fd >= 0:
+                        os.close(directory_fd)
+                    if gate is not None:
+                        gate.terminate()
+                    # Before a successful identity bind, a unit-name stop is not safe.
+                    # An uncertain failed preparation remains an explicit cleanup HOLD.
+
+    def take_cgroup_fd_once(self, ticket: DirectChildScopeTicket) -> int:
+        with self._lock:
+            owned = self._lookup(ticket)
+            if owned.issued or owned.released:
+                _fail()
+            self._verify(owned)
+            if owned.directory_fd < 0:
+                _fail()
+            members = _parse_pid_lines(self._adapter._read_cgroup_file(
+                owned.identity.control_group.lstrip("/"), "cgroup.procs"))
+            if members != frozenset({owned.gate_pid}):
+                _fail()
+            owned.issued = True
+            descriptor = os.dup(owned.directory_fd)
+            # Python os.dup returns a non-inheritable FD; T owns this duplicate.
+            return descriptor
+
+    def release_after_attach(self, ticket: DirectChildScopeTicket, child_pid: int) -> None:
+        with self._lock:
+            owned = self._lookup(ticket)
+            if not owned.issued or owned.released or type(child_pid) is not int or child_pid <= 0:
+                _fail()
+            self._verify(owned)
+            members = _parse_pid_lines(self._adapter._read_cgroup_file(
+                owned.identity.control_group.lstrip("/"), "cgroup.procs"))
+            if members != frozenset({owned.gate_pid, child_pid}) or child_pid == owned.gate_pid:
+                _fail()
+            owned.released = True
+            try:
+                owned.control.release_once(f"{owned.challenge}\n".encode("ascii"),
+                    timeout_seconds=COMMAND_TIMEOUT_SECONDS)
+                owned.control.read_ready(timeout_seconds=COMMAND_TIMEOUT_SECONDS)
+                result = owned.gate.finish(timeout_seconds=COMMAND_TIMEOUT_SECONDS,
+                    max_stdout_bytes=MAX_COMMAND_STDOUT_BYTES,
+                    max_stderr_bytes=MAX_COMMAND_STDERR_BYTES)
+                if result.returncode != 0 or result.stdout or result.stderr:
+                    _fail()
+            finally:
+                owned.control.close()
+            self._verify(owned)
+            members = _parse_pid_lines(self._adapter._read_cgroup_file(
+                owned.identity.control_group.lstrip("/"), "cgroup.procs"))
+            if members != frozenset({child_pid}):
+                _fail()
+
+    def observe_empty(self, ticket: DirectChildScopeTicket) -> bool:
+        with self._lock:
+            owned = self._lookup(ticket)
+            if owned.directory_fd >= 0:
+                info = os.fstat(owned.directory_fd)
+                if (info.st_dev, info.st_ino) != (owned.identity.device, owned.identity.inode):
+                    _fail()
+            return owned.released and g5_scope_is_empty(owned.identity)
+
+    def close_empty(self, ticket: DirectChildScopeTicket) -> None:
+        with self._lock:
+            owned = self._lookup(ticket)
+            if not self.observe_empty(ticket):
+                _fail()
+            owned.control.close()
+            if owned.directory_fd >= 0:
+                os.close(owned.directory_fd)
+            del self._owned[ticket.unit_name]
+
+    def abort(self, ticket: DirectChildScopeTicket) -> None:
+        with self._lock:
+            owned = self._lookup(ticket)
+            owned.control.close()
+            if not g5_scope_is_empty(owned.identity):
+                try:
+                    self._verify(owned)
+                    self._adapter._stop_new_unit(ticket.unit_name)
+                except (BoundedProcessError, CgroupPreflightError) as exc:
+                    if isinstance(exc, BoundedProcessError) and exc.code != "command_group_unavailable":
+                        raise
+                    same_empty_scope = False
+                    try:
+                        held = os.fstat(owned.directory_fd)
+                        empty = g5_scope_is_empty(owned.identity)
+                        current = os.stat(CGROUP_ROOT / owned.identity.control_group.lstrip("/"),
+                            follow_symlinks=False)
+                        expected = (owned.identity.device, owned.identity.inode)
+                        same_empty_scope = (empty and (held.st_dev, held.st_ino) == expected
+                            and (current.st_dev, current.st_ino) == expected)
+                    except OSError:
+                        pass
+                    if not same_empty_scope:
+                        raise
+            owned.gate.terminate()
+            # Closing the scope does not claim that T has reaped its direct child.
+            if not g5_scope_is_empty(owned.identity):
+                _fail()
+            if owned.directory_fd >= 0:
+                os.close(owned.directory_fd)
+            del self._owned[ticket.unit_name]

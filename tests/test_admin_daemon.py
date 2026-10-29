@@ -55,6 +55,55 @@ AUDIENCE = "application-audience"
 NOW = 2_000_000_000
 
 
+def _dispatch_ingress_configuration():
+    return {
+        "schema_version": 1, "http_host": "127.0.0.1", "http_port": 8443,
+        "origin_host": "hive.example", "authority_mode": "bearer",
+        "local_subject": "local-operator", "local_scopes": ["fleet.read"],
+        "remote_subject": "remote-operator", "remote_scopes": ["fleet.read"],
+        "trusted_proxy_addresses": ["127.0.0.1"],
+    }
+
+
+def _dispatch_ingress_payload():
+    return {
+        "schema_version": 1, "generation": 1, "admin_subject": "local-operator",
+        "actor_principal_id": "teamlead-one", "principal_version": 2,
+        "principal_config_digest": "sha256:" + "a" * 64, "repo_id": "codex-master",
+        "allowed_operations": ["native_spawn", "managed_replacement", "headless_assignment",
+            "agent_claim", "agent_start", "agent_assign", "fleet_series_apply", "emergency_queen_start"],
+        "expires_at_utc": "2026-10-29T20:00:00Z",
+    }
+
+
+def test_admin_dispatch_ingress_is_optional_typed_and_does_not_expand_operations():
+    configuration = _dispatch_ingress_configuration()
+    absent = admin_assembly.parse_admin_config(json.dumps(configuration).encode())
+    assert type(absent) is admin_assembly.AdminConfig and absent.hive_dispatch_ingress is None
+    payload = _dispatch_ingress_payload()
+    configuration["hive_dispatch_ingress"] = payload
+    actual = admin_assembly.parse_admin_config(json.dumps(configuration).encode())
+    assert type(actual.hive_dispatch_ingress) is admin_assembly.HiveDispatchIngressV1
+    assert actual.hive_dispatch_ingress.admin_subject == actual.local_subject
+    assert actual.hive_dispatch_ingress.actor_principal_id == "teamlead-one"
+    assert actual.hive_dispatch_ingress.allowed_operations == tuple(payload["allowed_operations"])
+    assert actual.hive_dispatch_ingress.expires_at_utc.isoformat() == "2026-10-29T20:00:00+00:00"
+
+
+@pytest.mark.parametrize("changes", (
+    {"generation": True}, {"principal_version": 0}, {"principal_config_digest": "unbound"},
+    {"allowed_operations": ["agent_start", "agent_start"]},
+    {"allowed_operations": ["emergency_no_call"]}, {"admin_subject": "other-operator"},
+    {"expires_at_utc": "2026-10-29T20:00:00"}, {"expires_at_utc": "2026-10-29T20:00:00+01:00"},
+    {"unexpected": True},
+))
+def test_admin_dispatch_ingress_rejects_unbound_origin_before_assembly(changes):
+    configuration = _dispatch_ingress_configuration()
+    configuration["hive_dispatch_ingress"] = {**_dispatch_ingress_payload(), **changes}
+    with pytest.raises(admin_assembly.AdminAssemblyError, match="^control.admin_configuration_invalid$"):
+        admin_assembly.parse_admin_config(json.dumps(configuration).encode())
+
+
 @pytest.fixture(autouse=True)
 def agent_control_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep production assembly tests on the exact non-secret shared boundary."""

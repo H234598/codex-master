@@ -202,8 +202,36 @@ def _await_pane_exec_evidence(
     return False
 
 
+
+
+def _direct_child_scope(control_name: str) -> None:
+    """Proposed hold-only mode; does not spawn, exec, publish, or grant."""
+    if not _valid_control_socket_name(control_name):
+        _reject()
+    challenge = f"{secrets.token_hex(32)}\n".encode("ascii")
+    received = bytearray()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+        control.settimeout(5.0)
+        try:
+            control.connect(b"\0" + control_name.encode("ascii"))
+            control.sendall(challenge)
+            while len(received) <= len(challenge):
+                chunk = control.recv(len(challenge) + 1 - len(received))
+                if not chunk:
+                    break
+                received.extend(chunk)
+            if bytes(received) != challenge:
+                _reject()
+            control.sendall(_GATE_READY)
+        except OSError:
+            _reject()
+
+
 def main() -> None:
     arguments = sys.argv[1:]
+    if len(arguments) == 2 and arguments[0] == "--direct-child-scope":
+        _direct_child_scope(arguments[1])
+        return
     if len(arguments) != 7:
         _reject()
     control_socket_name, socket_name, session_name, owner_pid_text, source_fd_text, device_text, inode_text = arguments

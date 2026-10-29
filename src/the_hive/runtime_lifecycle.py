@@ -7674,22 +7674,19 @@ def _canary_health_payload(image: _CanaryImage) -> Mapping[str, object]:
         payload = _d320_parse_json(raw)
     except D320CutoverJournalError as exc:
         raise _error("runtime_canary_evidence_invalid") from exc
-    if not isinstance(payload, Mapping) or set(payload) != {
-        "schema_version",
-        "checked_at",
-        "checks",
-        "commands",
-        "diagnostics",
-        "alarm",
-        "global_pilot_readiness",
-    }:
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 4:
         raise _error("runtime_canary_evidence_invalid")
     checks = payload.get("checks")
     commands = payload.get("commands")
     diagnostics = payload.get("diagnostics")
     keys = {"runtime_status", "hive_status", "hive_doctor"}
+    try:
+        from the_hive.hive.hourly_probe import valid_probe_record
+    except Exception as exc:
+        raise _error("runtime_canary_evidence_invalid") from exc
     if (
-        payload.get("schema_version") != 3
+        not valid_probe_record(payload)
+        or payload.get("schema_version") != 4
         or not isinstance(payload.get("checked_at"), str)
         or not isinstance(checks, Mapping)
         or set(checks) != {"runtime_layout", "hive_runtime", "hive_doctor"}
@@ -7710,47 +7707,64 @@ def _canary_evidence_result(
     manager_state: Mapping[str, str],
     payload: Mapping[str, object] | None = None,
 ) -> tuple[str, str | None]:
-    """Return only one fixed diagnosis from the private Canary state."""
-
+    """Classify only the two closed v4 service evidence outcomes."""
     payload = payload if payload is not None else _canary_health_payload(image)
     try:
         from the_hive.hive.hourly_probe import valid_probe_record
     except Exception as exc:
         raise _error("runtime_canary_evidence_invalid") from exc
-    record_valid = valid_probe_record(payload)
-    checks = payload.get("checks")
-    commands = payload.get("commands")
-    diagnostics = payload.get("diagnostics")
-    keys = {"runtime_status", "hive_status", "hive_doctor"}
+    if not valid_probe_record(payload) or payload.get("schema_version") != 4:
+        raise _error("runtime_canary_evidence_invalid")
+    checks = payload["checks"]
+    service_checks = payload["service_checks"]
+    commands = payload["commands"]
+    diagnostics = payload["diagnostics"]
+    command_names = {"runtime_status", "hive_status", "hive_doctor"}
     codes = {
         _canary_diagnostic_value(
             diagnostics[name], command_ready=commands[name] is True
         )
-        for name in keys
+        for name in command_names
     }
-    if (
-        record_valid
-        and all(checks.values())
-        and all(commands.values())
+    expected_checks = {
+        "runtime_layout": True,
+        "hive_runtime": False,
+        "hive_doctor": False,
+    }
+    alarm = payload["alarm"]
+    service_alarm = payload["service_alarm"]
+    positive_owner = (
+        isinstance(alarm, Mapping)
+        and isinstance(service_alarm, Mapping)
+        and alarm.get("owner") is not None
+        and alarm.get("owner") == service_alarm.get("owner")
+    )
+    strict_service_checks = {name: True for name in service_checks}
+    strict_green = (
+        checks == expected_checks
+        and service_checks == strict_service_checks
+        and payload["global_pilot_readiness"].get("pilot") == "ready"
+        and positive_owner
+        and all(value is True for value in commands.values())
         and codes == {"ok"}
         and manager_state.get("ActiveState") == "active"
         and manager_state.get("Result") == "success"
         and manager_state.get("ExecMainStatus") == "0"
-    ):
+    )
+    if strict_green:
         return "runtime_canary_green", None
-    if (
-        record_valid
-        and checks.get("runtime_layout") is True
-        and not all(checks.values())
-        and all(commands.values())
-        and codes == {"ok"}
+    pilot_blocked = (
+        checks == expected_checks
+        and not all(value is True for value in service_checks.values())
         and payload["global_pilot_readiness"].get("pilot") == "blocked"
+        and positive_owner
+        and all(value is True for value in commands.values())
+        and codes == {"ok"}
         and manager_state.get("ActiveState") == "failed"
         and manager_state.get("Result") == "exit-code"
         and manager_state.get("ExecMainStatus") == "1"
-    ):
-        # Runtime execution succeeded and emitted a complete fail-closed product
-        # record. Product readiness remains a separate activation/spawn gate.
+    )
+    if pilot_blocked:
         return "runtime_canary_green", None
     stage_codes = codes & _CANARY_STAGE_CODES
     if (
@@ -7764,13 +7778,10 @@ def _canary_evidence_result(
 
 
 def _canary_runtime_qualification_status(
-    *,
-    image: _CanaryImage,
-    manager_state: Mapping[str, str],
+    *, image: _CanaryImage, manager_state: Mapping[str, str],
     payload: Mapping[str, object] | None = None,
 ) -> str:
-    """Separate a successful pilot-blocked diagnosis from runtime qualification."""
-
+    """Qualify only strict service-green or exact pilot-blocked v4 evidence."""
     try:
         payload = payload if payload is not None else _canary_health_payload(image)
         status, _error_code = _canary_evidence_result(
@@ -7781,28 +7792,31 @@ def _canary_runtime_qualification_status(
     if status != "runtime_canary_green" or not isinstance(payload, Mapping):
         return "fail"
     checks = payload.get("checks")
+    service_checks = payload.get("service_checks")
     commands = payload.get("commands")
-    if not isinstance(checks, Mapping) or not isinstance(commands, Mapping):
+    pilot = payload.get("global_pilot_readiness")
+    if not all(isinstance(value, Mapping) for value in (checks, service_checks, commands, pilot)):
         return "unknown"
+    expected_checks = {
+        "runtime_layout": True,
+        "hive_runtime": False,
+        "hive_doctor": False,
+    }
     if (
-        all(value is True for value in checks.values())
+        checks == expected_checks
+        and all(value is True for value in service_checks.values())
+        and pilot.get("pilot") == "ready"
         and all(value is True for value in commands.values())
         and manager_state.get("ActiveState") == "active"
         and manager_state.get("Result") == "success"
         and manager_state.get("ExecMainStatus") == "0"
     ):
         return "pass"
-    pilot_blocked = payload.get("global_pilot_readiness")
     if (
-        checks
-        == {
-            "runtime_layout": True,
-            "hive_runtime": False,
-            "hive_doctor": False,
-        }
+        checks == expected_checks
+        and not all(value is True for value in service_checks.values())
+        and pilot.get("pilot") == "blocked"
         and all(value is True for value in commands.values())
-        and isinstance(pilot_blocked, Mapping)
-        and pilot_blocked.get("pilot") == "blocked"
         and manager_state.get("ActiveState") == "failed"
         and manager_state.get("Result") == "exit-code"
         and manager_state.get("ExecMainStatus") == "1"
@@ -7814,27 +7828,27 @@ def _canary_runtime_qualification_status(
 def _canary_runtime_features_qualification_status(
     *, image: _CanaryImage, payload: Mapping[str, object] | None = None
 ) -> str:
-    """Qualify only the bound runtime-layout and runtime-status surface."""
-
+    """Qualify the real runtime surface from a complete v4 owner record."""
     try:
         payload = payload if payload is not None else _canary_health_payload(image)
         from the_hive.hive.hourly_probe import valid_probe_record
-
-        if not valid_probe_record(payload):
+        if not valid_probe_record(payload) or payload.get("schema_version") != 4:
             return "fail"
         checks = payload.get("checks")
+        service_checks = payload.get("service_checks")
         commands = payload.get("commands")
         diagnostics = payload.get("diagnostics")
         if (
             not isinstance(checks, Mapping)
+            or not isinstance(service_checks, Mapping)
             or not isinstance(commands, Mapping)
             or not isinstance(diagnostics, Mapping)
             or checks.get("runtime_layout") is not True
+            or service_checks.get("runtime_surface") is not True
             or commands.get("runtime_status") is not True
             or _canary_diagnostic_value(
                 diagnostics.get("runtime_status"), command_ready=True
-            )
-            != "ok"
+            ) != "ok"
         ):
             return "unknown"
     except (RuntimeLifecycleError, D320CutoverJournalError):
@@ -7855,15 +7869,16 @@ def _canary_qualification_diagnostic(
     command_names = ("runtime_status", "hive_status", "hive_doctor")
     checks = payload.get("checks")
     commands = payload.get("commands")
-    if not isinstance(checks, Mapping) or not isinstance(commands, Mapping):
+    service_checks = payload.get("service_checks")
+    pilot = payload.get("global_pilot_readiness")
+    if not all(isinstance(value, Mapping) for value in (checks, commands, service_checks, pilot)):
         raise _error("runtime_canary_evidence_invalid")
     failed_checks = sorted(
         name for name in check_names if name in checks and checks[name] is not True
     )
     missing_checks = sorted(name for name in check_names if name not in checks)
     failed_commands = sorted(
-        name
-        for name in command_names
+        name for name in command_names
         if name in commands and commands[name] is not True
     )
     missing_commands = sorted(name for name in command_names if name not in commands)
@@ -7886,13 +7901,35 @@ def _canary_qualification_diagnostic(
         if failed_exit_code
         else "other"
     )
-    evidence_case = (
-        "stage_red"
-        if evidence_status == "runtime_canary_red"
-        else "strict_green"
-        if checks_all_true and commands_all_true and strict_unit_success
-        else "pilot_blocked_green"
-    )
+    expected_checks = {
+        "runtime_layout": True,
+        "hive_runtime": False,
+        "hive_doctor": False,
+    }
+    if evidence_status == "runtime_canary_red":
+        evidence_case = "stage_red"
+    elif (
+        evidence_status == "runtime_canary_green"
+        and checks == expected_checks
+        and all(value is True for value in service_checks.values())
+        and pilot.get("pilot") == "ready"
+        and commands_all_true
+        and strict_unit_success
+    ):
+        evidence_case = "service_green"
+    elif (
+        evidence_status == "runtime_canary_green"
+        and checks == expected_checks
+        and not all(value is True for value in service_checks.values())
+        and pilot.get("pilot") == "blocked"
+        and commands_all_true
+        and failed_exit_code
+    ):
+        evidence_case = "pilot_blocked_green"
+    elif checks_all_true and commands_all_true and strict_unit_success:
+        evidence_case = "strict_green"
+    else:
+        raise _error("runtime_canary_evidence_invalid")
     reasons: set[str] = set()
     if evidence_case == "stage_red":
         reasons.add("canary_evidence_red")
@@ -8810,9 +8847,10 @@ def _state_exactly_matches(
     )
 
 
-def _parse_health(state_root: Path) -> tuple[bool, bool, bool]:
-    """Return (valid-v3, product-green, queen-alarm-cleared) read-only."""
-
+def _parse_health(
+    state_root: Path,
+) -> tuple[bool, bool, bool, bool, bool, bool]:
+    """Return one validated record's legacy, service and gate projections."""
     try:
         raw = _regular_bytes(
             state_root / "hive-hourly-health.json",
@@ -8820,30 +8858,46 @@ def _parse_health(state_root: Path) -> tuple[bool, bool, bool]:
             mode=0o600,
         )
         if raw is None:
-            return False, False, False
-        value = json.loads(raw.decode("utf-8"))
-    except (RuntimeLifecycleError, UnicodeDecodeError, json.JSONDecodeError):
-        return False, False, False
+            return False, False, False, False, False, False
+        value = _d320_parse_json(raw)
+    except (RuntimeLifecycleError, D320CutoverJournalError):
+        return False, False, False, False, False, False
     try:
-        from the_hive.hive.hourly_probe import valid_probe_record
+        from the_hive.hive.hourly_probe import probe_spawn_gate, valid_probe_record
     except Exception:
-        return False, False, False
+        return False, False, False, False, False, False
     if not valid_probe_record(value):
-        return False, False, False
+        return False, False, False, False, False, False
     checks = value.get("checks")
     alarm = value.get("alarm")
-    health = isinstance(checks, dict) and checks == {
+    legacy_green = checks == {
         "runtime_layout": True,
         "hive_runtime": True,
         "hive_doctor": True,
     }
-    cleared = (
-        isinstance(alarm, dict)
+    legacy_alarm = (
+        isinstance(alarm, Mapping)
         and alarm.get("scope") == "hive"
         and alarm.get("status") == "cleared"
         and alarm.get("reason_codes") == []
     )
-    return True, health, cleared
+    service_checks = value.get("service_checks")
+    service_alarm = value.get("service_alarm")
+    service_green = (
+        value.get("schema_version") == 4
+        and isinstance(service_checks, Mapping)
+        and frozenset(service_checks)
+        == {"runtime_surface", "configuration", "repository", "principals", "state", "usage"}
+        and all(item is True for item in service_checks.values())
+    )
+    service_alarm_cleared = (
+        isinstance(service_alarm, Mapping)
+        and service_alarm.get("scope") == "hive"
+        and service_alarm.get("status") == "cleared"
+        and service_alarm.get("reason_codes") == []
+    )
+    gate_allowed = probe_spawn_gate(value).get("allowed") is True
+    return True, legacy_green, legacy_alarm, service_green, service_alarm_cleared, gate_allowed
 
 
 def _runtime_identity(release_root: Path) -> dict[str, object] | None:
@@ -9095,7 +9149,7 @@ def _observe_argumentless_installed_probe(home: Path) -> None:
     if result.returncode not in {0, 1}:
         raise _error("runtime_lifecycle_probe_failed")
     try:
-        from the_hive.hive.hourly_probe import valid_probe_record
+        from the_hive.hive.hourly_probe import probe_spawn_gate, valid_probe_record
 
         health_raw = _regular_bytes(
             state_root / "hive-hourly-health.json",
@@ -9113,11 +9167,9 @@ def _observe_argumentless_installed_probe(home: Path) -> None:
             if isinstance(checked_at_raw, str)
             else None
         )
-        checks = health.get("checks") if isinstance(health, Mapping) else None
         expected_returncode = (
             0
-            if isinstance(checks, Mapping)
-            and all(value is True for value in checks.values())
+            if probe_spawn_gate(health, now=finished_at).get("allowed") is True
             else 1
         )
         if (
@@ -9263,7 +9315,7 @@ def _verify_error_code(
         ("eight_utc_terms", "runtime_lifecycle_timer_terms_invalid"),
         ("no_legacy_or_duplicate_timer", "runtime_lifecycle_legacy_timer_present"),
         ("v2_generation_and_d296_parity", "runtime_lifecycle_v2_parity_invalid"),
-        ("health_v3_valid", "runtime_lifecycle_health_invalid"),
+        ("health_record_valid", "runtime_lifecycle_health_invalid"),
         ("argumentless_probe_observed", "runtime_lifecycle_probe_unobserved"),
     ):
         if checks[check] is not True:
@@ -9337,9 +9389,8 @@ def verify(
         and not _state_is_active(old_timer_state)
         and not _state_is_active(old_service_state)
     )
-    health_valid, health, alarm_cleared = _parse_health(state_root)
+    health_valid, health_v3_green, legacy_alarm_cleared, service_green, service_alarm_cleared, gate_allowed = _parse_health(state_root)
     v2 = _d296_and_v2_accepted()
-    gate_allowed = _probe_gate_allowed(state_root)
     enabled, active = _state_is_enabled(timer_state), _state_is_active(timer_state)
     observed = _observation_matches(home=home, state_root=state_root, identity=identity)
     checks = {
@@ -9348,15 +9399,20 @@ def verify(
         "eight_utc_terms": eight,
         "no_legacy_or_duplicate_timer": no_old,
         "v2_generation_and_d296_parity": v2,
-        "health_v3_valid": health_valid,
+        "health_record_valid": health_valid,
         "argumentless_probe_observed": observed,
     }
     product_checks = {
-        "health_v3_green": health,
-        "queen_alarm_cleared": alarm_cleared,
+        "service_probe_green": service_green,
+        "service_alarm_cleared": service_alarm_cleared,
         "probe_gate_allowed": gate_allowed,
     }
+    legacy_product_checks = {
+        "health_v3_green": health_v3_green,
+        "queen_alarm_cleared": legacy_alarm_cleared,
+    }
     all_green = all(checks.values()) and enabled and active and observed
+    service_ready = all(product_checks.values())
     return {
         "status": "runtime_lifecycle_green" if all_green else "runtime_lifecycle_red",
         "error_code": _verify_error_code(
@@ -9369,8 +9425,9 @@ def verify(
         "runtime_identity": identity
         or {"generation": None, "manifest_digest": None, "consumer_pin": False},
         "checks": checks,
-        "product_status": "ready" if all(product_checks.values()) else "blocked",
+        "product_status": "service_ready_request_required" if service_ready else "blocked",
         "product_checks": product_checks,
+        "legacy_product_checks": legacy_product_checks,
         "raw_output": "not_returned",
     }
 

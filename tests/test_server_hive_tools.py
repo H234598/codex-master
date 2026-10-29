@@ -3,6 +3,7 @@ import contextlib
 import inspect
 import os
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,33 @@ GREEN_HIVE_PROBE = {
     "reason_code": "probe_ready",
     "raw_output": "not_returned",
 }
+
+
+def test_direct_child_scope_handoff_requires_bound_typed_g5_without_starting(tmp_path):
+    gib = 1024**3
+    adapter = server.SystemdUserCgroupAdapter()
+    profile = server.CgroupProfileV1(tuple(range(4, 12)), 750, 50, 9 * gib, 12 * gib, 8 * gib, 50)
+    runtime = server.ResourceGateRuntime(
+        server.HiveStateStore(tmp_path / "state"), "test-boot", lambda: NOW,
+        lambda: 1, profile, adapter, False,
+    )
+    runtime_token = server._RESOURCE_GATE_RUNTIME.set(None)
+    typed_token = server._RESOURCE_GATE_RUNTIME_TYPED_G5.set(None)
+    try:
+        with pytest.raises(server.CgroupPreflightError):
+            server._g5_direct_child_scope_owner()
+        server._RESOURCE_GATE_RUNTIME.set(runtime)
+        with pytest.raises(server.CgroupPreflightError):
+            server._g5_direct_child_scope_owner()
+        approved = replace(runtime, h2_ready=True)
+        server._RESOURCE_GATE_RUNTIME.set(approved)
+        bound, owner = server._g5_direct_child_scope_owner()
+        assert bound is approved
+        assert type(owner) is server.SystemdDirectChildScopeOwner
+        assert owner._adapter is adapter and owner._profile is profile and owner._owned == {}
+    finally:
+        server._RESOURCE_GATE_RUNTIME.reset(runtime_token)
+        server._RESOURCE_GATE_RUNTIME_TYPED_G5.reset(typed_token)
 
 
 def test_dynamic_pool_product_callback_has_one_private_dispatcher_callsite_and_no_tool_bypass() -> (

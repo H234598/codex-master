@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import sys
@@ -27,7 +28,7 @@ from the_hive.runtime_status import (
     RUNTIME_STATUS_MCP_TIMEOUT_SECONDS,
     runtime_status,
 )
-from the_hive.hive.runtime import GlobalPilotReadinessV1
+from the_hive.hive.runtime import _RUNTIME_STATES, GlobalPilotReadinessV1
 
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
@@ -347,8 +348,273 @@ def _valid_alarm(value: object, checks: Mapping[str, object]) -> bool:
     )
 
 
-def valid_probe_record(payload: object) -> bool:
-    """Validate one complete v3 record without granting spawn authority."""
+# Adjacent to the existing v3 record constants.
+_SERVICE_CHECK_KEYS = frozenset(
+    {"runtime_surface", "configuration", "repository", "principals", "state", "usage"}
+)
+_PROBE_RECORD_V4_KEYS = _PROBE_RECORD_KEYS | {"service_checks", "service_alarm"}
+_HIVE_DOCTOR_KEYS = (_HIVE_STATUS_KEYS - {"schema_version", "counts", "authority"}) | {"healthy"}
+_RUNTIME_STATUS_KEYS = frozenset({"ok", "metadata", "mcp_surface", "raw_output"})
+_RUNTIME_METADATA_KEYS = frozenset({"ok", "reason_code"})
+_RUNTIME_SURFACE_KEYS = frozenset(
+    {"ok", "initialize", "tools_list", "tool_count", "reason_code"}
+)
+_RUNTIME_SURFACE_REASONS = frozenset(
+    {"ok", "metadata_invalid", "mcp_timeout", "mcp_cleanup_timeout", "mcp_unavailable", "mcp_surface_invalid"}
+)
+_RUNTIME_METADATA_REASONS = frozenset({"ok", "metadata_invalid"})
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate JSON member")
+        result[name] = value
+    return result
+
+
+def _reject_nonfinite(value: str) -> object:
+    del value
+    raise ValueError("nonfinite JSON number")
+
+
+def _strict_json_loads(raw: str | bytes) -> object:
+    return json.loads(
+        raw,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_nonfinite,
+    )
+
+
+def _valid_global_pilot_readiness(value: object) -> bool:
+    if type(value) is not dict or frozenset(value) != _GLOBAL_PILOT_READINESS_KEYS:
+        return False
+    reasons = value.get("reason_codes")
+    if type(reasons) is not list:
+        return False
+    try:
+        expected = GlobalPilotReadinessV1(
+            pilot=value.get("pilot"),
+            generation_id=value.get("generation_id"),
+            freshness=value.get("freshness"),
+            candidate_count=value.get("candidate_count"),
+            reason_codes=tuple(reasons),
+        ).public()
+    except (TypeError, ValueError):
+        return False
+    return value == expected
+
+
+def _valid_runtime_status_shape(value: object) -> bool:
+    if type(value) is not dict or frozenset(value) != _RUNTIME_STATUS_KEYS:
+        return False
+    metadata = value.get("metadata")
+    surface = value.get("mcp_surface")
+    if (
+        type(value.get("ok")) is not bool
+        or value.get("raw_output") != "not_returned"
+        or type(metadata) is not dict
+        or frozenset(metadata) != _RUNTIME_METADATA_KEYS
+        or type(metadata.get("ok")) is not bool
+        or type(metadata.get("reason_code")) is not str
+        or metadata["reason_code"] not in _RUNTIME_METADATA_REASONS
+        or type(surface) is not dict
+        or frozenset(surface) != _RUNTIME_SURFACE_KEYS
+        or any(type(surface.get(key)) is not bool for key in ("ok", "initialize", "tools_list"))
+        or type(surface.get("tool_count")) is not int
+        or surface["tool_count"] < 0
+        or type(surface.get("reason_code")) is not str
+        or surface["reason_code"] not in _RUNTIME_SURFACE_REASONS
+        or value["ok"] is not surface["ok"]
+    ):
+        return False
+    if metadata["ok"] is False:
+        return metadata["reason_code"] == "metadata_invalid" and surface["ok"] is False
+    return metadata["reason_code"] == "ok"
+
+
+def _valid_reason_codes(value: object) -> bool:
+    return (
+        type(value) is list
+        and all(
+            isinstance(code, str)
+            and 1 <= len(code) <= 96
+            and re.fullmatch(r"[a-z][a-z0-9_-]*", code) is not None
+            for code in value
+        )
+        and len(set(value)) == len(value)
+    )
+
+
+def _valid_hive_status_shape(value: object) -> bool:
+    if type(value) is not dict or frozenset(value) != _HIVE_STATUS_KEYS:
+        return False
+    counts = value.get("counts")
+    checks = value.get("checks")
+    reasons = value.get("reason_codes")
+    if (
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or type(value.get("mode")) is not str
+        or value["mode"] not in {"disabled", "shadow", "enforced"}
+        or type(counts) is not dict
+        or frozenset(counts) != {"principals", "repositories"}
+        or any(type(item) is not int or item < 0 for item in counts.values())
+        or type(checks) is not dict
+        or frozenset(checks) != {"authority", "repository", "state"}
+        or type(checks["authority"]) is not str
+        or checks["authority"] not in {"ready", "fail_closed"}
+        or any(type(checks[key]) is not str or checks[key] not in _RUNTIME_STATES for key in ("repository", "state"))
+        or type(value.get("authority")) is not str
+        or value["authority"] not in {"ready", "fail_closed"}
+        or any(type(value.get(key)) is not str or value[key] not in _RUNTIME_STATES for key in ("repository", "principal", "state"))
+        or type(value.get("pilot")) is not str
+        or value["pilot"] not in {"ready", "blocked"}
+        or not _valid_reason_codes(reasons)
+        or any(value.get(key) is not None and not _digest(value.get(key)) for key in ("config_digest", "catalog_digest"))
+        or type(value.get("mutation_performed")) is not bool
+        or value.get("raw_output") != "not_returned"
+        or not _valid_global_pilot_readiness(value.get("global_pilot_readiness"))
+    ):
+        return False
+    return checks == {
+        "authority": value["authority"],
+        "repository": value["repository"],
+        "state": value["state"],
+    }
+
+
+def _valid_hive_doctor_shape(value: object) -> bool:
+    if type(value) is not dict or frozenset(value) != _HIVE_DOCTOR_KEYS:
+        return False
+    checks = value.get("checks")
+    reasons = value.get("reason_codes")
+    if (
+        type(value.get("healthy")) is not bool
+        or type(value.get("mode")) is not str
+        or value["mode"] not in {"disabled", "shadow", "enforced"}
+        or type(checks) is not dict
+        or frozenset(checks) != {"authority", "repository", "state"}
+        or type(checks["authority"]) is not str
+        or checks["authority"] not in {"ready", "fail_closed"}
+        or any(type(checks[key]) is not str or checks[key] not in _RUNTIME_STATES for key in ("repository", "state"))
+        or any(type(value.get(key)) is not str or value[key] not in _RUNTIME_STATES for key in ("repository", "principal", "state"))
+        or type(value.get("pilot")) is not str
+        or value["pilot"] not in {"ready", "blocked"}
+        or not _valid_reason_codes(reasons)
+        or any(value.get(key) is not None and not _digest(value.get(key)) for key in ("config_digest", "catalog_digest"))
+        or type(value.get("mutation_performed")) is not bool
+        or value.get("raw_output") != "not_returned"
+        or not _valid_global_pilot_readiness(value.get("global_pilot_readiness"))
+    ):
+        return False
+    expected_healthy = all(
+        (checks["authority"] if key == "authority" else value[key]) == "ready"
+        for key in ("authority", "pilot", "state", "repository", "principal")
+    )
+    return (
+        checks == {"authority": checks["authority"], "repository": value["repository"], "state": value["state"]}
+        and value["healthy"] is expected_healthy
+    )
+
+
+def _valid_service_producer_shapes(
+    runtime: object, hive: object, doctor: object, readiness: object
+) -> bool:
+    return (
+        _valid_runtime_status_shape(runtime)
+        and _valid_hive_status_shape(hive)
+        and _valid_hive_doctor_shape(doctor)
+        and hive["mode"] == doctor["mode"]
+        and hive["authority"] == doctor["checks"]["authority"]
+        and hive["repository"] == doctor["repository"]
+        and hive["principal"] == doctor["principal"]
+        and hive["state"] == doctor["state"]
+        and hive["pilot"] == doctor["pilot"]
+        and hive["checks"] == doctor["checks"]
+        and hive["config_digest"] == doctor["config_digest"]
+        and hive["catalog_digest"] == doctor["catalog_digest"]
+        and hive["global_pilot_readiness"] == doctor["global_pilot_readiness"]
+        and hive["global_pilot_readiness"] == readiness
+        and hive["mutation_performed"] is doctor["mutation_performed"]
+        and hive["reason_codes"] == doctor["reason_codes"]
+    )
+
+
+def _service_usage_value(readiness: object) -> bool:
+    if not _valid_global_pilot_readiness(readiness):
+        return False
+    return (
+        readiness["pilot"] == "ready"
+        and readiness["freshness"] == "fresh"
+        and isinstance(readiness["generation_id"], str)
+        and bool(readiness["generation_id"])
+        and readiness["reason_codes"] == []
+    )
+
+
+def _service_check_values(
+    runtime: Mapping[str, Any],
+    hive: Mapping[str, Any],
+    doctor: Mapping[str, Any],
+    readiness: object,
+) -> dict[str, bool]:
+    usage = _service_usage_value(readiness)
+    if not _valid_service_producer_shapes(runtime, hive, doctor, readiness):
+        failed = {name: False for name in sorted(_SERVICE_CHECK_KEYS)}
+        failed["runtime_surface"] = _green_runtime_status(runtime)
+        failed["usage"] = usage
+        return failed
+    counts = hive["counts"]
+    checks = hive["checks"]
+    doctor_checks = doctor["checks"]
+    expected_authority_state = (
+        hive["authority"] == "fail_closed"
+        and doctor["checks"]["authority"] == "fail_closed"
+        and doctor["healthy"] is False
+    )
+    digests_match = (
+        _digest(hive["config_digest"])
+        and _digest(hive["catalog_digest"])
+        and hive["config_digest"] == doctor["config_digest"]
+        and hive["catalog_digest"] == doctor["catalog_digest"]
+    )
+    return {
+        "runtime_surface": _green_runtime_status(runtime),
+        "configuration": (
+            expected_authority_state
+            and hive["mode"] == "enforced"
+            and doctor["mode"] == "enforced"
+            and digests_match
+            and hive["reason_codes"] == []
+        ),
+        "repository": (
+            hive["repository"] == "ready"
+            and doctor["repository"] == "ready"
+            and checks["repository"] == "ready"
+            and doctor_checks["repository"] == "ready"
+            and counts["repositories"] > 0
+        ),
+        "principals": (
+            hive["principal"] == "ready"
+            and doctor["principal"] == "ready"
+            and counts["principals"] > 0
+        ),
+        "state": (
+            hive["state"] == "ready"
+            and doctor["state"] == "ready"
+            and checks["state"] == "ready"
+            and doctor_checks["state"] == "ready"
+            and hive["mutation_performed"] is False
+            and doctor["mutation_performed"] is False
+        ),
+        "usage": usage,
+    }
+
+
+def _valid_probe_record_v3(payload: object) -> bool:
+    """Validate the original complete v3 record without changing its contract."""
 
     if not isinstance(payload, Mapping) or frozenset(payload) != _PROBE_RECORD_KEYS:
         return False
@@ -384,31 +650,87 @@ def valid_probe_record(payload: object) -> bool:
     return observed.tzinfo is not None and observed.utcoffset() is not None
 
 
+
+def _valid_probe_record_v4(payload: object) -> bool:
+    if not isinstance(payload, Mapping) or frozenset(payload) != _PROBE_RECORD_V4_KEYS:
+        return False
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 4:
+        return False
+    service_checks = payload.get("service_checks")
+    checks = payload.get("checks")
+    readiness = payload.get("global_pilot_readiness")
+    alarm = payload.get("alarm")
+    service_alarm = payload.get("service_alarm")
+    if (
+        not isinstance(service_checks, Mapping)
+        or frozenset(service_checks) != _SERVICE_CHECK_KEYS
+        or any(type(value) is not bool for value in service_checks.values())
+        or not _valid_alarm(service_alarm, service_checks)
+    ):
+        return False
+    legacy = dict(payload)
+    del legacy["service_checks"]
+    del legacy["service_alarm"]
+    legacy["schema_version"] = 3
+    if not _valid_probe_record_v3(legacy):
+        return False
+    expected_usage = (
+        readiness["pilot"] == "ready"
+        and readiness["freshness"] == "fresh"
+        and isinstance(readiness["generation_id"], str)
+        and bool(readiness["generation_id"])
+        and readiness["reason_codes"] == []
+    )
+    if (
+        service_checks["runtime_surface"] is not checks["runtime_layout"]
+        or service_checks["usage"] is not expected_usage
+        or not isinstance(alarm, Mapping)
+        or not isinstance(service_alarm, Mapping)
+        or alarm.get("owner") != service_alarm.get("owner")
+    ):
+        return False
+    return True
+
+
+def valid_probe_record(payload: object) -> bool:
+    """Validate one complete known hourly record version without raising."""
+    if not isinstance(payload, Mapping):
+        return False
+    version = payload.get("schema_version")
+    if type(version) is not int:
+        return False
+    try:
+        if version == 3:
+            return _valid_probe_record_v3(payload)
+        if version == 4:
+            return _valid_probe_record_v4(payload)
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        return False
+    return False
+
+
 def probe_spawn_gate(
     payload: Mapping[str, Any],
     *,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Accept only one fresh, complete and green v3 result for Hive spawning."""
-
-    if not isinstance(payload, Mapping) or frozenset(payload) != _PROBE_RECORD_KEYS:
-        return {
-            "allowed": False,
-            "reason_code": "probe_ambiguous",
-            "raw_output": "not_returned",
-        }
-    checks = payload.get("checks")
-    commands = payload.get("commands")
+    """Accept only fresh, complete service-green v4; keep v3 as legacy HOLD."""
+    if not isinstance(payload, Mapping) or type(payload.get("schema_version")) is not int:
+        return {"allowed": False, "reason_code": "probe_ambiguous", "raw_output": "not_returned"}
+    if payload.get("schema_version") == 3:
+        return {"allowed": False, "reason_code": "probe_schema_legacy", "raw_output": "not_returned"}
+    if payload.get("schema_version") != 4 or not _valid_probe_record_v4(payload):
+        return {"allowed": False, "reason_code": "probe_red", "raw_output": "not_returned"}
+    service_checks = payload["service_checks"]
+    commands = payload["commands"]
+    diagnostics = payload["diagnostics"]
     if (
-        not valid_probe_record(payload)
-        or any(value is not True for value in checks.values())
+        any(value is not True for value in service_checks.values())
         or any(value is not True for value in commands.values())
+        or any(not _valid_diagnostic(diagnostics[name], command_ready=True) for name in _PROBE_COMMAND_KEYS)
+        or payload["service_alarm"].get("status") != "cleared"
     ):
-        return {
-            "allowed": False,
-            "reason_code": "probe_red",
-            "raw_output": "not_returned",
-        }
+        return {"allowed": False, "reason_code": "probe_red", "raw_output": "not_returned"}
     checked_at = payload.get("checked_at")
     if not isinstance(checked_at, str) or not 1 <= len(checked_at) <= 40:
         return {
@@ -485,8 +807,8 @@ def _read_private_probe_state(path: Path) -> Mapping[str, Any]:
     if len(raw) > MAX_PROBE_STATE_BYTES:
         raise ValueError("probe_state_invalid")
     try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        payload = _strict_json_loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ValueError("probe_state_invalid") from exc
     if not isinstance(payload, Mapping):
         raise ValueError("probe_state_invalid")
@@ -502,7 +824,7 @@ def read_probe_gate(
     state_file: Path | None = None,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Read the private v3 record without creating or changing state."""
+    """Read the private versioned record without creating or changing state."""
 
     if state_file is None:
         state_file = _probe_state_root() / STATE_FILE_NAME
@@ -745,17 +1067,28 @@ def _probe_alarm_owner(layout: RuntimeLayout) -> dict[str, str] | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _probe_alarm_payload(
-    result: Mapping[str, object], *, owner: dict[str, str] | None
-) -> dict[str, object]:
-    """Embed the durable Hive-wide alarm in the spawn-gated health record."""
 
-    checks = result.get("checks")
-    failed_checks = (
-        sorted(name for name, ready in checks.items() if ready is not True)
-        if isinstance(checks, Mapping)
-        else ["probe_result_invalid"]
-    )
+def _shape_command_result(
+    value: dict[str, Any], command_ready: bool, diagnostic: dict[str, object],
+    validator: Callable[[object], bool],
+) -> tuple[dict[str, Any], bool, dict[str, object]]:
+    try:
+        shape_valid = validator(value) if command_ready else False
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        shape_valid = False
+    if not command_ready or shape_valid:
+        return value, command_ready, diagnostic
+    return (value, False, {
+        "code": "command_output_invalid",
+        "exit_code": diagnostic.get("exit_code"),
+        "stderr": diagnostic.get("stderr", _not_returned_stderr()),
+    })
+
+
+def _probe_alarm_for_checks(
+    checks: Mapping[str, object], *, owner: dict[str, str] | None
+) -> dict[str, object]:
+    failed_checks = sorted(name for name, ready in checks.items() if ready is not True)
     if owner is None:
         failed_checks.append("alarm_owner_unavailable")
     return {
@@ -764,6 +1097,15 @@ def _probe_alarm_payload(
         "reason_codes": failed_checks,
         "owner": owner,
     }
+
+def _probe_alarm_payload(
+    result: Mapping[str, object], *, owner: dict[str, str] | None
+) -> dict[str, object]:
+    """Embed the durable Hive-wide alarm in the spawn-gated health record."""
+    checks = result.get("checks")
+    if not isinstance(checks, Mapping):
+        return {"scope": "hive", "status": "active", "reason_codes": ["probe_result_invalid"], "owner": owner}
+    return _probe_alarm_for_checks(checks, owner=owner)
 
 
 def publish_lifecycle_failure(
@@ -800,7 +1142,7 @@ def publish_lifecycle_failure(
         "stderr": {"state": "not_returned", "excerpt": "", "redaction_applied": False},
     }
     result: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "checked_at": moment.astimezone(UTC).isoformat(),
         "checks": checks,
         "commands": {
@@ -814,10 +1156,11 @@ def publish_lifecycle_failure(
             "hive_doctor": diagnostic,
         },
         "global_pilot_readiness": _bounded_global_pilot_readiness(None),
+        "service_checks": {name: False for name in sorted(_SERVICE_CHECK_KEYS)},
     }
-    result["alarm"] = _probe_alarm_payload(
-        result, owner=_probe_alarm_owner(layout) if layout is not None else None
-    )
+    owner = _probe_alarm_owner(layout) if layout is not None else None
+    result["alarm"] = _probe_alarm_payload(result, owner=owner)
+    result["service_alarm"] = _probe_alarm_for_checks(result["service_checks"], owner=owner)
     state_file = state_directory / STATE_FILE_NAME
     with _probe_gate_lock(state_file, exclusive=True, create=True):
         _atomic_write(state_file, result)
@@ -914,7 +1257,7 @@ def _run_json(
                 _diagnostic("command_stderr_warning", 0, completed.stderr),
             )
         try:
-            value = json.loads(completed.stdout)
+            value = _strict_json_loads(completed.stdout)
         except (json.JSONDecodeError, TypeError, ValueError):
             return (
                 {},
@@ -1166,7 +1509,13 @@ def run_probe(
                 )
             )
         )
+    runtime, runtime_command, runtime_diagnostic = _shape_command_result(runtime, runtime_command, runtime_diagnostic, _valid_runtime_status_shape)
+    hive, hive_command, hive_diagnostic = _shape_command_result(hive, hive_command, hive_diagnostic, _valid_hive_status_shape)
+    doctor, doctor_command, doctor_diagnostic = _shape_command_result(doctor, doctor_command, doctor_diagnostic, _valid_hive_doctor_shape)
     result = evaluate(runtime, hive, doctor)
+    result["service_checks"] = _service_check_values(
+        runtime, hive, doctor, result["global_pilot_readiness"]
+    )
     owner = _probe_alarm_owner(active_layout)
     if owner is None:
         result["checks"]["hive_runtime"] = False
@@ -1179,7 +1528,7 @@ def run_probe(
         raise ValueError("probe_clock_invalid")
     result.update(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "checked_at": moment.astimezone(UTC).isoformat(),
             "commands": {
                 "runtime_status": runtime_command,
@@ -1194,6 +1543,7 @@ def run_probe(
         }
     )
     result["alarm"] = _probe_alarm_payload(result, owner=owner)
+    result["service_alarm"] = _probe_alarm_for_checks(result["service_checks"], owner=owner)
     state_file = state_directory / STATE_FILE_NAME
     with _probe_gate_lock(state_file, exclusive=True, create=True):
         _atomic_write(state_file, result)
@@ -1234,6 +1584,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "checks": checks,
+                "service_checks": result.get("service_checks"),
                 "global_pilot_readiness": _bounded_global_pilot_readiness(
                     result.get("global_pilot_readiness")
                 ),
@@ -1241,25 +1592,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
             sort_keys=True,
         )
     )
-    failed_checks = sorted(name for name, ready in checks.items() if ready is not True)
-    if failed_checks:
-        diagnostics = result.get("diagnostics")
-        diagnostic_codes = (
-            ",".join(
-                f"{name}:{diagnostic.get('code')}"
-                for name, diagnostic in sorted(diagnostics.items())
-                if isinstance(diagnostic, Mapping) and diagnostic.get("code") != "ok"
-            )
-            if isinstance(diagnostics, Mapping)
-            else ""
-        )
-        print(
-            "hive_hourly_probe_red failed_checks="
-            + ",".join(failed_checks)
-            + (f" diagnostic_codes={diagnostic_codes}" if diagnostic_codes else ""),
-            file=sys.stderr,
-            flush=True,
-        )
+    service_checks = result.get("service_checks")
+    commands = result.get("commands")
+    diagnostics = result.get("diagnostics")
+    service_alarm = result.get("service_alarm")
+    if (
+        not isinstance(service_checks, Mapping)
+        or frozenset(service_checks) != _SERVICE_CHECK_KEYS
+        or any(value is not True for value in service_checks.values())
+        or not isinstance(commands, Mapping)
+        or frozenset(commands) != _PROBE_COMMAND_KEYS
+        or any(value is not True for value in commands.values())
+        or not isinstance(diagnostics, Mapping)
+        or any(not _valid_diagnostic(diagnostics[name], command_ready=True) for name in _PROBE_COMMAND_KEYS)
+        or not isinstance(service_alarm, Mapping)
+        or service_alarm.get("status") != "cleared"
+    ):
+        failed = sorted(name for name, ready in (service_checks.items() if isinstance(service_checks, Mapping) else ()) if ready is not True)
+        print("hive_hourly_probe_red failed_service_checks=" + ",".join(failed), file=sys.stderr, flush=True)
         return 1
     return 0
 

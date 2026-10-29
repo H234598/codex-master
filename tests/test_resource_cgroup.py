@@ -1001,6 +1001,35 @@ class _GateControlSocket:
         self.closed = True
 
 
+@pytest.mark.parametrize("release", (b"c" * 64 + b"\n", b"", b"c" * 63 + b"\n", b"c" * 64 + b"\nx"))
+def test_direct_scope_gate_only_holds_and_acknowledges_exact_challenge(monkeypatch, release):
+    class Control(_GateControlSocket):
+        def __enter__(self): return self
+        def __exit__(self, *_args): self.close()
+        def settimeout(self, seconds): assert seconds == 5.0
+
+    control = Control(release)
+    name = "the-hive-resource-" + "d" * 32
+    monkeypatch.setattr(socket, "socket", lambda *_args: control)
+    monkeypatch.setattr(resource_cgroup.secrets, "token_hex", lambda size: "c" * (2 * size))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail("hold-only gate must not fork"))
+    monkeypatch.setattr(os, "execve", lambda *_args: pytest.fail("hold-only gate must not exec"))
+    def reject(status):
+        raise SystemExit(status)
+    monkeypatch.setattr(os, "_exit", reject)
+    monkeypatch.setattr(sys, "argv", [str(GATE), "--direct-child-scope", name])
+    if release == b"c" * 64 + b"\n":
+        runpy.run_path(str(GATE), run_name="__main__")
+        assert control.sent == release + b"ready\n"
+    else:
+        with pytest.raises(SystemExit) as rejected:
+            runpy.run_path(str(GATE), run_name="__main__")
+        assert rejected.value.code == 64
+        assert control.sent == b"c" * 64 + b"\n"
+    assert control.address == b"\0" + name.encode()
+    assert control.closed
+
+
 def test_scope_gate_generates_internal_challenge_and_executes_only_fixed_tmux_argv(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1755,6 +1784,209 @@ def _systemd_adapter(
     _FakeScopeControl.instances.clear()
     monkeypatch.setattr(resource_cgroup, "_ScopeControl", _FakeScopeControl)
     return resource_cgroup.SystemdUserCgroupAdapter(runner=runner)
+
+
+def _direct_scope_owner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    unit = "the-hive-resource-" + "d" * 32 + ".scope"
+    directory = resource_cgroup.CGROUP_ROOT / "user.slice/the-hive.slice" / unit
+    (directory / "cgroup.procs").write_bytes(b"4241\n")
+    info = directory.stat()
+    identity = resource_cgroup.G5ScopeIdentity(
+        unit, f"/user.slice/the-hive.slice/{unit}", "b" * 32, info.st_dev, info.st_ino
+    )
+    monkeypatch.setattr(resource_cgroup, "bind_g5_scope", lambda *_args: identity)
+    monkeypatch.setattr(
+        resource_cgroup, "g5_scope_is_empty",
+        lambda actual: actual == identity and (directory / "cgroup.procs").read_bytes() == b"",
+    )
+    return resource_cgroup.SystemdDirectChildScopeOwner(adapter, _profile()), runner, directory
+
+
+def test_direct_scope_issues_one_fd_and_closes_only_after_child_quiescence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    owner, runner, directory = _direct_scope_owner(monkeypatch, tmp_path)
+    ticket = owner.prepare()
+    assert runner.started[0][-2:] == ("--direct-child-scope", "the-hive-resource-" + "d" * 32)
+    descriptor = owner.take_cgroup_fd_once(ticket)
+    try:
+        assert os.fstat(descriptor).st_ino == directory.stat().st_ino
+        assert not os.get_inheritable(descriptor)
+        with pytest.raises(CgroupPreflightError):
+            owner.take_cgroup_fd_once(ticket)
+        with pytest.raises(CgroupPreflightError):
+            owner.take_cgroup_fd_once(resource_cgroup.DirectChildScopeTicket(ticket.unit_name, ticket.nonce))
+        (directory / "cgroup.procs").write_bytes(b"4241\n4242\n")
+        finish = runner.gate.finish
+
+        def finish_gate(**kwargs):
+            (directory / "cgroup.procs").write_bytes(b"4242\n")
+            return finish(**kwargs)
+
+        monkeypatch.setattr(runner.gate, "finish", finish_gate)
+        owner.release_after_attach(ticket, 4242)
+        assert _scope_control_releases() == [b"c" * 64 + b"\n"]
+        assert not owner.observe_empty(ticket)
+        with pytest.raises(CgroupPreflightError):
+            owner.close_empty(ticket)
+        (directory / "cgroup.procs").write_bytes(b"")
+        assert owner.observe_empty(ticket)
+        owner.close_empty(ticket)
+        assert ticket.unit_name not in owner._owned
+    finally:
+        os.close(descriptor)
+
+
+def test_direct_scope_fd_open_failure_retains_ticket_and_recovery_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    owner, runner, directory = _direct_scope_owner(monkeypatch, tmp_path)
+    open_fd = resource_cgroup.os.open
+
+    def fail_directory(path, flags, *args, **kwargs):
+        if Path(path) == directory:
+            raise OSError("controlled FD-open failure")
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(resource_cgroup.os, "open", fail_directory)
+    with pytest.raises(resource_cgroup.DirectScopePreparationHold) as held:
+        owner.prepare()
+    ticket = held.value.ticket
+    assert type(ticket) is resource_cgroup.DirectChildScopeTicket
+    assert held.value.unit_name == ticket.unit_name
+    retained = owner._lookup(ticket)
+    assert retained.directory_fd == -1
+    assert not retained.control.closed
+    assert runner.stopped == []
+    with pytest.raises(CgroupPreflightError):
+        owner.take_cgroup_fd_once(ticket)
+    stop = resource_cgroup.SystemdUserCgroupAdapter._stop_new_unit
+
+    def stop_own(adapter, unit):
+        assert adapter is owner._adapter
+        stop(adapter, unit)
+        (directory / "cgroup.procs").write_bytes(b"")
+
+    monkeypatch.setattr(resource_cgroup.SystemdUserCgroupAdapter, "_stop_new_unit", stop_own)
+    owner.abort(ticket)
+    assert runner.stopped == [ticket.unit_name]
+    assert retained.control.closed
+    assert ticket.unit_name not in owner._owned
+
+
+@pytest.mark.parametrize("fault", (
+    "empty_during_verify", "stop_error_after_empty", "initial_empty", "foreign_invocation",
+    "nonempty", "transport", "unknown_events", "missing_scope", "foreign_fd", "other_error", "other_bounded_error",
+))
+def test_direct_scope_abort_revalidates_real_identity_after_a_race(monkeypatch, tmp_path, fault):
+    from the_hive import runtime_process as runtime
+
+    owner, runner, directory = _direct_scope_owner(monkeypatch, tmp_path)
+    ticket = owner.prepare()
+    owned = owner._lookup(ticket)
+    identity, descriptor = owned.identity, owned.directory_fd
+    processes, events = directory / "cgroup.procs", directory / "cgroup.events"
+    events.write_bytes(b"populated 1\n")
+    monkeypatch.setattr(runtime, "_CGROUP_ROOT", resource_cgroup.CGROUP_ROOT)
+    def snapshot(_unit):
+        return identity.control_group, identity.invocation_id, "loaded"
+
+    monkeypatch.setattr(runtime, "_g5_unit_snapshot", snapshot)
+    monkeypatch.setattr(resource_cgroup, "bind_g5_scope", runtime.bind_g5_scope)
+    assert runtime.bind_g5_scope(ticket.unit_name, identity.control_group) == identity
+    terminated = []
+    monkeypatch.setattr(runner.gate, "terminate", lambda: terminated.append(ticket.unit_name))
+    calls = []
+    moved = directory.with_name(directory.name + ".retained")
+    replacement_fd = -1
+
+    def empty():
+        processes.write_bytes(b"")
+        events.write_bytes(b"populated 0\n")
+
+    def unavailable(_unit):
+        raise runtime.BoundedProcessError("command_group_unavailable")
+
+    original_run = runner.run
+
+    def run(argv, **kwargs):
+        result = original_run(argv, **kwargs)
+        if argv[3:4] == ("stop",):
+            empty()
+            raise TimeoutError("controlled stop transport failure")
+        return result
+
+    if fault == "stop_error_after_empty":
+        monkeypatch.setattr(runner, "run", run)
+    if fault == "initial_empty":
+        empty()
+
+    def observe(actual):
+        nonlocal replacement_fd
+        result = runtime.g5_scope_is_empty(actual)
+        calls.append(result)
+        if len(calls) == 1 and fault != "initial_empty":
+            assert result is False
+            if fault in {"empty_during_verify", "foreign_fd", "other_error", "other_bounded_error"}:
+                empty()
+            if fault == "foreign_invocation":
+                monkeypatch.setattr(runtime, "_g5_unit_snapshot", lambda _unit: (identity.control_group, "f" * 32, "loaded"))
+            elif fault == "nonempty":
+                (directory / "cpu.max").write_bytes(b"wrong profile\n")
+            elif fault == "transport":
+                monkeypatch.setattr(runtime, "_g5_unit_snapshot", unavailable)
+            elif fault == "unknown_events":
+                processes.write_bytes(b"")
+                events.write_bytes(b"populated unknown\n")
+            elif fault == "missing_scope":
+                directory.rename(moved)
+                monkeypatch.setattr(runtime, "_g5_unit_snapshot", lambda _unit: ("", "", "not-found"))
+            elif fault == "foreign_fd":
+                foreign = tmp_path / "foreign-directory"
+                foreign.mkdir()
+                replacement_fd = os.open(foreign, os.O_RDONLY | os.O_DIRECTORY)
+                owned.directory_fd = replacement_fd
+            elif fault in {"other_error", "other_bounded_error"}:
+                def fail_verify(_owned):
+                    if fault == "other_bounded_error":
+                        raise runtime.BoundedProcessError("command_timeout")
+                    raise RuntimeError("unrelated verification failure")
+                monkeypatch.setattr(owner, "_verify", fail_verify)
+        return result
+
+    monkeypatch.setattr(resource_cgroup, "g5_scope_is_empty", observe)
+    caught = None
+    try:
+        try:
+            owner.abort(ticket)
+        except Exception as exc:
+            caught = exc
+        if fault in {"empty_during_verify", "stop_error_after_empty", "initial_empty"}:
+            assert caught is None
+            assert ticket.unit_name not in owner._owned
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+            assert terminated == [ticket.unit_name]
+        else:
+            assert caught is not None
+            assert isinstance(caught, RuntimeError if fault == "other_error" else (CgroupPreflightError, runtime.BoundedProcessError))
+            assert owner._lookup(ticket) is owned
+            assert os.fstat(descriptor).st_ino == identity.inode
+            assert terminated == []
+        assert runner.stopped == ([ticket.unit_name] if fault == "stop_error_after_empty" else [])
+    finally:
+        if ticket.unit_name in owner._owned:
+            if moved.exists():
+                moved.rename(directory)
+            owned.directory_fd = descriptor
+            monkeypatch.setattr(runtime, "_g5_unit_snapshot", snapshot)
+            empty()
+            monkeypatch.setattr(resource_cgroup, "g5_scope_is_empty", runtime.g5_scope_is_empty)
+            owner.abort(ticket)
+        if replacement_fd >= 0:
+            os.close(replacement_fd)
 
 
 def test_systemd_v259_scope_uses_pid_bound_control_without_pipe_and_one_gate_release(
