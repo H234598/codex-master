@@ -10,8 +10,11 @@ import selectors
 import signal
 import stat
 import subprocess
+import threading
 import time
 from types import SimpleNamespace
+from dataclasses import asdict, replace
+import hashlib
 
 import pytest
 
@@ -21,6 +24,328 @@ requires_user_systemd = pytest.mark.skipif(
     os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1",
     reason="systemd_user_it_disabled",
 )
+
+
+def _owned_test_child():
+    from the_hive import runtime_process as runtime
+    from the_hive.resource_cgroup import (
+        CgroupProfileV1, SystemdDirectChildScopeOwner, SystemdUserCgroupAdapter,
+    )
+
+    gib = 1024**3
+    scope = SystemdDirectChildScopeOwner(
+        SystemdUserCgroupAdapter(),
+        CgroupProfileV1(tuple(range(4, 12)), 750, 50, 9 * gib, 12 * gib, 8 * gib, 50),
+    )
+    now = time.monotonic_ns()
+    spec = runtime.OwnedChildSpec(
+        "leadership", -1, "a" * 64, -1,
+        ("codex", "--hive-owned-entry", "exec"), {},
+        now + 10_000_000_000, now + 20_000_000_000, now + 30_000_000_000,
+    )
+    ports = runtime.OwnedJournalPorts(*(lambda *_args: None for _ in range(5)))
+    return runtime, runtime.OwnedDirectChild(spec, scope, ports)
+
+
+@pytest.mark.parametrize("interleaving", ("waiting_for_stdin_lock", "between_chunks"))
+def test_owned_child_cancel_fences_each_write_on_the_same_child(
+    monkeypatch: pytest.MonkeyPatch, interleaving: str
+) -> None:
+    runtime, child = _owned_test_child()
+    child._settled.set()
+    child.process.pidfd = 123
+    child._fds["stdin"] = 456
+    writes: list[bytes] = []
+    signals: list[tuple[int, int]] = []
+    blocked = threading.Event()
+    resume = threading.Event()
+    errors: list[Exception] = []
+
+    class Writable:
+        calls = 0
+
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def register(self, *_args): return None
+
+        def select(self, _timeout):
+            self.calls += 1
+            if self.calls == 2:
+                blocked.set()
+                assert resume.wait(2)
+            return [(None, None)]
+
+    monkeypatch.setattr(runtime.selectors, "DefaultSelector", Writable)
+    monkeypatch.setattr(runtime.os, "dup", lambda _descriptor: 789)
+    monkeypatch.setattr(runtime.os, "close", lambda _descriptor: None)
+    monkeypatch.setattr(runtime.os, "write", lambda _descriptor, data: writes.append(bytes(data[:1])) or 1)
+    monkeypatch.setattr(runtime.signal, "pidfd_send_signal", lambda fd, sig: signals.append((fd, sig)))
+
+    def write():
+        try:
+            child.write(b"ab", time.monotonic_ns() + 5_000_000_000)
+        except Exception as exc:
+            errors.append(exc)
+
+    if interleaving == "waiting_for_stdin_lock":
+        child._stdin_lock.acquire()
+    writer = threading.Thread(target=write)
+    writer.start()
+    try:
+        if interleaving == "between_chunks":
+            assert blocked.wait(2)
+            assert writes == [b"a"]
+        child.interrupt()
+        child.cancel()
+        after_cancel = list(writes)
+    finally:
+        if interleaving == "waiting_for_stdin_lock":
+            child._stdin_lock.release()
+        resume.set()
+        writer.join(2)
+    assert not writer.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], runtime.OwnedChildHold)
+    assert errors[0].code == "owned_child_write_denied"
+    assert errors[0].child is child
+    assert writes == after_cancel == ([] if interleaving == "waiting_for_stdin_lock" else [b"a"])
+    assert signals == [(123, signal.SIGINT), (123, signal.SIGKILL)]
+    assert child.failure_code == "owned_child_cancelled"
+
+
+def test_owned_child_helpers_keep_observation_identity_and_bounded_replay() -> None:
+    runtime, child = _owned_test_child()
+    observation = runtime._owned_observation("output", {"chunk": b"abc", "nested": (b"x",)})
+    assert json.loads(observation.canonical_bytes) == {
+        "kind": "output", "body": {"chunk": {"bytes_hex": "616263"}, "nested": [{"bytes_hex": "78"}]}
+    }
+    assert observation.sha256 == hashlib.sha256(observation.canonical_bytes).hexdigest()
+    assert runtime._owned_hash_valid(observation.sha256)
+    assert not runtime._owned_hash_valid("sha256:" + observation.sha256)
+    with pytest.raises(runtime.BoundedProcessError, match="owned_child_deadline"):
+        runtime._owned_deadline(time.monotonic_ns() - 1)
+    for _ in range(1025):
+        child._emit("stdout", b"x", observation)
+    with pytest.raises(runtime.OwnedChildHold, match="owned_child_replay_lost"):
+        child.events_after(0, child.spec.start_deadline_ns)
+    with pytest.raises(runtime.OwnedChildHold, match="owned_child_read_invalid"):
+        child.events_after(True, child.spec.start_deadline_ns)
+    events = child.events_after(1024, child.spec.start_deadline_ns)
+    assert len(events) == 1 and events[0].seq == 1025 and events[0].observation is observation
+    with pytest.raises(runtime.OwnedChildHold, match="owned_child_channel_unavailable"):
+        child.leadership_channels()
+    with pytest.raises(runtime.OwnedChildHold, match="owned_child_signal_denied"):
+        child.interrupt()
+    read_fd, write_fd = os.pipe()
+    try:
+        child._own_fd("stdin", write_fd)
+        child.close_stdin()
+        assert "stdin" not in child._fds and child.process.stdin_fd == -1
+        with pytest.raises(OSError):
+            os.fstat(write_fd)
+    finally:
+        os.close(read_fd)
+    child._finished.set()
+    with pytest.raises(runtime.OwnedChildHold, match="owned_child_completion_unverified"):
+        child.wait_completion(child.spec.cleanup_deadline_ns)
+
+
+@pytest.mark.parametrize("changes", ({"kind": "other"}, {"arguments": ("codex",)}, {"d17_target_fd": 7}))
+def test_owned_child_spec_denies_invalid_contract_before_effects(changes) -> None:
+    runtime, child = _owned_test_child()
+    with pytest.raises(runtime.BoundedProcessError, match="owned_child_spec_invalid"):
+        runtime.start_owned_child(replace(child.spec, **changes), runtime_layout=object(),
+            scope_owner=child.scope_owner, ports=child.ports)
+    with pytest.raises(runtime.BoundedProcessError, match="owned_child_owner_unavailable"):
+        runtime.OwnedDirectChild(child.spec, object(), child.ports)
+
+
+@pytest.mark.parametrize("fault,reason", (
+    ("digest", "owned_child_input_changed"), ("mode", "owned_child_input_unavailable"),
+    ("environment", "owned_child_environment_invalid"),
+))
+def test_owned_child_pins_inputs_before_any_scope_or_journal_effect(tmp_path, fault, reason):
+    runtime, child = _owned_test_child()
+    executable = tmp_path / "private-elf"
+    payload = b"\x7fELFcontrolled input"
+    executable.write_bytes(payload)
+    executable.chmod(0o777 if fault == "mode" else 0o755)
+    executable_fd = os.open(executable, os.O_RDONLY | os.O_CLOEXEC)
+    cwd_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    child.spec = replace(child.spec, executable_fd=executable_fd, cwd_fd=cwd_fd,
+        executable_sha256="0" * 64 if fault == "digest" else hashlib.sha256(payload).hexdigest(),
+        environment={"bad\0name": "value"} if fault == "environment" else {})
+    try:
+        with pytest.raises(runtime.OwnedChildHold, match=f"^{reason}$"):
+            child._pin_inputs()
+        assert child.scope_owner._owned == {} and child.reservation is None
+    finally:
+        child._close_owned()
+        assert os.fstat(executable_fd).st_ino == executable.stat().st_ino
+        os.close(executable_fd)
+        os.close(cwd_fd)
+
+
+@pytest.mark.parametrize("kind", ("leadership", "mcp"))
+def test_owned_child_start_and_completion_keep_real_types_fds_and_journal_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_spawn_helper, kind: str
+) -> None:
+    import ctypes
+    import socket
+    from the_hive.resource_cgroup import DirectChildScopeTicket
+
+    runtime, child = _owned_test_child()
+    _library, actual_entry = runtime._owned_native_entry(runtime_spawn_helper)
+    assert actual_entry.restype is ctypes.c_int
+    assert actual_entry.argtypes == (ctypes.POINTER(runtime._OwnedNativeResult), ctypes.POINTER(runtime._OwnedNativeArgs))
+    assert actual_entry(None, None) == errno.EINVAL
+    executable = tmp_path / "pinned-elf"
+    executable.write_bytes(b"\x7fELFprivate test input")
+    executable.chmod(0o755)
+    executable_fd = os.open(executable, os.O_RDONLY | os.O_CLOEXEC)
+    cwd_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    group = tmp_path / "group"
+    group.mkdir()
+    info = group.stat()
+    unit = "the-hive-resource-" + "a" * 32 + ".scope"
+    identity = runtime.G5ScopeIdentity(
+        unit, f"/user.slice/the-hive.slice/{unit}", "b" * 32, info.st_dev, info.st_ino
+    )
+    child.spec = replace(
+        child.spec, kind=kind, executable_fd=executable_fd, cwd_fd=cwd_fd,
+        executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+        arguments=("codex", "--hive-owned-entry", "exec") if kind == "leadership" else ("codex", "mcp-server"),
+        d17_target_fd=None if kind == "leadership" else 17,
+    )
+    order: list[str] = []
+    peers: list[socket.socket] = []
+    child_descriptors: list[int] = []
+    reservation = runtime.OwnedStartReservation("c" * 64, "prepare-one", object())
+
+    def reserve(spec, _deadline):
+        assert spec is child.spec
+        order.append("reserved")
+        return reservation
+
+    def persist(actual, observed, _deadline):
+        assert actual is reservation and observed is child.identity
+        order.append("persisted")
+        return runtime.OwnedExecutionBinding(reservation, observed, "execution-one", "d" * 64, "prepare-one")
+
+    def publish(binding, observed, _deadline):
+        assert binding is child.binding and observed is child.started
+        order.append("d17")
+        payload = {"principal_id": "principal-one", "class_id": "spezialistin", "repo_id": "repo-one",
+            "principal_version": 1, "config_digest": "sha256:" + "e" * 64,
+            "execution_binding_id": binding.execution_binding_id,
+            "issued_at_utc": "2026-10-29T00:00:00Z", "expires_at_utc": "2026-10-29T00:01:00Z"}
+        return runtime.OwnedD17Publication(binding, observed.sha256,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+
+    def complete(binding, evidence, _deadline):
+        assert binding is child.binding and evidence.child is child.identity
+        assert evidence.exit_code == 0 and evidence.failure_code is None
+        assert evidence.stdout_eof.kind == "stdout_eof" and evidence.stderr_eof.kind == "stderr_eof"
+        assert evidence.kernel_quiescence.kind == "kernel_quiescence"
+        order.append("completed")
+        canonical = json.dumps({"kind": "completion_evidence", "body": asdict(evidence)},
+            default=lambda value: {"bytes_hex": value.hex()}, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+        expected_digest = hashlib.sha256(canonical).hexdigest()
+        assert runtime.owned_completion_evidence_sha256(evidence) == expected_digest
+        return runtime.OwnedCompletion(binding, expected_digest, "f" * 64)
+
+    child.ports = runtime.OwnedJournalPorts(reserve, lambda *_args: pytest.fail("not an unstarted child"), persist, publish, complete)
+    monkeypatch.setattr(child.scope_owner, "prepare", lambda: DirectChildScopeTicket(unit, "ticket"))
+    monkeypatch.setattr(child.scope_owner, "take_cgroup_fd_once", lambda _ticket: os.open(group, os.O_RDONLY | os.O_DIRECTORY))
+    monkeypatch.setattr(child.scope_owner, "release_after_attach", lambda _ticket, pid: order.append(f"attached:{pid}"))
+    monkeypatch.setattr(child.scope_owner, "close_empty", lambda _ticket: order.append("scope_closed"))
+    monkeypatch.setattr(runtime, "_g5_unit_snapshot", lambda _unit: (identity.control_group, identity.invocation_id, "loaded"))
+    monkeypatch.setattr(runtime, "bind_g5_scope", lambda *_args: identity)
+    monkeypatch.setattr(runtime, "g5_scope_is_empty", lambda actual: actual is identity)
+    monkeypatch.setattr(runtime.os, "waitid", lambda *_args: None)
+    monkeypatch.setattr(runtime.signal, "pidfd_send_signal", lambda *_args: None)
+    original_stat = runtime.os.stat
+
+    def stat_exec(path, *args, **kwargs):
+        if path == "/proc/4242/exe":
+            return os.fstat(executable_fd)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.os, "stat", stat_exec)
+
+    def native(result, arguments):
+        assert order == ["reserved"]
+        args = arguments._obj
+        assert args.kind == (1 if kind == "leadership" else 2)
+        result._obj.pid = 4242
+        result._obj.pidfd = os.dup(executable_fd)
+        child_descriptors.append(os.dup(args.release_fd))
+        os.write(args.stdout_fd, b"out")
+        os.write(args.stderr_fd, b"err")
+        for descriptor in (args.control_fd, args.events_fd, args.d17_fd):
+            if descriptor >= 0:
+                peers.append(socket.socket(fileno=os.dup(descriptor)))
+        order.append("native")
+        return 0
+
+    class DeferredThread:
+        def __init__(self, **kwargs): self.target = kwargs["target"]
+        def start(self): order.append("pump_armed")
+
+    monkeypatch.setattr(runtime, "_owned_native_entry", lambda layout: (object(), native))
+    monkeypatch.setattr(runtime.threading, "Thread", DeferredThread)
+    try:
+        assert child._start(runtime_spawn_helper) is child
+        assert os.read(child_descriptors[0], 2) == b"\x01"
+        assert os.read(child_descriptors[0], 1) == b""
+        assert child.identity.parent_pid == os.getpid() and child.identity.pid == 4242
+        assert child.binding.reservation is reservation and child.binding.child is child.identity
+        peers[0].settimeout(1)
+        frame = peers[0].recv(4096)
+        length = runtime.struct.unpack("!I", frame[:4])[0]
+        payload = json.loads(frame[4:])
+        assert length == len(frame) - 4
+        if kind == "leadership":
+            assert payload["child_pid"] == child.identity.pid
+            assert payload["prepared_request_ref"] == "prepare-one"
+            assert child.leadership_channels() == (child._sockets["control"], child._sockets["events"])
+        else:
+            assert payload["execution_binding_id"] == child.binding.execution_binding_id
+            assert "d17" not in child._sockets
+        assert order == ["reserved", "native", "pump_armed", "attached:4242", "persisted"] + (["d17"] if kind == "mcp" else [])
+
+        class PumpSelector:
+            def __init__(self): self.keys = {}
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def register(self, descriptor, _events, name):
+                self.keys[descriptor] = SimpleNamespace(fd=descriptor, data=name)
+            def unregister(self, descriptor): del self.keys[descriptor]
+            def select(self, _timeout): return [(key, None) for key in list(self.keys.values())]
+
+        def waited(process, _timeout):
+            process.returncode = 0
+            return 0
+
+        monkeypatch.setattr(runtime.selectors, "DefaultSelector", PumpSelector)
+        monkeypatch.setattr(runtime, "_wait_for_process", waited)
+        child._pump()
+        completion = child.wait_completion(child.spec.cleanup_deadline_ns)
+        assert completion.binding is child.binding
+        assert order[-2:] == ["completed", "scope_closed"]
+        events = child.events_after(0, child.spec.cleanup_deadline_ns)
+        assert {event.kind for event in events} == {"stdout", "stderr", "exited", "closed"}
+        assert b"".join(event.data for event in events if event.kind == "stdout") == b"out"
+        assert b"".join(event.data for event in events if event.kind == "stderr") == b"err"
+        assert child._fds == {} and child._sockets == {} and child.process.pidfd == -1
+    finally:
+        child._close_owned()
+        os.close(executable_fd)
+        os.close(cwd_fd)
+        for peer in peers:
+            peer.close()
+        for descriptor in child_descriptors:
+            os.close(descriptor)
 
 
 def _script(path: Path, body: str) -> Path:

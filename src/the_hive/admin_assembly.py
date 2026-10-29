@@ -134,6 +134,7 @@ class AdminConfig:
     trusted_proxy_addresses: tuple[str, ...]
     cloudflare_team_domain: str | None
     cloudflare_audience: str | None
+    hive_dispatch_ingress: HiveDispatchIngressV1 | None = None
 
 
 class SystemdCredentialSet:
@@ -300,6 +301,8 @@ def parse_admin_config(raw: bytes) -> AdminConfig:
     expected = _ACCOUNT_FIELDS | (
         _CLOUDFLARE_FIELDS if mode in {"cloudflare", "require_both"} else frozenset()
     )
+    if "hive_dispatch_ingress" in value:
+        expected = expected | {"hive_dispatch_ingress"}
     if (
         set(value) != expected
         or value.get("schema_version") != 1
@@ -335,6 +338,11 @@ def parse_admin_config(raw: bytes) -> AdminConfig:
         or len(audience.encode("utf-8")) > 1024
     ):
         raise AdminAssemblyError
+    ingress = None
+    if "hive_dispatch_ingress" in value:
+        ingress = _hive_dispatch_ingress(value["hive_dispatch_ingress"])
+        if ingress.admin_subject != value.get("local_subject"):
+            raise AdminAssemblyError
     return AdminConfig(
         cast(str, value["http_host"]),
         cast(int, value["http_port"]),
@@ -347,6 +355,7 @@ def parse_admin_config(raw: bytes) -> AdminConfig:
         trusted,
         team,
         audience,
+        ingress,
     )
 
 
@@ -2480,3 +2489,89 @@ def assemble_admin_runtime() -> AdminRuntime:
     except BaseException:
         _close_partial(cleanup)
         raise AdminAssemblyError from None
+
+
+# Optionale, geschlossene Herkunftsbindung; keine Authorityausgabe.
+
+@dataclass(frozen=True, slots=True)
+class HiveDispatchIngressV1:
+    generation: int
+    admin_subject: str
+    actor_principal_id: str
+    principal_version: int
+    principal_config_digest: str
+    repo_id: str
+    allowed_operations: tuple[str, ...]
+    expires_at_utc: datetime
+
+_HIVE_DISPATCH_OPERATIONS = frozenset(
+    {
+        "native_spawn",
+        "managed_replacement",
+        "headless_assignment",
+        "agent_claim",
+        "agent_start",
+        "agent_assign",
+        "fleet_series_apply",
+        "emergency_queen_start",
+    }
+)
+
+_HIVE_DISPATCH_INGRESS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "generation",
+        "admin_subject",
+        "actor_principal_id",
+        "principal_version",
+        "principal_config_digest",
+        "repo_id",
+        "allowed_operations",
+        "expires_at_utc",
+    }
+)
+
+_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+
+def _hive_dispatch_ingress(value: object) -> HiveDispatchIngressV1:
+    if type(value) is not dict or set(value) != _HIVE_DISPATCH_INGRESS_FIELDS:
+        raise AdminAssemblyError
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["generation"]) is not int
+        or not 1 <= value["generation"] <= 2**31 - 1
+        or type(value["principal_version"]) is not int
+        or not 1 <= value["principal_version"] <= 10**12
+        or type(value["principal_config_digest"]) is not str
+        or _SHA256.fullmatch(value["principal_config_digest"]) is None
+        or type(value["allowed_operations"]) is not list
+        or not 1 <= len(value["allowed_operations"]) <= len(_HIVE_DISPATCH_OPERATIONS)
+        or type(value["expires_at_utc"]) is not str
+    ):
+        raise AdminAssemblyError
+    operations = tuple(
+        _configured_token(operation) for operation in value["allowed_operations"]
+    )
+    if len(set(operations)) != len(operations) or not set(
+        operations
+    ) <= _HIVE_DISPATCH_OPERATIONS:
+        raise AdminAssemblyError
+    try:
+        expiry = datetime.fromisoformat(
+            value["expires_at_utc"].replace("Z", "+00:00")
+        )
+        if expiry.tzinfo is None or expiry.utcoffset() != UTC.utcoffset(expiry):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        raise AdminAssemblyError from None
+    return HiveDispatchIngressV1(
+        value["generation"],
+        _configured_token(value["admin_subject"]),
+        _configured_token(value["actor_principal_id"]),
+        value["principal_version"],
+        value["principal_config_digest"],
+        _configured_token(value["repo_id"]),
+        operations,
+        expiry.astimezone(UTC),
+    )

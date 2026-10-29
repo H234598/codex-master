@@ -294,6 +294,107 @@ def green_hive_runtime() -> dict[str, object]:
     }
 
 
+def service_hive_runtime() -> dict[str, object]:
+    value = green_hive_runtime()
+    value["authority"] = "fail_closed"
+    value["checks"] = {**value["checks"], "authority": "fail_closed"}
+    return value
+
+
+def service_hive_doctor() -> dict[str, object]:
+    value = service_hive_runtime()
+    for name in ("schema_version", "counts", "authority"):
+        del value[name]
+    return {**value, "healthy": False}
+
+
+def service_probe(checked_at: str) -> dict[str, object]:
+    value = green_probe(checked_at)
+    value["schema_version"] = 4
+    value["checks"] = {
+        "runtime_layout": True, "hive_runtime": False, "hive_doctor": False,
+    }
+    value["service_checks"] = {
+        name: True for name in (
+            "runtime_surface", "configuration", "repository", "principals", "state", "usage"
+        )
+    }
+    value["service_alarm"] = dict(value["alarm"])
+    value["alarm"] = {
+        **value["alarm"], "status": "active", "reason_codes": ["hive_doctor", "hive_runtime"]
+    }
+    return value
+
+
+@pytest.mark.parametrize("raw", ('{"value":1,"value":2}', '{"value":NaN}', '{"value":Infinity}', '{"value":-Infinity}'))
+def test_health_v4_json_decoder_rejects_duplicate_members_and_nonfinite_numbers(raw):
+    with pytest.raises(ValueError):
+        hourly_probe_module._strict_json_loads(raw)
+    assert hourly_probe_module._strict_json_loads('{"value":[1,2]}') == {"value": [1, 2]}
+
+
+@pytest.mark.parametrize("producer,key,value", (
+    ("runtime_status", "ok", 1),
+    ("runtime_status", "unexpected", True),
+    ("hive_status", "mutation_performed", True),
+    ("hive_status", "unexpected", True),
+    ("hive_doctor", "healthy", True),
+))
+def test_health_v4_rejects_malformed_or_incoherent_producers_without_forging_usage(
+    tmp_path, monkeypatch, producer, key, value
+):
+    values = {"runtime_status": green_runtime_status(), "hive_status": service_hive_runtime(),
+        "hive_doctor": service_hive_doctor()}
+    values[producer][key] = value
+    monkeypatch.setattr(hourly_probe_module, "runtime_status", lambda **_kwargs: values["runtime_status"])
+    record = run_probe(layout=runtime_layout(tmp_path), state_directory=tmp_path / "state", now=lambda: NOW,
+        runner=lambda _command, *arguments: (values["hive_status" if arguments[-1] == "status" else "hive_doctor"], True))
+    assert valid_probe_record(record)
+    assert probe_spawn_gate(record, now=NOW)["allowed"] is False
+    if producer == "runtime_status":
+        assert record["commands"][producer] is False
+        assert record["diagnostics"][producer]["code"] == (
+            "runtime_status_red" if key == "ok" else "command_output_invalid"
+        )
+        assert record["service_checks"]["usage"] is True
+        assert record["service_checks"]["runtime_surface"] is record["checks"]["runtime_layout"]
+        assert record["service_checks"]["runtime_surface"] is (key != "ok")
+    elif key == "mutation_performed":
+        assert record["service_checks"]["state"] is False
+    else:
+        assert record["commands"][producer] is False
+        assert record["diagnostics"][producer]["code"] == "command_output_invalid"
+
+
+@pytest.mark.parametrize("mismatch", ("usage", "surface", "owner", "schema"))
+def test_health_v4_gate_rejects_broken_service_cross_bindings(mismatch):
+    record = service_probe(NOW.isoformat())
+    if mismatch == "usage":
+        record["service_checks"]["usage"] = False
+    elif mismatch == "surface":
+        record["service_checks"]["runtime_surface"] = False
+    elif mismatch == "owner":
+        record["service_alarm"]["owner"] = {**record["service_alarm"]["owner"], "principal_id": "other-queen"}
+    else:
+        record["schema_version"] = True
+    assert not valid_probe_record(record)
+    assert probe_spawn_gate(record, now=NOW)["allowed"] is False
+
+
+def test_health_v4_product_authority_is_not_a_service_readiness_grant(tmp_path, monkeypatch):
+    hive = green_hive_runtime()
+    doctor = {key: value for key, value in hive.items() if key not in {"schema_version", "counts", "authority"}}
+    doctor["healthy"] = True
+    monkeypatch.setattr(hourly_probe_module, "runtime_status", lambda **_kwargs: green_runtime_status())
+    record = run_probe(layout=runtime_layout(tmp_path), state_directory=tmp_path / "state", now=lambda: NOW,
+        runner=lambda _command, *arguments: (hive if arguments[-1] == "status" else doctor, True))
+    assert valid_probe_record(record)
+    assert all(record["commands"].values()) and all(record["checks"].values())
+    assert record["service_checks"]["configuration"] is False
+    assert record["service_alarm"]["reason_codes"] == ["configuration"]
+    assert probe_spawn_gate(record, now=NOW)["allowed"] is False
+
+
 def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     root = tmp_path / "the-hive-runtime"
     root.mkdir(mode=0o700)
@@ -499,13 +600,16 @@ def test_probe_has_exactly_eight_deterministic_utc_slots() -> None:
     assert len(DETERMINISTIC_PROBE_HOURS_UTC) == 8
 
 
-def test_spawn_gate_accepts_only_a_fresh_complete_green_v3_record() -> None:
-    fresh = green_probe(NOW.isoformat())
+def test_spawn_gate_accepts_only_a_fresh_complete_service_green_v4_record() -> None:
+    fresh = service_probe(NOW.isoformat())
     assert probe_spawn_gate(fresh, now=NOW)["allowed"] is True
+    assert probe_spawn_gate(green_probe(NOW.isoformat()), now=NOW) == {
+        "allowed": False, "reason_code": "probe_schema_legacy", "raw_output": "not_returned"
+    }
     assert probe_spawn_gate({"checks": {}}, now=NOW)["reason_code"] == "probe_ambiguous"
     assert (
         probe_spawn_gate({**fresh, "unexpected": True}, now=NOW)["reason_code"]
-        == "probe_ambiguous"
+        == "probe_red"
     )
     assert (
         probe_spawn_gate(
@@ -522,7 +626,7 @@ def test_spawn_gate_accepts_only_a_fresh_complete_green_v3_record() -> None:
         is False
     )
     stale = NOW.replace(hour=0).isoformat()
-    assert probe_spawn_gate(green_probe(stale), now=NOW)["reason_code"] == "probe_stale"
+    assert probe_spawn_gate(service_probe(stale), now=NOW)["reason_code"] == "probe_stale"
     assert MAX_PROBE_AGE_SECONDS == 4 * 60 * 60
 
 
@@ -594,7 +698,7 @@ def test_atomic_write_never_unlinks_a_foreign_temp_swapped_before_replace_failur
     assert foreign_temporary.read_bytes() == foreign_contents
 
 
-def test_run_probe_persists_only_one_schema_v3_health_record(
+def test_run_probe_persists_only_one_schema_v4_health_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_directory = tmp_path / "state"
@@ -603,18 +707,11 @@ def test_run_probe_persists_only_one_schema_v3_health_record(
     direct_status = green_runtime_status()
     green = {
         "hive status": (
-            green_hive_runtime(),
+            service_hive_runtime(),
             True,
         ),
         "hive doctor": (
-            {
-                "healthy": True,
-                "checks": {
-                    "authority": "ready",
-                    "repository": "ready",
-                    "state": "ready",
-                },
-            },
+            service_hive_doctor(),
             True,
         ),
     }
@@ -640,9 +737,16 @@ def test_run_probe_persists_only_one_schema_v3_health_record(
         "commands",
         "diagnostics",
         "alarm",
+        "service_checks",
+        "service_alarm",
         "global_pilot_readiness",
     }
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
+    assert valid_probe_record(result)
+    assert result["checks"] == {
+        "runtime_layout": True, "hive_runtime": False, "hive_doctor": False
+    }
+    assert all(result["service_checks"].values())
     assert calls == [("hive", "status"), ("hive", "doctor")]
     assert (
         read_probe_gate(
@@ -669,6 +773,8 @@ def test_run_probe_persists_only_one_schema_v3_health_record(
         "commands",
         "diagnostics",
         "alarm",
+        "service_checks",
+        "service_alarm",
         "global_pilot_readiness",
     }
     published = json.loads(
@@ -677,7 +783,7 @@ def test_run_probe_persists_only_one_schema_v3_health_record(
     assert published["alarm"] == {
         "scope": "hive",
         "status": "active",
-        "reason_codes": ["runtime_layout"],
+        "reason_codes": ["hive_doctor", "hive_runtime", "runtime_layout"],
         "owner": {
             "principal_id": "queen-codex-master",
             "class_id": "koenigin",
@@ -1260,27 +1366,14 @@ def test_hourly_probe_direct_entrypoint_runs_without_an_argument(
     monkeypatch.setattr(
         hourly_probe_module,
         "run_probe",
-        lambda: {
-            "checks": {
-                "runtime_layout": True,
-                "hive_runtime": True,
-                "hive_doctor": True,
-            }
-        },
+        lambda: service_probe(NOW.isoformat()),
     )
 
     assert hourly_probe_module.main([]) == 0
     assert json.loads(capsys.readouterr().out) == {
-        "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
-        "global_pilot_readiness": {
-            "schema_version": 1,
-            "pilot": "blocked",
-            "generation_id": None,
-            "freshness": "unknown",
-            "candidate_count": 0,
-            "reason_codes": ["usage_missing"],
-            "raw_output": "not_returned",
-        },
+        "checks": service_probe(NOW.isoformat())["checks"],
+        "service_checks": service_probe(NOW.isoformat())["service_checks"],
+        "global_pilot_readiness": green_probe(NOW.isoformat())["global_pilot_readiness"],
     }
 
 
@@ -1301,63 +1394,40 @@ def test_hourly_probe_direct_entrypoint_uses_a_fixed_protected_home_marker(
         hourly_probe_module,
         "run_probe",
         lambda *, protected_home_runtime: observed.append(protected_home_runtime)
-        or {
-            "checks": {
-                "runtime_layout": True,
-                "hive_runtime": True,
-                "hive_doctor": True,
-            }
-        },
+        or service_probe(NOW.isoformat()),
     )
 
     assert hourly_probe_module.main(["--protected-home-runtime", "--json"]) == 0
     assert observed == [True]
     assert json.loads(capsys.readouterr().out)["checks"] == {
         "runtime_layout": True,
-        "hive_runtime": True,
-        "hive_doctor": True,
+        "hive_runtime": False,
+        "hive_doctor": False,
     }
 
 
 def test_hourly_probe_direct_entrypoint_explains_a_red_result(
     monkeypatch, capsys
 ) -> None:
+    payload = service_probe(NOW.isoformat())
+    payload["service_checks"]["configuration"] = False
+    payload["service_alarm"] = {
+        **payload["service_alarm"], "status": "active", "reason_codes": ["configuration"]
+    }
     monkeypatch.setattr(
         hourly_probe_module,
         "run_probe",
-        lambda: {
-            "checks": {
-                "runtime_layout": True,
-                "hive_runtime": False,
-                "hive_doctor": True,
-            },
-            "global_pilot_readiness": {
-                "schema_version": 1,
-                "pilot": "blocked",
-                "generation_id": None,
-                "freshness": "fresh",
-                "candidate_count": 1,
-                "reason_codes": ["usage_generation_missing"],
-                "raw_output": "not_returned",
-            },
-        },
+        lambda: payload,
     )
 
     assert hourly_probe_module.main([]) == 1
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
-        "checks": {"runtime_layout": True, "hive_runtime": False, "hive_doctor": True},
-        "global_pilot_readiness": {
-            "schema_version": 1,
-            "pilot": "blocked",
-            "generation_id": None,
-            "freshness": "fresh",
-            "candidate_count": 1,
-            "reason_codes": ["usage_generation_missing"],
-            "raw_output": "not_returned",
-        },
+        "checks": payload["checks"],
+        "service_checks": payload["service_checks"],
+        "global_pilot_readiness": payload["global_pilot_readiness"],
     }
-    assert captured.err == "hive_hourly_probe_red failed_checks=hive_runtime\n"
+    assert captured.err == "hive_hourly_probe_red failed_service_checks=configuration\n"
 
 
 def test_red_probe_publishes_a_hive_wide_alarm_for_the_repository_queen(
@@ -1447,11 +1517,11 @@ def test_lifecycle_rollback_failure_publishes_the_same_fail_closed_hive_alarm(
 
 
 def test_spawn_gate_rejects_a_health_record_without_a_consistent_global_alarm() -> None:
-    healthy = green_probe(NOW.isoformat())
+    healthy = service_probe(NOW.isoformat())
     assert probe_spawn_gate(healthy, now=NOW)["allowed"] is True
 
     without_alarm = {key: value for key, value in healthy.items() if key != "alarm"}
-    assert probe_spawn_gate(without_alarm, now=NOW)["reason_code"] == "probe_ambiguous"
+    assert probe_spawn_gate(without_alarm, now=NOW)["reason_code"] == "probe_red"
 
     inconsistent = {
         **healthy,
@@ -1460,7 +1530,7 @@ def test_spawn_gate_rejects_a_health_record_without_a_consistent_global_alarm() 
     assert probe_spawn_gate(inconsistent, now=NOW)["reason_code"] == "probe_red"
 
 
-def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
+def test_a_service_green_probe_keeps_authority_alarm_and_clears_service_alarm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_directory = tmp_path / "state"
@@ -1472,16 +1542,9 @@ def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
 
     def runner(_command: Path, *arguments: str) -> tuple[dict[str, object], bool]:
         if arguments == ("hive", "status"):
-            return green_hive_runtime(), True
+            return service_hive_runtime(), True
         return (
-            {
-                "healthy": True,
-                "checks": {
-                    "authority": "ready",
-                    "repository": "ready",
-                    "state": "ready",
-                },
-            },
+            service_hive_doctor(),
             True,
         )
 
@@ -1493,11 +1556,13 @@ def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
         layout=layout, state_directory=state_directory, now=lambda: NOW, runner=runner
     )
 
-    assert result["alarm"]["status"] == "cleared"
+    assert result["alarm"]["status"] == "active"
+    assert result["service_alarm"]["status"] == "cleared"
+    assert valid_probe_record(result)
     state_file = state_directory / "hive-hourly-health.json"
     assert read_probe_gate(state_file=state_file, now=NOW)["allowed"] is True
     assert (
-        json.loads(state_file.read_text(encoding="utf-8"))["alarm"]["reason_codes"]
+        json.loads(state_file.read_text(encoding="utf-8"))["service_alarm"]["reason_codes"]
         == []
     )
 
@@ -3089,16 +3154,9 @@ def test_probe_capacity_guard_serializes_the_health_record_publication(
     layout = runtime_layout(tmp_path)
     healthy = {
         "hive runtime-status": (green_runtime_status(), True),
-        "hive status": (green_hive_runtime(), True),
+        "hive status": (service_hive_runtime(), True),
         "hive doctor": (
-            {
-                "healthy": True,
-                "checks": {
-                    "authority": "ready",
-                    "repository": "ready",
-                    "state": "ready",
-                },
-            },
+            service_hive_doctor(),
             True,
         ),
     }

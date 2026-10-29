@@ -6,6 +6,9 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable, Mapping
+import copy
+import hashlib
+import json
 
 import pytest
 
@@ -36,6 +39,7 @@ from the_hive.hive.authority import AuthorityContext, AuthorityEngine
 from the_hive.hive.principals import Principal, PrincipalRegistry
 from the_hive.hive.repositories import RepositoryBinding, RepositoryRegistry
 from the_hive.hive.state import HiveStateStore
+from the_hive.hive.state import HiveStateError
 from the_hive.hive.types import DispatchPriority, TaskComplexity
 from the_hive.hive import work_dispatcher as dispatcher_module
 from the_hive.hive.work_dispatcher import HiveWorkDispatcher
@@ -45,6 +49,336 @@ from the_hive.selection import SelectionBand, SelectionResult
 NOW = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
 DIGEST = "sha256:" + "a" * 64
 REQUEST_DIGEST = "sha256:" + "b" * 64
+
+
+def _leadership_prepare(*, dispatch_id="leadership-one", request_id="leadership-request", prepared_ref="prepare-one"):
+    seed = {
+        "schema_version": 1, "dispatch_id": dispatch_id, "request_id": request_id,
+        "workpackage_id": "workpackage-one", "workpackage_version": 7, "intent_id": "intent-one",
+        "operation": "agent_start", "execution_kind": "leadership_session",
+        "actor_principal_id": "specialist-one", "actor_version": 1,
+        "actor_config_digest": DIGEST, "actor_execution_binding_id": None,
+        "execution_subject_id": "specialist-one", "execution_subject_version": 1,
+        "repo_id": "codex-master", "scope_mode": "write", "scope": ["src"],
+        "write_paths": ["src/task.py"], "task_digest": REQUEST_DIGEST, "target_ref": "agent-one",
+        "resource_binding": {"agent_id": "agent-one", "account_key": "account-key",
+            "budget_key": "standard", "model_id": "gpt-primary", "expected_usage_micro": 1,
+            "account_pool_binding": None},
+        "actor_lease_id": None, "actor_lease_fence": None,
+        "target_lease_expected": {"expected_state": "available", "lease_id": None, "fence": 0},
+        "actor_capacity_capability": "hive.specialist.assign", "execution_capability": "hive.specialist.assign",
+        "ingress_generation": 1, "created_at_utc": NOW.isoformat(),
+        "expires_at_utc": (NOW + timedelta(seconds=60)).isoformat(),
+    }
+    canonical = json.dumps(seed, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    request_digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    transition_digest = "sha256:" + hashlib.sha256(f"1\0prepared\0{request_digest}".encode()).hexdigest()
+    record = {
+        "kind": "leadership_dispatch_v1", "schema_version": 1, "dispatch_id": dispatch_id,
+        "request_id": request_id, "prepared_request_ref": prepared_ref, "operation": "agent_start",
+        "execution_kind": "leadership_session", "state": "prepared", "generation": 1,
+        "request_digest": request_digest, "admin_request_digest": DIGEST, "seed": seed,
+        "actor_grant_id": None, "actor_grant_digest": None, "execution_grant_id": None,
+        "execution_grant_digest": None, "admission_id": None, "admission_revision": None,
+        "completion_state": "not_started",
+        "transitions": [{"generation": 1, "state": "prepared", "digest": transition_digest}],
+    }
+    record["digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    ).hexdigest()
+    return record
+
+
+def _task9_dispatcher(tmp_path):
+    state = HiveStateStore(tmp_path / "state")
+    control = HiveControlPlaneStore(state)
+    control.initialize_task9(now=NOW)
+    return control, HiveWorkDispatcher(control)
+
+
+def test_leadership_append_reads_real_pool_aggregate_and_planned_workpackage(tmp_path):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    pool = dispatcher.persist(workpackage=_workpackage(), intent=_intent(), grant=_grant(),
+        selection=_selection(), dynamic_inventory=_inventory(), scope_digest=DIGEST,
+        base_admission_id="admission-one", now=NOW)
+    planned = replace(_workpackage(), state="planned", version=1)
+    document = control.load_task9()
+    document["workpackages"] = [dispatcher_module._workpackage_payload(planned)]
+    control.replace_task9(document, expected_revision=document["revision"], now=NOW)
+    revision = control.load_task9()["revision"]
+    assert dispatcher.leadership_workpackage(workpackage_id=planned.workpackage_id, expected_version=1) == planned
+    assert control.load_task9()["revision"] == revision
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="stale_leadership_workpackage"):
+        dispatcher.leadership_workpackage(workpackage_id=planned.workpackage_id, expected_version=2)
+    record = _leadership_prepare()
+    assert dispatcher.append_leadership_prepare(record, now=NOW) == record
+    assert HiveWorkDispatcher(control).rehydrate_leadership("prepare-one") == record
+    assert dispatcher.rehydrate("dispatch-one") == pool
+    before = control.load_task9()
+    assert [row["kind"] for row in before["pool_dispatches"]] == ["hive_work_dispatcher", "leadership_dispatch_v1"]
+    duplicate_ref = _leadership_prepare(dispatch_id="other-dispatch", request_id="other-request")
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="^duplicate_leadership_prepared_ref$"):
+        dispatcher.append_leadership_prepare(duplicate_ref, now=NOW)
+    assert control.load_task9() == before
+    duplicate = _leadership_prepare(dispatch_id="other-dispatch", request_id="request-one", prepared_ref="prepare-two")
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="duplicate_hive_work_request"):
+        dispatcher.append_leadership_prepare(duplicate, now=NOW)
+    assert control.load_task9() == before
+
+
+@pytest.mark.parametrize("phase", ("append", "replace"))
+def test_leadership_cas_rejects_real_competing_task9_revision_without_overwrite(
+    tmp_path, monkeypatch, phase
+):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    record = _leadership_prepare()
+    if phase == "replace":
+        dispatcher.append_leadership_prepare(record, now=NOW)
+    peer = HiveControlPlaneStore(HiveStateStore(tmp_path / "state"))
+    original = control.replace_task9
+    snapshot = peer.load_task9()
+
+    def competing(document, *, expected_revision, now):
+        assert expected_revision == snapshot["revision"]
+        peer.replace_task9(snapshot, expected_revision=snapshot["revision"], now=now)
+        return original(document, expected_revision=expected_revision, now=now)
+
+    monkeypatch.setattr(control, "replace_task9", competing)
+    with pytest.raises(HiveStateError, match="stale_control_plane_revision"):
+        if phase == "append":
+            dispatcher.append_leadership_prepare(record, now=NOW)
+        else:
+            cancelled = dispatcher_module._next_record(record, {"state": "cancelled"})
+            dispatcher.replace_leadership_record(record, cancelled, now=NOW)
+    current = peer.load_task9()
+    assert current["revision"] == snapshot["revision"] + 1
+    assert current["pool_dispatches"] == snapshot["pool_dispatches"]
+
+
+@pytest.mark.parametrize("changes,reason", (
+    ({"workpackage_version": True}, "invalid_leadership_seed"),
+    ({"scope": ["../escape"]}, "invalid_leadership_scope_paths"),
+    ({"write_paths": ["src/task.py", "src/task.py"]}, "duplicate_leadership_scope_path"),
+    ({"resource_binding": {}}, "invalid_leadership_resource_binding"),
+    ({"target_lease_expected": {"expected_state": "claimed", "lease_id": None, "fence": 0}}, "invalid_leadership_target_lease"),
+    ({"actor_lease_id": "lease-one", "actor_lease_fence": None}, "invalid_leadership_actor_lease"),
+    ({"operation": "unbound_start"}, "invalid_leadership_operation"),
+    ({"expires_at_utc": (NOW + timedelta(seconds=121)).isoformat()}, "invalid_leadership_seed_time"),
+))
+def test_leadership_seed_validation_is_strict_before_task9_cas(tmp_path, changes, reason):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    record = copy.deepcopy(_leadership_prepare())
+    record["seed"].update(changes)
+    before = control.load_task9()
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match=f"^{reason}$"):
+        dispatcher.append_leadership_prepare(record, now=NOW)
+    assert control.load_task9() == before
+
+
+@pytest.mark.parametrize("changes", (
+    {"digest": "sha256:" + "0" * 64}, {"transitions": []},
+    {"actor_grant_id": "unbound-grant"}, {"admission_id": "unbound-admission"},
+))
+def test_leadership_record_tampering_is_typed_and_read_only(tmp_path, changes):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    record = {**_leadership_prepare(), **changes}
+    before = control.load_task9()
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError):
+        dispatcher.append_leadership_prepare(record, now=NOW)
+    assert control.load_task9() == before
+
+
+def test_leadership_forward_rebinds_real_grant_principals_scope_and_admission(tmp_path):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    record = _leadership_prepare(dispatch_id="dispatch-one", request_id="request-one")
+    dispatcher.append_leadership_prepare(record, now=NOW)
+    authority, repositories = _real_assignment_authority(tmp_path)
+    principals = authority.context.principals
+    admissions = AdmissionStore()
+    arguments = dict(authority=authority, admission_store=admissions,
+        principal_registry=principals, repository_registry=repositories, now=NOW)
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="leadership_forward_state_denied"):
+        dispatcher.revalidate_leadership_forward("prepare-one", **arguments)
+    grant = authority.issue_grant(grant_id="lead-grant", issuer_principal_id="teamlead-one",
+        subject_principal_id="specialist-one", repo_id="codex-master", dispatch_id="dispatch-one",
+        capabilities=("hive.specialist.assign",), scope=("src",), write_paths=("src/task.py",),
+        max_delegation_depth=1, issued_at_utc=NOW, expires_at_utc=NOW + timedelta(hours=1),
+        nonce="lead-nonce", request_digest=record["request_digest"])
+    granted = dispatcher_module._next_record(record, {
+        "state": "granted", "actor_grant_id": grant.grant_id, "actor_grant_digest": grant.binding_digest(),
+        "execution_grant_id": grant.grant_id, "execution_grant_digest": grant.binding_digest(),
+    })
+    dispatcher.replace_leadership_record(record, granted, now=NOW)
+    assert dispatcher.revalidate_leadership_forward("prepare-one", **arguments) == granted
+    planned = create_admission(admission_id="lead-admission", request_id="request-one", dispatch_id="dispatch-one",
+        workpackage_id="workpackage-one", assignment_intent_id="intent-one", repo_id="codex-master",
+        principal_id="specialist-one", parent_principal_id="teamlead-one", grant_id=grant.grant_id,
+        grant_digest=grant.binding_digest(), work_item_version=7,
+        scope=ScopeBinding("write", ("src/task.py",), repositories.scope_digest("codex-master", "write", ("src/task.py",))),
+        resource=ResourceBinding("agent-one", "account-key", "standard", "gpt-primary", 1),
+        lease_context=LeaseBinding("available", None), priority=AdmissionPriority("DP1", "selection"), now=NOW)
+    reserved = admissions.reserve(planned, now=NOW)
+    revalidating = admissions.begin_revalidation(reserved.admission_id, expected_revision=reserved.revision, now=NOW)
+    admitted = admissions.complete_revalidation(revalidating.admission_id, expected_revision=revalidating.revision, valid=True, now=NOW)
+    executing = admissions.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
+    forward = dispatcher_module._next_record(granted, {"state": "executing", "completion_state": "executing",
+        "admission_id": executing.admission_id, "admission_revision": executing.revision})
+    dispatcher.replace_leadership_record(granted, forward, now=NOW)
+    assert dispatcher.revalidate_leadership_forward("prepare-one", **arguments) == forward
+    before = control.load_task9()
+    admissions.mark_execution_failed(executing.admission_id, expected_revision=executing.revision, now=NOW)
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="leadership_admission_binding_mismatch"):
+        dispatcher.revalidate_leadership_forward("prepare-one", **arguments)
+    authority.revoke_grant(grant.grant_id, expected_version=grant.version)
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="leadership_grant_(binding_mismatch|denied)"):
+        dispatcher.revalidate_leadership_forward("prepare-one", **arguments)
+    assert control.load_task9() == before
+
+
+def _leadership_bound_grant(authority, record, suffix):
+    return authority.issue_grant(grant_id="bound-grant-" + suffix,
+        issuer_principal_id="teamlead-one", subject_principal_id="specialist-one",
+        repo_id="codex-master", dispatch_id=record["dispatch_id"],
+        capabilities=("hive.specialist.assign",), scope=("src",), write_paths=("src/task.py",),
+        max_delegation_depth=1, issued_at_utc=NOW, expires_at_utc=NOW + timedelta(hours=1),
+        nonce="bound-nonce-" + suffix, request_digest=record["request_digest"])
+
+
+def _leadership_executing_admission(record, grant, repositories, suffix):
+    planned = create_admission(admission_id="bound-admission-" + suffix,
+        request_id=record["request_id"], dispatch_id=record["dispatch_id"],
+        workpackage_id="workpackage-one", assignment_intent_id="intent-one", repo_id="codex-master",
+        principal_id="specialist-one", parent_principal_id="teamlead-one", grant_id=grant.grant_id,
+        grant_digest=grant.binding_digest(), work_item_version=7,
+        scope=ScopeBinding("write", ("src/task.py",), repositories.scope_digest("codex-master", "write", ("src/task.py",))),
+        resource=ResourceBinding("agent-one", "account-key", "standard", "gpt-primary", 1),
+        lease_context=LeaseBinding("available", None), priority=AdmissionPriority("DP1", "selection"), now=NOW)
+    store = AdmissionStore()
+    reserved = store.reserve(planned, now=NOW)
+    checking = store.begin_revalidation(reserved.admission_id, expected_revision=reserved.revision, now=NOW)
+    admitted = store.complete_revalidation(checking.admission_id, expected_revision=checking.revision, valid=True, now=NOW)
+    return store, store.begin_execution(admitted.admission_id, expected_revision=admitted.revision, now=NOW)
+
+
+@pytest.mark.parametrize("mutation", (
+    "admin_request_digest", "actor_grant", "actor_grant_digest", "execution_grant",
+    "execution_grant_digest", "remove_grants", "admission", "remove_admission", "revision_rollback",
+))
+def test_leadership_replace_preserves_bound_inputs_and_task9_bytes(tmp_path, mutation):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    record = _leadership_prepare()
+    dispatcher.append_leadership_prepare(record, now=NOW)
+    authority, repositories = _real_assignment_authority(tmp_path)
+    first = _leadership_bound_grant(authority, record, "first")
+    second = _leadership_bound_grant(authority, record, "second")
+    changes = {"state": "cancelled"}
+    if mutation == "admin_request_digest":
+        changes[mutation] = second.binding_digest()
+    else:
+        granted = dispatcher_module._next_record(record, {
+            "state": "granted", "actor_grant_id": first.grant_id, "actor_grant_digest": first.binding_digest(),
+            "execution_grant_id": first.grant_id, "execution_grant_digest": first.binding_digest(),
+        })
+        dispatcher.replace_leadership_record(record, granted, now=NOW)
+        record = granted
+        if mutation in {"admission", "remove_admission", "revision_rollback"}:
+            _, admission = _leadership_executing_admission(record, first, repositories, "first")
+            executing = dispatcher_module._next_record(record, {
+                "state": "executing", "completion_state": "executing", "admission_id": admission.admission_id,
+                "admission_revision": admission.revision,
+            })
+            dispatcher.replace_leadership_record(record, executing, now=NOW)
+            record = executing
+            changes = {"state": "completed", "completion_state": "completed"}
+            if mutation == "admission":
+                _, other = _leadership_executing_admission(record, first, repositories, "second")
+                changes.update(admission_id=other.admission_id, admission_revision=other.revision)
+            elif mutation == "remove_admission":
+                changes.update(state="blocked", completion_state="not_started", admission_id=None, admission_revision=None)
+            else:
+                changes["admission_revision"] = admission.revision - 1
+        elif mutation == "remove_grants":
+            changes.update(actor_grant_id=None, actor_grant_digest=None, execution_grant_id=None, execution_grant_digest=None)
+        elif mutation.endswith("_digest"):
+            changes[mutation] = second.binding_digest()
+        else:
+            changes.update({mutation + "_id": second.grant_id, mutation + "_digest": second.binding_digest()})
+    candidate = dispatcher_module._next_record(record, changes)
+    before = control.load_task9()
+    task9_path = tmp_path / "state" / "control-plane" / "task9.json"
+    before_bytes = task9_path.read_bytes()
+    with pytest.raises(dispatcher_module.HiveWorkDispatcherError, match="^leadership_transition_binding_mismatch$"):
+        dispatcher.replace_leadership_record(record, candidate, now=NOW)
+    assert control.load_task9() == before
+    assert task9_path.read_bytes() == before_bytes
+    assert dispatcher.rehydrate_leadership(record["prepared_request_ref"]) == record
+
+
+@pytest.mark.parametrize("terminal", ("cancelled", "completed", "blocked"))
+def test_leadership_replace_preserves_first_bindings_and_owner_revision_progress(tmp_path, terminal):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    prepared = _leadership_prepare()
+    dispatcher.append_leadership_prepare(prepared, now=NOW)
+    authority, repositories = _real_assignment_authority(tmp_path)
+    grant = _leadership_bound_grant(authority, prepared, "first")
+    granted = dispatcher_module._next_record(prepared, {
+        "state": "granted", "actor_grant_id": grant.grant_id, "actor_grant_digest": grant.binding_digest(),
+        "execution_grant_id": grant.grant_id, "execution_grant_digest": grant.binding_digest(),
+    })
+    dispatcher.replace_leadership_record(prepared, granted, now=NOW)
+    record = granted
+    changes = {"state": terminal}
+    if terminal != "cancelled":
+        store, admission = _leadership_executing_admission(record, grant, repositories, "first")
+        executing = dispatcher_module._next_record(record, {
+            "state": "executing", "completion_state": "executing", "admission_id": admission.admission_id,
+            "admission_revision": admission.revision,
+        })
+        dispatcher.replace_leadership_record(record, executing, now=NOW)
+        record = executing
+        finish = store.finalize if terminal == "completed" else store.mark_execution_failed
+        final = finish(admission.admission_id, expected_revision=admission.revision, now=NOW)
+        assert final.revision == admission.revision + 1
+        changes.update(completion_state="completed" if terminal == "completed" else "failed",
+            admission_revision=final.revision)
+    candidate = dispatcher_module._next_record(record, changes)
+    if terminal != "cancelled":
+        dispatcher_module._require_current_admission(store, candidate, principal_registry=authority.context.principals,
+            repository_registry=repositories, now=NOW)
+    before_revision = control.load_task9()["revision"]
+    assert dispatcher.replace_leadership_record(record, candidate, now=NOW) == candidate
+    assert control.load_task9()["revision"] == before_revision + 1
+    assert dispatcher.rehydrate_leadership(record["prepared_request_ref"]) == candidate
+
+
+@pytest.mark.parametrize(("previous_state", "terminal"), (
+    ("prepared", "cancelled"), ("prepared", "blocked"), ("prepared", "failed"), ("granted", "failed"),
+))
+def test_leadership_replace_keeps_valid_first_bindings_on_terminal_paths(tmp_path, previous_state, terminal):
+    control, dispatcher = _task9_dispatcher(tmp_path)
+    record = _leadership_prepare()
+    dispatcher.append_leadership_prepare(record, now=NOW)
+    authority, repositories = _real_assignment_authority(tmp_path)
+    grant = _leadership_bound_grant(authority, record, "first")
+    bindings = {"actor_grant_id": grant.grant_id, "actor_grant_digest": grant.binding_digest(),
+        "execution_grant_id": grant.grant_id, "execution_grant_digest": grant.binding_digest()}
+    if previous_state == "granted":
+        granted = dispatcher_module._next_record(record, {"state": "granted", **bindings})
+        dispatcher.replace_leadership_record(record, granted, now=NOW)
+        record = granted
+    changes = {"state": "blocked" if terminal == "failed" else terminal, **bindings}
+    if terminal == "failed":
+        store, executing = _leadership_executing_admission(record, grant, repositories, "first")
+        failed = store.mark_execution_failed(executing.admission_id, expected_revision=executing.revision, now=NOW)
+        changes.update(completion_state="failed", admission_id=failed.admission_id, admission_revision=failed.revision)
+    candidate = dispatcher_module._next_record(record, changes)
+    if terminal == "failed":
+        dispatcher_module._require_current_admission(store, candidate, principal_registry=authority.context.principals,
+            repository_registry=repositories, now=NOW)
+    before_revision = control.load_task9()["revision"]
+    dispatcher.replace_leadership_record(record, candidate, now=NOW)
+    assert control.load_task9()["revision"] == before_revision + 1
+    assert dispatcher.rehydrate_leadership(record["prepared_request_ref"]) == candidate
 
 
 def _workpackage(*, dispatch_id: str = "dispatch-one") -> WorkPackage:

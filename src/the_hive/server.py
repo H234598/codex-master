@@ -149,6 +149,7 @@ from the_hive.resource_cgroup import (
     REQUIRED_CONTROLLERS,
     read_hive_io_pressure,
     SystemdUserCgroupAdapter,
+    SystemdDirectChildScopeOwner,
     require_cgroup_preflight,
     confirm_verified_scope,
     start_released_scope,
@@ -12987,6 +12988,15 @@ def _g5_start_scope(
             },
         ) from exc
     return runtime, scope
+
+
+def _g5_direct_child_scope_owner() -> tuple[ResourceGateRuntime, SystemdDirectChildScopeOwner]:
+    """Proposed internal G5 handoff, never a dispatch or grant issuer."""
+    runtime = _RESOURCE_GATE_RUNTIME.get()
+    approved = _typed_g5_cgroup_runtime()
+    if runtime is None or approved is None:
+        raise CgroupPreflightError("cgroup_preflight_failed")
+    return runtime, SystemdDirectChildScopeOwner(approved[1], approved[0])
 
 
 def _g5_confirm_scope(runtime: ResourceGateRuntime, scope: PreparedAgentScope) -> None:

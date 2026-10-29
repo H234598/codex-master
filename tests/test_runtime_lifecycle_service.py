@@ -17,7 +17,7 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -192,12 +192,25 @@ def _canary_health(code: str) -> bytes:
     return (
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "checked_at": "2026-09-28T00:00:00+00:00",
                 "checks": {
                     "runtime_layout": True,
                     "hive_runtime": False,
                     "hive_doctor": False,
+                },
+                "service_checks": {
+                    "runtime_surface": True,
+                    "configuration": False,
+                    "repository": False,
+                    "principals": False,
+                    "state": False,
+                    "usage": False,
+                },
+                "service_alarm": {
+                    "scope": "hive", "status": "active",
+                    "reason_codes": ["configuration", "principals", "repository", "state", "usage", "alarm_owner_unavailable"],
+                    "owner": None,
                 },
                 "commands": {
                     "runtime_status": True,
@@ -212,7 +225,7 @@ def _canary_health(code: str) -> bytes:
                 "alarm": {
                     "scope": "hive",
                     "status": "active",
-                    "reason_codes": ["hive_doctor", "hive_runtime"],
+                    "reason_codes": ["hive_doctor", "hive_runtime", "alarm_owner_unavailable"],
                     "owner": None,
                 },
                 "global_pilot_readiness": {
@@ -241,8 +254,8 @@ def _canary_green_health() -> bytes:
     }
     payload["checks"] = {
         "runtime_layout": True,
-        "hive_runtime": True,
-        "hive_doctor": True,
+        "hive_runtime": False,
+        "hive_doctor": False,
     }
     payload["commands"] = {
         "runtime_status": True,
@@ -256,13 +269,22 @@ def _canary_green_health() -> bytes:
     }
     payload["alarm"] = {
         "scope": "hive",
-        "status": "cleared",
-        "reason_codes": [],
+        "status": "active",
+        "reason_codes": ["hive_doctor", "hive_runtime"],
         "owner": {
             "principal_id": "canary",
             "class_id": "koenigin",
             "repo_id": "the-hive",
         },
+    }
+    payload["service_checks"] = {name: True for name in payload["service_checks"]}
+    payload["service_alarm"] = {
+        **payload["alarm"], "status": "cleared", "reason_codes": []
+    }
+    payload["global_pilot_readiness"] = {
+        "schema_version": 1, "pilot": "ready", "generation_id": "1" * 32,
+        "freshness": "fresh", "candidate_count": 1, "reason_codes": [],
+        "raw_output": "not_returned",
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
@@ -293,7 +315,30 @@ def _canary_isolated_health() -> bytes:
         "reason_codes": ["usage_generation_missing"],
         "raw_output": "not_returned",
     }
+    payload["service_checks"]["usage"] = False
+    payload["service_alarm"] = {
+        **payload["alarm"], "status": "active", "reason_codes": ["usage"]
+    }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def test_health_v4_parse_keeps_service_readiness_separate_from_legacy_authority(tmp_path):
+    payload = json.loads(_canary_green_health())
+    payload["checked_at"] = datetime.now(UTC).isoformat()
+    health = tmp_path / "hive-hourly-health.json"
+    health.write_text(json.dumps(payload))
+    health.chmod(0o600)
+    assert runtime_lifecycle._parse_health(tmp_path) == (True, False, False, True, True, True)
+    legacy = dict(payload)
+    legacy["schema_version"] = 3
+    del legacy["service_checks"]
+    del legacy["service_alarm"]
+    health.write_text(json.dumps(legacy))
+    assert runtime_lifecycle._parse_health(tmp_path) == (True, False, False, False, False, False)
+    with pytest.raises(runtime_lifecycle.RuntimeLifecycleError, match="runtime_canary_evidence_invalid"):
+        runtime_lifecycle._canary_evidence_result(image=object(), manager_state={
+            "ActiveState": "active", "Result": "success", "ExecMainStatus": "0"
+        }, payload=legacy)
 
 
 def _fake_canary_image(root: Path, code: str) -> object:
@@ -929,8 +974,8 @@ def test_canary_unknown_diagnostic_fails_closed_without_returning_it(
     (
         (
             _canary_green_health().replace(
-                b'"schema_version":3}',
-                b'"schema_version":3,"schema_version":3}',
+                b'"schema_version":4,',
+                b'"schema_version":4,"schema_version":4,',
                 1,
             ),
             "d320_json_invalid",
@@ -1083,12 +1128,12 @@ def test_canary_green_result_is_bounded_and_quiescent(
         "manifest_digest": _CANARY_DIGEST,
         "raw_output": "not_returned",
         "qualification_diagnostic": {
-            "evidence_case": "strict_green",
+            "evidence_case": "service_green",
             "runtime_status": "pass",
-            "runtime_reasons": [],
-            "checks_all_true": True,
+            "runtime_reasons": ["health_checks_not_all_true"],
+            "checks_all_true": False,
             "commands_all_true": True,
-            "failed_checks": [],
+            "failed_checks": ["hive_doctor", "hive_runtime"],
             "missing_checks": [],
             "failed_commands": [],
             "missing_commands": [],
@@ -1383,12 +1428,12 @@ def test_canary_records_client_metadata_without_claiming_client_behavior(
 
     assert result["status"] == "runtime_canary_green", result
     assert result["qualification_diagnostic"] == {
-        "evidence_case": "strict_green",
+        "evidence_case": "service_green",
         "runtime_status": "pass",
-        "runtime_reasons": [],
-        "checks_all_true": True,
+        "runtime_reasons": ["health_checks_not_all_true"],
+        "checks_all_true": False,
         "commands_all_true": True,
-        "failed_checks": [],
+        "failed_checks": ["hive_doctor", "hive_runtime"],
         "missing_checks": [],
         "failed_commands": [],
         "missing_commands": [],
@@ -1641,7 +1686,7 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
     "invalid_field",
     ("alarm", "global_pilot_readiness", "checked_at", "diagnostics"),
 )
-def test_canary_criteria_reject_health_v3_records_rejected_by_full_validator(
+def test_canary_criteria_reject_health_v4_records_rejected_by_full_validator(
     tmp_path: Path, invalid_field: str
 ) -> None:
     from the_hive.hive.hourly_probe import valid_probe_record
@@ -1730,14 +1775,13 @@ def test_canary_accepts_a_valid_fail_closed_live_usage_state(tmp_path: Path) -> 
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
     health.chmod(0o600)
-    assert runtime_lifecycle._canary_evidence_result(
-        image=image, manager_state=manager_state
-    ) == ("runtime_canary_green", None)
+    with pytest.raises(runtime_lifecycle.RuntimeLifecycleError, match="runtime_canary_evidence_invalid"):
+        runtime_lifecycle._canary_evidence_result(image=image, manager_state=manager_state)
     assert (
         runtime_lifecycle._canary_runtime_qualification_status(
             image=image, manager_state=manager_state
         )
-        == "unknown"
+        == "fail"
     )
     assert (
         runtime_lifecycle._canary_runtime_features_qualification_status(image=image)
@@ -4617,7 +4661,7 @@ def test_verify_separates_green_runtime_from_blocked_product_authority(
     )
     monkeypatch.setattr(runtime_lifecycle, "_d296_and_v2_accepted", lambda: True)
     monkeypatch.setattr(
-        runtime_lifecycle, "_parse_health", lambda _root: (True, False, False)
+        runtime_lifecycle, "_parse_health", lambda _root: (True, False, False, False, False, False)
     )
     monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: False)
     monkeypatch.setattr(
@@ -4641,12 +4685,15 @@ def test_verify_separates_green_runtime_from_blocked_product_authority(
 
     assert result["status"] == "runtime_lifecycle_green"
     assert result["error_code"] is None
-    assert result["checks"]["health_v3_valid"] is True
+    assert result["checks"]["health_record_valid"] is True
     assert result["product_status"] == "blocked"
     assert result["product_checks"] == {
-        "health_v3_green": False,
-        "queen_alarm_cleared": False,
+        "service_probe_green": False,
+        "service_alarm_cleared": False,
         "probe_gate_allowed": False,
+    }
+    assert result["legacy_product_checks"] == {
+        "health_v3_green": False, "queen_alarm_cleared": False
     }
 
 
@@ -4704,6 +4751,19 @@ def test_observation_receipt_accepts_only_a_fresh_consistent_launcher_result(
         is True
     )
 
+    def run_service_green(arguments, **_kwargs):
+        calls.append(tuple(arguments))
+        payload = json.loads(_canary_green_health())
+        payload["checked_at"] = datetime.now(UTC).isoformat()
+        health = state_root / "hive-hourly-health.json"
+        health.write_text(json.dumps(payload), encoding="utf-8")
+        health.chmod(0o600)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(runtime_lifecycle, "run_bounded", run_service_green)
+    runtime_lifecycle._observe_argumentless_installed_probe(home)
+    assert runtime_lifecycle._observation_matches(home=home, state_root=state_root, identity=identity) is True
+
     def run_inconsistent(arguments, **_kwargs):
         calls.append(tuple(arguments))
         payload = json.loads(_canary_green_health())
@@ -4719,6 +4779,26 @@ def test_observation_receipt_accepts_only_a_fresh_consistent_launcher_result(
         match="^runtime_lifecycle_probe_result_invalid$",
     ):
         runtime_lifecycle._observe_argumentless_installed_probe(home)
+
+    receipt = state_root / "runtime-lifecycle-probe-observation.json"
+    before = receipt.read_bytes()
+    for fault in ("stale", "alarm_owner", "red_exit_zero"):
+        def run_invalid(arguments, **_kwargs):
+            payload = json.loads(_canary_isolated_health() if fault == "red_exit_zero" else _canary_green_health())
+            payload["checked_at"] = (datetime.now(UTC) - timedelta(minutes=1) if fault == "stale" else datetime.now(UTC)).isoformat()
+            if fault == "alarm_owner":
+                payload["service_alarm"]["owner"] = {
+                    **payload["service_alarm"]["owner"], "principal_id": "foreign-queen"
+                }
+            health = state_root / "hive-hourly-health.json"
+            health.write_text(json.dumps(payload), encoding="utf-8")
+            health.chmod(0o600)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(runtime_lifecycle, "run_bounded", run_invalid)
+        with pytest.raises(runtime_lifecycle.RuntimeLifecycleError, match="^runtime_lifecycle_probe_result_invalid$"):
+            runtime_lifecycle._observe_argumentless_installed_probe(home)
+        assert receipt.read_bytes() == before
 
 
 def test_observation_does_not_write_a_receipt_when_the_bounded_launcher_fails(
@@ -9048,14 +9128,11 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         systemctl=private_systemctl,
         systemd_run=private_systemd_run,
     )
-    assert canary_result["status"] == "runtime_canary_green", canary_result
     if scenario == "partial_blocked":
-        assert canary_result["qualification_diagnostic"]["runtime_status"] == "unknown"
+        assert canary_result["status"] == "runtime_canary_failed", canary_result
+        assert canary_result["error_code"] == "runtime_canary_evidence_invalid"
         record = runtime_lifecycle._read_canary_qualification_record(qualification_root)
-        assert record is not None
-        assert record["status"] == "unqualified"
-        assert record["criteria"]["runtime_canary"] == "unknown"
-        assert record["criteria"]["runtime_features"] == "pass"
+        assert record is None
         assert transient_manager.stopped is True
         assert transient_manager.reset is True
         blocked = runtime_lifecycle.plan(
@@ -9064,10 +9141,11 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         )
         assert blocked["status"] == "runtime_lifecycle_plan_blocked", blocked
         assert (
-            "runtime_lifecycle_qualification_record_unqualified"
+            "runtime_lifecycle_qualification_record_missing"
             in blocked["reason_codes"]
         )
         return
+    assert canary_result["status"] == "runtime_canary_green", canary_result
     if scenario == "pilot_blocked":
         assert canary_result["qualification_diagnostic"] == {
             "evidence_case": "pilot_blocked_green",
@@ -9086,12 +9164,12 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         }
     else:
         assert canary_result["qualification_diagnostic"] == {
-            "evidence_case": "strict_green",
+            "evidence_case": "service_green",
             "runtime_status": "pass",
-            "runtime_reasons": [],
-            "checks_all_true": True,
+            "runtime_reasons": ["health_checks_not_all_true"],
+            "checks_all_true": False,
             "commands_all_true": True,
-            "failed_checks": [],
+            "failed_checks": ["hive_doctor", "hive_runtime"],
             "missing_checks": [],
             "failed_commands": [],
             "missing_commands": [],
