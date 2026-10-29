@@ -249,6 +249,16 @@ jobs:
           PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src"
           "${THE_HIVE_TEST_CODEX_USAGE_PYTHON}" -m pytest -q tests/test_usage_snapshot.py
 
+      - name: Diagnose structural qualification on Python 3.12
+        run: |
+          set -eu
+          pytest_parent="$(mktemp -d "${HOME}/.the-hive-pytest-qualification.XXXXXX")"
+          chmod 700 "${pytest_parent}"
+          pytest_tmp="${pytest_parent}/basetemp"
+          PYTHONPATH="src:${THE_HIVE_TEST_CODEX_USAGE_ROOT}/src:${THE_HIVE_TEST_NATIVE_PYTHON}" \
+            python -m pytest -q -s --basetemp="${pytest_tmp}" \
+            tests/test_runtime_lifecycle_service.py::test_public_plan_accepts_current_owner_qualified_structural_profile
+
       - name: Run remaining unit tests with Python 3.12
         run: |
           set -eu

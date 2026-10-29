@@ -8716,6 +8716,72 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
     assert canary_result["status"] == "runtime_canary_green", canary_result
     assert set(manager_observations) == set(runtime_lifecycle._V2_MANAGER_UNITS)
     record = runtime_lifecycle._read_canary_qualification_record(qualification_root)
+    if isinstance(record, Mapping):
+        bindings = record.get("bindings")
+        criteria = record.get("criteria")
+        bindings = bindings if isinstance(bindings, Mapping) else {}
+        criteria = criteria if isinstance(criteria, Mapping) else {}
+        client = bindings.get("client")
+        client = client if isinstance(client, Mapping) else {}
+        compatibility = client.get("compatibility_probe")
+        compatibility = compatibility if isinstance(compatibility, Mapping) else {}
+        manager = bindings.get("manager_api_contract")
+        manager = manager if isinstance(manager, Mapping) else {}
+        manager_details = manager.get("manager")
+        manager_details = (
+            manager_details if isinstance(manager_details, Mapping) else {}
+        )
+        predecessor = bindings.get("predecessor")
+        predecessor = predecessor if isinstance(predecessor, Mapping) else {}
+        diagnostic = {
+            "record_status": record.get("status"),
+            "criteria": {
+                key: criteria.get(key)
+                for key in sorted(runtime_lifecycle._CANARY_QUALIFICATION_CRITERIA)
+            },
+            "bindings": {
+                "source_commit": bindings.get("source_commit"),
+                "source_tree_sha256": bindings.get("source_tree_sha256"),
+                "candidate_generation": bindings.get("candidate_generation"),
+                "candidate_manifest_digest": bindings.get("candidate_manifest_digest"),
+                "profile_sha256": bindings.get("profile_sha256"),
+                "manager_states_sha256": bindings.get("manager_states_sha256"),
+                "predecessor": {
+                    key: predecessor.get(key)
+                    for key in ("generation", "manifest_digest", "consumer_sha256")
+                },
+                "client": {
+                    key: client.get(key)
+                    for key in ("artifact_sha256", "features_sha256", "version")
+                },
+                "client_compatibility_probe": {
+                    key: compatibility.get(key)
+                    for key in (
+                        "schema_revision",
+                        "argv",
+                        "exit_codes",
+                        "expected",
+                        "observed",
+                        "config_sha256",
+                        "readback_line_sha256",
+                        "response_sha256",
+                    )
+                },
+                "manager_api_contract": {
+                    "api_sha256": manager.get("api_sha256"),
+                    "unit_path_sha256": manager.get("unit_path_sha256"),
+                    "manager": {
+                        key: manager_details.get(key)
+                        for key in ("version", "features_sha256")
+                    },
+                    "present": bool(manager),
+                },
+            },
+        }
+        print(
+            "CANARY_QUALIFICATION_DIAGNOSTIC "
+            + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+        )
     assert isinstance(record, Mapping) and record["status"] == "qualified"
     assert record["criteria"]["runtime_canary"] == "pass"
     assert record["criteria"]["runtime_features"] == "pass"
