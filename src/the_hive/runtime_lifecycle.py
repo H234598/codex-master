@@ -33,6 +33,7 @@ import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from typing import cast
 
 from the_hive.runtime_process import BoundedProcessError, run_bounded
 
@@ -70,6 +71,9 @@ _ROOT_HOOK_ABI_PARENT = Path("/usr/local/libexec/the-hive/hook-abi")
 _ROOT_HOOK_ABI_UID = 0
 _ROOT_HOOK_ABI_GID = 0
 _ROOT_HOOK_EFFECT_RECEIPT = "root-hook-effect-receipt-v1.json"
+_ROOT_HOOK_UPGRADE_STATE = ".root-hook-abi-upgrade-v1.json"
+_SHA256_HEX_PATTERN = r"[0-9a-f]{64}"
+_ROOT_HOOK_MANIFEST_DIGEST_PATTERN = rf"sha256:{_SHA256_HEX_PATTERN}"
 _PLUGIN_EFFECT_RECEIPT = "plugin-release-effect-receipt-v1.json"
 _OWNER_RECEIPT_FRESHNESS_NS = 3_600 * 1_000_000_000
 _OBSERVATION_NAME = "runtime-lifecycle-probe-observation.json"
@@ -3523,10 +3527,189 @@ def _read_regular_at(
         os.close(descriptor)
 
 
+def _read_root_hook_upgrade_state(
+    parent_fd: int, lock_info: os.stat_result
+) -> tuple[dict[str, object], os.stat_result]:
+    try:
+        raw, state_info = _read_regular_at(
+            parent_fd,
+            _ROOT_HOOK_UPGRADE_STATE,
+            owner_uid=_ROOT_HOOK_ABI_UID,
+            owner_gid=_ROOT_HOOK_ABI_GID,
+            mode=0o644,
+        )
+        parsed_state = _d320_parse_json(raw)
+    except (OSError, TypeError, ValueError) as exc:
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted") from exc
+    expected_keys = {
+        "backup_name",
+        "expected_root_state_sha256",
+        "generation",
+        "manifest_digest",
+        "old_receipt",
+        "old_target",
+        "owner_lock",
+        "parent",
+        "receipt",
+        "schema",
+        "stage_name",
+        "status",
+        "target",
+        "transaction_id",
+    }
+    if not isinstance(parsed_state, dict):
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    state = cast(dict[str, object], parsed_state)
+    if set(state) != expected_keys:
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    parent_info = os.fstat(parent_fd)
+    expected_parent = {
+        "dev": parent_info.st_dev,
+        "gid": parent_info.st_gid,
+        "ino": parent_info.st_ino,
+        "mode": stat.S_IMODE(parent_info.st_mode),
+        "uid": parent_info.st_uid,
+    }
+    expected_lock = {
+        "dev": lock_info.st_dev,
+        "gid": lock_info.st_gid,
+        "ino": lock_info.st_ino,
+        "mode": stat.S_IMODE(lock_info.st_mode),
+        "nlink": lock_info.st_nlink,
+        "sha256": hashlib.sha256(b"").hexdigest() if lock_info.st_size == 0 else None,
+        "size": lock_info.st_size,
+        "uid": lock_info.st_uid,
+    }
+    lock_raw, lock_state = _read_regular_at(
+        parent_fd,
+        ".root-hook-abi-owner.lock",
+        owner_uid=_ROOT_HOOK_ABI_UID,
+        owner_gid=_ROOT_HOOK_ABI_GID,
+        mode=0o644,
+    )
+    expected_lock["sha256"] = hashlib.sha256(lock_raw).hexdigest()
+    if (
+        state.get("schema") != "RootHookAbiUpgradeStateV1"
+        or state.get("status") != "committed"
+        or not isinstance(state.get("transaction_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", state["transaction_id"]) is None
+        or not isinstance(state.get("expected_root_state_sha256"), str)
+        or re.fullmatch(_SHA256_HEX_PATTERN, state["expected_root_state_sha256"])
+        is None
+        or state.get("parent") != expected_parent
+        or state.get("owner_lock") != expected_lock
+        or state_info.st_uid != _ROOT_HOOK_ABI_UID
+        or state_info.st_gid != _ROOT_HOOK_ABI_GID
+        or state_info.st_nlink != 1
+        or stat.S_IMODE(state_info.st_mode) != 0o644
+        or (lock_state.st_dev, lock_state.st_ino)
+        != (lock_info.st_dev, lock_info.st_ino)
+    ):
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    parsed_old_target = state["old_target"]
+    if not isinstance(parsed_old_target, dict):
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    old_target = cast(dict[str, object], parsed_old_target)
+    backup_name = state["backup_name"]
+    if old_target == {"present": False}:
+        if backup_name is not None:
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    else:
+        if (
+            set(old_target) != {"dev", "gid", "ino", "mode", "present", "uid"}
+            or old_target.get("present") is not True
+            or any(
+                type(old_target.get(field)) is not int
+                for field in ("dev", "gid", "ino", "mode", "uid")
+            )
+        ):
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+        if (
+            not isinstance(backup_name, str)
+            or re.fullmatch(r"\.v1\.previous-[0-9a-f]{32}", backup_name) is None
+        ):
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+        try:
+            backup_info = os.stat(backup_name, dir_fd=parent_fd, follow_symlinks=False)
+        except (OSError, TypeError) as exc:
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted") from exc
+        if (
+            not stat.S_ISDIR(backup_info.st_mode)
+            or backup_info.st_uid != old_target["uid"]
+            or backup_info.st_gid != old_target["gid"]
+            or stat.S_IMODE(backup_info.st_mode) != old_target["mode"]
+            or (backup_info.st_dev, backup_info.st_ino)
+            != (old_target["dev"], old_target["ino"])
+        ):
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    parsed_old_receipt = state["old_receipt"]
+    if not isinstance(parsed_old_receipt, dict):
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    old_receipt = cast(dict[str, object], parsed_old_receipt)
+    old_receipt_fields = {
+        "dev",
+        "gid",
+        "ino",
+        "mode",
+        "nlink",
+        "present",
+        "sha256",
+        "size",
+        "uid",
+    }
+    if old_receipt != {"present": False} and (
+        set(old_receipt) != old_receipt_fields
+        or old_receipt.get("present") is not True
+        or any(
+            type(old_receipt.get(field)) is not int
+            for field in old_receipt_fields - {"sha256", "present"}
+        )
+        or not isinstance(old_receipt.get("sha256"), str)
+        or re.fullmatch(_SHA256_HEX_PATTERN, old_receipt["sha256"]) is None
+    ):
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    for name in ("stage_name", "backup_name"):
+        parsed_value = state[name]
+        if parsed_value is None:
+            continue
+        if (
+            not isinstance(parsed_value, str)
+            or re.fullmatch(r"\.v1\.(?:stage|previous)-[0-9a-f]{32}", parsed_value)
+            is None
+        ):
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    for name in ("target", "receipt"):
+        value = state[name]
+        expected = {"dev", "gid", "ino", "mode", "nlink", "size", "uid"}
+        if name == "target":
+            expected -= {"nlink", "size"}
+        else:
+            expected.add("sha256")
+        if set(value) != expected:
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+        if any(type(value.get(field)) is not int for field in expected - {"sha256"}):
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+        if name == "receipt" and (
+            not isinstance(value.get("sha256"), str)
+            or re.fullmatch(_SHA256_HEX_PATTERN, value["sha256"]) is None
+        ):
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    if (
+        not isinstance(state.get("generation"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", state["generation"]) is None
+        or not isinstance(state.get("manifest_digest"), str)
+        or re.fullmatch(_ROOT_HOOK_MANIFEST_DIGEST_PATTERN, state["manifest_digest"])
+        is None
+    ):
+        raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
+    return state, state_info
+
+
 def _verify_root_hook_effect_receipt(
     *, generation: str, manifest_digest: str, hold_lock: bool = False
 ) -> str | tuple[str, int]:
     parent_fd = _open_owner_directory(_ROOT_HOOK_ABI_PARENT)
+    parent_info = os.fstat(parent_fd)
     lock_fd = -1
     target_fd = -1
     try:
@@ -3548,7 +3731,11 @@ def _verify_root_hook_effect_receipt(
             fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError as exc:
             raise _error("runtime_lifecycle_root_hook_effect_busy") from exc
-        raw, _receipt_info = _read_regular_at(
+        lock_info = os.fstat(lock_fd)
+        upgrade_state, upgrade_info = _read_root_hook_upgrade_state(
+            parent_fd, lock_info
+        )
+        raw, receipt_info = _read_regular_at(
             parent_fd,
             _ROOT_HOOK_EFFECT_RECEIPT,
             owner_uid=_ROOT_HOOK_ABI_UID,
@@ -3557,8 +3744,11 @@ def _verify_root_hook_effect_receipt(
         )
         try:
             receipt = _d320_parse_json(raw)
-        except (D320CutoverJournalError, TypeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:
             raise _error("runtime_lifecycle_root_hook_effect_unverified") from exc
+        if not isinstance(receipt, dict):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        receipt = cast(dict[str, object], receipt)
         expected_keys = {
             "effect",
             "files",
@@ -3572,8 +3762,7 @@ def _verify_root_hook_effect_receipt(
             "target",
         }
         if (
-            not isinstance(receipt, dict)
-            or set(receipt) != expected_keys
+            set(receipt) != expected_keys
             or receipt.get("schema_version") != 1
             or receipt.get("owner") != "root_hook_abi_v1"
             or receipt.get("effect") != "root_hook_abi_verified_present"
@@ -3583,6 +3772,11 @@ def _verify_root_hook_effect_receipt(
             or receipt.get("root_uid") != _ROOT_HOOK_ABI_UID
             or receipt.get("source_uid") != os.geteuid()
             or type(receipt.get("issued_at_unix_ns")) is not int
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        if (
+            upgrade_state["generation"] != generation
+            or upgrade_state["manifest_digest"] != manifest_digest
         ):
             raise _error("runtime_lifecycle_root_hook_effect_unverified")
         issued = receipt["issued_at_unix_ns"]
@@ -3599,6 +3793,36 @@ def _verify_root_hook_effect_receipt(
             target_info.st_uid != _ROOT_HOOK_ABI_UID
             or target_info.st_gid != _ROOT_HOOK_ABI_GID
             or stat.S_IMODE(target_info.st_mode) != 0o755
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        receipt_identity = upgrade_state["receipt"]
+        target_identity = upgrade_state["target"]
+        state_name_info = os.stat(
+            _ROOT_HOOK_UPGRADE_STATE, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (
+            (state_name_info.st_dev, state_name_info.st_ino)
+            != (upgrade_info.st_dev, upgrade_info.st_ino)
+            or (target_info.st_dev, target_info.st_ino)
+            != (target_identity["dev"], target_identity["ino"])
+            or any(
+                getattr(target_info, field) != target_identity[key]
+                for field, key in (
+                    ("st_dev", "dev"),
+                    ("st_ino", "ino"),
+                    ("st_uid", "uid"),
+                    ("st_gid", "gid"),
+                )
+            )
+            or stat.S_IMODE(target_info.st_mode) != target_identity["mode"]
+            or (receipt_info.st_dev, receipt_info.st_ino)
+            != (receipt_identity["dev"], receipt_identity["ino"])
+            or receipt_info.st_uid != receipt_identity["uid"]
+            or receipt_info.st_gid != receipt_identity["gid"]
+            or stat.S_IMODE(receipt_info.st_mode) != receipt_identity["mode"]
+            or receipt_info.st_nlink != receipt_identity["nlink"]
+            or receipt_info.st_size != receipt_identity["size"]
+            or hashlib.sha256(raw).hexdigest() != receipt_identity["sha256"]
         ):
             raise _error("runtime_lifecycle_root_hook_effect_unverified")
         files = receipt.get("files")
@@ -3681,6 +3905,68 @@ def _verify_root_hook_effect_receipt(
                 or info.st_nlink != member.get("nlink")
             ):
                 raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        final_parent_fd = _open_owner_directory(_ROOT_HOOK_ABI_PARENT)
+        try:
+            final_parent_info = os.fstat(final_parent_fd)
+            final_lock_raw, final_lock_info = _read_regular_at(
+                final_parent_fd,
+                ".root-hook-abi-owner.lock",
+                owner_uid=_ROOT_HOOK_ABI_UID,
+                owner_gid=_ROOT_HOOK_ABI_GID,
+                mode=0o644,
+            )
+            final_target_info = os.stat(
+                "v1", dir_fd=final_parent_fd, follow_symlinks=False
+            )
+            final_receipt_raw, final_receipt_info = _read_regular_at(
+                final_parent_fd,
+                _ROOT_HOOK_EFFECT_RECEIPT,
+                owner_uid=_ROOT_HOOK_ABI_UID,
+                owner_gid=_ROOT_HOOK_ABI_GID,
+                mode=0o644,
+            )
+            final_state_raw, final_state_info = _read_regular_at(
+                final_parent_fd,
+                _ROOT_HOOK_UPGRADE_STATE,
+                owner_uid=_ROOT_HOOK_ABI_UID,
+                owner_gid=_ROOT_HOOK_ABI_GID,
+                mode=0o644,
+            )
+            final_state = _d320_parse_json(final_state_raw)
+        finally:
+            os.close(final_parent_fd)
+        if (
+            (final_parent_info.st_dev, final_parent_info.st_ino)
+            != (parent_info.st_dev, parent_info.st_ino)
+            or final_parent_info.st_uid != parent_info.st_uid
+            or final_parent_info.st_gid != parent_info.st_gid
+            or stat.S_IMODE(final_parent_info.st_mode)
+            != stat.S_IMODE(parent_info.st_mode)
+            or (final_lock_info.st_dev, final_lock_info.st_ino)
+            != (lock_info.st_dev, lock_info.st_ino)
+            or hashlib.sha256(final_lock_raw).hexdigest()
+            != upgrade_state["owner_lock"]["sha256"]
+            or (final_target_info.st_dev, final_target_info.st_ino)
+            != (target_info.st_dev, target_info.st_ino)
+            or not stat.S_ISDIR(final_target_info.st_mode)
+            or final_target_info.st_uid != target_info.st_uid
+            or final_target_info.st_gid != target_info.st_gid
+            or stat.S_IMODE(final_target_info.st_mode)
+            != stat.S_IMODE(target_info.st_mode)
+            or final_target_info.st_mtime_ns != target_info.st_mtime_ns
+            or final_target_info.st_ctime_ns != target_info.st_ctime_ns
+            or (final_receipt_info.st_dev, final_receipt_info.st_ino)
+            != (receipt_info.st_dev, receipt_info.st_ino)
+            or final_receipt_raw != raw
+            or final_receipt_info.st_mtime_ns != receipt_info.st_mtime_ns
+            or final_receipt_info.st_ctime_ns != receipt_info.st_ctime_ns
+            or (final_state_info.st_dev, final_state_info.st_ino)
+            != (upgrade_info.st_dev, upgrade_info.st_ino)
+            or final_state != upgrade_state
+            or final_state_info.st_mtime_ns != upgrade_info.st_mtime_ns
+            or final_state_info.st_ctime_ns != upgrade_info.st_ctime_ns
+        ):
+            raise _error("runtime_lifecycle_root_hook_upgrade_uncommitted")
         digest = hashlib.sha256(raw).hexdigest()
         if hold_lock:
             result_fd = lock_fd
@@ -5157,7 +5443,7 @@ def _v2_install_phase(
                 or effect["present"]
                 or temporary != _v2_setup_temp_path(journal.payload, path)
                 or not isinstance(digest, str)
-                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or re.fullmatch(_SHA256_HEX_PATTERN, digest) is None
             ):
                 raise _error("runtime_lifecycle_installer_setup_unbound")
             if any(
@@ -7443,7 +7729,8 @@ def _canary_evidence_result(
         for name in keys
     }
     if (
-        all(checks.values())
+        record_valid
+        and all(checks.values())
         and all(commands.values())
         and codes == {"ok"}
         and manager_state.get("ActiveState") == "active"
@@ -7495,16 +7782,63 @@ def _canary_runtime_qualification_status(
         return "fail"
     checks = payload.get("checks")
     commands = payload.get("commands")
-    if (
-        not isinstance(checks, Mapping)
-        or not isinstance(commands, Mapping)
-        or not all(value is True for value in checks.values())
-        or not all(value is True for value in commands.values())
-        or manager_state.get("ActiveState") != "active"
-        or manager_state.get("Result") != "success"
-        or manager_state.get("ExecMainStatus") != "0"
-    ):
+    if not isinstance(checks, Mapping) or not isinstance(commands, Mapping):
         return "unknown"
+    if (
+        all(value is True for value in checks.values())
+        and all(value is True for value in commands.values())
+        and manager_state.get("ActiveState") == "active"
+        and manager_state.get("Result") == "success"
+        and manager_state.get("ExecMainStatus") == "0"
+    ):
+        return "pass"
+    pilot_blocked = payload.get("global_pilot_readiness")
+    if (
+        checks
+        == {
+            "runtime_layout": True,
+            "hive_runtime": False,
+            "hive_doctor": False,
+        }
+        and all(value is True for value in commands.values())
+        and isinstance(pilot_blocked, Mapping)
+        and pilot_blocked.get("pilot") == "blocked"
+        and manager_state.get("ActiveState") == "failed"
+        and manager_state.get("Result") == "exit-code"
+        and manager_state.get("ExecMainStatus") == "1"
+    ):
+        return "pass"
+    return "unknown"
+
+
+def _canary_runtime_features_qualification_status(
+    *, image: _CanaryImage, payload: Mapping[str, object] | None = None
+) -> str:
+    """Qualify only the bound runtime-layout and runtime-status surface."""
+
+    try:
+        payload = payload if payload is not None else _canary_health_payload(image)
+        from the_hive.hive.hourly_probe import valid_probe_record
+
+        if not valid_probe_record(payload):
+            return "fail"
+        checks = payload.get("checks")
+        commands = payload.get("commands")
+        diagnostics = payload.get("diagnostics")
+        if (
+            not isinstance(checks, Mapping)
+            or not isinstance(commands, Mapping)
+            or not isinstance(diagnostics, Mapping)
+            or checks.get("runtime_layout") is not True
+            or commands.get("runtime_status") is not True
+            or _canary_diagnostic_value(
+                diagnostics.get("runtime_status"), command_ready=True
+            )
+            != "ok"
+        ):
+            return "unknown"
+    except (RuntimeLifecycleError, D320CutoverJournalError):
+        return "fail"
     return "pass"
 
 
@@ -8040,21 +8374,21 @@ def _valid_client_compatibility_probe(value: object) -> bool:
         and set(config_sha256) == {"false", "true"}
         and all(
             isinstance(config_sha256.get(key), str)
-            and re.fullmatch(r"[0-9a-f]{64}", config_sha256[key])
+            and re.fullmatch(_SHA256_HEX_PATTERN, config_sha256[key])
             for key in ("false", "true")
         )
         and isinstance(readback, Mapping)
         and set(readback) == {"false", "true"}
         and all(
             isinstance(readback.get(key), str)
-            and re.fullmatch(r"[0-9a-f]{64}", readback[key])
+            and re.fullmatch(_SHA256_HEX_PATTERN, readback[key])
             for key in ("false", "true")
         )
         and isinstance(responses, Mapping)
         and set(responses) == {"false", "true"}
         and all(
             isinstance(responses.get(key), str)
-            and re.fullmatch(r"[0-9a-f]{64}", responses[key])
+            and re.fullmatch(_SHA256_HEX_PATTERN, responses[key])
             for key in ("false", "true")
         )
     )
@@ -9113,7 +9447,7 @@ def _valid_manager_api_contract(value: object) -> bool:
         and isinstance(manager, Mapping)
         and set(manager) == {"features_sha256", "version"}
         and isinstance(manager.get("features_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", manager["features_sha256"])
+        and re.fullmatch(_SHA256_HEX_PATTERN, manager["features_sha256"])
         and isinstance(manager.get("version"), str)
         and bool(manager["version"])
         and isinstance(owner, Mapping)
@@ -9144,11 +9478,11 @@ def _valid_manager_api_contract(value: object) -> bool:
             for item in value["unit_paths"]
         )
         and isinstance(value.get("unit_path_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", value["unit_path_sha256"])
+        and re.fullmatch(_SHA256_HEX_PATTERN, value["unit_path_sha256"])
         and value["unit_path_sha256"]
         == hashlib.sha256(_d320_canonical_json(value["unit_paths"])).hexdigest()
         and isinstance(value.get("api_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", value["api_sha256"])
+        and re.fullmatch(_SHA256_HEX_PATTERN, value["api_sha256"])
     )
 
 
@@ -9307,17 +9641,18 @@ def _read_canary_qualification_record(root: Path) -> Mapping[str, object] | None
             or not isinstance(bindings.get("candidate_generation"), str)
             or not isinstance(bindings.get("candidate_manifest_digest"), str)
             or not re.fullmatch(r"[0-9a-f]{40}", bindings["source_commit"])
-            or not re.fullmatch(r"[0-9a-f]{64}", bindings["source_tree_sha256"])
+            or not re.fullmatch(_SHA256_HEX_PATTERN, bindings["source_tree_sha256"])
             or not re.fullmatch(r"[0-9a-f]{40}", bindings["candidate_generation"])
             or not re.fullmatch(
-                r"sha256:[0-9a-f]{64}", bindings["candidate_manifest_digest"]
+                _ROOT_HOOK_MANIFEST_DIGEST_PATTERN,
+                bindings["candidate_manifest_digest"],
             )
             or (
                 bindings.get("manager_states_sha256") is not None
                 and (
                     not isinstance(bindings.get("manager_states_sha256"), str)
                     or not re.fullmatch(
-                        r"[0-9a-f]{64}", bindings["manager_states_sha256"]
+                        _SHA256_HEX_PATTERN, bindings["manager_states_sha256"]
                     )
                 )
             )
@@ -9348,14 +9683,14 @@ def _read_canary_qualification_record(root: Path) -> Mapping[str, object] | None
                     }
                     or not isinstance(bindings["client"].get("artifact_sha256"), str)
                     or not re.fullmatch(
-                        r"[0-9a-f]{64}", bindings["client"]["artifact_sha256"]
+                        _SHA256_HEX_PATTERN, bindings["client"]["artifact_sha256"]
                     )
                     or not _valid_client_compatibility_probe(
                         bindings["client"].get("compatibility_probe")
                     )
                     or not isinstance(bindings["client"].get("features_sha256"), str)
                     or not re.fullmatch(
-                        r"[0-9a-f]{64}", bindings["client"]["features_sha256"]
+                        _SHA256_HEX_PATTERN, bindings["client"]["features_sha256"]
                     )
                     or not isinstance(bindings["client"].get("version"), str)
                     or not bindings["client"]["version"]
@@ -9378,7 +9713,7 @@ def _read_canary_qualification_record(root: Path) -> Mapping[str, object] | None
                 profile_sha256 is not None
                 and (
                     not isinstance(profile_sha256, str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", profile_sha256)
+                    or not re.fullmatch(_SHA256_HEX_PATTERN, profile_sha256)
                 )
             )
             or (
@@ -9388,12 +9723,15 @@ def _read_canary_qualification_record(root: Path) -> Mapping[str, object] | None
                     or set(predecessor)
                     != {"consumer_sha256", "generation", "manifest_digest"}
                     or not isinstance(predecessor.get("consumer_sha256"), str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", predecessor["consumer_sha256"])
+                    or not re.fullmatch(
+                        _SHA256_HEX_PATTERN, predecessor["consumer_sha256"]
+                    )
                     or not isinstance(predecessor.get("generation"), str)
                     or not re.fullmatch(r"[0-9a-f]{40}", predecessor["generation"])
                     or not isinstance(predecessor.get("manifest_digest"), str)
                     or not re.fullmatch(
-                        r"sha256:[0-9a-f]{64}", predecessor["manifest_digest"]
+                        _ROOT_HOOK_MANIFEST_DIGEST_PATTERN,
+                        predecessor["manifest_digest"],
                     )
                 )
             )
@@ -9449,6 +9787,7 @@ def _canary_qualification_record(
     source_tree_digest: str,
     image: _CanaryImage,
     runtime_status: str,
+    runtime_features_status: str,
     client_metadata: Mapping[str, object] | None,
     manager_states: Mapping[str, Mapping[str, str]] | None,
     manager_api_contract: Mapping[str, object] | None,
@@ -9480,9 +9819,9 @@ def _canary_qualification_record(
     client_probe_valid = (
         isinstance(client_metadata, Mapping)
         and isinstance(client_metadata.get("artifact_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", client_metadata["artifact_sha256"])
+        and re.fullmatch(_SHA256_HEX_PATTERN, client_metadata["artifact_sha256"])
         and isinstance(client_metadata.get("features_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", client_metadata["features_sha256"])
+        and re.fullmatch(_SHA256_HEX_PATTERN, client_metadata["features_sha256"])
         and isinstance(client_metadata.get("version"), str)
         and bool(client_metadata["version"])
         and _valid_client_compatibility_probe(
@@ -9500,7 +9839,7 @@ def _canary_qualification_record(
         ),
         "manager_actions": "unknown",
         "runtime_canary": runtime_status,
-        "runtime_features": runtime_status,
+        "runtime_features": runtime_features_status,
     }
     required_bindings_present = (
         isinstance(predecessor, Mapping)
@@ -9820,7 +10159,7 @@ def canary(
     manager_states: dict[str, dict[str, str]] | None = None
     qualification_diagnostic: dict[str, object] | None = None
     qualification_input: (
-        tuple[_CanaryImage, str, Mapping[str, object] | None] | None
+        tuple[_CanaryImage, str, str, Mapping[str, object] | None] | None
     ) = None
     root = _canary_runtime_root()
     try:
@@ -9877,9 +10216,15 @@ def canary(
                     runtime_status = _canary_runtime_qualification_status(
                         image=image, manager_state=manager_state, payload=payload
                     )
+                    runtime_features_status = (
+                        _canary_runtime_features_qualification_status(
+                            image=image, payload=payload
+                        )
+                    )
                     qualification_input = (
                         image,
                         runtime_status,
+                        runtime_features_status,
                         _canary_client_metadata(invocation),
                     )
                 if status_code in {"runtime_canary_green", "runtime_canary_red"}:
@@ -9913,7 +10258,12 @@ def canary(
             if qualification_diagnostic is not None:
                 result["qualification_diagnostic"] = qualification_diagnostic
             if qualification_input is not None:
-                image, runtime_status, client_metadata = qualification_input
+                (
+                    image,
+                    runtime_status,
+                    runtime_features_status,
+                    client_metadata,
+                ) = qualification_input
                 manager_states = _canary_manager_state_snapshot(systemctl)
                 manager_api_contract = _manager_api_contract_snapshot()
                 qualification_record = _canary_qualification_record(
@@ -9923,6 +10273,7 @@ def canary(
                     source_tree_digest=source_tree_digest,
                     image=image,
                     runtime_status=runtime_status,
+                    runtime_features_status=runtime_features_status,
                     client_metadata=client_metadata,
                     manager_states=manager_states,
                     manager_api_contract=manager_api_contract,
@@ -10068,7 +10419,7 @@ def cutover(
             "status": "runtime_lifecycle_plan_required",
             "raw_output": "not_returned",
         }
-    if re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
+    if re.fullmatch(_SHA256_HEX_PATTERN, plan_sha256) is None:
         return {
             "status": "runtime_lifecycle_plan_digest_invalid",
             "raw_output": "not_returned",

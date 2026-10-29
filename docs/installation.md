@@ -104,21 +104,39 @@ set -eu
 : "${APPROVED_GENERATION:?must come from the independent release record}"
 : "${APPROVED_MANIFEST_DIGEST:?must come from the independent release record}"
 : "${APPROVED_HOOK_INSTALLER_SHA256:?must come from the independent release record}"
+: "${APPROVED_ROOT_STATE_SHA256:?reviewed root-state snapshot required}"
 USER_HOME=$(/usr/bin/getent passwd "$APPROVED_UID" | /usr/bin/cut -d: -f6)
 test -n "$USER_HOME"
 SOURCE="$USER_HOME/.local/lib/the-hive-runtime/generations/$APPROVED_GENERATION/bin/the-hive-hook-abi-v1-install"
 STAGE_DIR=$(/usr/bin/mktemp -d -p /run the-hive-hook-abi.XXXXXXXXXX)
 test "$(/usr/bin/stat -c '%u:%a' "$STAGE_DIR")" = '0:700'
 /usr/bin/install -o root -g root -m 0755 "$SOURCE" "$STAGE_DIR/the-hive-hook-abi-v1-install"
-test "$(/usr/bin/stat -c '%u:%a:%h' "$STAGE_DIR/the-hive-hook-abi-v1-install")" = '0:755:1'
-actual=$(/usr/bin/sha256sum "$STAGE_DIR/the-hive-hook-abi-v1-install" | /usr/bin/cut -d ' ' -f 1)
+test "$(/usr/bin/stat -c '%u:%a:%h' \
+  "$STAGE_DIR/the-hive-hook-abi-v1-install")" = '0:755:1'
+actual=$(/usr/bin/sha256sum \
+  "$STAGE_DIR/the-hive-hook-abi-v1-install" | /usr/bin/cut -d ' ' -f 1)
 test "$actual" = "$APPROVED_HOOK_INSTALLER_SHA256"
+/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -B \
+  "$STAGE_DIR/the-hive-hook-abi-v1-install" --inspect-root-state
+# Compare root_state_sha256 from that complete read-only result with the
+# independently reviewed APPROVED_ROOT_STATE_SHA256 before continuing.
 /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -B \
   "$STAGE_DIR/the-hive-hook-abi-v1-install" \
   --uid "$APPROVED_UID" \
   --generation "$APPROVED_GENERATION" \
-  --manifest-sha256 "$APPROVED_MANIFEST_DIGEST"
+  --manifest-sha256 "$APPROVED_MANIFEST_DIGEST" \
+  --expected-root-state-sha256 "$APPROVED_ROOT_STATE_SHA256"
 ```
+
+The read-only snapshot is taken immediately before the Root mutation and its
+digest must match the independently reviewed expected root-state digest. If
+the target, receipt, owner lock, parent or committed upgrade marker changed
+since that snapshot, the installer stops before publishing. A pending upgrade
+marker records the exact target and receipt identities before the atomic
+publish; rerunning the same approved generation and snapshot resumes only that
+bound transaction. A committed marker retains the prior target under its
+recorded backup name, and Lifecycle rechecks that backup's physical identity
+before accepting the Root receipt.
 
 An empty or unapproved value is a stop condition. The command sequence has not
 been run with Root privileges, and this checkout has not produced the required
