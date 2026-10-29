@@ -29,10 +29,14 @@ HOT_WEEKLY_USED_PERCENT = 80.0
 HOT_WEEKLY_WINDOWS = 5
 HOT_PER_WINDOW_PERCENT = 85.0
 FIVE_HOUR_SECONDS = 18_000
-EMERGENCY_QUEEN_ACTIVE_STATES = frozenset({"requested", "running", "finishing", "next", "draining"})
+EMERGENCY_QUEEN_ACTIVE_STATES = frozenset(
+    {"requested", "running", "finishing", "next", "draining"}
+)
 
 
-def emergency_refresh_needed(evaluation: dict[str, Any], *, active_fast: bool = False) -> bool:
+def emergency_refresh_needed(
+    evaluation: dict[str, Any], *, active_fast: bool = False
+) -> bool:
     """Return whether the emergency path may spend an API pull.
 
     The normal tracker is intentionally snapshot-only.  In the hot end-window
@@ -43,7 +47,11 @@ def emergency_refresh_needed(evaluation: dict[str, Any], *, active_fast: bool = 
         return True
     tracker = evaluation.get("five_hour_tracker", {})
     weekly = next(
-        (item for item in evaluation.get("weekly_monthly", []) if item.get("window") == "weekly"),
+        (
+            item
+            for item in evaluation.get("weekly_monthly", [])
+            if item.get("window") == "weekly"
+        ),
         {},
     )
     used = weekly.get("used_percent")
@@ -58,7 +66,9 @@ def emergency_refresh_needed(evaluation: dict[str, Any], *, active_fast: bool = 
 
 def refresh_usage_snapshots() -> dict[str, Any]:
     """Pull fresh account usage through codex-usage for the emergency gate."""
-    command = os.environ.get("CODEX_USAGE_COMMAND", str(Path.home() / ".local/bin/codex-usage"))
+    command = os.environ.get(
+        "CODEX_USAGE_COMMAND", str(Path.home() / ".local/bin/codex-usage")
+    )
     if not os.path.isabs(command):
         command = shutil.which(command) or command
     config = os.environ.get(
@@ -131,9 +141,17 @@ def _window(
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
     reset = _dt(window.get("reset_at"))
-    used = float(window.get("used", 0.0)) if isinstance(window.get("used"), (int, float)) else None
+    used = (
+        float(window.get("used", 0.0))
+        if isinstance(window.get("used"), (int, float))
+        else None
+    )
     if reset is None or used is None:
-        return {"available": False, "reason": "missing_window_data", "window": window.get("name")}
+        return {
+            "available": False,
+            "reason": "missing_window_data",
+            "window": window.get("name"),
+        }
     remaining_seconds = max(0.0, (reset - now).total_seconds())
     rows: list[tuple[float, int]] = []
     try:
@@ -142,7 +160,15 @@ def _window(
                 (float(row[0]), int(row[1]))
                 for row in db.execute(
                     "SELECT used_percent,captured_at_ms FROM samples WHERE account_id=? AND pool_key=? AND window_seconds=? AND captured_at_ms>=? ORDER BY captured_at_ms",
-                    (account, pool, int(window.get("duration_seconds") or (604800 if window.get("name") == "weekly" else 2592000)), int((now.timestamp() - 86400) * 1000)),
+                    (
+                        account,
+                        pool,
+                        int(
+                            window.get("duration_seconds")
+                            or (604800 if window.get("name") == "weekly" else 2592000)
+                        ),
+                        int((now.timestamp() - 86400) * 1000),
+                    ),
                 )
             ]
     except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -151,7 +177,8 @@ def _window(
     projected = min(200.0, used + rate * remaining_seconds)
     deviation = projected - 100.0
     start = (
-        deviation > FAST_START_THRESHOLD and remaining_seconds <= FAST_START_HORIZON_SECONDS
+        deviation > FAST_START_THRESHOLD
+        and remaining_seconds <= FAST_START_HORIZON_SECONDS
         if not active_fast
         else deviation > FAST_STOP_THRESHOLD
     )
@@ -168,16 +195,24 @@ def _window(
         "threshold_start_pp": FAST_START_THRESHOLD,
         "start_horizon_seconds": FAST_START_HORIZON_SECONDS,
         "threshold_stop_pp": FAST_STOP_THRESHOLD if active_fast else None,
-        "fast_recommendation": "keep_fast" if active_fast and start else ("activate" if start else "flex"),
+        "fast_recommendation": "keep_fast"
+        if active_fast and start
+        else ("activate" if start else "flex"),
         "sample_count": len(rows),
     }
 
 
 def evaluate_account(account: str, *, active_fast: bool = False) -> dict[str, Any]:
     try:
-        payload = json.loads((SNAPSHOTS / f"{account}.json").read_text(encoding="utf-8"))
+        payload = json.loads(
+            (SNAPSHOTS / f"{account}.json").read_text(encoding="utf-8")
+        )
     except (OSError, ValueError, TypeError):
-        return {"account": account, "available": False, "reason": "snapshot_unavailable"}
+        return {
+            "account": account,
+            "available": False,
+            "reason": "snapshot_unavailable",
+        }
     windows = []
     for key in ("weekly", "monthly"):
         value = payload.get(key)
@@ -186,23 +221,48 @@ def evaluate_account(account: str, *, active_fast: bool = False) -> dict[str, An
     main = payload.get("main") if isinstance(payload, dict) else None
     five_hour = None
     if isinstance(main, dict):
-        five_hour = next((item for item in main.get("windows", []) if isinstance(item, dict) and item.get("name") == "5h"), None)
+        five_hour = next(
+            (
+                item
+                for item in main.get("windows", [])
+                if isinstance(item, dict) and item.get("name") == "5h"
+            ),
+            None,
+        )
     five_tracker = {"available": False, "reason": "missing_5h_window"}
     if isinstance(five_hour, dict):
         reset = _dt(five_hour.get("reset_at"))
         five_tracker = {
             "available": reset is not None,
-            "remaining_seconds": max(0, round((reset - datetime.now(UTC)).total_seconds())) if reset else None,
+            "remaining_seconds": max(
+                0, round((reset - datetime.now(UTC)).total_seconds())
+            )
+            if reset
+            else None,
             "five_hour_windows_until_weekly_reset": None,
         }
-        weekly_reset = _dt(payload.get("weekly", {}).get("reset_at")) if isinstance(payload.get("weekly"), dict) else None
+        weekly_reset = (
+            _dt(payload.get("weekly", {}).get("reset_at"))
+            if isinstance(payload.get("weekly"), dict)
+            else None
+        )
         if reset and weekly_reset:
             five_tracker["five_hour_windows_until_weekly_reset"] = max(
-                0, math.ceil(max(0, (weekly_reset - datetime.now(UTC)).total_seconds()) / FIVE_HOUR_SECONDS)
+                0,
+                math.ceil(
+                    max(0, (weekly_reset - datetime.now(UTC)).total_seconds())
+                    / FIVE_HOUR_SECONDS
+                ),
             )
             weekly_value = payload.get("weekly")
-            weekly_used = weekly_value.get("used") if isinstance(weekly_value, dict) else None
-            weekly_remaining = 100.0 - float(weekly_used) if isinstance(weekly_used, (int, float)) else None
+            weekly_used = (
+                weekly_value.get("used") if isinstance(weekly_value, dict) else None
+            )
+            weekly_remaining = (
+                100.0 - float(weekly_used)
+                if isinstance(weekly_used, (int, float))
+                else None
+            )
             five_tracker["weekly_remaining_percent"] = weekly_remaining
             count = five_tracker["five_hour_windows_until_weekly_reset"]
             five_tracker["weekly_budget_per_remaining_5h_window"] = (
@@ -214,33 +274,57 @@ def evaluate_account(account: str, *, active_fast: bool = False) -> dict[str, An
             five_tracker["zero_landing_is_realistic"] = (
                 isinstance(weekly_remaining, float) and weekly_remaining >= 0
             )
-        five_projection = _window(account, five_hour, active_fast=active_fast, pool="main")
+        five_projection = _window(
+            account, five_hour, active_fast=active_fast, pool="main"
+        )
     else:
         five_projection = {"available": False, "reason": "missing_5h_window"}
     activate = any(item.get("fast_recommendation") == "activate" for item in windows)
-    keep_fast = active_fast and any(item.get("fast_recommendation") in {"keep_fast", "activate"} for item in windows)
-    weekly_projection = next((item for item in windows if item.get("window") == "weekly"), None)
+    keep_fast = active_fast and any(
+        item.get("fast_recommendation") in {"keep_fast", "activate"} for item in windows
+    )
+    weekly_projection = next(
+        (item for item in windows if item.get("window") == "weekly"), None
+    )
     if weekly_projection is not None:
-        five_tracker["projected_weekly_deviation_pp"] = weekly_projection.get("deviation_from_limit_pp")
-        five_tracker["zero_landing_projection"] = weekly_projection.get("projected_percent_at_reset")
+        five_tracker["projected_weekly_deviation_pp"] = weekly_projection.get(
+            "deviation_from_limit_pp"
+        )
+        five_tracker["zero_landing_projection"] = weekly_projection.get(
+            "projected_percent_at_reset"
+        )
         five_tracker["zero_landing_is_realistic"] = (
             isinstance(weekly_projection.get("deviation_from_limit_pp"), (int, float))
             and weekly_projection["deviation_from_limit_pp"] <= 0
         )
     spark_windows: list[dict[str, Any]] = []
     models = payload.get("models") if isinstance(payload, dict) else None
-    spark_payload = models.get("gpt-5.3-codex-spark") if isinstance(models, dict) else None
+    spark_payload = (
+        models.get("gpt-5.3-codex-spark") if isinstance(models, dict) else None
+    )
     if isinstance(spark_payload, dict):
         for item in spark_payload.get("windows", []):
-            if isinstance(item, dict) and item.get("name") in {"5h", "weekly", "monthly", "30d"}:
-                spark_windows.append(_window(account, item, active_fast=False, pool="spark"))
+            if isinstance(item, dict) and item.get("name") in {
+                "5h",
+                "weekly",
+                "monthly",
+                "30d",
+            }:
+                spark_windows.append(
+                    _window(account, item, active_fast=False, pool="spark")
+                )
     spark_recommendation = "flex"
     if spark_windows:
-        spark_recommendation = "activate" if any(
-            item.get("deviation_from_limit_pp", 0) > FAST_START_THRESHOLD
-            and item.get("remaining_seconds", FAST_START_HORIZON_SECONDS + 1) <= FAST_START_HORIZON_SECONDS
-            for item in spark_windows
-        ) else "flex"
+        spark_recommendation = (
+            "activate"
+            if any(
+                item.get("deviation_from_limit_pp", 0) > FAST_START_THRESHOLD
+                and item.get("remaining_seconds", FAST_START_HORIZON_SECONDS + 1)
+                <= FAST_START_HORIZON_SECONDS
+                for item in spark_windows
+            )
+            else "flex"
+        )
     return {
         "account": account,
         "available": True,
@@ -253,7 +337,9 @@ def evaluate_account(account: str, *, active_fast: bool = False) -> dict[str, An
             "windows": spark_windows,
             "recommended_action": spark_recommendation,
         },
-        "recommended_action": "activate" if activate else ("keep_fast" if keep_fast else "flex"),
+        "recommended_action": "activate"
+        if activate
+        else ("keep_fast" if keep_fast else "flex"),
         "raw_output": "not_returned",
     }
 
@@ -266,7 +352,9 @@ def _write_state(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def _read_state_file(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
+def _read_state_file(
+    path: Path, default: dict[str, Any] | None = None
+) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
@@ -283,6 +371,7 @@ def _emergency_queen_lock():
     try:
         try:
             import fcntl
+
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         except (ImportError, OSError):
             # The state transition remains atomic; platforms without flock
@@ -292,6 +381,7 @@ def _emergency_queen_lock():
     finally:
         try:
             import fcntl
+
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except (ImportError, OSError):
             pass
@@ -302,7 +392,15 @@ def emergency_queen_status() -> dict[str, Any]:
     """Return the bounded, durable emergency-Queen state without secrets."""
     value = _read_state_file(EMERGENCY_QUEEN_STATE)
     state = value.get("state")
-    if state not in {"idle", "requested", "running", "finishing", "next", "draining", "blocked"}:
+    if state not in {
+        "idle",
+        "requested",
+        "running",
+        "finishing",
+        "next",
+        "draining",
+        "blocked",
+    }:
         state = "idle"
     generation = value.get("generation")
     if not isinstance(generation, int) or generation < 0:
@@ -314,25 +412,40 @@ def emergency_queen_status() -> dict[str, Any]:
     return {
         "state": state,
         "generation": generation,
-        "queen_agent": value.get("queen_agent") if isinstance(value.get("queen_agent"), str) else None,
-        "children": [item for item in value.get("children", [])[:32] if isinstance(item, str)]
-            if isinstance(value.get("children"), list) else [],
-        "current_plan": value.get("current_plan") if isinstance(value.get("current_plan"), str) else None,
+        "queen_agent": value.get("queen_agent")
+        if isinstance(value.get("queen_agent"), str)
+        else None,
+        "children": [
+            item for item in value.get("children", [])[:32] if isinstance(item, str)
+        ]
+        if isinstance(value.get("children"), list)
+        else [],
+        "current_plan": value.get("current_plan")
+        if isinstance(value.get("current_plan"), str)
+        else None,
         "plans": plans,
         "emergency_active": value.get("emergency_active") is True,
         "reason": value.get("reason") if isinstance(value.get("reason"), str) else None,
-        "blocked_reason": value.get("blocked_reason") if isinstance(value.get("blocked_reason"), str) else None,
+        "blocked_reason": value.get("blocked_reason")
+        if isinstance(value.get("blocked_reason"), str)
+        else None,
         "raw_output": "not_returned",
     }
 
 
 def _queen_candidates() -> list[str]:
-    plans_root = Path.home() / "Dokumente/Obsidian_Vaults/Teladi_Programming/Projekte/codex-master/Baupläne!"
+    plans_root = (
+        Path.home()
+        / "Dokumente/Obsidian_Vaults/Teladi_Programming/Projekte/codex-master/Baupläne!"
+    )
     candidates: list[str] = []
     try:
         for path in sorted(plans_root.glob("*.md"))[:256]:
             text = path.read_text(encoding="utf-8", errors="replace")[:32_000].lower()
-            if any(marker in text for marker in ("status: approved", "freigegeben", "in umsetzung")):
+            if any(
+                marker in text
+                for marker in ("status: approved", "freigegeben", "in umsetzung")
+            ):
                 candidates.append(str(path))
     except OSError:
         pass
@@ -340,9 +453,16 @@ def _queen_candidates() -> list[str]:
 
 
 def _queen_state_payload(
-    *, state: str, generation: int, reason: str, plans: list[str],
-    current_plan: str | None, emergency_active: bool, queen_agent: str | None = None,
-    blocked_reason: str | None = None, children: list[str] | None = None,
+    *,
+    state: str,
+    generation: int,
+    reason: str,
+    plans: list[str],
+    current_plan: str | None,
+    emergency_active: bool,
+    queen_agent: str | None = None,
+    blocked_reason: str | None = None,
+    children: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -354,7 +474,9 @@ def _queen_state_payload(
         "emergency_active": emergency_active,
         "queen_agent": queen_agent,
         "children": [item for item in (children or [])[:32] if isinstance(item, str)],
-        "blocked_reason": blocked_reason[:200] if isinstance(blocked_reason, str) else None,
+        "blocked_reason": blocked_reason[:200]
+        if isinstance(blocked_reason, str)
+        else None,
         "updated_at_utc": datetime.now(UTC).isoformat(),
     }
 
@@ -368,7 +490,9 @@ def set_emergency_display_override(
 ) -> dict[str, Any]:
     """Publish a bounded, reversible display override for the Cinnamon applet."""
     try:
-        current = json.loads(CODEX_USAGE_EMERGENCY_OVERRIDES.read_text(encoding="utf-8"))
+        current = json.loads(
+            CODEX_USAGE_EMERGENCY_OVERRIDES.read_text(encoding="utf-8")
+        )
     except (OSError, ValueError, TypeError):
         current = {}
     if not isinstance(current, dict):
@@ -377,16 +501,24 @@ def set_emergency_display_override(
         current[account] = {
             "active": True,
             "delta_enabled": True,
-            "limit_window": limit_window if limit_window in {"short", "weekly", "monthly", "spark"} else "short",
+            "limit_window": limit_window
+            if limit_window in {"short", "weekly", "monthly", "spark"}
+            else "short",
             "reason": reason[:200],
         }
     else:
         current.pop(account, None)
     _write_state(CODEX_USAGE_EMERGENCY_OVERRIDES, current)
-    return {"account": account, "active": enabled, "limit_window": current.get(account, {}).get("limit_window")}
+    return {
+        "account": account,
+        "active": enabled,
+        "limit_window": current.get(account, {}).get("limit_window"),
+    }
 
 
-def set_spark_priority(account: str, *, enabled: bool, reason: str = "") -> dict[str, Any]:
+def set_spark_priority(
+    account: str, *, enabled: bool, reason: str = ""
+) -> dict[str, Any]:
     """Reject retired activation; permit clearing old priority state."""
     if enabled:
         raise ValueError("spark_model_retired")
@@ -424,7 +556,12 @@ def preferred_delta_window(payload: dict[str, Any], *, pool: str = "main") -> st
         if isinstance(payload.get("monthly"), dict):
             windows = list(windows) + [payload["monthly"]]
     names = {item.get("name") for item in windows if isinstance(item, dict)}
-    for candidate in (("5h", "short"), ("weekly", "weekly"), ("monthly", "monthly"), ("30d", "monthly")):
+    for candidate in (
+        ("5h", "short"),
+        ("weekly", "weekly"),
+        ("monthly", "monthly"),
+        ("30d", "monthly"),
+    ):
         if candidate[0] in names:
             return candidate[1]
     return "short"
@@ -435,13 +572,22 @@ def request_emergency_queen_work(*, reason: str) -> dict[str, Any]:
     with _emergency_queen_lock():
         current = emergency_queen_status()
         if current["state"] in EMERGENCY_QUEEN_ACTIVE_STATES:
-            return {"queued": False, "duplicate": True, "state": current, "raw_output": "not_returned"}
+            return {
+                "queued": False,
+                "duplicate": True,
+                "state": current,
+                "raw_output": "not_returned",
+            }
         candidates = _queen_candidates()
         generation = int(current["generation"]) + 1
         selected = secrets.choice(candidates) if candidates else None
         state = _queen_state_payload(
-            state="requested", generation=generation, reason=reason,
-            plans=candidates, current_plan=selected, emergency_active=True,
+            state="requested",
+            generation=generation,
+            reason=reason,
+            plans=candidates,
+            current_plan=selected,
+            emergency_active=True,
         )
         _write_state(EMERGENCY_QUEEN_STATE, state)
         request = {
@@ -458,21 +604,39 @@ def request_emergency_queen_work(*, reason: str) -> dict[str, Any]:
             "generation": generation,
         }
         _write_state(EMERGENCY_QUEEN_REQUEST, request)
-        return {"queued": True, "duplicate": False, "candidate_count": len(candidates), "state": emergency_queen_status(), "raw_output": "not_returned"}
+        return {
+            "queued": True,
+            "duplicate": False,
+            "candidate_count": len(candidates),
+            "state": emergency_queen_status(),
+            "raw_output": "not_returned",
+        }
 
 
 def set_emergency_queen_running(generation: int, agent: str) -> dict[str, Any]:
     with _emergency_queen_lock():
         current = emergency_queen_status()
-        if current["generation"] != generation or current["state"] not in {"requested", "blocked"}:
+        if current["generation"] != generation or current["state"] not in {
+            "requested",
+            "blocked",
+        }:
             return {"updated": False, "state": current, "raw_output": "not_returned"}
         payload = _queen_state_payload(
-            state="running", generation=generation, reason=current["reason"] or "Notfallmodus",
-            plans=current["plans"], current_plan=current["current_plan"],
-            emergency_active=True, queen_agent=agent, children=current["children"],
+            state="running",
+            generation=generation,
+            reason=current["reason"] or "Notfallmodus",
+            plans=current["plans"],
+            current_plan=current["current_plan"],
+            emergency_active=True,
+            queen_agent=agent,
+            children=current["children"],
         )
         _write_state(EMERGENCY_QUEEN_STATE, payload)
-        return {"updated": True, "state": emergency_queen_status(), "raw_output": "not_returned"}
+        return {
+            "updated": True,
+            "state": emergency_queen_status(),
+            "raw_output": "not_returned",
+        }
 
 
 def set_emergency_queen_blocked(generation: int, reason: str) -> dict[str, Any]:
@@ -481,20 +645,35 @@ def set_emergency_queen_blocked(generation: int, reason: str) -> dict[str, Any]:
         if current["generation"] != generation:
             return {"updated": False, "state": current, "raw_output": "not_returned"}
         payload = _queen_state_payload(
-            state="blocked", generation=generation, reason=current["reason"] or "Notfallmodus",
-            plans=current["plans"], current_plan=current["current_plan"],
-            emergency_active=True, queen_agent=current["queen_agent"], blocked_reason=reason,
+            state="blocked",
+            generation=generation,
+            reason=current["reason"] or "Notfallmodus",
+            plans=current["plans"],
+            current_plan=current["current_plan"],
+            emergency_active=True,
+            queen_agent=current["queen_agent"],
+            blocked_reason=reason,
             children=current["children"],
         )
         _write_state(EMERGENCY_QUEEN_STATE, payload)
-        return {"updated": True, "state": emergency_queen_status(), "raw_output": "not_returned"}
+        return {
+            "updated": True,
+            "state": emergency_queen_status(),
+            "raw_output": "not_returned",
+        }
 
 
-def advance_emergency_queen(generation: int, *, emergency_active: bool, completed_plan: str) -> dict[str, Any]:
+def advance_emergency_queen(
+    generation: int, *, emergency_active: bool, completed_plan: str
+) -> dict[str, Any]:
     """Advance one completed plan or drain the Queen after emergency mode."""
     with _emergency_queen_lock():
         current = emergency_queen_status()
-        if current["generation"] != generation or current["state"] not in {"running", "finishing", "next"}:
+        if current["generation"] != generation or current["state"] not in {
+            "running",
+            "finishing",
+            "next",
+        }:
             return {"updated": False, "state": current, "raw_output": "not_returned"}
         remaining = [plan for plan in current["plans"] if plan != completed_plan]
         if emergency_active and remaining:
@@ -506,12 +685,21 @@ def advance_emergency_queen(generation: int, *, emergency_active: bool, complete
             state = "draining"
             active = False
         payload = _queen_state_payload(
-            state=state, generation=generation, reason=current["reason"] or "Notfallmodus",
-            plans=remaining, current_plan=next_plan, emergency_active=active,
-            queen_agent=current["queen_agent"], children=current["children"],
+            state=state,
+            generation=generation,
+            reason=current["reason"] or "Notfallmodus",
+            plans=remaining,
+            current_plan=next_plan,
+            emergency_active=active,
+            queen_agent=current["queen_agent"],
+            children=current["children"],
         )
         _write_state(EMERGENCY_QUEEN_STATE, payload)
-        return {"updated": True, "state": emergency_queen_status(), "raw_output": "not_returned"}
+        return {
+            "updated": True,
+            "state": emergency_queen_status(),
+            "raw_output": "not_returned",
+        }
 
 
 def finish_emergency_queen(generation: int) -> dict[str, Any]:
@@ -520,70 +708,145 @@ def finish_emergency_queen(generation: int) -> dict[str, Any]:
         if current["generation"] != generation:
             return {"updated": False, "state": current, "raw_output": "not_returned"}
         payload = _queen_state_payload(
-            state="idle", generation=generation, reason=current["reason"] or "Notfallmodus beendet",
-            plans=[], current_plan=None, emergency_active=False,
+            state="idle",
+            generation=generation,
+            reason=current["reason"] or "Notfallmodus beendet",
+            plans=[],
+            current_plan=None,
+            emergency_active=False,
             children=[],
         )
         _write_state(EMERGENCY_QUEEN_STATE, payload)
-        _write_state(EMERGENCY_QUEEN_REQUEST, {"active": False, "generation": generation})
-        return {"updated": True, "state": emergency_queen_status(), "raw_output": "not_returned"}
+        _write_state(
+            EMERGENCY_QUEEN_REQUEST, {"active": False, "generation": generation}
+        )
+        return {
+            "updated": True,
+            "state": emergency_queen_status(),
+            "raw_output": "not_returned",
+        }
 
 
 def register_emergency_queen_child(generation: int, agent: str) -> dict[str, Any]:
     """Persist one managed child so draining waits for it as well."""
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
-        return {"updated": False, "reason": "invalid_generation", "raw_output": "not_returned"}
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        return {
+            "updated": False,
+            "reason": "invalid_generation",
+            "raw_output": "not_returned",
+        }
     if not isinstance(agent, str) or not agent or len(agent) > 128:
-        return {"updated": False, "reason": "invalid_agent", "raw_output": "not_returned"}
+        return {
+            "updated": False,
+            "reason": "invalid_agent",
+            "raw_output": "not_returned",
+        }
     with _emergency_queen_lock():
         current = emergency_queen_status()
-        if current["generation"] != generation or current["state"] not in EMERGENCY_QUEEN_ACTIVE_STATES:
+        if (
+            current["generation"] != generation
+            or current["state"] not in EMERGENCY_QUEEN_ACTIVE_STATES
+        ):
             return {"updated": False, "state": current, "raw_output": "not_returned"}
         children = list(current["children"])
         if agent not in children:
             children.append(agent)
         payload = _queen_state_payload(
-            state=current["state"], generation=generation,
-            reason=current["reason"] or "Notfallmodus", plans=current["plans"],
-            current_plan=current["current_plan"], emergency_active=current["emergency_active"],
-            queen_agent=current["queen_agent"], blocked_reason=current["blocked_reason"],
+            state=current["state"],
+            generation=generation,
+            reason=current["reason"] or "Notfallmodus",
+            plans=current["plans"],
+            current_plan=current["current_plan"],
+            emergency_active=current["emergency_active"],
+            queen_agent=current["queen_agent"],
+            blocked_reason=current["blocked_reason"],
             children=children,
         )
         _write_state(EMERGENCY_QUEEN_STATE, payload)
-        return {"updated": True, "state": emergency_queen_status(), "raw_output": "not_returned"}
+        return {
+            "updated": True,
+            "state": emergency_queen_status(),
+            "raw_output": "not_returned",
+        }
 
 
 def unregister_emergency_queen_child(generation: int, agent: str) -> dict[str, Any]:
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
-        return {"updated": False, "reason": "invalid_generation", "raw_output": "not_returned"}
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        return {
+            "updated": False,
+            "reason": "invalid_generation",
+            "raw_output": "not_returned",
+        }
     with _emergency_queen_lock():
         current = emergency_queen_status()
         if current["generation"] != generation:
             return {"updated": False, "state": current, "raw_output": "not_returned"}
         children = [item for item in current["children"] if item != agent]
         payload = _queen_state_payload(
-            state=current["state"], generation=generation,
-            reason=current["reason"] or "Notfallmodus", plans=current["plans"],
-            current_plan=current["current_plan"], emergency_active=current["emergency_active"],
-            queen_agent=current["queen_agent"], blocked_reason=current["blocked_reason"],
+            state=current["state"],
+            generation=generation,
+            reason=current["reason"] or "Notfallmodus",
+            plans=current["plans"],
+            current_plan=current["current_plan"],
+            emergency_active=current["emergency_active"],
+            queen_agent=current["queen_agent"],
+            blocked_reason=current["blocked_reason"],
             children=children,
         )
         _write_state(EMERGENCY_QUEEN_STATE, payload)
-        return {"updated": True, "state": emergency_queen_status(), "raw_output": "not_returned"}
+        return {
+            "updated": True,
+            "state": emergency_queen_status(),
+            "raw_output": "not_returned",
+        }
 
 
-def emergency_recommendation(evaluation: dict[str, Any], *, active_fast: bool = False) -> str:
+def emergency_recommendation(
+    evaluation: dict[str, Any], *, active_fast: bool = False
+) -> str:
     """Cheap 10-minute guard for the final weekly-window regime."""
     tracker = evaluation.get("five_hour_tracker", {})
-    weekly = next((item for item in evaluation.get("weekly_monthly", []) if item.get("window") == "weekly"), {})
+    weekly = next(
+        (
+            item
+            for item in evaluation.get("weekly_monthly", [])
+            if item.get("window") == "weekly"
+        ),
+        {},
+    )
     five = evaluation.get("five_hour_projection", {})
     used = weekly.get("used_percent")
     count = tracker.get("five_hour_windows_until_weekly_reset")
-    hot = isinstance(used, (int, float)) and used >= HOT_WEEKLY_USED_PERCENT and isinstance(count, int) and count <= HOT_WEEKLY_WINDOWS
-    weekly_hot = isinstance(weekly.get("deviation_from_limit_pp"), (int, float)) and weekly["deviation_from_limit_pp"] > HOT_PER_WINDOW_PERCENT
-    five_hot = isinstance(five.get("deviation_from_limit_pp"), (int, float)) and five["deviation_from_limit_pp"] > FAST_START_THRESHOLD
+    hot = (
+        isinstance(used, (int, float))
+        and used >= HOT_WEEKLY_USED_PERCENT
+        and isinstance(count, int)
+        and count <= HOT_WEEKLY_WINDOWS
+    )
+    weekly_hot = (
+        isinstance(weekly.get("deviation_from_limit_pp"), (int, float))
+        and weekly["deviation_from_limit_pp"] > HOT_PER_WINDOW_PERCENT
+    )
+    five_hot = (
+        isinstance(five.get("deviation_from_limit_pp"), (int, float))
+        and five["deviation_from_limit_pp"] > FAST_START_THRESHOLD
+    )
     if active_fast:
-        weekly_stop = isinstance(weekly.get("deviation_from_limit_pp"), (int, float)) and weekly["deviation_from_limit_pp"] <= FAST_STOP_THRESHOLD
-        five_stop = isinstance(five.get("deviation_from_limit_pp"), (int, float)) and five["deviation_from_limit_pp"] <= FAST_STOP_THRESHOLD
+        weekly_stop = (
+            isinstance(weekly.get("deviation_from_limit_pp"), (int, float))
+            and weekly["deviation_from_limit_pp"] <= FAST_STOP_THRESHOLD
+        )
+        five_stop = (
+            isinstance(five.get("deviation_from_limit_pp"), (int, float))
+            and five["deviation_from_limit_pp"] <= FAST_STOP_THRESHOLD
+        )
         return "flex" if weekly_stop and five_stop else "keep_fast"
     return "activate" if hot and (weekly_hot or five_hot) else "flex"

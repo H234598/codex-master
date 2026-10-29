@@ -61,7 +61,10 @@ def _container_name(node: Node) -> str | None:
                 return name
         if current.type == "object":
             parent = current.parent
-            if parent is not None and parent.type in {"assignment_expression", "variable_declarator"}:
+            if parent is not None and parent.type in {
+                "assignment_expression",
+                "variable_declarator",
+            }:
                 field = "left" if parent.type == "assignment_expression" else "name"
                 name = _node_text(parent.child_by_field_name(field))
                 if name:
@@ -88,7 +91,11 @@ def _dependency_digest(node: Node) -> str:
     stack = [node]
     while stack:
         current = stack.pop()
-        if current.type in {"identifier", "property_identifier", "private_property_identifier"}:
+        if current.type in {
+            "identifier",
+            "property_identifier",
+            "private_property_identifier",
+        }:
             rows.add(f"{current.type}:{_node_text(current)}")
         stack.extend(current.named_children)
     return _digest("\n".join(sorted(rows)))
@@ -101,7 +108,11 @@ def _assertion_digest(callback: Node) -> str:
         current = stack.pop()
         if current.type == "call_expression":
             called = _node_text(current.child_by_field_name("function"))
-            if called == "assert" or called.startswith("assert.") or ".assert" in called:
+            if (
+                called == "assert"
+                or called.startswith("assert.")
+                or ".assert" in called
+            ):
                 assertions.append(current.text)
         stack.extend(current.named_children)
     if not assertions:
@@ -186,7 +197,10 @@ class JavaScriptTestIndexBuilder:
         for test_id in sorted(tests):
             path, node_id, callback = tests[test_id]
             strictest = max(
-                (by_function[function_id]["cooldown_class"] for function_id in covers[test_id]),
+                (
+                    by_function[function_id]["cooldown_class"]
+                    for function_id in covers[test_id]
+                ),
                 key=_COOLDOWN_RANK.__getitem__,
             )
             metadata = test_meta.get(test_id, {})
@@ -207,7 +221,8 @@ class JavaScriptTestIndexBuilder:
                 }
             )
         source_rows = "\n".join(
-            f"{entry['function_id']}:{entry['source_digest']}" for entry in function_entries
+            f"{entry['function_id']}:{entry['source_digest']}"
+            for entry in function_entries
         )
         test_rows = "\n".join(
             f"{entry['test_id']}:{entry['test_digest']}:{entry['assertion_digest']}"
@@ -269,7 +284,9 @@ class JavaScriptTestIndexBuilder:
             raise TestIndexError("test.index_invalid")
         return inventory
 
-    def _inventory_tests(self, paths: Sequence[str]) -> dict[str, tuple[str, str, Node]]:
+    def _inventory_tests(
+        self, paths: Sequence[str]
+    ) -> dict[str, tuple[str, str, Node]]:
         inventory: dict[str, tuple[str, str, Node]] = {}
         for path in self._paths(paths):
             _, root = self._parse(path)
@@ -280,9 +297,16 @@ class JavaScriptTestIndexBuilder:
                     called = _node_text(node.child_by_field_name("function"))
                     arguments = node.child_by_field_name("arguments")
                     named = arguments.named_children if arguments is not None else []
-                    if called in {"test", "it"} and len(named) >= 2 and named[0].type == "string":
+                    if (
+                        called in {"test", "it"}
+                        and len(named) >= 2
+                        and named[0].type == "string"
+                    ):
                         callback = named[1]
-                        if callback.type not in {"arrow_function", "function_expression"}:
+                        if callback.type not in {
+                            "arrow_function",
+                            "function_expression",
+                        }:
                             raise TestIndexError("test.test_uncollectable")
                         node_id = _string_literal(named[0])
                         test_id = f"node_test:{path}:{node_id}"

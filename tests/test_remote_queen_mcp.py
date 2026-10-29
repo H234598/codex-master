@@ -119,7 +119,9 @@ def _vector():
         None,
         None,
         (),
-        McpGatewayAttestationV1(False, False, False, False, False, False, False, False, False, False),
+        McpGatewayAttestationV1(
+            False, False, False, False, False, False, False, False, False, False
+        ),
     )
     plan = plan_remote_queen_mcp(manifest, StaticOperations(before))
     return {
@@ -138,7 +140,9 @@ def _vector():
 def _desired_fact(data, *, attestation=None, **changes):
     manifest = data["manifest"]
     if attestation is None:
-        attestation = McpGatewayAttestationV1(True, True, True, True, True, True, True, True, True, True)
+        attestation = McpGatewayAttestationV1(
+            True, True, True, True, True, True, True, True, True, True
+        )
     fact = RemoteMcpFactV1(
         RemoteMcpStateKindV1.OWNED,
         manifest.desired_generation.generation,
@@ -211,7 +215,11 @@ def test_closed_contract_types_constants_and_enum_values_are_immutable():
     assert ADMIN_AUTHORITY_ID == "masterjet-control"
     assert ADMIN_CONTRACT_NAME == "AdminRequestV1"
     assert ADMIN_TRANSPORT == "authenticated-https-admin"
-    assert [item.value for item in RemoteMcpStateKindV1] == ["absent", "owned", "foreign"]
+    assert [item.value for item in RemoteMcpStateKindV1] == [
+        "absent",
+        "owned",
+        "foreign",
+    ]
     assert [item.value for item in RemoteMcpActionV1] == [
         "create-configuration",
         "replace-owned-configuration",
@@ -222,16 +230,102 @@ def test_closed_contract_types_constants_and_enum_values_are_immutable():
         "read-only-once",
     ]
     expected_fields = {
-        CanonicalMcpToolBindingV1: ["tool_name", "input_schema_sha256", "required_scopes", "read_only", "retry_class", "admin_operation"],
-        CentralAdminAuthorityRefV1: ["authority_id", "contract_name", "contract_generation", "transport", "operation_names", "authority_digest"],
-        McpPrincipalBindingV1: ["principal_id", "repo_id", "topic_id", "role", "authority_generation", "scopes", "binding_digest"],
-        McpCredentialBindingV1: ["ca_bundle_sha256", "mtls_identity_sha256", "capability_sha256", "capability_generation", "max_ttl_seconds", "binding_digest"],
-        McpGatewayAttestationV1: ["initialize_ok", "tools_list_ok", "request_id_bound", "replay_rejected", "cancellation_supported", "retry_classification_enforced", "request_size_enforced", "response_size_enforced", "revocation_enforced", "redaction_enforced"],
-        RemoteMcpFactV1: ["state", "generation", "owner_principal_id", "endpoint_url", "config_manifest_digest", "catalog_sha256", "principal_binding_digest", "credential_binding_digest", "admin_authority_digest", "tool_schema_digests", "attestation"],
-        RemoteQueenMcpManifestV1: ["schema_version", "desired_generation", "catalog_generation", "endpoint_url", "server_name", "transport", "required", "startup_timeout_ms", "tool_timeout_ms", "max_request_bytes", "max_response_bytes", "request_id_required", "replay_rejection_required", "cancellation_required", "revocation_required", "redaction_required", "principal", "credentials", "tools", "admin_authority", "manifest_digest"],
-        RemoteQueenMcpPlanV1: ["schema_version", "manifest", "before", "before_digest", "action", "remove_own_configuration_on_rollback", "plan_digest"],
+        CanonicalMcpToolBindingV1: [
+            "tool_name",
+            "input_schema_sha256",
+            "required_scopes",
+            "read_only",
+            "retry_class",
+            "admin_operation",
+        ],
+        CentralAdminAuthorityRefV1: [
+            "authority_id",
+            "contract_name",
+            "contract_generation",
+            "transport",
+            "operation_names",
+            "authority_digest",
+        ],
+        McpPrincipalBindingV1: [
+            "principal_id",
+            "repo_id",
+            "topic_id",
+            "role",
+            "authority_generation",
+            "scopes",
+            "binding_digest",
+        ],
+        McpCredentialBindingV1: [
+            "ca_bundle_sha256",
+            "mtls_identity_sha256",
+            "capability_sha256",
+            "capability_generation",
+            "max_ttl_seconds",
+            "binding_digest",
+        ],
+        McpGatewayAttestationV1: [
+            "initialize_ok",
+            "tools_list_ok",
+            "request_id_bound",
+            "replay_rejected",
+            "cancellation_supported",
+            "retry_classification_enforced",
+            "request_size_enforced",
+            "response_size_enforced",
+            "revocation_enforced",
+            "redaction_enforced",
+        ],
+        RemoteMcpFactV1: [
+            "state",
+            "generation",
+            "owner_principal_id",
+            "endpoint_url",
+            "config_manifest_digest",
+            "catalog_sha256",
+            "principal_binding_digest",
+            "credential_binding_digest",
+            "admin_authority_digest",
+            "tool_schema_digests",
+            "attestation",
+        ],
+        RemoteQueenMcpManifestV1: [
+            "schema_version",
+            "desired_generation",
+            "catalog_generation",
+            "endpoint_url",
+            "server_name",
+            "transport",
+            "required",
+            "startup_timeout_ms",
+            "tool_timeout_ms",
+            "max_request_bytes",
+            "max_response_bytes",
+            "request_id_required",
+            "replay_rejection_required",
+            "cancellation_required",
+            "revocation_required",
+            "redaction_required",
+            "principal",
+            "credentials",
+            "tools",
+            "admin_authority",
+            "manifest_digest",
+        ],
+        RemoteQueenMcpPlanV1: [
+            "schema_version",
+            "manifest",
+            "before",
+            "before_digest",
+            "action",
+            "remove_own_configuration_on_rollback",
+            "plan_digest",
+        ],
         ApplyRemoteQueenMcpRequestV1: ["plan", "expected_plan_digest"],
-        RemoteQueenMcpApplyJournalV1: ["before_digest", "created_generation", "resulting_fact_digest"],
+        RemoteQueenMcpApplyJournalV1: [
+            "before_digest",
+            "created_generation",
+            "resulting_fact_digest",
+        ],
         RemoteQueenMcpApplyResultV1: ["changed", "fact", "journal"],
         VerifyRemoteQueenMcpRequestV1: ["plan", "expected_plan_digest"],
         RemoteQueenMcpVerifyResultV1: ["verified", "fact"],
@@ -244,28 +338,34 @@ def test_closed_contract_types_constants_and_enum_values_are_immutable():
     data = _vector()
     with pytest.raises(FrozenInstanceError):
         data["manifest"].endpoint_url = "https://other.example.test/mcp"
-    assert _error_code(
-        McpCredentialBindingV1,
-        "sha256:" + "e" * 64,
-        "sha256:" + "f" * 64,
-        "sha256:" + "1" * 64,
-        data["desired_generation"],
-        True,
-        data["credentials"].binding_digest,
-    ) == "RQ_E_PLAN_INCONSISTENT"
-    assert _error_code(
-        McpGatewayAttestationV1,
-        1,
-        True,
-        True,
-        True,
-        True,
-        True,
-        True,
-        True,
-        True,
-        True,
-    ) == "RQ_E_PLAN_INCONSISTENT"
+    assert (
+        _error_code(
+            McpCredentialBindingV1,
+            "sha256:" + "e" * 64,
+            "sha256:" + "f" * 64,
+            "sha256:" + "1" * 64,
+            data["desired_generation"],
+            True,
+            data["credentials"].binding_digest,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
+    assert (
+        _error_code(
+            McpGatewayAttestationV1,
+            1,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
 
 
 def test_every_public_builder_and_operation_function_is_exercised_by_vector():
@@ -278,26 +378,64 @@ def test_every_public_builder_and_operation_function_is_exercised_by_vector():
     assert data["plan"].plan_digest.startswith("sha256:")
     operations = StaticOperations(data["before"], apply_fact=_desired_fact(data))
     request = ApplyRemoteQueenMcpRequestV1(data["plan"], data["plan"].plan_digest)
-    assert isinstance(apply_remote_queen_mcp(request, operations), RemoteQueenMcpApplyResultV1)
-    verify_request = VerifyRemoteQueenMcpRequestV1(data["plan"], data["plan"].plan_digest)
+    assert isinstance(
+        apply_remote_queen_mcp(request, operations), RemoteQueenMcpApplyResultV1
+    )
+    verify_request = VerifyRemoteQueenMcpRequestV1(
+        data["plan"], data["plan"].plan_digest
+    )
     verify_operations = StaticOperations(data["before"])
-    assert _error_code(verify_remote_queen_mcp, verify_request, verify_operations) == "RQ_E_MCP_UNAVAILABLE"
-    rollback_request = RollbackRemoteQueenMcpRequestV1(data["plan"], data["plan"].plan_digest, None)
+    assert (
+        _error_code(verify_remote_queen_mcp, verify_request, verify_operations)
+        == "RQ_E_MCP_UNAVAILABLE"
+    )
+    rollback_request = RollbackRemoteQueenMcpRequestV1(
+        data["plan"], data["plan"].plan_digest, None
+    )
     rollback_operations = StaticOperations(data["before"])
-    assert _error_code(rollback_remote_queen_mcp, rollback_request, rollback_operations) == "RQ_E_ROLLBACK_DRIFT"
+    assert (
+        _error_code(rollback_remote_queen_mcp, rollback_request, rollback_operations)
+        == "RQ_E_ROLLBACK_DRIFT"
+    )
 
 
 def test_canonical_digest_vector_matches_literal_attested_values():
     data = _vector()
-    assert data["principal"].binding_digest == "sha256:e8b8b123952d2c340153a8ac72dcf309dfb6ac4b1137f18949d010c861c33472"
-    assert data["authority"].authority_digest == "sha256:eeebf3870c30f76ad08b9d23ea33eec84b4702d2108322dcfe9839b0b5139ca0"
-    assert data["credentials"].binding_digest == "sha256:c8efc1ea986cf0ce0365c696ee9c8cd5ce504a321a10d26ad4cda871854e0b23"
-    assert data["manifest"].manifest_digest == "sha256:2df182841ca009004d0e9bb5b83ce70d413e967066843aeabc23bc0a27b81398"
-    assert remote_mcp_fact_digest(data["before"]) == "sha256:4de4c445c13b21d4285e2ae6f9250b04dd967b492e4e415b5d6446df131f15f9"
-    assert data["plan"].before_digest == "sha256:4de4c445c13b21d4285e2ae6f9250b04dd967b492e4e415b5d6446df131f15f9"
-    assert data["plan"].plan_digest == "sha256:b115f1fec98cd54e936384774100986896fa50518c86f7af4d5f83f79fbbe3f1"
-    assert canonical_json_bytes({"z": "ä", "a": (True, None, 4)}) == '{"a":[true,null,4],"z":"ä"}'.encode("utf-8")
-    assert canonical_digest(("remote", 4)) == "sha256:c1b7c32f0ac50a65ad1df9821f1801852a5c9da3f1a42990c52dc51a2eb1471f"
+    assert (
+        data["principal"].binding_digest
+        == "sha256:e8b8b123952d2c340153a8ac72dcf309dfb6ac4b1137f18949d010c861c33472"
+    )
+    assert (
+        data["authority"].authority_digest
+        == "sha256:eeebf3870c30f76ad08b9d23ea33eec84b4702d2108322dcfe9839b0b5139ca0"
+    )
+    assert (
+        data["credentials"].binding_digest
+        == "sha256:c8efc1ea986cf0ce0365c696ee9c8cd5ce504a321a10d26ad4cda871854e0b23"
+    )
+    assert (
+        data["manifest"].manifest_digest
+        == "sha256:2df182841ca009004d0e9bb5b83ce70d413e967066843aeabc23bc0a27b81398"
+    )
+    assert (
+        remote_mcp_fact_digest(data["before"])
+        == "sha256:4de4c445c13b21d4285e2ae6f9250b04dd967b492e4e415b5d6446df131f15f9"
+    )
+    assert (
+        data["plan"].before_digest
+        == "sha256:4de4c445c13b21d4285e2ae6f9250b04dd967b492e4e415b5d6446df131f15f9"
+    )
+    assert (
+        data["plan"].plan_digest
+        == "sha256:b115f1fec98cd54e936384774100986896fa50518c86f7af4d5f83f79fbbe3f1"
+    )
+    assert canonical_json_bytes(
+        {"z": "ä", "a": (True, None, 4)}
+    ) == '{"a":[true,null,4],"z":"ä"}'.encode("utf-8")
+    assert (
+        canonical_digest(("remote", 4))
+        == "sha256:c1b7c32f0ac50a65ad1df9821f1801852a5c9da3f1a42990c52dc51a2eb1471f"
+    )
 
 
 def test_digest_changes_for_security_fields_and_sorted_equivalents_remain_equal():
@@ -331,12 +469,26 @@ def test_digest_changes_for_security_fields_and_sorted_equivalents_remain_equal(
         data["manifest"].admin_authority,
     )
     assert changed_manifest.manifest_digest != data["manifest"].manifest_digest
-    assert _error_code(replace, data["principal"], scopes=("fleet.read",), binding_digest=data["principal"].binding_digest) == "RQ_E_PLAN_INCONSISTENT"
-    assert _error_code(
-        canonical_json_bytes,
-        {1: "non-string-key"},
-    ) == "RQ_E_PLAN_INCONSISTENT"
-    assert _error_code(canonical_json_bytes, ["lists-not-tuples"]) == "RQ_E_PLAN_INCONSISTENT"
+    assert (
+        _error_code(
+            replace,
+            data["principal"],
+            scopes=("fleet.read",),
+            binding_digest=data["principal"].binding_digest,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
+    assert (
+        _error_code(
+            canonical_json_bytes,
+            {1: "non-string-key"},
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
+    assert (
+        _error_code(canonical_json_bytes, ["lists-not-tuples"])
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
     assert _error_code(canonical_json_bytes, b"bytes") == "RQ_E_PLAN_INCONSISTENT"
     assert _error_code(canonical_json_bytes, float("nan")) == "RQ_E_PLAN_INCONSISTENT"
     assert _error_code(canonical_json_bytes, float("inf")) == "RQ_E_PLAN_INCONSISTENT"
@@ -394,16 +546,19 @@ def test_endpoint_parser_accepts_only_valid_https_dns_mcp_endpoints(endpoint):
 )
 def test_endpoint_parser_rejects_transport_path_and_secret_tricks(endpoint):
     data = _vector()
-    assert _error_code(
-        build_remote_queen_mcp_manifest,
-        data["manifest"].desired_generation,
-        data["manifest"].catalog_generation,
-        endpoint,
-        data["manifest"].principal,
-        data["manifest"].credentials,
-        data["manifest"].tools,
-        data["manifest"].admin_authority,
-    ) == "RQ_E_PLAN_INCONSISTENT"
+    assert (
+        _error_code(
+            build_remote_queen_mcp_manifest,
+            data["manifest"].desired_generation,
+            data["manifest"].catalog_generation,
+            endpoint,
+            data["manifest"].principal,
+            data["manifest"].credentials,
+            data["manifest"].tools,
+            data["manifest"].admin_authority,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
 
 
 @pytest.mark.parametrize(
@@ -424,26 +579,33 @@ def test_endpoint_parser_rejects_transport_path_and_secret_tricks(endpoint):
 def test_endpoint_parser_rejects_legacy_numeric_ipv4_literals(host):
     data = _vector()
 
-    assert _error_code(
-        build_remote_queen_mcp_manifest,
-        data["manifest"].desired_generation,
-        data["manifest"].catalog_generation,
-        f"https://{host}/mcp",
-        data["manifest"].principal,
-        data["manifest"].credentials,
-        data["manifest"].tools,
-        data["manifest"].admin_authority,
-    ) == "RQ_E_PLAN_INCONSISTENT"
+    assert (
+        _error_code(
+            build_remote_queen_mcp_manifest,
+            data["manifest"].desired_generation,
+            data["manifest"].catalog_generation,
+            f"https://{host}/mcp",
+            data["manifest"].principal,
+            data["manifest"].credentials,
+            data["manifest"].tools,
+            data["manifest"].admin_authority,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
 
 
 def test_secret_canaries_are_rejected_without_entering_repr_json_errors_or_digest():
     canary = "CANARY_PRIVATE_KEY_BEARER_COOKIE_HTTP_BODY"
     generation = _generation("capability", "2")
     with pytest.raises(RemoteQueenBootstrapError) as caught:
-        build_mcp_credential_binding(canary, "sha256:" + "f" * 64, "sha256:" + "1" * 64, generation)
+        build_mcp_credential_binding(
+            canary, "sha256:" + "f" * 64, "sha256:" + "1" * 64, generation
+        )
     assert canary not in repr(caught.value)
     assert canary not in str(caught.value)
-    assert canary not in canonical_json_bytes({"redacted": "sha256:" + "a" * 64}).decode()
+    assert (
+        canary not in canonical_json_bytes({"redacted": "sha256:" + "a" * 64}).decode()
+    )
     assert canary not in canonical_digest(("redacted", "sha256:" + "a" * 64))
 
 
@@ -497,60 +659,77 @@ def test_canonical_json_rejects_nested_mixed_case_private_key_canary():
 def test_catalog_scope_retry_and_admin_authority_rules_fail_closed():
     data = _vector()
     unsorted_tools = tuple(reversed(data["tools"]))
-    assert _error_code(
-        build_remote_queen_mcp_manifest,
-        data["manifest"].desired_generation,
-        data["manifest"].catalog_generation,
-        data["manifest"].endpoint_url,
-        data["manifest"].principal,
-        data["manifest"].credentials,
-        unsorted_tools,
-        data["manifest"].admin_authority,
-    ) == "RQ_E_PLAN_INCONSISTENT"
+    assert (
+        _error_code(
+            build_remote_queen_mcp_manifest,
+            data["manifest"].desired_generation,
+            data["manifest"].catalog_generation,
+            data["manifest"].endpoint_url,
+            data["manifest"].principal,
+            data["manifest"].credentials,
+            unsorted_tools,
+            data["manifest"].admin_authority,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
     narrow_principal = build_mcp_principal_binding(
         "queen-g18",
         data["principal"].authority_generation,
         ("fleet.read",),
     )
-    assert _error_code(
-        build_remote_queen_mcp_manifest,
-        data["manifest"].desired_generation,
-        data["manifest"].catalog_generation,
-        data["manifest"].endpoint_url,
-        narrow_principal,
-        data["manifest"].credentials,
-        data["manifest"].tools,
-        data["manifest"].admin_authority,
-    ) == "RQ_E_MCP_SCOPE"
-    assert _error_code(
-        CanonicalMcpToolBindingV1,
-        "write_tool",
-        "sha256:" + "5" * 64,
-        ("fleet.read",),
-        False,
-        McpRetryClassV1.READ_ONLY_ONCE,
-        None,
-    ) == "RQ_E_MCP_SCOPE"
-    assert _error_code(
-        CanonicalMcpToolBindingV1,
-        "write_tool",
-        "sha256:" + "5" * 64,
-        ("fleet.read",),
-        False,
-        McpRetryClassV1.PRE_DISPATCH_ONLY,
-        None,
-    ) == "RQ_E_MCP_SCOPE"
-    missing_admin = build_admin_authority_ref(data["authority"].contract_generation, ("other.operation",))
-    assert _error_code(
-        build_remote_queen_mcp_manifest,
-        data["manifest"].desired_generation,
-        data["manifest"].catalog_generation,
-        data["manifest"].endpoint_url,
-        data["principal"],
-        data["credentials"],
-        data["tools"],
-        missing_admin,
-    ) == "RQ_E_MCP_SCOPE"
+    assert (
+        _error_code(
+            build_remote_queen_mcp_manifest,
+            data["manifest"].desired_generation,
+            data["manifest"].catalog_generation,
+            data["manifest"].endpoint_url,
+            narrow_principal,
+            data["manifest"].credentials,
+            data["manifest"].tools,
+            data["manifest"].admin_authority,
+        )
+        == "RQ_E_MCP_SCOPE"
+    )
+    assert (
+        _error_code(
+            CanonicalMcpToolBindingV1,
+            "write_tool",
+            "sha256:" + "5" * 64,
+            ("fleet.read",),
+            False,
+            McpRetryClassV1.READ_ONLY_ONCE,
+            None,
+        )
+        == "RQ_E_MCP_SCOPE"
+    )
+    assert (
+        _error_code(
+            CanonicalMcpToolBindingV1,
+            "write_tool",
+            "sha256:" + "5" * 64,
+            ("fleet.read",),
+            False,
+            McpRetryClassV1.PRE_DISPATCH_ONLY,
+            None,
+        )
+        == "RQ_E_MCP_SCOPE"
+    )
+    missing_admin = build_admin_authority_ref(
+        data["authority"].contract_generation, ("other.operation",)
+    )
+    assert (
+        _error_code(
+            build_remote_queen_mcp_manifest,
+            data["manifest"].desired_generation,
+            data["manifest"].catalog_generation,
+            data["manifest"].endpoint_url,
+            data["principal"],
+            data["credentials"],
+            data["tools"],
+            missing_admin,
+        )
+        == "RQ_E_MCP_SCOPE"
+    )
     assert "arguments" not in CanonicalMcpToolBindingV1.__dataclass_fields__
     assert "expected_generation" not in CanonicalMcpToolBindingV1.__dataclass_fields__
     assert "idempotency_key" not in CanonicalMcpToolBindingV1.__dataclass_fields__
@@ -568,16 +747,19 @@ def test_catalog_rejects_duplicate_admin_operation_across_tool_aliases():
         "hosts.list",
     )
 
-    assert _error_code(
-        build_remote_queen_mcp_manifest,
-        data["manifest"].desired_generation,
-        data["manifest"].catalog_generation,
-        data["manifest"].endpoint_url,
-        data["principal"],
-        data["credentials"],
-        (alias, *data["tools"]),
-        data["authority"],
-    ) == "RQ_E_MCP_SCOPE"
+    assert (
+        _error_code(
+            build_remote_queen_mcp_manifest,
+            data["manifest"].desired_generation,
+            data["manifest"].catalog_generation,
+            data["manifest"].endpoint_url,
+            data["principal"],
+            data["credentials"],
+            (alias, *data["tools"]),
+            data["authority"],
+        )
+        == "RQ_E_MCP_SCOPE"
+    )
 
 
 def test_plan_matrix_absent_noop_and_owned_stale_are_deterministic():
@@ -615,15 +797,23 @@ def test_plan_rejects_same_generation_configuration_digest_drift(changes):
     data = _vector()
     operations = StaticOperations(_desired_fact(data, **changes))
 
-    assert _error_code(plan_remote_queen_mcp, data["manifest"], operations) == "RQ_E_MCP_UNAVAILABLE"
+    assert (
+        _error_code(plan_remote_queen_mcp, data["manifest"], operations)
+        == "RQ_E_MCP_UNAVAILABLE"
+    )
     assert operations.calls == [("inspect", data["manifest"].manifest_digest)]
 
 
 def test_plan_rejects_foreign_malformed_and_contradictory_facts_before_mutation():
     data = _vector()
     desired = _desired_fact(data)
-    foreign = replace(desired, state=RemoteMcpStateKindV1.FOREIGN, owner_principal_id="other-queen")
-    assert _error_code(plan_remote_queen_mcp, data["manifest"], StaticOperations(foreign)) == "RQ_E_FOREIGN_STATE"
+    foreign = replace(
+        desired, state=RemoteMcpStateKindV1.FOREIGN, owner_principal_id="other-queen"
+    )
+    assert (
+        _error_code(plan_remote_queen_mcp, data["manifest"], StaticOperations(foreign))
+        == "RQ_E_FOREIGN_STATE"
+    )
     malformed = object.__new__(RemoteMcpFactV1)
     object.__setattr__(malformed, "state", RemoteMcpStateKindV1.OWNED)
     object.__setattr__(malformed, "generation", None)
@@ -636,12 +826,22 @@ def test_plan_rejects_foreign_malformed_and_contradictory_facts_before_mutation(
     object.__setattr__(malformed, "admin_authority_digest", None)
     object.__setattr__(malformed, "tool_schema_digests", ())
     object.__setattr__(malformed, "attestation", desired.attestation)
-    assert _error_code(plan_remote_queen_mcp, data["manifest"], StaticOperations(malformed)) == "RQ_E_FOREIGN_STATE"
+    assert (
+        _error_code(
+            plan_remote_queen_mcp, data["manifest"], StaticOperations(malformed)
+        )
+        == "RQ_E_FOREIGN_STATE"
+    )
     contradictory = object.__new__(RemoteMcpFactV1)
     for field in fields(RemoteMcpFactV1):
         object.__setattr__(contradictory, field.name, getattr(desired, field.name))
     object.__setattr__(contradictory, "state", RemoteMcpStateKindV1.ABSENT)
-    assert _error_code(plan_remote_queen_mcp, data["manifest"], StaticOperations(contradictory)) == "RQ_E_FOREIGN_STATE"
+    assert (
+        _error_code(
+            plan_remote_queen_mcp, data["manifest"], StaticOperations(contradictory)
+        )
+        == "RQ_E_FOREIGN_STATE"
+    )
 
 
 @pytest.mark.parametrize(
@@ -663,7 +863,10 @@ def test_plan_requires_each_gateway_attestation(field, expected):
     data = _vector()
     attestation = replace(_desired_fact(data).attestation, **{field: False})
     fact = _desired_fact(data, attestation=attestation)
-    assert _error_code(plan_remote_queen_mcp, data["manifest"], StaticOperations(fact)) == expected
+    assert (
+        _error_code(plan_remote_queen_mcp, data["manifest"], StaticOperations(fact))
+        == expected
+    )
 
 
 def test_port_exception_is_redacted_and_plan_does_not_mutate():
@@ -712,17 +915,23 @@ def test_apply_rejects_stale_plan_and_bad_journal_without_second_mutation():
     data = _vector()
     desired = _desired_fact(data)
     stale_ops = StaticOperations(desired, apply_fact=desired)
-    assert _error_code(
-        apply_remote_queen_mcp,
-        ApplyRemoteQueenMcpRequestV1(data["plan"], data["plan"].plan_digest),
-        stale_ops,
-    ) == "RQ_E_PLAN_INCONSISTENT"
+    assert (
+        _error_code(
+            apply_remote_queen_mcp,
+            ApplyRemoteQueenMcpRequestV1(data["plan"], data["plan"].plan_digest),
+            stale_ops,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
     assert stale_ops.calls == [("inspect", data["manifest"].manifest_digest)]
-    assert _error_code(
-        ApplyRemoteQueenMcpRequestV1,
-        data["plan"],
-        "sha256:" + "9" * 64,
-    ) == "RQ_E_PLAN_INCONSISTENT"
+    assert (
+        _error_code(
+            ApplyRemoteQueenMcpRequestV1,
+            data["plan"],
+            "sha256:" + "9" * 64,
+        )
+        == "RQ_E_PLAN_INCONSISTENT"
+    )
 
 
 def test_verify_has_one_inspect_no_mutation_and_requires_desired_owned_state():
@@ -736,11 +945,14 @@ def test_verify_has_one_inspect_no_mutation_and_requires_desired_owned_state():
     assert result == RemoteQueenMcpVerifyResultV1(True, desired)
     assert operations.calls == [("inspect", data["manifest"].manifest_digest)]
     unavailable = StaticOperations(data["before"])
-    assert _error_code(
-        verify_remote_queen_mcp,
-        VerifyRemoteQueenMcpRequestV1(data["plan"], data["plan"].plan_digest),
-        unavailable,
-    ) == "RQ_E_MCP_UNAVAILABLE"
+    assert (
+        _error_code(
+            verify_remote_queen_mcp,
+            VerifyRemoteQueenMcpRequestV1(data["plan"], data["plan"].plan_digest),
+            unavailable,
+        )
+        == "RQ_E_MCP_UNAVAILABLE"
+    )
     assert unavailable.calls == [("inspect", data["manifest"].manifest_digest)]
 
 
@@ -789,11 +1001,14 @@ def test_rollback_rejects_stale_generation_owner_result_digest_and_post_drift_be
         replace(good_journal, resulting_fact_digest="sha256:" + "9" * 64),
     ):
         operations = StaticOperations(desired, rollback_fact=data["before"])
-        assert _error_code(
-            rollback_remote_queen_mcp,
-            RollbackRemoteQueenMcpRequestV1(plan, plan.plan_digest, journal),
-            operations,
-        ) == "RQ_E_ROLLBACK_DRIFT"
+        assert (
+            _error_code(
+                rollback_remote_queen_mcp,
+                RollbackRemoteQueenMcpRequestV1(plan, plan.plan_digest, journal),
+                operations,
+            )
+            == "RQ_E_ROLLBACK_DRIFT"
+        )
         expected_calls = (
             []
             if journal.before_digest != plan.before_digest
@@ -803,11 +1018,14 @@ def test_rollback_rejects_stale_generation_owner_result_digest_and_post_drift_be
         assert operations.calls == expected_calls
     foreign = replace(desired, owner_principal_id="other-queen")
     operations = StaticOperations(foreign, rollback_fact=data["before"])
-    assert _error_code(
-        rollback_remote_queen_mcp,
-        RollbackRemoteQueenMcpRequestV1(plan, plan.plan_digest, good_journal),
-        operations,
-    ) == "RQ_E_ROLLBACK_DRIFT"
+    assert (
+        _error_code(
+            rollback_remote_queen_mcp,
+            RollbackRemoteQueenMcpRequestV1(plan, plan.plan_digest, good_journal),
+            operations,
+        )
+        == "RQ_E_ROLLBACK_DRIFT"
+    )
     assert operations.calls == [("inspect", plan.manifest.manifest_digest)]
 
 
@@ -858,9 +1076,20 @@ def test_ast_effect_gate_rejects_forbidden_imports_calls_and_admin_envelope_usag
             assert node.module not in forbidden_modules
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
-                assert node.func.id not in {"open", "exec", "eval", "compile", "__import__", "import_module"}
+                assert node.func.id not in {
+                    "open",
+                    "exec",
+                    "eval",
+                    "compile",
+                    "__import__",
+                    "import_module",
+                }
             if isinstance(node.func, ast.Attribute):
-                root = node.func.value.id if isinstance(node.func.value, ast.Name) else None
+                root = (
+                    node.func.value.id
+                    if isinstance(node.func.value, ast.Name)
+                    else None
+                )
                 assert (root, node.func.attr) not in {
                     ("os", "system"),
                     ("os", "popen"),
@@ -880,7 +1109,15 @@ def test_ast_effect_gate_rejects_forbidden_imports_calls_and_admin_envelope_usag
 def test_importing_contract_has_no_port_calls_or_mutable_runtime_state():
     import the_hive.remote_queen_mcp as module
 
-    assert not [name for name in vars(module) if name.endswith("CACHE") or name.endswith("_CACHE")]
+    assert not [
+        name
+        for name in vars(module)
+        if name.endswith("CACHE") or name.endswith("_CACHE")
+    ]
     assert not hasattr(module, "_PORT")
     assert isinstance(module.RemoteQueenMcpOperations, type)
-    assert all(not callable(value) for name, value in vars(module).items() if name.startswith("_PORT"))
+    assert all(
+        not callable(value)
+        for name, value in vars(module).items()
+        if name.startswith("_PORT")
+    )

@@ -156,7 +156,9 @@ def test_recovery_document_rejects_directly_constructed_invalid_journal(
         lambda raw: raw.update(phase="unknown"),
         lambda raw: raw["entries"][0].update(kind="unknown"),
         lambda raw: raw["entries"][0]["manifest"][0].update(relative_path="../escape"),
-        lambda raw: raw["entries"][0].update(manifest=[raw["entries"][0]["manifest"][0]] * 2),
+        lambda raw: raw["entries"][0].update(
+            manifest=[raw["entries"][0]["manifest"][0]] * 2
+        ),
     ],
 )
 def test_recovery_document_rejects_invalid_contract(mutate) -> None:
@@ -229,22 +231,78 @@ def test_descriptor_classification(authoritative, old, new, expected) -> None:
 @pytest.mark.parametrize(
     ("kind", "state", "action"),
     [
-        (MutationKind.CREATED, DescriptorState.ABSENT, RecoveryActionKind.QUARANTINE_CREATED),
-        (MutationKind.CREATED, DescriptorState.OLD, RecoveryActionKind.QUARANTINE_CREATED),
+        (
+            MutationKind.CREATED,
+            DescriptorState.ABSENT,
+            RecoveryActionKind.QUARANTINE_CREATED,
+        ),
+        (
+            MutationKind.CREATED,
+            DescriptorState.OLD,
+            RecoveryActionKind.QUARANTINE_CREATED,
+        ),
         (MutationKind.CREATED, DescriptorState.NEW, RecoveryActionKind.VERIFY_CREATED),
-        (MutationKind.CREATED, DescriptorState.THIRD, RecoveryActionKind.QUARANTINE_CREATED),
-        (MutationKind.BACKUP, DescriptorState.ABSENT, RecoveryActionKind.RETAIN_QUARANTINE),
+        (
+            MutationKind.CREATED,
+            DescriptorState.THIRD,
+            RecoveryActionKind.QUARANTINE_CREATED,
+        ),
+        (
+            MutationKind.BACKUP,
+            DescriptorState.ABSENT,
+            RecoveryActionKind.RETAIN_QUARANTINE,
+        ),
         (MutationKind.BACKUP, DescriptorState.OLD, RecoveryActionKind.RESTORE_BACKUP),
-        (MutationKind.BACKUP, DescriptorState.NEW, RecoveryActionKind.RETAIN_QUARANTINE),
-        (MutationKind.BACKUP, DescriptorState.THIRD, RecoveryActionKind.RETAIN_QUARANTINE),
-        (MutationKind.TOMBSTONE, DescriptorState.ABSENT, RecoveryActionKind.RETAIN_QUARANTINE),
-        (MutationKind.TOMBSTONE, DescriptorState.OLD, RecoveryActionKind.RESTORE_TOMBSTONE),
-        (MutationKind.TOMBSTONE, DescriptorState.NEW, RecoveryActionKind.RETAIN_QUARANTINE),
-        (MutationKind.TOMBSTONE, DescriptorState.THIRD, RecoveryActionKind.RETAIN_QUARANTINE),
-        (MutationKind.RESERVATION, DescriptorState.ABSENT, RecoveryActionKind.RELEASE_RESERVATION),
-        (MutationKind.RESERVATION, DescriptorState.OLD, RecoveryActionKind.RELEASE_RESERVATION),
-        (MutationKind.RESERVATION, DescriptorState.NEW, RecoveryActionKind.RELEASE_RESERVATION),
-        (MutationKind.RESERVATION, DescriptorState.THIRD, RecoveryActionKind.RELEASE_RESERVATION),
+        (
+            MutationKind.BACKUP,
+            DescriptorState.NEW,
+            RecoveryActionKind.RETAIN_QUARANTINE,
+        ),
+        (
+            MutationKind.BACKUP,
+            DescriptorState.THIRD,
+            RecoveryActionKind.RETAIN_QUARANTINE,
+        ),
+        (
+            MutationKind.TOMBSTONE,
+            DescriptorState.ABSENT,
+            RecoveryActionKind.RETAIN_QUARANTINE,
+        ),
+        (
+            MutationKind.TOMBSTONE,
+            DescriptorState.OLD,
+            RecoveryActionKind.RESTORE_TOMBSTONE,
+        ),
+        (
+            MutationKind.TOMBSTONE,
+            DescriptorState.NEW,
+            RecoveryActionKind.RETAIN_QUARANTINE,
+        ),
+        (
+            MutationKind.TOMBSTONE,
+            DescriptorState.THIRD,
+            RecoveryActionKind.RETAIN_QUARANTINE,
+        ),
+        (
+            MutationKind.RESERVATION,
+            DescriptorState.ABSENT,
+            RecoveryActionKind.RELEASE_RESERVATION,
+        ),
+        (
+            MutationKind.RESERVATION,
+            DescriptorState.OLD,
+            RecoveryActionKind.RELEASE_RESERVATION,
+        ),
+        (
+            MutationKind.RESERVATION,
+            DescriptorState.NEW,
+            RecoveryActionKind.RELEASE_RESERVATION,
+        ),
+        (
+            MutationKind.RESERVATION,
+            DescriptorState.THIRD,
+            RecoveryActionKind.RELEASE_RESERVATION,
+        ),
     ],
 )
 def test_reconciliation_matrix_is_complete(kind, state, action) -> None:
@@ -279,7 +337,9 @@ def test_intent_without_identity_only_verifies_unchanged_public_state() -> None:
     plan = plan_reconciliation(sample_journal(entry), {"d1": "4" * 64})
 
     assert plan.actions == (
-        RecoveryAction(RecoveryActionKind.VERIFY_UNCHANGED, 0, "d1", DescriptorState.OLD),
+        RecoveryAction(
+            RecoveryActionKind.VERIFY_UNCHANGED, 0, "d1", DescriptorState.OLD
+        ),
     )
 
 
@@ -312,9 +372,7 @@ def sample_g_journal() -> GMigrationJournal:
                 "rollback-m1",
             ),
         ),
-        aliases=(
-            GMigrationAlias("m1", "g2", G_MEMBER_ID, 219, G_MIGRATION_ID),
-        ),
+        aliases=(GMigrationAlias("m1", "g2", G_MEMBER_ID, 219, G_MIGRATION_ID),),
         phase=GMigrationPhase.PREPARED,
         authoritative_generation=None,
         blocking_error_codes=(),
@@ -323,7 +381,9 @@ def sample_g_journal() -> GMigrationJournal:
 
 def test_g_journal_is_closed_frozen_sorted_and_redacted() -> None:
     journal = sample_g_journal()
-    assert normalize_g_migration_journal(g_migration_journal_document(journal)) == journal
+    assert (
+        normalize_g_migration_journal(g_migration_journal_document(journal)) == journal
+    )
     aliases = g_migration_alias_view(journal)
     assert type(aliases) is MappingProxyType
     with pytest.raises(TypeError):
@@ -355,7 +415,9 @@ def test_g_journal_repr_and_str_redact_every_private_value() -> None:
         "prepared",
     ):
         assert private_value not in public
-    assert normalize_g_migration_journal(g_migration_journal_document(journal)) == journal
+    assert (
+        normalize_g_migration_journal(g_migration_journal_document(journal)) == journal
+    )
 
 
 def test_g_alias_view_rejects_duplicate_cycle_and_wrong_generation() -> None:
@@ -390,17 +452,31 @@ def test_descriptor_fingerprint_returns_hash_not_private_path() -> None:
 
 def test_materialization_fingerprint_is_deterministic() -> None:
     value = materialization_fingerprint(descriptor("old"), sample_entry().manifest)
-    value_repeat = materialization_fingerprint(descriptor("old"), sample_entry().manifest)
+    value_repeat = materialization_fingerprint(
+        descriptor("old"), sample_entry().manifest
+    )
     assert value == value_repeat
 
 
 _TRANSITIONS = {
-    RecoveryPhase.PREPARED: frozenset({RecoveryPhase.MATERIALIZING, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.MATERIALIZING: frozenset({RecoveryPhase.CAS_PENDING, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.CAS_PENDING: frozenset({RecoveryPhase.RECONCILING, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.RECONCILING: frozenset({RecoveryPhase.VERIFIED, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.VERIFIED: frozenset({RecoveryPhase.PUBLISHED, RecoveryPhase.DEGRADED}),
-    RecoveryPhase.PUBLISHED: frozenset({RecoveryPhase.COMPLETE, RecoveryPhase.DEGRADED}),
+    RecoveryPhase.PREPARED: frozenset(
+        {RecoveryPhase.MATERIALIZING, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.MATERIALIZING: frozenset(
+        {RecoveryPhase.CAS_PENDING, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.CAS_PENDING: frozenset(
+        {RecoveryPhase.RECONCILING, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.RECONCILING: frozenset(
+        {RecoveryPhase.VERIFIED, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.VERIFIED: frozenset(
+        {RecoveryPhase.PUBLISHED, RecoveryPhase.DEGRADED}
+    ),
+    RecoveryPhase.PUBLISHED: frozenset(
+        {RecoveryPhase.COMPLETE, RecoveryPhase.DEGRADED}
+    ),
     RecoveryPhase.COMPLETE: frozenset(),
     RecoveryPhase.DEGRADED: frozenset({RecoveryPhase.RECONCILING}),
 }
@@ -433,7 +509,10 @@ def test_advance_recovery_phase_accepts_valid_transitions() -> None:
     degraded = advance_recovery_phase(
         base,
         RecoveryPhase.DEGRADED,
-        blocking_error_codes=("fleet_create_rollback_diverged", "fleet_create_rollback_diverged"),
+        blocking_error_codes=(
+            "fleet_create_rollback_diverged",
+            "fleet_create_rollback_diverged",
+        ),
     )
     assert journal.phase is RecoveryPhase.COMPLETE
     assert degraded.phase is RecoveryPhase.DEGRADED
@@ -450,7 +529,9 @@ def test_advance_recovery_phase_rejects_invalid_edges() -> None:
                 advance_recovery_phase(base, target)
 
 
-def test_advance_recovery_phase_rejects_missing_authoritative_generation_when_needed() -> None:
+def test_advance_recovery_phase_rejects_missing_authoritative_generation_when_needed() -> (
+    None
+):
     journal = replace(sample_journal(), phase=RecoveryPhase.CAS_PENDING)
     with pytest.raises(FleetRecoveryValidationError):
         advance_recovery_phase(journal, RecoveryPhase.RECONCILING)
@@ -503,7 +584,9 @@ def test_recovery_store_fsyncs_file_and_parent_before_success(tmp_path: Path) ->
     assert len(calls) == 2
 
 
-def test_recovery_store_keeps_foreign_temp_swapped_before_replace(tmp_path: Path) -> None:
+def test_recovery_store_keeps_foreign_temp_swapped_before_replace(
+    tmp_path: Path,
+) -> None:
     import the_hive.server as server_module
 
     paths = FleetPaths.from_state_root(tmp_path)
@@ -586,7 +669,10 @@ def test_recovery_remove_keeps_journal_swapped_after_load(tmp_path: Path) -> Non
         "open_directory_no_follow_matching",
         side_effect=open_parent_then_swap,
     ):
-        assert server_module._fleet_remove_complete_recovery_journal(expected, paths) is False
+        assert (
+            server_module._fleet_remove_complete_recovery_journal(expected, paths)
+            is False
+        )
 
     assert swapped is True
     assert server_module._fleet_load_recovery_journal(paths) == foreign
@@ -599,24 +685,35 @@ def test_recovery_remove_fails_closed_when_parent_fsync_fails(tmp_path: Path) ->
     expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
     server_module._fleet_store_recovery_journal(expected, paths)
 
-    with patch.object(server_module.os, "fsync", side_effect=OSError("parent fsync failed")):
-        assert server_module._fleet_remove_complete_recovery_journal(expected, paths) is False
+    with patch.object(
+        server_module.os, "fsync", side_effect=OSError("parent fsync failed")
+    ):
+        assert (
+            server_module._fleet_remove_complete_recovery_journal(expected, paths)
+            is False
+        )
 
     assert not paths.recovery.exists()
 
 
-def test_recovery_remove_complete_journal_unlinks_and_fsyncs_parent(tmp_path: Path) -> None:
+def test_recovery_remove_complete_journal_unlinks_and_fsyncs_parent(
+    tmp_path: Path,
+) -> None:
     import the_hive.server as server_module
 
     paths = FleetPaths.from_state_root(tmp_path)
     expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
     server_module._fleet_store_recovery_journal(expected, paths)
 
-    assert server_module._fleet_remove_complete_recovery_journal(expected, paths) is True
+    assert (
+        server_module._fleet_remove_complete_recovery_journal(expected, paths) is True
+    )
     assert not paths.recovery.exists()
 
 
-def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path: Path) -> None:
+def test_reconciler_continues_every_mutation_class_after_first_failure(
+    tmp_path: Path,
+) -> None:
     from the_hive.server import (
         _fleet_execute_recovery_plan,
         _FleetRecoveryTransaction,
@@ -646,7 +743,9 @@ def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path:
     )
     plan = RecoveryPlan(
         tuple(
-            RecoveryAction(action_kind, index, entries[index].agent_id, DescriptorState.OLD)
+            RecoveryAction(
+                action_kind, index, entries[index].agent_id, DescriptorState.OLD
+            )
             for index, action_kind in enumerate(action_kinds)
         ),
         False,
@@ -664,23 +763,30 @@ def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path:
         def load(self) -> FleetSnapshot:
             return authoritative
 
-    with patch.object(
-        __import__("the_hive.server", fromlist=["_fleet_execute_recovery_action"]),
-        "_fleet_execute_recovery_action",
-        side_effect=execute,
-    ), patch.object(
-        server,
-        "current_fleet_service",
-        return_value=_Service(),
+    with (
+        patch.object(
+            __import__("the_hive.server", fromlist=["_fleet_execute_recovery_action"]),
+            "_fleet_execute_recovery_action",
+            side_effect=execute,
+        ),
+        patch.object(
+            server,
+            "current_fleet_service",
+            return_value=_Service(),
+        ),
     ):
-        errors, blocking = _fleet_execute_recovery_plan(transaction, plan, authoritative)
+        errors, blocking = _fleet_execute_recovery_plan(
+            transaction, plan, authoritative
+        )
 
     assert calls == list(action_kinds)
     assert blocking is True
     assert "fleet_create_rollback_diverged" in errors
 
 
-def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_path: Path) -> None:
+def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(
+    tmp_path: Path,
+) -> None:
     from the_hive.server import (
         FLEET_TOMBSTONE_PREFIX,
         _fleet_execute_recovery_plan,
@@ -708,7 +814,11 @@ def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_p
         ),
     )
     plan = RecoveryPlan(
-        (RecoveryAction(RecoveryActionKind.RETAIN_QUARANTINE, 0, "d1", DescriptorState.NEW),),
+        (
+            RecoveryAction(
+                RecoveryActionKind.RETAIN_QUARANTINE, 0, "d1", DescriptorState.NEW
+            ),
+        ),
         has_third=False,
     )
     journal = replace(
@@ -716,7 +826,9 @@ def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_p
         phase=RecoveryPhase.RECONCILING,
         authoritative_generation=1,
     )
-    transaction = _FleetRecoveryTransaction(FleetPaths.from_state_root(tmp_path), journal)
+    transaction = _FleetRecoveryTransaction(
+        FleetPaths.from_state_root(tmp_path), journal
+    )
     authoritative = FleetSnapshot(1, 1, (), ())
     reloaded = FleetSnapshot(1, 1, (), ())
     service = _Service(reloaded)
@@ -736,9 +848,13 @@ def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_p
             side_effect=execute,
         ):
             with patch.object(
-                __import__("the_hive.server", fromlist=["_fleet_verify_authoritative_materialization"]),
+                __import__(
+                    "the_hive.server",
+                    fromlist=["_fleet_verify_authoritative_materialization"],
+                ),
                 "_fleet_verify_authoritative_materialization",
-                side_effect=lambda snapshot, actual: verified.append(snapshot) or _fleet_verify_authoritative_materialization(snapshot, actual),
+                side_effect=lambda snapshot, actual: verified.append(snapshot)
+                or _fleet_verify_authoritative_materialization(snapshot, actual),
             ):
                 _fleet_execute_recovery_plan(transaction, plan, authoritative)
 
@@ -764,7 +880,11 @@ def test_recovery_plan_execution_blocks_if_post_plan_load_fails(tmp_path: Path) 
         journal,
     )
     plan = RecoveryPlan(
-        (RecoveryAction(RecoveryActionKind.RETAIN_QUARANTINE, 0, "d1", DescriptorState.NEW),),
+        (
+            RecoveryAction(
+                RecoveryActionKind.RETAIN_QUARANTINE, 0, "d1", DescriptorState.NEW
+            ),
+        ),
         has_third=False,
     )
     authoritative = FleetSnapshot(1, 1, (), ())
@@ -895,20 +1015,27 @@ def test_reconcile_fails_closed_without_persisted_journal(
     paths = FleetPaths.from_state_root(tmp_path)
     transaction = server_module._FleetRecoveryTransaction(paths, journal)
     persisted = None
-    load_error = AgentError("fleet_recovery_state_invalid") if persisted_state == "invalid" else None
+    load_error = (
+        AgentError("fleet_recovery_state_invalid")
+        if persisted_state == "invalid"
+        else None
+    )
     current = FleetSnapshot(1, 2, (), ())
     planned = FleetSnapshot(1, 3, (), ())
 
-    with patch.object(
-        server_module,
-        "_fleet_load_recovery_journal",
-        return_value=persisted,
-        side_effect=load_error,
-    ), patch.object(
-        server_module,
-        "_fleet_execute_recovery_plan",
-        return_value=((), False),
-    ) as execute:
+    with (
+        patch.object(
+            server_module,
+            "_fleet_load_recovery_journal",
+            return_value=persisted,
+            side_effect=load_error,
+        ),
+        patch.object(
+            server_module,
+            "_fleet_execute_recovery_plan",
+            return_value=((), False),
+        ) as execute,
+    ):
         assert not server_module._fleet_reconcile_divergent_materialization(
             current,
             planned,
@@ -919,7 +1046,9 @@ def test_reconcile_fails_closed_without_persisted_journal(
     execute.assert_not_called()
 
 
-def test_reconcile_accepts_persisted_empty_registry_only_journal(tmp_path: Path) -> None:
+def test_reconcile_accepts_persisted_empty_registry_only_journal(
+    tmp_path: Path,
+) -> None:
     import the_hive.server as server_module
 
     current = FleetSnapshot(1, 2, (), ())
@@ -1008,11 +1137,15 @@ def test_registry_only_publish_rejects_different_generation_before_snapshot_dive
         def load(self) -> FleetSnapshot:
             return authoritative
 
-    with patch.object(server_module, "STATE_ROOT", state), patch.object(
-        server_module,
-        "AGENT_POOL_ROOT",
-        pool,
-    ), server_module.temporary_agent_inventory(before_inventory):
+    with (
+        patch.object(server_module, "STATE_ROOT", state),
+        patch.object(
+            server_module,
+            "AGENT_POOL_ROOT",
+            pool,
+        ),
+        server_module.temporary_agent_inventory(before_inventory),
+    ):
         transaction = server_module._FleetRecoveryTransaction.begin(
             RecoveryOperation.REGISTRY_ONLY,
             current,
@@ -1104,7 +1237,9 @@ def test_recovery_status_marks_root_mismatch_invalid_without_details(
 
 
 def test_recovery_status_marks_oserror_invalid_without_details() -> None:
-    with patch.object(server, "_fleet_load_recovery_journal", side_effect=OSError("private state")):
+    with patch.object(
+        server, "_fleet_load_recovery_journal", side_effect=OSError("private state")
+    ):
         result = server.fleet_recovery_status()
 
     assert result == {
@@ -1149,7 +1284,9 @@ def test_recovery_gate_blocks_mutations_and_preserves_public_shape(
         server.require_fleet_recovery_ready("agent_status")
 
 
-def test_missing_recovery_journal_is_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_recovery_journal_is_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
     assert server.fleet_recovery_status() == {
@@ -1215,10 +1352,18 @@ def test_emergency_controls_diagnosis_and_recovery_remain_reachable_when_blocked
     server._fleet_store_recovery_journal(blocked)
 
     with (
-        patch.object(server, "agent_lifecycle_lock", return_value=nullcontext()) as lifecycle_lock,
-        patch.object(server, "_release_agent_unlocked", return_value={"status": "released"}),
-        patch.object(server, "_stop_agent_unlocked", return_value={"status": "stopped"}),
-        patch.object(server, "_interrupt_agent_unlocked", return_value={"status": "interrupted"}),
+        patch.object(
+            server, "agent_lifecycle_lock", return_value=nullcontext()
+        ) as lifecycle_lock,
+        patch.object(
+            server, "_release_agent_unlocked", return_value={"status": "released"}
+        ),
+        patch.object(
+            server, "_stop_agent_unlocked", return_value={"status": "stopped"}
+        ),
+        patch.object(
+            server, "_interrupt_agent_unlocked", return_value={"status": "interrupted"}
+        ),
     ):
         assert server.release_agent("a")["status"] == "released"
         assert server.stop_agent("a")["status"] == "stopped"
@@ -1226,12 +1371,17 @@ def test_emergency_controls_diagnosis_and_recovery_remain_reachable_when_blocked
 
     assert lifecycle_lock.call_count == 3
 
-    with patch.object(server, "status_agent", return_value={"agent": "a1", "raw_output": "not_returned"}):
+    with patch.object(
+        server,
+        "status_agent",
+        return_value={"agent": "a1", "raw_output": "not_returned"},
+    ):
         diagnosed = server.call_tool("agent_status", {"agent": "a1"})
     assert diagnosed["results"][0]["agent"] == "a1"
 
-    with patch.object(server, "fleet_mutation_lock", return_value=nullcontext()), patch.object(
-        server, "_fleet_load_recovery_journal", return_value=None
+    with (
+        patch.object(server, "fleet_mutation_lock", return_value=nullcontext()),
+        patch.object(server, "_fleet_load_recovery_journal", return_value=None),
     ):
         recovered = server.fleet_recovery_retry()
     assert recovered["state"] == "ready"

@@ -74,7 +74,9 @@ def _certificate(
         .not_valid_before(now)
         .not_valid_after(datetime(2099, 1, 1, tzinfo=UTC))
         .add_extension(
-            x509.BasicConstraints(ca=issuer is None, path_length=0 if issuer is None else None),
+            x509.BasicConstraints(
+                ca=issuer is None, path_length=0 if issuer is None else None
+            ),
             critical=True,
         )
         .add_extension(
@@ -82,9 +84,7 @@ def _certificate(
             critical=False,
         )
         .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                issuer_key.public_key()
-            ),
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
             critical=False,
         )
         .add_extension(
@@ -116,7 +116,10 @@ def _certificate(
         if not client:
             builder = builder.add_extension(
                 x509.SubjectAlternativeName(
-                    [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+                    [
+                        x509.DNSName("localhost"),
+                        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                    ]
                 ),
                 critical=False,
             )
@@ -126,7 +129,9 @@ def _certificate(
 @pytest.fixture
 def host_agent_pki(tmp_path: Path) -> Path:
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ca = _certificate("host-agent-ca", key=ca_key, issuer_key=ca_key, issuer=None, client=False)
+    ca = _certificate(
+        "host-agent-ca", key=ca_key, issuer_key=ca_key, issuer=None, client=False
+    )
     server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     client_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     files = {
@@ -206,7 +211,9 @@ def _live_client(pki: Path, port: int) -> HostAgentClient:
     context = ssl.create_default_context(cafile=str(pki / "ca.crt"))
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.load_cert_chain(pki / "client.crt", pki / "client.key")
-    return HostAgentClient(f"https://localhost:{port}", context=context, sleep=lambda _: None)
+    return HostAgentClient(
+        f"https://localhost:{port}", context=context, sleep=lambda _: None
+    )
 
 
 def _idle_body() -> bytes:
@@ -631,6 +638,7 @@ def test_client_enforces_response_bound_and_exact_idle_type() -> None:
     client = HostAgentClient(
         "https://master.internal", context=ssl.create_default_context()
     )
+
     class Headers:
         def __init__(self, length: int) -> None:
             self.length = length
@@ -644,6 +652,7 @@ def test_client_enforces_response_bound_and_exact_idle_type() -> None:
 
     class Response:
         status = 200
+
         def __init__(self, body: bytes, url: str) -> None:
             self.body = body
             self.headers = Headers(len(body))
@@ -804,9 +813,7 @@ def test_host_probe_and_credentials_are_descriptor_first_and_exact(
         ),
         kernel=Kernel(),
     )
-    payload = probe.collect(
-        {"admin_operation_id": "op-one", "probe_schema": 1}
-    )
+    payload = probe.collect({"admin_operation_id": "op-one", "probe_schema": 1})
     assert payload["evidence_digest"].startswith("sha256:")
     assert payload["observed_at"] == "2026-08-31T08:00:00Z"
     for invalid in (
@@ -904,9 +911,15 @@ def test_assemble_host_agent_wires_owned_credentials(
     ollama = object()
     client = object()
     monkeypatch.setattr(host_agent_module, "load_host_agent_config", lambda _fd: config)
-    monkeypatch.setattr(host_agent_module, "build_tls_context", lambda **_values: object())
-    monkeypatch.setattr(host_agent_module, "HostAgentState", lambda *_values, **_named: state)
-    monkeypatch.setattr(host_agent_module, "OllamaRegistryStore", lambda _path: registry)
+    monkeypatch.setattr(
+        host_agent_module, "build_tls_context", lambda **_values: object()
+    )
+    monkeypatch.setattr(
+        host_agent_module, "HostAgentState", lambda *_values, **_named: state
+    )
+    monkeypatch.setattr(
+        host_agent_module, "OllamaRegistryStore", lambda _path: registry
+    )
     monkeypatch.setattr(
         host_agent_module,
         "ProductionAgentOllamaAdapter",
@@ -971,5 +984,7 @@ def test_poll_loop_recovers_expected_error_but_propagates_fatal() -> None:
 
     with pytest.raises(MemoryError):
         run_poll_loop(
-            Fatal(), max_wait_seconds=20, stop_event=threading.Event()  # type: ignore[arg-type]
+            Fatal(),
+            max_wait_seconds=20,
+            stop_event=threading.Event(),  # type: ignore[arg-type]
         )

@@ -19,7 +19,9 @@ NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
 
 def principal(principal_id: str, class_id: str, parent: str | None, repo: str | None):
     scope = "global" if repo is None else "repository"
-    return Principal(principal_id, class_id, parent, "profile", scope, repo, "active", DIGEST, 1)
+    return Principal(
+        principal_id, class_id, parent, "profile", scope, repo, "active", DIGEST, 1
+    )
 
 
 def test_principal_public_projection_omits_config_digest() -> None:
@@ -47,8 +49,17 @@ def binding(
     expires_at_utc: str = "2026-08-06T12:01:00Z",
 ) -> ExecutionBinding:
     return ExecutionBinding(
-        binding_id, "lead-one", "repo-one", dispatch_id, "a1", "private-account",
-        "gpt-primary", "lease-one", "adm-one", "active", expires_at_utc,
+        binding_id,
+        "lead-one",
+        "repo-one",
+        dispatch_id,
+        "a1",
+        "private-account",
+        "gpt-primary",
+        "lease-one",
+        "adm-one",
+        "active",
+        expires_at_utc,
     )
 
 
@@ -60,7 +71,19 @@ def test_parent_chain_and_repository_scope_are_enforced() -> None:
     with pytest.raises(PrincipalError, match="principal_parent_required"):
         registry.create(principal("bad-queen", "koenigin", None, "repo-one"))
     with pytest.raises(PrincipalError, match="principal_scope_mismatch"):
-        registry.create(Principal("bad-queen", "koenigin", "godbee-main", "profile", "global", "repo-one", "active", DIGEST, 1))
+        registry.create(
+            Principal(
+                "bad-queen",
+                "koenigin",
+                "godbee-main",
+                "profile",
+                "global",
+                "repo-one",
+                "active",
+                DIGEST,
+                1,
+            )
+        )
 
 
 def test_execution_binding_is_unique_and_public_view_is_private() -> None:
@@ -82,7 +105,12 @@ def test_active_execution_binding_lookup_returns_exact_live_binding() -> None:
     registry.bind_execution(binding("bind-other", dispatch_id="dispatch-two"))
     stored = registry.bind_execution(binding())
 
-    assert registry.get_active_execution_binding("bind-one", "lead-one", "repo-one", now=NOW) == stored
+    assert (
+        registry.get_active_execution_binding(
+            "bind-one", "lead-one", "repo-one", now=NOW
+        )
+        == stored
+    )
 
 
 @pytest.mark.parametrize(
@@ -104,7 +132,9 @@ def test_active_execution_binding_lookup_requires_exact_binding_subject_and_repo
     registry.bind_execution(binding())
 
     with pytest.raises(PrincipalError, match=error):
-        registry.get_active_execution_binding(binding_id, principal_id, repo_id, now=NOW)
+        registry.get_active_execution_binding(
+            binding_id, principal_id, repo_id, now=NOW
+        )
 
 
 def test_active_execution_binding_lookup_rejects_released_and_expired_binding() -> None:
@@ -114,14 +144,18 @@ def test_active_execution_binding_lookup_rejects_released_and_expired_binding() 
     registry.release_execution("bind-one")
 
     with pytest.raises(PrincipalError, match="execution_binding_inactive"):
-        registry.get_active_execution_binding("bind-one", "lead-one", "repo-one", now=NOW)
+        registry.get_active_execution_binding(
+            "bind-one", "lead-one", "repo-one", now=NOW
+        )
 
     expired = PrincipalRegistry()
     chain(expired)
     expired.bind_execution(binding(expires_at_utc="2026-08-06T12:00:00Z"))
 
     with pytest.raises(PrincipalError, match="execution_binding_expired"):
-        expired.get_active_execution_binding("bind-one", "lead-one", "repo-one", now=NOW)
+        expired.get_active_execution_binding(
+            "bind-one", "lead-one", "repo-one", now=NOW
+        )
 
 
 def test_active_execution_binding_lookup_rejects_retired_principal() -> None:
@@ -131,19 +165,30 @@ def test_active_execution_binding_lookup_rejects_retired_principal() -> None:
     registry.retire("lead-one", expected_version=1)
 
     with pytest.raises(PrincipalError, match="execution_binding_inactive"):
-        registry.get_active_execution_binding("bind-one", "lead-one", "repo-one", now=NOW)
+        registry.get_active_execution_binding(
+            "bind-one", "lead-one", "repo-one", now=NOW
+        )
 
 
-def test_active_execution_binding_lookup_rejects_invalid_time_and_remains_reentrant(tmp_path: Path) -> None:
+def test_active_execution_binding_lookup_rejects_invalid_time_and_remains_reentrant(
+    tmp_path: Path,
+) -> None:
     state = HiveStateStore(tmp_path / "hive")
     registry = PrincipalRegistry(state)
     chain(registry)
     registry.bind_execution(binding())
 
     with pytest.raises(PrincipalError, match="invalid_execution_binding_lookup"):
-        registry.get_active_execution_binding("bind-one", "lead-one", "repo-one", now=None)  # type: ignore[arg-type]
+        registry.get_active_execution_binding(
+            "bind-one", "lead-one", "repo-one", now=None
+        )  # type: ignore[arg-type]
     with state.locked():
-        assert registry.get_active_execution_binding("bind-one", "lead-one", "repo-one", now=NOW).binding_id == "bind-one"
+        assert (
+            registry.get_active_execution_binding(
+                "bind-one", "lead-one", "repo-one", now=NOW
+            ).binding_id
+            == "bind-one"
+        )
 
 
 def test_registry_persists_principals_and_bindings(tmp_path: Path) -> None:

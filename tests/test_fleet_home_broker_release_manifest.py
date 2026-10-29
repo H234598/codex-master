@@ -56,13 +56,13 @@ EXPECTED_PAYLOAD = (
     (
         "python/the_hive/fleet_home_broker_identity.py",
         "src/the_hive/fleet_home_broker_identity.py",
-        "e1020cac4275441a9720d2ea9029288cbf2f2289054278e2508e4169d0990c49",
+        "78f7f3ed0aeaa1f5062668f6be01d2687b3dc21b9175ae684324abcc1839e71a",
         420,
     ),
     (
         "python/the_hive/fleet_home_broker_linux.py",
         "src/the_hive/fleet_home_broker_linux.py",
-        "63067a170efa8dec4f80007d6b4a249cfd1f04d46a1c53191896dc9b0a570f5f",
+        "be89c436a725746280e984c2459e616ec630f1fc66ade67bb5f6f527cd7751c8",
         420,
     ),
     (
@@ -80,7 +80,7 @@ EXPECTED_PAYLOAD = (
     (
         "python/the_hive/fleet_home_broker_wal.py",
         "src/the_hive/fleet_home_broker_wal.py",
-        "f720caf69b6b036315dcfd86691c89be5f5ec8e6c8acd125b68f786f25213920",
+        "2d72a2578d70079c2ccfd2517e3640c52557c44b48bd6ac43898a496c039d855",
         420,
     ),
 )
@@ -104,10 +104,10 @@ EXPECTED_MANIFEST_BYTES = (
     b'3868f1b86aedfdc1eb861082260a1e0dc3026a82ec0651ca6b67a957b88853a6",'
     b'"mode":420},'
     b'{"path":"python/the_hive/fleet_home_broker_identity.py","sha256":"'
-    b'e1020cac4275441a9720d2ea9029288cbf2f2289054278e2508e4169d0990c49",'
+    b'78f7f3ed0aeaa1f5062668f6be01d2687b3dc21b9175ae684324abcc1839e71a",'
     b'"mode":420},'
     b'{"path":"python/the_hive/fleet_home_broker_linux.py","sha256":"'
-    b'63067a170efa8dec4f80007d6b4a249cfd1f04d46a1c53191896dc9b0a570f5f",'
+    b'be89c436a725746280e984c2459e616ec630f1fc66ade67bb5f6f527cd7751c8",'
     b'"mode":420},'
     b'{"path":"python/the_hive/fleet_home_broker_package.py","sha256":"'
     b'7989c0c92dab6cf1ea7ce3d4b8de6433756525bd5bd9f293e1041a9ccf0c5de6",'
@@ -116,7 +116,7 @@ EXPECTED_MANIFEST_BYTES = (
     b'f748e44c665883d9842f4259472fdbd651ee7f7fd03cd953230263f42a9d1596",'
     b'"mode":420},'
     b'{"path":"python/the_hive/fleet_home_broker_wal.py","sha256":"'
-    b'f720caf69b6b036315dcfd86691c89be5f5ec8e6c8acd125b68f786f25213920",'
+    b'2d72a2578d70079c2ccfd2517e3640c52557c44b48bd6ac43898a496c039d855",'
     b'"mode":420}'
     b"]}\n"
 )

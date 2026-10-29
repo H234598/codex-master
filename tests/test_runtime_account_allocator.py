@@ -26,8 +26,7 @@ from the_hive.agent_resolver import (
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "src/the_hive/runtime_account_allocator.py"
+    Path(__file__).resolve().parents[1] / "src/the_hive/runtime_account_allocator.py"
 )
 
 
@@ -1673,7 +1672,10 @@ def test_lease_binding_verifier_denies_exact_opaque_text_forge_and_cross_objects
     ):
         _assert_sparse_denial(
             module,
-            lambda attempted_receipt=attempted_receipt, attempted_lease=attempted_lease, attempted_ticket=attempted_ticket, attempted_evidence=attempted_evidence: (
+            lambda attempted_receipt=attempted_receipt,
+            attempted_lease=attempted_lease,
+            attempted_ticket=attempted_ticket,
+            attempted_evidence=attempted_evidence: (
                 _verify_lease_binding(
                     allocator,
                     attempted_receipt,

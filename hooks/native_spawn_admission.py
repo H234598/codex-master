@@ -17,11 +17,19 @@ if str(SRC_ROOT) not in sys.path:
 
 def _deny(error_code: str, reason_codes: list[str]) -> int:
     reason = f"error_code={error_code} reason_codes={','.join(reason_codes)}"
-    sys.stdout.write(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    }}, separators=(",", ":")) + "\n")
+    sys.stdout.write(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     return 0
 
 
@@ -33,21 +41,40 @@ def main() -> int:
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             return _deny("invalid_pretooluse_input", ["invalid_input"])
-        if payload.get("hook_event_name") != "PreToolUse" or payload.get("tool_name") not in SPAWN_TOOL_NAMES:
+        if (
+            payload.get("hook_event_name") != "PreToolUse"
+            or payload.get("tool_name") not in SPAWN_TOOL_NAMES
+        ):
             return _deny("invalid_pretooluse_input", ["invalid_input"])
         if not isinstance(payload.get("session_id"), str) or not payload["session_id"]:
             return _deny("invalid_pretooluse_input", ["invalid_input"])
-        if not isinstance(payload.get("tool_input"), dict) or not isinstance(payload.get("cwd"), str):
+        if not isinstance(payload.get("tool_input"), dict) or not isinstance(
+            payload.get("cwd"), str
+        ):
             return _deny("invalid_pretooluse_input", ["invalid_input"])
-        from the_hive.server import native_hook_source_context, reserve_native_agent_spawn
+        from the_hive.server import (
+            native_hook_source_context,
+            reserve_native_agent_spawn,
+        )
+
         with native_hook_source_context():
             result = reserve_native_agent_spawn(payload)
         if not isinstance(result, dict) or result.get("allowed") is not True:
-            code = result.get("error_code", "spawn_capacity_unavailable") if isinstance(result, dict) else "reservation_unavailable"
-            reasons = result.get("reason_codes", ["session_metrics_unavailable"]) if isinstance(result, dict) else ["reservation_error"]
+            code = (
+                result.get("error_code", "spawn_capacity_unavailable")
+                if isinstance(result, dict)
+                else "reservation_unavailable"
+            )
+            reasons = (
+                result.get("reason_codes", ["session_metrics_unavailable"])
+                if isinstance(result, dict)
+                else ["reservation_error"]
+            )
             if not isinstance(code, str) or not code:
                 code = "reservation_unavailable"
-            if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
+            if not isinstance(reasons, list) or not all(
+                isinstance(item, str) for item in reasons
+            ):
                 reasons = ["reservation_error"]
             return _deny(code, reasons)
         return 0

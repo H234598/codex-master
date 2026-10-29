@@ -74,7 +74,9 @@ def test_probe_provider_models_dispatches_supported_lanes_and_rejects_other(
     )
 
     for provider, sentinel in sentinels.items():
-        assert probe_provider_models(provider, secret="secret", opener=opener) is sentinel
+        assert (
+            probe_provider_models(provider, secret="secret", opener=opener) is sentinel
+        )
     unsupported = probe_provider_models(Provider.OPENAI_API)
 
     assert calls == [
@@ -107,16 +109,34 @@ class _ProbeProcess:
         return self._returncode
 
 
-def agent(tmp_path: Path, provider: Provider, runner: RunnerKind, *, account_id: str | None) -> AgentDescriptor:
+def agent(
+    tmp_path: Path, provider: Provider, runner: RunnerKind, *, account_id: str | None
+) -> AgentDescriptor:
     return AgentDescriptor(
-        "d1", "d", 1, "Test agent", runner, provider, "gemini-3-flash-preview", account_id,
-        tmp_path / "agents" / "d1", "codex_agent_d1_mcp", True,
+        "d1",
+        "d",
+        1,
+        "Test agent",
+        runner,
+        provider,
+        "gemini-3-flash-preview",
+        account_id,
+        tmp_path / "agents" / "d1",
+        "codex_agent_d1_mcp",
+        True,
     )
 
 
-def test_codex_runner_keeps_chatgpt_home_and_unsets_foreign_secrets(tmp_path: Path) -> None:
+def test_codex_runner_keeps_chatgpt_home_and_unsets_foreign_secrets(
+    tmp_path: Path,
+) -> None:
     plan = build_runner_plan(
-        agent(tmp_path, Provider.OPENAI_CHATGPT, RunnerKind.CODEX_CLI, account_id="chatgpt"),
+        agent(
+            tmp_path,
+            Provider.OPENAI_CHATGPT,
+            RunnerKind.CODEX_CLI,
+            account_id="chatgpt",
+        ),
         Path("/usr/local/bin/codex"),
     )
 
@@ -139,7 +159,9 @@ def test_openai_api_runner_allows_only_its_secret_name(tmp_path: Path) -> None:
     assert "HF_TOKEN" in plan.unset_env
 
 
-def test_ollama_runner_uses_codex_builtin_provider_without_secret(tmp_path: Path) -> None:
+def test_ollama_runner_uses_codex_builtin_provider_without_secret(
+    tmp_path: Path,
+) -> None:
     plan = build_runner_plan(
         agent(tmp_path, Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, account_id=None),
         Path("/usr/local/bin/codex"),
@@ -151,7 +173,12 @@ def test_ollama_runner_uses_codex_builtin_provider_without_secret(tmp_path: Path
 
 def test_hf_runner_uses_responses_profile_and_env_reference(tmp_path: Path) -> None:
     plan = build_runner_plan(
-        agent(tmp_path, Provider.HUGGINGFACE_INFERENCE, RunnerKind.CODEX_CLI, account_id="hf"),
+        agent(
+            tmp_path,
+            Provider.HUGGINGFACE_INFERENCE,
+            RunnerKind.CODEX_CLI,
+            account_id="hf",
+        ),
         Path("/usr/local/bin/codex"),
     )
 
@@ -163,14 +190,24 @@ def test_hf_runner_uses_responses_profile_and_env_reference(tmp_path: Path) -> N
 
 def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> None:
     plan = build_runner_plan(
-        agent(tmp_path, Provider.GEMINI_API, RunnerKind.GEMINI_CLI, account_id="gemini-project-1"),
+        agent(
+            tmp_path,
+            Provider.GEMINI_API,
+            RunnerKind.GEMINI_CLI,
+            account_id="gemini-project-1",
+        ),
         Path("/usr/local/bin/gemini"),
     )
 
     assert plan.mode == "headless_job"
     assert plan.argv == (
-        "/usr/local/bin/gemini", "--output-format", "stream-json", "--model",
-        "gemini-3-flash-preview", "--prompt", "",
+        "/usr/local/bin/gemini",
+        "--output-format",
+        "stream-json",
+        "--model",
+        "gemini-3-flash-preview",
+        "--prompt",
+        "",
     )
     assert "private task" not in plan.argv
     assert plan.env == {
@@ -180,18 +217,32 @@ def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> No
     }
     assert plan.secret_env_name == "GEMINI_API_KEY"
     assert "OPENAI_API_KEY" in plan.unset_env
-    assert {"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
-            "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI"} <= plan.unset_env
+    assert {
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    } <= plan.unset_env
 
     lightweight = build_runner_plan(
-        replace(agent(tmp_path, Provider.GEMINI_API, RunnerKind.GEMINI_CLI, account_id="gemini-project-1"), model="auto"),
+        replace(
+            agent(
+                tmp_path,
+                Provider.GEMINI_API,
+                RunnerKind.GEMINI_CLI,
+                account_id="gemini-project-1",
+            ),
+            model="auto",
+        ),
         Path("/usr/local/bin/gemini"),
     )
     assert "gemini-3.1-flash-lite" in lightweight.argv
 
 
 def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executable = tmp_path / "gemini"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -201,7 +252,9 @@ def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
     def launch(argv: tuple[str, ...], **kwargs: object) -> _ProbeProcess:
         captured["argv"] = argv
         captured["env"] = dict(kwargs["env"])  # type: ignore[arg-type]
-        settings_path = Path(captured["env"]["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json"  # type: ignore[index]
+        settings_path = (
+            Path(captured["env"]["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json"
+        )  # type: ignore[index]
         captured["settings"] = settings_path.read_text(encoding="utf-8")
         return _ProbeProcess(
             b'{"type":"init","model":"gemini-3-flash-preview"}\n'
@@ -260,7 +313,9 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
 
     captured_timeout: list[float] = []
 
-    def _run_bounded(*_args: object, timeout_seconds: float, **_kwargs: object) -> HeadlessProcessResult:
+    def _run_bounded(
+        *_args: object, timeout_seconds: float, **_kwargs: object
+    ) -> HeadlessProcessResult:
         captured_timeout.append(timeout_seconds)
         return timeout_result
 
@@ -492,8 +547,10 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
     executable.chmod(0o700)
 
     if prepare == "headless_unreaped":
+
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             raise HeadlessJobError("headless_process_unreaped")
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "normal_exit":
         result_process = HeadlessProcessResult(
@@ -508,6 +565,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return result_process
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "terminal_structured_error":
         result_process = HeadlessProcessResult(
@@ -525,6 +583,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return result_process
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "terminal_result_without_model":
         result_process = HeadlessProcessResult(
@@ -539,6 +598,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return result_process
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare in {
         "timeout_no_output",
@@ -567,14 +627,12 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_stdout_terminal":
         timeout_result = HeadlessProcessResult(
             returncode=0,
-            stdout=(
-                b'{"type":"init","model":"gemini-2.5-flash"}\n'
-                b'{"type":"result"}\n'
-            ),
+            stdout=(b'{"type":"init","model":"gemini-2.5-flash"}\n{"type":"result"}\n'),
             stderr=b"",
             stdout_truncated=False,
             stderr_truncated=False,
@@ -584,6 +642,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_stdout_unclassified":
         timeout_result = HeadlessProcessResult(
@@ -598,6 +657,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare in {"timeout_stderr_only", "timeout_stdout_and_stderr"}:
         timeout_result = HeadlessProcessResult(
@@ -606,27 +666,24 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
                 b""
                 if prepare == "timeout_stderr_only"
                 else (
-                    b'{"type":"init","model":"gemini-2.5-flash"}\n'
-                    b'{"type":"result"}\n'
+                    b'{"type":"init","model":"gemini-2.5-flash"}\n{"type":"result"}\n'
                 )
             ),
-                stderr=b"timeout stderr\n",
-                stdout_truncated=False,
-                stderr_truncated=False,
-                timed_out=True,
-                cancelled=False,
-            )
+            stderr=b"timeout stderr\n",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            timed_out=True,
+            cancelled=False,
+        )
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_open_reader":
         timeout_result = HeadlessProcessResult(
             returncode=0,
-            stdout=(
-                b'{"type":"init","model":"gemini-2.5-flash"}\n'
-                b'{"type":"result"}\n'
-            ),
+            stdout=(b'{"type":"init","model":"gemini-2.5-flash"}\n{"type":"result"}\n'),
             stderr=b"",
             stdout_truncated=False,
             stderr_truncated=False,
@@ -637,6 +694,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_truncated_or_pipe_open":
         timeout_result = HeadlessProcessResult(
@@ -651,6 +709,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
+
         monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     else:
         executable.write_text("not executable", encoding="utf-8")
@@ -673,27 +732,30 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
     assert result.process_stdout_error_seen == expected_stdout_error_seen
 
 
-@pytest.mark.parametrize(("stdout", "expected_code", "expected_kind", "expected_retryable"), [
-    (
-        b'{"type":"error","error":{"code":503,"status":"UNAVAILABLE","message":"private"}}\n'
-        b'{"type":"result"}\n',
-        "gemini_probe_structured_response",
-        "provider_unavailable",
-        True,
-    ),
-    (
-        b'{"type":"init","model":"gemini-2.5-flash"}\n',
-        "gemini_probe_jsonl_terminal_invalid",
-        "runner_failed",
-        False,
-    ),
-    (
-        b"not-json\n",
-        "gemini_probe_jsonl_terminal_invalid",
-        "runner_failed",
-        False,
-    ),
-])
+@pytest.mark.parametrize(
+    ("stdout", "expected_code", "expected_kind", "expected_retryable"),
+    [
+        (
+            b'{"type":"error","error":{"code":503,"status":"UNAVAILABLE","message":"private"}}\n'
+            b'{"type":"result"}\n',
+            "gemini_probe_structured_response",
+            "provider_unavailable",
+            True,
+        ),
+        (
+            b'{"type":"init","model":"gemini-2.5-flash"}\n',
+            "gemini_probe_jsonl_terminal_invalid",
+            "runner_failed",
+            False,
+        ),
+        (
+            b"not-json\n",
+            "gemini_probe_jsonl_terminal_invalid",
+            "runner_failed",
+            False,
+        ),
+    ],
+)
 def test_gemini_provider_probe_reports_structured_and_parser_diagnostic_codes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -730,8 +792,12 @@ def test_gemini_provider_probe_reports_structured_and_parser_diagnostic_codes(
     assert "private-gemini-secret" not in repr(result)
 
 
-def test_runner_plan_is_immutable_and_refuses_relative_or_controlled_executable(tmp_path: Path) -> None:
-    valid_agent = agent(tmp_path, Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, account_id=None)
+def test_runner_plan_is_immutable_and_refuses_relative_or_controlled_executable(
+    tmp_path: Path,
+) -> None:
+    valid_agent = agent(
+        tmp_path, Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, account_id=None
+    )
     plan = build_runner_plan(valid_agent, Path("/usr/local/bin/codex"))
     with pytest.raises(TypeError):
         plan.env["X"] = "value"  # type: ignore[index]
@@ -743,9 +809,17 @@ def test_runner_plan_is_immutable_and_refuses_relative_or_controlled_executable(
 
 
 def test_runner_plan_constructor_freezes_nested_collections(tmp_path: Path) -> None:
-    valid_agent = agent(tmp_path, Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, account_id=None)
+    valid_agent = agent(
+        tmp_path, Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, account_id=None
+    )
     plan = build_runner_plan(valid_agent, Path("/usr/local/bin/codex"))
-    direct = type(plan)(plan.mode, list(plan.argv), dict(plan.env), set(plan.unset_env), plan.secret_env_name)
+    direct = type(plan)(
+        plan.mode,
+        list(plan.argv),
+        dict(plan.env),
+        set(plan.unset_env),
+        plan.secret_env_name,
+    )
     with pytest.raises(TypeError):
         direct.env["X"] = "value"  # type: ignore[index]
     with pytest.raises(AttributeError):
@@ -753,20 +827,26 @@ def test_runner_plan_constructor_freezes_nested_collections(tmp_path: Path) -> N
 
 
 def test_gemini_parser_keeps_only_assistant_response_and_aggregate_usage() -> None:
-    result = parse_gemini_jsonl([
-        '{"type":"init","session_id":"session-1","model":"gemini-3-flash-preview"}',
-        '{"type":"message","role":"user","content":"private user prompt"}',
-        '{"type":"tool_use","parameters":{"private":"argument"}}',
-        '{"type":"tool_result","output":"private tool output"}',
-        '{"type":"message","role":"assistant","content":"first "}',
-        '{"type":"message","role":"assistant","content":"answer"}',
-        '{"type":"result","stats":{"input_tokens":12,"output_tokens":7}}',
-    ])
+    result = parse_gemini_jsonl(
+        [
+            '{"type":"init","session_id":"session-1","model":"gemini-3-flash-preview"}',
+            '{"type":"message","role":"user","content":"private user prompt"}',
+            '{"type":"tool_use","parameters":{"private":"argument"}}',
+            '{"type":"tool_result","output":"private tool output"}',
+            '{"type":"message","role":"assistant","content":"first "}',
+            '{"type":"message","role":"assistant","content":"answer"}',
+            '{"type":"result","stats":{"input_tokens":12,"output_tokens":7}}',
+        ]
+    )
 
     assert result.response == "first answer"
     assert result.session_id == "session-1"
     assert result.model == "gemini-3-flash-preview"
-    assert (result.input_tokens, result.output_tokens, result.tool_call_count) == (12, 7, 1)
+    assert (result.input_tokens, result.output_tokens, result.tool_call_count) == (
+        12,
+        7,
+        1,
+    )
     assert result.event_count == 7
     assert result.unknown_event_count == 0
     assert result.error is None
@@ -774,27 +854,36 @@ def test_gemini_parser_keeps_only_assistant_response_and_aggregate_usage() -> No
 
 
 def test_gemini_parser_accepts_final_response_and_counts_unknown_events() -> None:
-    result = parse_gemini_jsonl([
-        '{"type":"init","session_id":"session-1","model":"gemini-3-flash-preview"}',
-        '{"type":"new_event","prompt":"private"}',
-        '{"type":"result","response":"final answer","stats":{"input_tokens":0,"output_tokens":2}}',
-    ])
+    result = parse_gemini_jsonl(
+        [
+            '{"type":"init","session_id":"session-1","model":"gemini-3-flash-preview"}',
+            '{"type":"new_event","prompt":"private"}',
+            '{"type":"result","response":"final answer","stats":{"input_tokens":0,"output_tokens":2}}',
+        ]
+    )
 
     assert result.response == "final answer"
     assert result.unknown_event_count == 1
 
 
-@pytest.mark.parametrize("lines", [
-    ['{"type":"init"}'],
-    ["not json"],
-    ["[]"],
-    ['{"type":"result","stats":{"input_tokens":-1}}'],
-    ['{"type":"result","stats":{"output_tokens":9223372036854775808}}'],
-    ["\ud800"],
-    ["x" * (1024 * 1024 + 1)],
-    ['{"type":"message","role":"assistant","content":"' + "x" * (1024 * 1024 + 1) + '"}',
-     '{"type":"result"}'],
-])
+@pytest.mark.parametrize(
+    "lines",
+    [
+        ['{"type":"init"}'],
+        ["not json"],
+        ["[]"],
+        ['{"type":"result","stats":{"input_tokens":-1}}'],
+        ['{"type":"result","stats":{"output_tokens":9223372036854775808}}'],
+        ["\ud800"],
+        ["x" * (1024 * 1024 + 1)],
+        [
+            '{"type":"message","role":"assistant","content":"'
+            + "x" * (1024 * 1024 + 1)
+            + '"}',
+            '{"type":"result"}',
+        ],
+    ],
+)
 def test_gemini_parser_rejects_malformed_or_bounded_streams(lines: list[str]) -> None:
     with pytest.raises(FleetRunnerError):
         parse_gemini_jsonl(lines)
@@ -809,18 +898,24 @@ def test_gemini_parser_rejects_more_than_ten_thousand_events() -> None:
 def test_gemini_parser_enforces_one_response_budget_across_chunks_and_result() -> None:
     response_part = "x" * 700_000
     with pytest.raises(FleetRunnerError):
-        parse_gemini_jsonl([
-            '{"type":"message","role":"assistant","content":"' + response_part + '"}',
-            '{"type":"result","response":"' + response_part + '"}',
-        ])
+        parse_gemini_jsonl(
+            [
+                '{"type":"message","role":"assistant","content":"'
+                + response_part
+                + '"}',
+                '{"type":"result","response":"' + response_part + '"}',
+            ]
+        )
 
 
 def test_gemini_parser_returns_data_minimized_structured_provider_error() -> None:
-    result = parse_gemini_jsonl([
-        '{"type":"error","error":{"code":429,"status":"RESOURCE_EXHAUSTED",'
-        '"message":"private provider diagnosis"}}',
-        '{"type":"result"}',
-    ])
+    result = parse_gemini_jsonl(
+        [
+            '{"type":"error","error":{"code":429,"status":"RESOURCE_EXHAUSTED",'
+            '"message":"private provider diagnosis"}}',
+            '{"type":"result"}',
+        ]
+    )
 
     assert result.error is not None
     assert result.error.kind == "account_limited"
@@ -830,7 +925,9 @@ def test_gemini_parser_returns_data_minimized_structured_provider_error() -> Non
 
 def test_resource_exhausted_is_shared_account_limit() -> None:
     error = classify_provider_error(
-        Provider.GEMINI_API, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}, "",
+        Provider.GEMINI_API,
+        {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}},
+        "",
     )
 
     assert error.kind == "account_limited"
@@ -838,18 +935,23 @@ def test_resource_exhausted_is_shared_account_limit() -> None:
 
 
 def test_stderr_alone_never_marks_an_account_limited() -> None:
-    error = classify_provider_error(Provider.GEMINI_API, None, "quota exhausted private details")
+    error = classify_provider_error(
+        Provider.GEMINI_API, None, "quota exhausted private details"
+    )
     assert error.kind == "runner_failed"
     assert error.status_code is None
 
 
-@pytest.mark.parametrize(("payload", "kind", "retryable"), [
-    ({"code": 401}, "auth_invalid", False),
-    ({"status": "UNAVAILABLE"}, "provider_unavailable", True),
-    ({"error": {"code": 503}}, "provider_unavailable", True),
-    ({"status": "MODEL_NOT_FOUND"}, "model_unavailable", False),
-    ({"message": "private unknown failure"}, "runner_failed", False),
-])
+@pytest.mark.parametrize(
+    ("payload", "kind", "retryable"),
+    [
+        ({"code": 401}, "auth_invalid", False),
+        ({"status": "UNAVAILABLE"}, "provider_unavailable", True),
+        ({"error": {"code": 503}}, "provider_unavailable", True),
+        ({"status": "MODEL_NOT_FOUND"}, "model_unavailable", False),
+        ({"message": "private unknown failure"}, "runner_failed", False),
+    ],
+)
 def test_provider_error_classifier_uses_only_structured_confirmations(
     payload: object, kind: str, retryable: bool
 ) -> None:
@@ -925,7 +1027,9 @@ def test_provider_error_records_quota_retry_scope_model_and_clamps_duration() ->
     assert "3600.1" not in repr(bounded_error.quota_observation)
 
 
-def test_provider_error_records_scope_account_unknown_and_sanitizes_retry_info() -> None:
+def test_provider_error_records_scope_account_unknown_and_sanitizes_retry_info() -> (
+    None
+):
     account_payload = {
         "error": {
             "code": 429,
@@ -1002,13 +1106,21 @@ def test_provider_error_records_scope_account_unknown_and_sanitizes_retry_info()
             ],
         },
     }
-    missing_payload = {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [{"foo": 1}]}}
+    missing_payload = {
+        "error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [{"foo": 1}]}
+    }
 
     account_error = classify_provider_error(Provider.GEMINI_API, account_payload, "")
     unknown_error = classify_provider_error(Provider.GEMINI_API, unknown_payload, "")
-    malformed_retry_error = classify_provider_error(Provider.GEMINI_API, malformed_retry_payload, "")
-    overlong_retry_error = classify_provider_error(Provider.GEMINI_API, overlong_retry_payload, "")
-    missing_payload_error = classify_provider_error(Provider.GEMINI_API, missing_payload, "")
+    malformed_retry_error = classify_provider_error(
+        Provider.GEMINI_API, malformed_retry_payload, ""
+    )
+    overlong_retry_error = classify_provider_error(
+        Provider.GEMINI_API, overlong_retry_payload, ""
+    )
+    missing_payload_error = classify_provider_error(
+        Provider.GEMINI_API, missing_payload, ""
+    )
 
     assert account_error.kind == "account_limited"
     assert account_error.status_code == 429
@@ -1029,12 +1141,18 @@ def test_provider_error_records_scope_account_unknown_and_sanitizes_retry_info()
     assert missing_payload_error.quota_observation.retry_after_seconds is None
 
 
-def test_provider_error_non_429_keeps_quota_observation_none_and_old_constructors() -> None:
+def test_provider_error_non_429_keeps_quota_observation_none_and_old_constructors() -> (
+    None
+):
     not_429 = classify_provider_error(
-        Provider.GEMINI_API, {"code": 503, "status": "UNAVAILABLE", "details": []}, "",
+        Provider.GEMINI_API,
+        {"code": 503, "status": "UNAVAILABLE", "details": []},
+        "",
     )
     no_http_429 = classify_provider_error(
-        Provider.GEMINI_API, {"status": "RESOURCE_EXHAUSTED", "details": []}, "",
+        Provider.GEMINI_API,
+        {"status": "RESOURCE_EXHAUSTED", "details": []},
+        "",
     )
     legacy = ProviderError("account_limited", True, 429, None)
 
@@ -1047,10 +1165,14 @@ def test_provider_error_non_429_keeps_quota_observation_none_and_old_constructor
 
 def test_provider_error_keeps_only_valid_structured_reset_time() -> None:
     valid = classify_provider_error(
-        Provider.GEMINI_API, {"code": 429, "reset_at_utc": "2026-08-03T12:00:00Z"}, "",
+        Provider.GEMINI_API,
+        {"code": 429, "reset_at_utc": "2026-08-03T12:00:00Z"},
+        "",
     )
     invalid = classify_provider_error(
-        Provider.GEMINI_API, {"code": 429, "reset_at_utc": "private reset date"}, "",
+        Provider.GEMINI_API,
+        {"code": 429, "reset_at_utc": "private reset date"},
+        "",
     )
     assert valid.reset_at_utc == "2026-08-03T12:00:00Z"
     assert invalid.reset_at_utc is None
@@ -1058,22 +1180,41 @@ def test_provider_error_keeps_only_valid_structured_reset_time() -> None:
 
 def test_provider_error_rejects_non_rfc3339_structured_reset_time() -> None:
     error = classify_provider_error(
-        Provider.GEMINI_API, {"code": 429, "reset_at_utc": "2026-08-03T12:00Z"}, "",
+        Provider.GEMINI_API,
+        {"code": 429, "reset_at_utc": "2026-08-03T12:00Z"},
+        "",
     )
     assert error.reset_at_utc is None
 
 
-@pytest.mark.parametrize(("provider", "metadata", "expected"), [
-    (Provider.OLLAMA_LOCAL, {"installed": True, "supports_tools": True}, True),
-    (Provider.OLLAMA_LOCAL, {"installed": True, "supports_tools": False}, False),
-    (Provider.OLLAMA_LOCAL, {"installed": "true"}, False),
-    (Provider.HUGGINGFACE_INFERENCE,
-     {"supports_tools": True, "supports_responses": True, "provider_available": True}, True),
-    (Provider.HUGGINGFACE_INFERENCE,
-     {"supports_tools": True, "supports_responses": "true", "provider_available": True}, False),
-    (Provider.GEMINI_API, {"probe_ok": True, "supports_tools": True}, True),
-    (Provider.OPENAI_API, {"probe_ok": True, "supports_tools": "true"}, False),
-])
+@pytest.mark.parametrize(
+    ("provider", "metadata", "expected"),
+    [
+        (Provider.OLLAMA_LOCAL, {"installed": True, "supports_tools": True}, True),
+        (Provider.OLLAMA_LOCAL, {"installed": True, "supports_tools": False}, False),
+        (Provider.OLLAMA_LOCAL, {"installed": "true"}, False),
+        (
+            Provider.HUGGINGFACE_INFERENCE,
+            {
+                "supports_tools": True,
+                "supports_responses": True,
+                "provider_available": True,
+            },
+            True,
+        ),
+        (
+            Provider.HUGGINGFACE_INFERENCE,
+            {
+                "supports_tools": True,
+                "supports_responses": "true",
+                "provider_available": True,
+            },
+            False,
+        ),
+        (Provider.GEMINI_API, {"probe_ok": True, "supports_tools": True}, True),
+        (Provider.OPENAI_API, {"probe_ok": True, "supports_tools": "true"}, False),
+    ],
+)
 def test_model_agentic_requires_real_capability_booleans(
     provider: Provider, metadata: dict[str, object], expected: bool
 ) -> None:
@@ -1081,7 +1222,14 @@ def test_model_agentic_requires_real_capability_booleans(
 
 
 class FakeProviderResponse:
-    def __init__(self, url: str, body: bytes, *, status: int = 200, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        body: bytes,
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._url = url
         self._body = body
         self.status = status
@@ -1109,23 +1257,36 @@ def _gemini_models_response(
     url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
     models = []
     if include_model:
-        models.append({
-            "name": f"models/{model}",
-            "supportedGenerationMethods": methods if methods is not None else ["generateContent"],
-        })
+        models.append(
+            {
+                "name": f"models/{model}",
+                "supportedGenerationMethods": methods
+                if methods is not None
+                else ["generateContent"],
+            }
+        )
     return FakeProviderResponse(url, json.dumps({"models": models}).encode())
 
 
-@pytest.mark.parametrize(("include_model", "methods", "expected_code"), [
-    (False, None, "gemini_probe_generate_content_capability_model_missing"),
-    (True, ["countTokens"], "gemini_probe_generate_content_capability_method_missing"),
-])
+@pytest.mark.parametrize(
+    ("include_model", "methods", "expected_code"),
+    [
+        (False, None, "gemini_probe_generate_content_capability_model_missing"),
+        (
+            True,
+            ["countTokens"],
+            "gemini_probe_generate_content_capability_method_missing",
+        ),
+    ],
+)
 def test_gemini_rest_probe_stops_before_content_without_exact_capability(
     include_model: bool,
     methods: list[str] | None,
     expected_code: str,
 ) -> None:
-    model_response = _gemini_models_response(include_model=include_model, methods=methods)
+    model_response = _gemini_models_response(
+        include_model=include_model, methods=methods
+    )
     observed_urls: list[str] = []
 
     def opener(request: object, *, timeout: int) -> FakeProviderResponse:
@@ -1160,15 +1321,17 @@ def test_gemini_rest_probe_uses_capability_checked_generate_content_contract() -
     observed: list[dict[str, object]] = []
 
     def opener(request: object, *, timeout: int) -> FakeProviderResponse:
-        observed.append({
-            "url": request.full_url,  # type: ignore[attr-defined]
-            "method": request.get_method(),  # type: ignore[attr-defined]
-            "key": request.get_header("X-goog-api-key"),  # type: ignore[attr-defined]
-            "authorization": request.get_header("Authorization"),  # type: ignore[attr-defined]
-            "content_type": request.get_header("Content-type"),  # type: ignore[attr-defined]
-            "body": request.data,  # type: ignore[attr-defined]
-            "timeout": timeout,
-        })
+        observed.append(
+            {
+                "url": request.full_url,  # type: ignore[attr-defined]
+                "method": request.get_method(),  # type: ignore[attr-defined]
+                "key": request.get_header("X-goog-api-key"),  # type: ignore[attr-defined]
+                "authorization": request.get_header("Authorization"),  # type: ignore[attr-defined]
+                "content_type": request.get_header("Content-type"),  # type: ignore[attr-defined]
+                "body": request.data,  # type: ignore[attr-defined]
+                "timeout": timeout,
+            }
+        )
         return next(responses)
 
     result = probe_gemini_rest("private-gemini-key", opener=opener)
@@ -1195,10 +1358,14 @@ def test_gemini_rest_probe_uses_capability_checked_generate_content_contract() -
             "key": "private-gemini-key",
             "authorization": None,
             "content_type": "application/json",
-            "body": json.dumps({
-                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
-                "generationConfig": {"maxOutputTokens": 1},
-            }, separators=(",", ":"), sort_keys=True).encode(),
+            "body": json.dumps(
+                {
+                    "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                    "generationConfig": {"maxOutputTokens": 1},
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode(),
             "timeout": 5,
         },
     ]
@@ -1211,44 +1378,137 @@ def test_gemini_rest_probe_uses_capability_checked_generate_content_contract() -
     assert content_url not in repr(result)
 
 
-@pytest.mark.parametrize(("status", "provider_fields", "expected_kind", "retryable", "expected_code"), [
-    (400, {"code": "invalid_request"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_contract_rejected"),
-    (400, {"code": "parameter_unknown"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_contract_rejected"),
-    (400, {"status": "INVALID_ARGUMENT"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_contract_rejected"),
-    (401, {"code": "authentication"}, "auth_invalid", False,
-     "gemini_probe_generate_content_http_4xx_authentication"),
-    (401, {"status": "UNAUTHENTICATED"}, "auth_invalid", False,
-     "gemini_probe_generate_content_http_4xx_authentication"),
-    (403, {"code": "permission_denied"}, "auth_or_billing_denied", False,
-     "gemini_probe_generate_content_http_4xx_auth_or_billing_denied"),
-    (403, {"status": "PERMISSION_DENIED"}, "auth_or_billing_denied", False,
-     "gemini_probe_generate_content_http_4xx_auth_or_billing_denied"),
-    (404, {"code": "model_not_found"}, "model_unavailable", False,
-     "gemini_probe_generate_content_http_4xx_model_not_found"),
-    (404, {"status": "MODEL_NOT_FOUND"}, "model_unavailable", False,
-     "gemini_probe_generate_content_http_4xx_model_not_found"),
-    (404, {"code": "not_found"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_not_found_unclassified"),
-    (404, {"status": "NOT_FOUND"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_not_found_unclassified"),
-    (429, {"code": "rate_limit_exceeded"}, "account_limited", True,
-     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"),
-    (429, {"code": "quota_exceeded"}, "account_limited", True,
-     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"),
-    (429, {"status": "RESOURCE_EXHAUSTED"}, "account_limited", True,
-     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"),
-    (500, {"code": "api_error"}, "provider_unavailable", True,
-     "gemini_probe_generate_content_http_5xx_provider_unavailable"),
-    (503, {"code": "service_unavailable"}, "provider_unavailable", True,
-     "gemini_probe_generate_content_http_5xx_provider_unavailable"),
-    (503, {"status": "UNAVAILABLE"}, "provider_unavailable", True,
-     "gemini_probe_generate_content_http_5xx_provider_unavailable"),
-    (418, {"code": "vendor-private-project-marker"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_client_rejected_unknown"),
-])
+@pytest.mark.parametrize(
+    ("status", "provider_fields", "expected_kind", "retryable", "expected_code"),
+    [
+        (
+            400,
+            {"code": "invalid_request"},
+            "runner_failed",
+            False,
+            "gemini_probe_generate_content_http_4xx_contract_rejected",
+        ),
+        (
+            400,
+            {"code": "parameter_unknown"},
+            "runner_failed",
+            False,
+            "gemini_probe_generate_content_http_4xx_contract_rejected",
+        ),
+        (
+            400,
+            {"status": "INVALID_ARGUMENT"},
+            "runner_failed",
+            False,
+            "gemini_probe_generate_content_http_4xx_contract_rejected",
+        ),
+        (
+            401,
+            {"code": "authentication"},
+            "auth_invalid",
+            False,
+            "gemini_probe_generate_content_http_4xx_authentication",
+        ),
+        (
+            401,
+            {"status": "UNAUTHENTICATED"},
+            "auth_invalid",
+            False,
+            "gemini_probe_generate_content_http_4xx_authentication",
+        ),
+        (
+            403,
+            {"code": "permission_denied"},
+            "auth_or_billing_denied",
+            False,
+            "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+        ),
+        (
+            403,
+            {"status": "PERMISSION_DENIED"},
+            "auth_or_billing_denied",
+            False,
+            "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+        ),
+        (
+            404,
+            {"code": "model_not_found"},
+            "model_unavailable",
+            False,
+            "gemini_probe_generate_content_http_4xx_model_not_found",
+        ),
+        (
+            404,
+            {"status": "MODEL_NOT_FOUND"},
+            "model_unavailable",
+            False,
+            "gemini_probe_generate_content_http_4xx_model_not_found",
+        ),
+        (
+            404,
+            {"code": "not_found"},
+            "runner_failed",
+            False,
+            "gemini_probe_generate_content_http_4xx_not_found_unclassified",
+        ),
+        (
+            404,
+            {"status": "NOT_FOUND"},
+            "runner_failed",
+            False,
+            "gemini_probe_generate_content_http_4xx_not_found_unclassified",
+        ),
+        (
+            429,
+            {"code": "rate_limit_exceeded"},
+            "account_limited",
+            True,
+            "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+        ),
+        (
+            429,
+            {"code": "quota_exceeded"},
+            "account_limited",
+            True,
+            "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+        ),
+        (
+            429,
+            {"status": "RESOURCE_EXHAUSTED"},
+            "account_limited",
+            True,
+            "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+        ),
+        (
+            500,
+            {"code": "api_error"},
+            "provider_unavailable",
+            True,
+            "gemini_probe_generate_content_http_5xx_provider_unavailable",
+        ),
+        (
+            503,
+            {"code": "service_unavailable"},
+            "provider_unavailable",
+            True,
+            "gemini_probe_generate_content_http_5xx_provider_unavailable",
+        ),
+        (
+            503,
+            {"status": "UNAVAILABLE"},
+            "provider_unavailable",
+            True,
+            "gemini_probe_generate_content_http_5xx_provider_unavailable",
+        ),
+        (
+            418,
+            {"code": "vendor-private-project-marker"},
+            "runner_failed",
+            False,
+            "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
+        ),
+    ],
+)
 def test_gemini_rest_probe_classifies_only_allowlisted_redacted_error_semantics(
     status: int,
     provider_fields: dict[str, object],
@@ -1264,20 +1524,24 @@ def test_gemini_rest_probe_classifies_only_allowlisted_redacted_error_semantics(
     body_marker = f"private-provider-message-{status}"
     header_marker = f"private-provider-header-{status}"
     project_marker = f"private-project-{status}"
-    error_body = json.dumps({
-        "error": {
-            **provider_fields,
-            "message": body_marker,
-            "project": project_marker,
-        },
-    }).encode()
+    error_body = json.dumps(
+        {
+            "error": {
+                **provider_fields,
+                "message": body_marker,
+                "project": project_marker,
+            },
+        }
+    ).encode()
     content_response = FakeProviderResponse(
         content_url,
         error_body,
         status=status,
         headers={"X-Private-Diagnostic": header_marker},
     )
-    failure = HTTPError(content_url, status, "private-http-reason", None, content_response)
+    failure = HTTPError(
+        content_url, status, "private-http-reason", None, content_response
+    )
     responses: list[object] = [model_response, failure]
 
     def opener(*_args: object, **_kwargs: object) -> FakeProviderResponse:
@@ -1312,10 +1576,13 @@ def test_gemini_rest_probe_classifies_only_allowlisted_redacted_error_semantics(
     assert content_response.closed is True
 
 
-@pytest.mark.parametrize("provider_fields", [
-    {"code": "not_found"},
-    {"status": "NOT_FOUND"},
-])
+@pytest.mark.parametrize(
+    "provider_fields",
+    [
+        {"code": "not_found"},
+        {"status": "NOT_FOUND"},
+    ],
+)
 def test_gemini_rest_probe_classifies_direct_not_found_response_neutrally(
     provider_fields: dict[str, str],
 ) -> None:
@@ -1355,22 +1622,26 @@ def test_gemini_rest_probe_preserves_redacted_quota_scope_and_retry() -> None:
     )
     content_response = FakeProviderResponse(
         content_url,
-        json.dumps({
-            "error": {
-                "code": "quota_exceeded",
-                "message": "private quota body",
-                "details": [
-                    {
-                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
-                        "violations": [{"quotaDimensions": {"model": "private-model-value"}}],
-                    },
-                    {
-                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
-                        "retryDelay": "7s",
-                    },
-                ],
-            },
-        }).encode(),
+        json.dumps(
+            {
+                "error": {
+                    "code": "quota_exceeded",
+                    "message": "private quota body",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                            "violations": [
+                                {"quotaDimensions": {"model": "private-model-value"}}
+                            ],
+                        },
+                        {
+                            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                            "retryDelay": "7s",
+                        },
+                    ],
+                },
+            }
+        ).encode(),
         status=429,
     )
     failure = HTTPError(content_url, 429, "private", None, content_response)
@@ -1391,13 +1662,18 @@ def test_gemini_rest_probe_preserves_redacted_quota_scope_and_retry() -> None:
     assert "private-model-value" not in repr(result)
 
 
-@pytest.mark.parametrize("body", [
-    b"{",
-    b"[]",
-    b"{}",
-    b"{}" + b"x" * MAX_GEMINI_PROBE_RESPONSE_BYTES,
-])
-def test_gemini_rest_probe_rejects_invalid_generate_content_json_without_leak(body: bytes) -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{",
+        b"[]",
+        b"{}",
+        b"{}" + b"x" * MAX_GEMINI_PROBE_RESPONSE_BYTES,
+    ],
+)
+def test_gemini_rest_probe_rejects_invalid_generate_content_json_without_leak(
+    body: bytes,
+) -> None:
     model_response = _gemini_models_response()
     content_url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -1414,41 +1690,52 @@ def test_gemini_rest_probe_rejects_invalid_generate_content_json_without_leak(bo
     assert result.ok is False
     assert result.error is not None
     assert result.error.kind == "provider_unavailable"
-    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_2xx_json_invalid"
+    assert (
+        result.error.diagnostic_code
+        == "gemini_probe_generate_content_http_2xx_json_invalid"
+    )
     assert getattr(result, "endpoint_role", None) == "generate_content"
     assert getattr(result, "http_class", None) == "2xx"
     assert body.decode("utf-8", errors="ignore") not in repr(result)
     assert content_url not in repr(result)
 
 
-@pytest.mark.parametrize("value", [
-    "gemini_probe_generate_content_capability_model_missing",
-    "gemini_probe_generate_content_capability_method_missing",
-    "gemini_probe_generate_content_http_4xx_contract_rejected",
-    "gemini_probe_generate_content_http_4xx_authentication",
-    "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
-    "gemini_probe_generate_content_http_4xx_model_not_found",
-    "gemini_probe_generate_content_http_4xx_not_found_unclassified",
-    "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
-    "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
-    "gemini_probe_generate_content_http_5xx_provider_unavailable",
-    "gemini_probe_generate_content_http_2xx_json_invalid",
-    "gemini_probe_generate_content_redirect_rejected",
-    "gemini_probe_generate_content_transport",
-])
-def test_gemini_probe_normalizer_accepts_only_generate_content_probe_diagnostics(value: str) -> None:
+@pytest.mark.parametrize(
+    "value",
+    [
+        "gemini_probe_generate_content_capability_model_missing",
+        "gemini_probe_generate_content_capability_method_missing",
+        "gemini_probe_generate_content_http_4xx_contract_rejected",
+        "gemini_probe_generate_content_http_4xx_authentication",
+        "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+        "gemini_probe_generate_content_http_4xx_model_not_found",
+        "gemini_probe_generate_content_http_4xx_not_found_unclassified",
+        "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+        "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
+        "gemini_probe_generate_content_http_5xx_provider_unavailable",
+        "gemini_probe_generate_content_http_2xx_json_invalid",
+        "gemini_probe_generate_content_redirect_rejected",
+        "gemini_probe_generate_content_transport",
+    ],
+)
+def test_gemini_probe_normalizer_accepts_only_generate_content_probe_diagnostics(
+    value: str,
+) -> None:
     assert normalize_gemini_probe_diagnostic_code(value) == value
 
 
-@pytest.mark.parametrize("retired", [
-    "gemini_probe_rest_http_unclassified",
-    "gemini_probe_rest_interactions_http_4xx",
-    "gemini_probe_rest_interactions_http_5xx",
-    "gemini_probe_rest_interaction_not_completed",
-    "gemini_probe_rest_steps_invalid",
-    "gemini_probe_rest_model_output_missing",
-    "gemini_probe_generate_content_http_4xx_route_not_found",
-])
+@pytest.mark.parametrize(
+    "retired",
+    [
+        "gemini_probe_rest_http_unclassified",
+        "gemini_probe_rest_interactions_http_4xx",
+        "gemini_probe_rest_interactions_http_5xx",
+        "gemini_probe_rest_interaction_not_completed",
+        "gemini_probe_rest_steps_invalid",
+        "gemini_probe_rest_model_output_missing",
+        "gemini_probe_generate_content_http_4xx_route_not_found",
+    ],
+)
 def test_gemini_probe_normalizer_rejects_retired_diagnostics(retired: str) -> None:
     assert normalize_gemini_probe_diagnostic_code(retired) is None
 
@@ -1475,14 +1762,19 @@ def test_gemini_rest_probe_maps_generate_content_transport_without_leak() -> Non
     assert "private-offline-marker" not in repr(result)
 
 
-@pytest.mark.parametrize("model", [
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent",
-    "gemini-2.5-flash-lite/extra",
-    "gemini-2.5-flash-lite?x=1",
-    "GEMINI-2.5-FLASH-LITE",
-    " gemini-2.5-flash-lite",
-])
-def test_gemini_rest_probe_rejects_noncanonical_model_without_opener(model: str) -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent",
+        "gemini-2.5-flash-lite/extra",
+        "gemini-2.5-flash-lite?x=1",
+        "GEMINI-2.5-FLASH-LITE",
+        " gemini-2.5-flash-lite",
+    ],
+)
+def test_gemini_rest_probe_rejects_noncanonical_model_without_opener(
+    model: str,
+) -> None:
     result = probe_gemini_rest(
         "private-gemini-key",
         model=model,
@@ -1501,39 +1793,51 @@ def test_gemini_models_catalog_is_paged_bounded_and_projects_safe_fields() -> No
     second_url = f"{first_url}&pageToken=next%2Ftoken"
     first_response = FakeProviderResponse(
         first_url,
-        json.dumps({
-            "models": [
-                {
-                    "name": "models/gemini-2.5-flash-lite",
-                    "supportedGenerationMethods": ["countTokens", "generateContent", "privateMethod"],
-                },
-                {
-                    "name": f"models/{future_model}",
-                    "supportedGenerationMethods": ["countTokens"],
-                },
-            ],
-            "nextPageToken": "next/token",
-        }).encode(),
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "name": "models/gemini-2.5-flash-lite",
+                        "supportedGenerationMethods": [
+                            "countTokens",
+                            "generateContent",
+                            "privateMethod",
+                        ],
+                    },
+                    {
+                        "name": f"models/{future_model}",
+                        "supportedGenerationMethods": ["countTokens"],
+                    },
+                ],
+                "nextPageToken": "next/token",
+            }
+        ).encode(),
     )
     second_response = FakeProviderResponse(
         second_url,
-        json.dumps({
-            "models": [{
-                "name": "models/gemini-2.5-flash-lite",
-                "supportedGenerationMethods": ["streamGenerateContent"],
-            }],
-        }).encode(),
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "name": "models/gemini-2.5-flash-lite",
+                        "supportedGenerationMethods": ["streamGenerateContent"],
+                    }
+                ],
+            }
+        ).encode(),
     )
     responses = iter([first_response, second_response])
     observed: list[dict[str, object]] = []
 
     def opener(request: object, *, timeout: int) -> FakeProviderResponse:
-        observed.append({
-            "url": request.full_url,  # type: ignore[attr-defined]
-            "key": request.get_header("X-goog-api-key"),  # type: ignore[attr-defined]
-            "authorization": request.get_header("Authorization"),  # type: ignore[attr-defined]
-            "timeout": timeout,
-        })
+        observed.append(
+            {
+                "url": request.full_url,  # type: ignore[attr-defined]
+                "key": request.get_header("X-goog-api-key"),  # type: ignore[attr-defined]
+                "authorization": request.get_header("Authorization"),  # type: ignore[attr-defined]
+                "timeout": timeout,
+            }
+        )
         return next(responses)
 
     result = probe_gemini_models(secret, opener=opener)
@@ -1542,7 +1846,11 @@ def test_gemini_models_catalog_is_paged_bounded_and_projects_safe_fields() -> No
     assert result.models == (
         {
             "id": "gemini-2.5-flash-lite",
-            "supported_generation_methods": ["countTokens", "generateContent", "streamGenerateContent"],
+            "supported_generation_methods": [
+                "countTokens",
+                "generateContent",
+                "streamGenerateContent",
+            ],
             "supports_generate_content": True,
             "agentic": True,
             "readiness_worker": True,
@@ -1565,13 +1873,16 @@ def test_gemini_models_catalog_is_paged_bounded_and_projects_safe_fields() -> No
     assert second_response.read_sizes == [MAX_GEMINI_MODELS_RESPONSE_BYTES + 1]
 
 
-@pytest.mark.parametrize(("status", "provider_fields", "expected_error"), [
-    (400, {"code": "invalid_request"}, "runner_failed"),
-    (403, {"code": "permission_denied"}, "auth_or_billing_denied"),
-    (404, {"code": "model_not_found"}, "model_unavailable"),
-    (429, {"code": "quota_exceeded"}, "account_limited"),
-    (503, {"code": "service_unavailable"}, "provider_unavailable"),
-])
+@pytest.mark.parametrize(
+    ("status", "provider_fields", "expected_error"),
+    [
+        (400, {"code": "invalid_request"}, "runner_failed"),
+        (403, {"code": "permission_denied"}, "auth_or_billing_denied"),
+        (404, {"code": "model_not_found"}, "model_unavailable"),
+        (429, {"code": "quota_exceeded"}, "account_limited"),
+        (503, {"code": "service_unavailable"}, "provider_unavailable"),
+    ],
+)
 def test_gemini_models_uses_shared_redacted_http_error_normalization(
     status: int,
     provider_fields: dict[str, object],
@@ -1604,12 +1915,14 @@ def test_gemini_rest_probe_preserves_models_list_normalized_error() -> None:
     url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
     response = FakeProviderResponse(
         url,
-        json.dumps({
-            "error": {
-                "code": "permission_denied",
-                "message": "private-models-permission-body",
-            },
-        }).encode(),
+        json.dumps(
+            {
+                "error": {
+                    "code": "permission_denied",
+                    "message": "private-models-permission-body",
+                },
+            }
+        ).encode(),
         status=403,
     )
     failure = HTTPError(url, 403, "private-models-permission-reason", None, response)
@@ -1624,7 +1937,10 @@ def test_gemini_rest_probe_preserves_models_list_normalized_error() -> None:
     assert result.error.kind == "auth_or_billing_denied"
     assert result.error.retryable is False
     assert result.error.status_code is None
-    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_4xx_auth_or_billing_denied"
+    assert (
+        result.error.diagnostic_code
+        == "gemini_probe_generate_content_http_4xx_auth_or_billing_denied"
+    )
     assert result.endpoint_role == "generate_content"
     assert result.http_class == "4xx"
     assert "private-models-permission" not in repr(result)
@@ -1635,22 +1951,29 @@ def test_gemini_rest_probe_preserves_direct_models_http_diagnostic() -> None:
     url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
     response = FakeProviderResponse(
         url,
-        json.dumps({
-            "error": {
-                "code": "invalid_request",
-                "message": "private-direct-models-body",
-            },
-        }).encode(),
+        json.dumps(
+            {
+                "error": {
+                    "code": "invalid_request",
+                    "message": "private-direct-models-body",
+                },
+            }
+        ).encode(),
         status=400,
     )
 
-    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
+    result = probe_gemini_rest(
+        "private-gemini-key", opener=lambda *_args, **_kwargs: response
+    )
 
     assert result.ok is False
     assert result.error is not None
     assert result.error.kind == "runner_failed"
     assert result.error.retryable is False
-    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_4xx_contract_rejected"
+    assert (
+        result.error.diagnostic_code
+        == "gemini_probe_generate_content_http_4xx_contract_rejected"
+    )
     assert result.http_class == "4xx"
     assert "private-direct-models-body" not in repr(result)
     assert "private-gemini-key" not in repr(result)
@@ -1660,26 +1983,32 @@ def test_gemini_rest_probe_preserves_models_list_model_quota_observation() -> No
     url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
     response = FakeProviderResponse(
         url,
-        json.dumps({
-            "error": {
-                "code": "quota_exceeded",
-                "message": "private-models-quota-body",
-                "details": [
-                    {
-                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
-                        "violations": [{"quotaDimensions": {"model": "private-model-value"}}],
-                    },
-                    {
-                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
-                        "retryDelay": "11s",
-                    },
-                ],
-            },
-        }).encode(),
+        json.dumps(
+            {
+                "error": {
+                    "code": "quota_exceeded",
+                    "message": "private-models-quota-body",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                            "violations": [
+                                {"quotaDimensions": {"model": "private-model-value"}}
+                            ],
+                        },
+                        {
+                            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                            "retryDelay": "11s",
+                        },
+                    ],
+                },
+            }
+        ).encode(),
         status=429,
     )
 
-    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
+    result = probe_gemini_rest(
+        "private-gemini-key", opener=lambda *_args, **_kwargs: response
+    )
 
     assert result.ok is False
     assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
@@ -1687,7 +2016,10 @@ def test_gemini_rest_probe_preserves_models_list_model_quota_observation() -> No
     assert result.error.kind == "account_limited"
     assert result.error.retryable is True
     assert result.error.quota_observation == ProviderErrorQuotaObservation("model", 11)
-    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"
+    assert (
+        result.error.diagnostic_code
+        == "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"
+    )
     assert result.http_class == "4xx"
     assert "private-models-quota-body" not in repr(result)
     assert "private-model-value" not in repr(result)
@@ -1697,13 +2029,18 @@ def test_gemini_rest_probe_rejects_direct_models_redirect_before_body_parse() ->
     url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
     response = FakeProviderResponse(url, b"private-redirect-body", status=302)
 
-    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
+    result = probe_gemini_rest(
+        "private-gemini-key", opener=lambda *_args, **_kwargs: response
+    )
 
     assert result.ok is False
     assert result.error is not None
     assert result.error.kind == "provider_unavailable"
     assert result.error.retryable is True
-    assert result.error.diagnostic_code == "gemini_probe_generate_content_redirect_rejected"
+    assert (
+        result.error.diagnostic_code
+        == "gemini_probe_generate_content_redirect_rejected"
+    )
     assert result.http_class == "transport"
     assert response.read_sizes == []
     assert response.closed is True
@@ -1737,14 +2074,17 @@ def test_gemini_rest_probe_uses_valid_custom_model_after_capability_check() -> N
     assert "%2F" not in observed_urls[1]
 
 
-@pytest.mark.parametrize(("error_code", "expected_kind", "retryable"), [
-    ("auth_invalid", "auth_invalid", False),
-    ("account_limited", "account_limited", True),
-    ("model_unavailable", "model_unavailable", False),
-    ("provider_unavailable", "provider_unavailable", True),
-    ("runner_failed", "runner_failed", False),
-    ("private_unclassified_error", "runner_failed", False),
-])
+@pytest.mark.parametrize(
+    ("error_code", "expected_kind", "retryable"),
+    [
+        ("auth_invalid", "auth_invalid", False),
+        ("account_limited", "account_limited", True),
+        ("model_unavailable", "model_unavailable", False),
+        ("provider_unavailable", "provider_unavailable", True),
+        ("runner_failed", "runner_failed", False),
+        ("private_unclassified_error", "runner_failed", False),
+    ],
+)
 def test_gemini_rest_probe_preserves_fleet_runner_error_semantics(
     error_code: str,
     expected_kind: str,
@@ -1771,7 +2111,10 @@ def test_gemini_rest_probe_preserves_fleet_runner_error_semantics(
 
 
 def test_gemini_model_validator_accepts_future_ids_and_rejects_path_injection() -> None:
-    assert validate_gemini_probe_model("gemini-9.9-future-preview") == "gemini-9.9-future-preview"
+    assert (
+        validate_gemini_probe_model("gemini-9.9-future-preview")
+        == "gemini-9.9-future-preview"
+    )
     for value in (
         "",
         "gemini-2.5-flash-lite/other",
@@ -1800,7 +2143,10 @@ def test_gemini_rest_probe_rejects_redirects() -> None:
     assert result.ok is False
     assert result.error is not None
     assert result.error.kind == "provider_unavailable"
-    assert result.error.diagnostic_code == "gemini_probe_generate_content_redirect_rejected"
+    assert (
+        result.error.diagnostic_code
+        == "gemini_probe_generate_content_redirect_rejected"
+    )
     assert getattr(result, "endpoint_role", None) == "generate_content"
     assert getattr(result, "http_class", None) == "transport"
     assert "private-redirect" not in repr(result)
@@ -1811,9 +2157,20 @@ def test_gemini_rest_probe_rejects_redirects() -> None:
 def test_ollama_probe_is_loopback_bounded_and_secret_free() -> None:
     response = FakeProviderResponse(
         OLLAMA_MODELS_URL,
-        json.dumps({"models": [{
-            "name": "qwen3-coder:latest", "capabilities": ["completion", "tools"],
-        }, {"name": "qwen3-coder:latest", "capabilities": ["completion", "tools"]}]}).encode(),
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "name": "qwen3-coder:latest",
+                        "capabilities": ["completion", "tools"],
+                    },
+                    {
+                        "name": "qwen3-coder:latest",
+                        "capabilities": ["completion", "tools"],
+                    },
+                ]
+            }
+        ).encode(),
     )
     observed: dict[str, object] = {}
 
@@ -1825,10 +2182,14 @@ def test_ollama_probe_is_loopback_bounded_and_secret_free() -> None:
 
     result = probe_ollama_models(opener=opener)
     assert result.available is True
-    assert result.models == ({
-        "id": "qwen3-coder:latest", "installed": True,
-        "supports_tools": True, "agentic": True,
-    },)
+    assert result.models == (
+        {
+            "id": "qwen3-coder:latest",
+            "installed": True,
+            "supports_tools": True,
+            "agentic": True,
+        },
+    )
     assert observed == {"url": OLLAMA_MODELS_URL, "authorization": None, "timeout": 5}
     assert response.read_sizes == [MAX_PROVIDER_RESPONSE_BYTES + 1]
     assert response.closed is True
@@ -1838,25 +2199,47 @@ def test_ollama_probe_is_loopback_bounded_and_secret_free() -> None:
 def test_ollama_probe_keeps_models_without_tools_non_agentic() -> None:
     response = FakeProviderResponse(
         OLLAMA_MODELS_URL,
-        json.dumps({"models": [{"name": "completion-only", "capabilities": ["completion"]}]}).encode(),
+        json.dumps(
+            {"models": [{"name": "completion-only", "capabilities": ["completion"]}]}
+        ).encode(),
     )
 
     result = probe_ollama_models(opener=lambda *_args, **_kwargs: response)
 
     assert result.available is True
-    assert result.models == ({
-        "id": "completion-only", "installed": True,
-        "supports_tools": False, "agentic": False,
-    },)
+    assert result.models == (
+        {
+            "id": "completion-only",
+            "installed": True,
+            "supports_tools": False,
+            "agentic": False,
+        },
+    )
 
 
-def test_huggingface_probe_sends_secret_only_in_private_request_and_gates_capabilities() -> None:
+def test_huggingface_probe_sends_secret_only_in_private_request_and_gates_capabilities() -> (
+    None
+):
     response = FakeProviderResponse(
         HUGGINGFACE_MODELS_URL,
-        json.dumps({"data": [
-            {"id": "good/model", "supports_tools": True, "supports_responses": True, "provider_available": True},
-            {"id": "text/model", "supports_tools": True, "supports_responses": False, "provider_available": True},
-        ]}).encode(),
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "id": "good/model",
+                        "supports_tools": True,
+                        "supports_responses": True,
+                        "provider_available": True,
+                    },
+                    {
+                        "id": "text/model",
+                        "supports_tools": True,
+                        "supports_responses": False,
+                        "provider_available": True,
+                    },
+                ]
+            }
+        ).encode(),
     )
     observed: dict[str, object] = {}
 
@@ -1870,16 +2253,28 @@ def test_huggingface_probe_sends_secret_only_in_private_request_and_gates_capabi
     assert result.available is True
     assert result.models[0]["agentic"] is True
     assert result.models[1]["agentic"] is False
-    assert observed == {"url": HUGGINGFACE_MODELS_URL, "authorization": "Bearer private-token", "timeout": 5}
+    assert observed == {
+        "url": HUGGINGFACE_MODELS_URL,
+        "authorization": "Bearer private-token",
+        "timeout": 5,
+    }
     assert "private-token" not in repr(result)
 
 
 def test_provider_probe_rejects_redirects_and_unbounded_bodies() -> None:
     redirected = FakeProviderResponse("http://localhost:11434/api/tags", b"{}")
-    assert probe_ollama_models(opener=lambda *_args, **_kwargs: redirected).error == "redirect_rejected"
+    assert (
+        probe_ollama_models(opener=lambda *_args, **_kwargs: redirected).error
+        == "redirect_rejected"
+    )
 
-    oversized = FakeProviderResponse(OLLAMA_MODELS_URL, b"x" * (MAX_PROVIDER_RESPONSE_BYTES + 1))
-    assert probe_ollama_models(opener=lambda *_args, **_kwargs: oversized).error == "provider_response_too_large"
+    oversized = FakeProviderResponse(
+        OLLAMA_MODELS_URL, b"x" * (MAX_PROVIDER_RESPONSE_BYTES + 1)
+    )
+    assert (
+        probe_ollama_models(opener=lambda *_args, **_kwargs: oversized).error
+        == "provider_response_too_large"
+    )
 
 
 def test_huggingface_probe_requires_a_private_secret_before_network() -> None:

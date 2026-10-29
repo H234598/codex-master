@@ -21,7 +21,9 @@ from the_hive.admin_operations import (
 
 
 NOW = datetime(2026, 8, 28, 10, 0, tzinfo=UTC)
-LEGACY_DIGEST = "sha256:b5029f1bcea0a6630628a94cccbed49e025e36551d85fddd6224c7788ca096b5"
+LEGACY_DIGEST = (
+    "sha256:b5029f1bcea0a6630628a94cccbed49e025e36551d85fddd6224c7788ca096b5"
+)
 V1_STATE_BYTES = 2 * 1024 * 1024
 MAX_OWNER_METADATA_BYTES = len(
     b',"owner":{"boot_id":"ffffffff-ffff-ffff-ffff-ffffffffffff",'
@@ -151,9 +153,7 @@ def fixture_digest(steps: list[str]) -> str:
 
 
 def maximum_v1_records() -> list[dict[str, object]]:
-    step_sets = {
-        count: [f"s{index}" for index in range(count)] for count in (134, 135)
-    }
+    step_sets = {count: [f"s{index}" for index in range(count)] for count in (134, 135)}
     digests = {count: fixture_digest(steps) for count, steps in step_sets.items()}
     records = []
     for index in range(MAX_OPERATION_RECORDS):
@@ -203,12 +203,15 @@ def test_maximum_v1_document_migrates_without_evicting_unexpired_ids(
     assert len(persisted_raw) <= V2_STATE_BYTES
     assert persisted["schema_version"] == 2
     assert {record["id"] for record in persisted["operations"]} == retained_ids
-    assert store.plan(
-        kind="google.provision",
-        generation=4,
-        key=records[0]["idempotency_key"],
-        steps=tuple(step["name"] for step in records[0]["steps"]),
-    ).operation_id == records[0]["id"]
+    assert (
+        store.plan(
+            kind="google.provision",
+            generation=4,
+            key=records[0]["idempotency_key"],
+            steps=tuple(step["name"] for step in records[0]["steps"]),
+        ).operation_id
+        == records[0]["id"]
+    )
     assert store_at(tmp_path).get(records[-1]["id"]).id == records[-1]["id"]
 
 
@@ -242,7 +245,9 @@ def test_v2_document_one_byte_over_calculated_limit_is_rejected(tmp_path) -> Non
     document.write_bytes(raw + b" " * (V2_STATE_BYTES + 1 - len(raw)))
     document.chmod(0o600)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store_at(tmp_path)
 
 
@@ -252,7 +257,9 @@ def test_v1_document_one_byte_over_legacy_limit_is_rejected(tmp_path) -> None:
     assert len(raw) <= V2_STATE_BYTES
     write_operation_bytes(tmp_path, raw)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store_at(tmp_path)
 
 
@@ -267,7 +274,9 @@ def test_v2_payload_cannot_consume_one_byte_of_owner_reserve(tmp_path) -> None:
     assert len(raw) <= V2_STATE_BYTES
     write_operation_bytes(tmp_path, raw)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store_at(tmp_path)
 
 
@@ -291,9 +300,7 @@ def test_regular_write_cannot_consume_v2_owner_metadata_reserve(tmp_path) -> Non
     store = store_at(tmp_path)
 
     with pytest.raises(AdminOperationError, match="control.operation_limit"):
-        store.plan(
-            kind="google.provision", generation=4, key="reserve", steps=("one",)
-        )
+        store.plan(kind="google.provision", generation=4, key="reserve", steps=("one",))
 
     assert document.read_bytes() == raw
 
@@ -341,7 +348,9 @@ def test_v1_running_migrates_to_restart_stable_unknown_owner(tmp_path) -> None:
     assert migrated.expires_at == NOW + timedelta(minutes=15)
     assert persisted["schema_version"] == 2
     assert persisted["operations"][0]["owner"] == {"status": "unknown"}
-    assert store_at(tmp_path, owner_probe=dead_probe).get(migrated.id).state == "running"
+    assert (
+        store_at(tmp_path, owner_probe=dead_probe).get(migrated.id).state == "running"
+    )
 
 
 def test_unknown_persistence_major_is_rejected(tmp_path) -> None:
@@ -350,7 +359,9 @@ def test_unknown_persistence_major_is_rejected(tmp_path) -> None:
         {"schema_version": 3, "operations": [legacy_v1_record("planned")]},
     )
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store_at(tmp_path)
 
 
@@ -394,9 +405,7 @@ def test_idempotency_key_cannot_be_rebound_to_another_payload(tmp_path) -> None:
     )
 
     with pytest.raises(AdminOperationError, match="control.idempotency_conflict"):
-        store.plan(
-            kind="google.provision", generation=7, key="same", steps=("two",)
-        )
+        store.plan(kind="google.provision", generation=7, key="same", steps=("two",))
 
     assert store.get(first.operation_id).state == "planned"
 
@@ -426,9 +435,7 @@ def test_unexpired_terminal_capacity_preserves_idempotency_binding(tmp_path) -> 
     )
     assert repeated.operation_id == first_id
     with pytest.raises(AdminOperationError, match="control.operation_limit"):
-        store.plan(
-            kind="google.provision", generation=7, key="new", steps=("one",)
-        )
+        store.plan(kind="google.provision", generation=7, key="new", steps=("one",))
 
 
 def test_expired_planned_records_are_removed_at_record_pressure(tmp_path) -> None:
@@ -453,9 +460,7 @@ def test_expired_planned_records_are_removed_at_record_pressure(tmp_path) -> Non
 def test_expired_records_are_removed_at_byte_pressure(tmp_path) -> None:
     clock = Clock()
     store = store_at(tmp_path, clock)
-    large_steps = tuple(
-        f"step-{index:04d}-" + "x" * 116 for index in range(1_000)
-    )
+    large_steps = tuple(f"step-{index:04d}-" + "x" * 116 for index in range(1_000))
     created = 0
     for index in range(MAX_OPERATION_RECORDS):
         try:
@@ -487,9 +492,7 @@ def test_expired_records_are_removed_at_byte_pressure(tmp_path) -> None:
 def test_byte_capacity_failure_still_persists_safe_expiry_cleanup(tmp_path) -> None:
     clock = Clock()
     store = store_at(tmp_path, clock)
-    large_steps = tuple(
-        f"step-{index:04d}-" + "x" * 116 for index in range(1_000)
-    )
+    large_steps = tuple(f"step-{index:04d}-" + "x" * 116 for index in range(1_000))
     running_ids = []
     for index in range(11):
         plan = store.plan(
@@ -609,9 +612,7 @@ def test_unpaired_expired_host_probe_plan_prunes_normally(tmp_path) -> None:
 
     with pytest.raises(AdminOperationError, match="control.operation_not_found"):
         store.get(probe.operation_id)
-    assert not (
-        tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-    ).exists()
+    assert not (tmp_path / "admin-operations" / "host-probe-lifecycle.json").exists()
 
 
 def test_host_probe_owner_rejects_wrong_binding_and_missing_operation_without_mutation(
@@ -685,9 +686,7 @@ def test_host_probe_owner_rejects_reused_agent_operation_id_without_mutation(
     owner_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
     before = owner_path.read_bytes()
 
-    with pytest.raises(
-        AdminOperationError, match="control.operation_state_conflict"
-    ):
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
         store.bind_host_probe_agent(
             second.operation_id,
             agent_operation_id="operation-agent-one",
@@ -760,7 +759,9 @@ def test_host_probe_owner_schema_rejects_unknown_fields(tmp_path) -> None:
     owner_path.write_text(json.dumps(document), encoding="utf-8")
     owner_path.chmod(0o600)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store_at(tmp_path)
 
 
@@ -784,7 +785,10 @@ def test_plan_digest_binds_kind_generation_and_ordered_steps(
     )
 
     changed = store.plan(
-        kind=kind, generation=generation, key=f"changed-{kind}-{generation}", steps=steps
+        kind=kind,
+        generation=generation,
+        key=f"changed-{kind}-{generation}",
+        steps=steps,
     )
 
     assert changed.plan_digest != baseline.plan_digest
@@ -794,9 +798,7 @@ def test_plan_digest_binds_kind_generation_and_ordered_steps(
 
 def test_stale_generation_changes_nothing(tmp_path) -> None:
     store = store_at(tmp_path)
-    plan = store.plan(
-        kind="google.provision", generation=4, key="x", steps=("one",)
-    )
+    plan = store.plan(kind="google.provision", generation=4, key="x", steps=("one",))
 
     with pytest.raises(AdminOperationError, match="control.plan_stale"):
         store.begin(plan.operation_id, current_generation=5)
@@ -818,9 +820,7 @@ def test_step_progress_and_finish_survive_restart(tmp_path) -> None:
         steps=("create", "probe"),
     )
     running = store.begin(plan.operation_id, current_generation=4)
-    progressed = store.record_step(
-        plan.operation_id, "create", succeeded=True
-    )
+    progressed = store.record_step(plan.operation_id, "create", succeeded=True)
     store.record_step(plan.operation_id, "probe", succeeded=True)
     clock.now += timedelta(seconds=5)
     finished = store.finish(
@@ -882,9 +882,7 @@ def test_only_restart_reconciled_host_probe_can_be_resumed(tmp_path) -> None:
     store.begin(probe.operation_id, current_generation=4)
     recovered = store_at(tmp_path, owner_probe=dead_probe)
 
-    resumed = recovered.resume_host_probe(
-        probe.operation_id, expected_generation=4
-    )
+    resumed = recovered.resume_host_probe(probe.operation_id, expected_generation=4)
 
     assert resumed.state == "running"
     assert resumed.not_attempted_count == 1
@@ -1033,13 +1031,21 @@ def test_expired_restart_reconciled_host_probe_accepts_every_durable_step_shape(
     assert terminal.state == expected_state
     assert terminal.reason_codes == (expected_reason,)
     assert terminal.completed_count == (step_state == "succeeded")
-    assert terminal.failed_count == (step_state == "failed" or step_state == "not_attempted")
-    assert recovered.expire_host_probe(
-        probe.operation_id,
-        expected_generation=4,
-        plan_digest=probe.plan_digest,
-    ) == terminal
-    assert store_at(tmp_path, clock, owner_probe=dead_probe).get(probe.operation_id) == terminal
+    assert terminal.failed_count == (
+        step_state == "failed" or step_state == "not_attempted"
+    )
+    assert (
+        recovered.expire_host_probe(
+            probe.operation_id,
+            expected_generation=4,
+            plan_digest=probe.plan_digest,
+        )
+        == terminal
+    )
+    assert (
+        store_at(tmp_path, clock, owner_probe=dead_probe).get(probe.operation_id)
+        == terminal
+    )
 
 
 def test_expired_restart_reconciled_host_probe_rejects_noncanonical_step_shape(
@@ -1147,11 +1153,14 @@ def test_expired_planned_host_probe_has_one_exact_idempotent_failure_transition(
     assert terminal.failed_count == 1
     assert terminal.not_attempted_count == 0
     assert terminal.reason_codes == ("host.probe_unknown",)
-    assert store.expire_host_probe(
-        probe.operation_id,
-        expected_generation=4,
-        plan_digest=probe.plan_digest,
-    ) == terminal
+    assert (
+        store.expire_host_probe(
+            probe.operation_id,
+            expected_generation=4,
+            plan_digest=probe.plan_digest,
+        )
+        == terminal
+    )
 
 
 @pytest.mark.parametrize(
@@ -1289,16 +1298,16 @@ def test_state_files_remain_private(tmp_path) -> None:
 
 def test_operation_document_symlink_is_rejected(tmp_path) -> None:
     store = store_at(tmp_path)
-    plan = store.plan(
-        kind="google.provision", generation=1, key="safe", steps=("one",)
-    )
+    plan = store.plan(kind="google.provision", generation=1, key="safe", steps=("one",))
     document = tmp_path / "admin-operations" / "operations.json"
     target = tmp_path / "outside.json"
     target.write_text("{}", encoding="utf-8")
     document.unlink()
     document.symlink_to(target)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store.get(plan.operation_id)
 
     assert target.read_text(encoding="utf-8") == "{}"
@@ -1315,7 +1324,9 @@ def test_lock_symlink_is_reported_as_generic_store_error(tmp_path) -> None:
     lock.unlink()
     lock.symlink_to(target)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store.get(plan.operation_id)
 
     assert target.read_text(encoding="utf-8") == "unchanged"
@@ -1323,16 +1334,16 @@ def test_lock_symlink_is_reported_as_generic_store_error(tmp_path) -> None:
 
 def test_restart_rejects_digest_not_bound_to_persisted_plan(tmp_path) -> None:
     store = store_at(tmp_path)
-    store.plan(
-        kind="google.provision", generation=1, key="digest-safe", steps=("one",)
-    )
+    store.plan(kind="google.provision", generation=1, key="digest-safe", steps=("one",))
     document = tmp_path / "admin-operations" / "operations.json"
     payload = json.loads(document.read_text(encoding="utf-8"))
     payload["operations"][0]["plan_digest"] = "sha256:" + "0" * 64
     document.write_text(json.dumps(payload), encoding="utf-8")
     document.chmod(0o600)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store_at(tmp_path)
 
 
@@ -1360,7 +1371,9 @@ def test_restart_rejects_state_machine_tampering(tmp_path, mutation: str) -> Non
     document.write_text(json.dumps(payload), encoding="utf-8")
     document.chmod(0o600)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         store_at(tmp_path)
 
 

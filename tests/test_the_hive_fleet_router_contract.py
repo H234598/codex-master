@@ -304,9 +304,10 @@ def test_runtime_migration_policy_is_closed_linked_read_only_contract() -> None:
     assert "weder Install noch Activate noch Reload noch Cutover" in text["SKILL.md"]
     assert "echten Consumer-E2E-Vertrag" in text["references/common-invariants.md"]
     assert "ungebundene Migration" in text["references/tl-worker-operations.md"]
-    assert "Zwei identische Live-Fehlschläge" in text[
-        "references/diagnostics-retry-reporting.md"
-    ]
+    assert (
+        "Zwei identische Live-Fehlschläge"
+        in text["references/diagnostics-retry-reporting.md"]
+    )
 
 
 def test_runtime_diagnostic_evidence_contract_stays_non_authoritative() -> None:
@@ -354,9 +355,7 @@ def test_runtime_diagnostic_evidence_contract_stays_non_authoritative() -> None:
         assert marker in text[relative], f"{relative} grants lifecycle authority"
 
 
-def test_runtime_migration_roadmap_keeps_fixture_and_masterplan_holds_visible() -> (
-    None
-):
+def test_runtime_migration_roadmap_keeps_fixture_and_masterplan_holds_visible() -> None:
     """Keep the repo plan complete without turning deferred live evidence into a loop."""
     roadmap = Path(__file__).resolve().parents[1] / ROADMAP
     text = re.sub(r"\s+", " ", roadmap.read_text(encoding="utf-8"))

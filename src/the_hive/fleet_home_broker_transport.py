@@ -183,7 +183,10 @@ def _safe_token(value: object, *, maximum: int) -> bool:
     return (
         type(value) is str
         and 0 < len(value) <= maximum
-        and all(character.isascii() and (character.isalnum() or character in "._-") for character in value)
+        and all(
+            character.isascii() and (character.isalnum() or character in "._-")
+            for character in value
+        )
     )
 
 

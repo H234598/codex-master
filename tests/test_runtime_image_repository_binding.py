@@ -110,11 +110,7 @@ def _attested_pool_evidence(now: datetime) -> UsageEvidenceV2:
                         now + timedelta(hours=1),
                     ),
                 ),
-                (
-                    TrackerEvidenceV2(
-                        "main", 18_000, generation, "complete", now
-                    ),
-                ),
+                (TrackerEvidenceV2("main", 18_000, generation, "complete", now),),
             ),
         ),
         status="complete",
@@ -140,8 +136,13 @@ def _attested_pool_evidence(now: datetime) -> UsageEvidenceV2:
             "pool_authority-v3.model_capabilities",
             (
                 ModelInvocabilityV1(
-                    "runtime-image-test", "gpt-6.1-sol", "codex_cli",
-                    True, True, True, True,
+                    "runtime-image-test",
+                    "gpt-6.1-sol",
+                    "codex_cli",
+                    True,
+                    True,
+                    True,
+                    True,
                 ),
             ),
         ),
@@ -156,7 +157,9 @@ def _p2_runtime_image(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     state_root.parent.mkdir(mode=0o700, parents=True)
     apply_pilot_provisioning(repository_root=checkout, state_root=state_root)
 
-    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
     stage = tmp_path / "runtime-image"
     stage.mkdir(mode=0o700)
     installer["_build_runtime_image"](
@@ -178,7 +181,8 @@ def _p2_runtime_image(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
 
 
 def test_user_runtime_cli_refuses_root_gate_install_without_mutation(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     stage, _state_root, _installer = _p2_runtime_image(tmp_path)
     staged_server = runpy.run_path(str(stage / "src" / "the_hive" / "server.py"))
@@ -198,7 +202,9 @@ def test_runtime_stage_validator_rejects_unattested_scope_gate_bytes(
     gate = stage / "bin" / "the-hive-resource-scope-gate"
     gate.write_bytes(gate.read_bytes() + b"# changed after manifest\n")
 
-    with pytest.raises(installer["InstallError"], match="^install_stage_validation_failed$"):
+    with pytest.raises(
+        installer["InstallError"], match="^install_stage_validation_failed$"
+    ):
         installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
 
 
@@ -207,7 +213,9 @@ def _published_launcher_release(
 ) -> tuple[Path, str, str, dict[str, object]]:
     """Build a harmless attested generation for the stable launchers alone."""
 
-    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
     stage = tmp_path / ".the-hive-runtime.stage.launcher-test"
     stage.mkdir(mode=0o700)
     generation = "launcher-test"
@@ -237,24 +245,32 @@ def _published_launcher_release(
     library.mkdir(mode=0o700, parents=True)
     release_root = library / "the-hive-runtime"
     installer["_publish_runtime_generation"](stage=stage, release_root=release_root)  # type: ignore[operator]
-    manifest_digest = "sha256:" + hashlib.sha256(
-        (
-            release_root
-            / "generations"
-            / generation
-            / ".the-hive-runtime-manifest.json"
-        ).read_bytes()
-    ).hexdigest()
-    assert RuntimeLayout.from_current_release(
-        release_root, generation, manifest_digest
-    ).root == release_root / "generations" / generation
+    manifest_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            (
+                release_root
+                / "generations"
+                / generation
+                / ".the-hive-runtime-manifest.json"
+            ).read_bytes()
+        ).hexdigest()
+    )
+    assert (
+        RuntimeLayout.from_current_release(
+            release_root, generation, manifest_digest
+        ).root
+        == release_root / "generations" / generation
+    )
     return release_root, generation, manifest_digest, installer
 
 
 def test_stable_launchers_require_one_attested_current_generation_without_checkout_or_cache(
     tmp_path: Path,
 ) -> None:
-    release_root, generation, manifest_digest, _installer = _published_launcher_release(tmp_path)
+    release_root, generation, manifest_digest, _installer = _published_launcher_release(
+        tmp_path
+    )
     dirty_checkout = tmp_path / "dirty-checkout"
     (dirty_checkout / "the_hive").mkdir(parents=True)
     (dirty_checkout / "the_hive" / "server.py").write_text(
@@ -282,24 +298,44 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
     for launcher in launchers:
         for arguments in ((), (str(release_root), generation)):
             result = subprocess.run(
-                [launcher, *arguments], cwd=dirty_checkout, env=env,
-                check=False, capture_output=True, text=True, timeout=10,
+                [launcher, *arguments],
+                cwd=dirty_checkout,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             assert result.returncode == 64
             assert result.stdout == ""
             assert result.stderr == ""
         successful = subprocess.run(
-            [launcher, release_root, generation, manifest_digest], cwd=dirty_checkout, env=env,
-            check=False, capture_output=True, text=True, timeout=10,
+            [launcher, release_root, generation, manifest_digest],
+            cwd=dirty_checkout,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         assert successful.returncode == 0, successful.stderr
         assert successful.stdout == ""
         assert successful.stderr == ""
         if launcher.name == "the-hive-mcp":
             forwarded = subprocess.run(
-                [launcher, release_root, generation, manifest_digest, "--runtime-status-mcp"],
-                cwd=dirty_checkout, env=env, check=False, capture_output=True,
-                text=True, timeout=10,
+                [
+                    launcher,
+                    release_root,
+                    generation,
+                    manifest_digest,
+                    "--runtime-status-mcp",
+                ],
+                cwd=dirty_checkout,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             assert forwarded.returncode == 0, forwarded.stderr
             assert forwarded.stdout == ""
@@ -307,8 +343,12 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
         else:
             extra = subprocess.run(
                 [launcher, release_root, generation, manifest_digest, "extra"],
-                cwd=dirty_checkout, env=env, check=False, capture_output=True,
-                text=True, timeout=10,
+                cwd=dirty_checkout,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             assert extra.returncode == 64
             assert extra.stdout == ""
@@ -320,8 +360,12 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
         ):
             result = subprocess.run(
                 [launcher, release_root, invalid_generation, invalid_digest],
-                cwd=dirty_checkout, env=env, check=False, capture_output=True,
-                text=True, timeout=10,
+                cwd=dirty_checkout,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             assert result.returncode == 64
             assert result.stdout == ""
@@ -334,19 +378,28 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
     pointers.chmod(0o644)
     for launcher in launchers:
         result = subprocess.run(
-            [launcher, release_root, generation, manifest_digest], cwd=dirty_checkout,
-            env=env, check=False, capture_output=True, text=True, timeout=10,
+            [launcher, release_root, generation, manifest_digest],
+            cwd=dirty_checkout,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         assert result.returncode == 64
         assert result.stdout == ""
         assert result.stderr == ""
-    assert [path.relative_to(plugin_cache) for path in plugin_cache.rglob("*")] == [Path("untouched")]
+    assert [path.relative_to(plugin_cache) for path in plugin_cache.rglob("*")] == [
+        Path("untouched")
+    ]
 
 
 def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
     tmp_path: Path,
 ) -> None:
-    release_root, generation, manifest_digest, _installer = _published_launcher_release(tmp_path)
+    release_root, generation, manifest_digest, _installer = _published_launcher_release(
+        tmp_path
+    )
     config = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
     server = config["mcpServers"]["the-hive-mcp"]
     assert server == {
@@ -360,7 +413,9 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
     assert stat.S_ISREG(item.st_mode)
     assert not stable.is_symlink()
     assert stat.S_IMODE(item.st_mode) == 0o755
-    immutable = release_root / "generations" / generation / "bin" / "the-hive-mcp-stable"
+    immutable = (
+        release_root / "generations" / generation / "bin" / "the-hive-mcp-stable"
+    )
     manifest = json.loads(
         (
             release_root
@@ -386,7 +441,8 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
     sentinel = plugin_cache / "untouched"
     sentinel.write_text("native cache", encoding="utf-8")
     result = subprocess.run(
-        [stable, "--runtime-status-mcp"], cwd=dirty_checkout,
+        [stable, "--runtime-status-mcp"],
+        cwd=dirty_checkout,
         env={
             "HOME": str(tmp_path / "attacker-home"),
             "LANG": "C",
@@ -395,18 +451,27 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
             "PYTHONPATH": str(dirty_checkout),
             "CODEX_HOME": str(plugin_cache),
         },
-        check=False, capture_output=True, text=True, timeout=10,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
     assert result.stderr == ""
-    assert [path.relative_to(plugin_cache) for path in plugin_cache.rglob("*")] == [Path("untouched")]
+    assert [path.relative_to(plugin_cache) for path in plugin_cache.rglob("*")] == [
+        Path("untouched")
+    ]
     stable.write_bytes(stable.read_bytes() + b"\n# external stable drift\n")
     stable.chmod(0o755)
     drifted_stable = subprocess.run(
-        [stable], cwd=dirty_checkout,
+        [stable],
+        cwd=dirty_checkout,
         env={"HOME": str(tmp_path / "attacker-home"), "PATH": "/usr/bin:/bin"},
-        check=False, capture_output=True, text=True, timeout=10,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     assert drifted_stable.returncode == 64
     assert drifted_stable.stdout == ""
@@ -419,9 +484,13 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
     pointers.write_text(json.dumps(drifted), encoding="utf-8")
     pointers.chmod(0o644)
     rejected = subprocess.run(
-        [stable], cwd=dirty_checkout,
+        [stable],
+        cwd=dirty_checkout,
         env={"HOME": str(tmp_path / "attacker-home"), "PATH": "/usr/bin:/bin"},
-        check=False, capture_output=True, text=True, timeout=10,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     assert rejected.returncode == 64
     assert rejected.stdout == ""
@@ -433,8 +502,8 @@ def test_interactive_runtime_entrypoint_is_the_current_stable_launcher(
 ) -> None:
     import the_hive.server as server
 
-    release_root, generation, manifest_digest, _installer = (
-        _published_launcher_release(tmp_path)
+    release_root, generation, manifest_digest, _installer = _published_launcher_release(
+        tmp_path
     )
     layout = RuntimeLayout.from_current_release(
         release_root, generation, manifest_digest
@@ -483,7 +552,11 @@ def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
     monkeypatch.chdir(external_checkout)
     monkeypatch.setenv("CODEX_HOME", str(external_checkout / "attacker-codex-home"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(external_checkout))
-    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "the_hive" / "hive" / "runtime.py"))
+    monkeypatch.setattr(
+        hive_runtime,
+        "__file__",
+        str(stage / "src" / "the_hive" / "hive" / "runtime.py"),
+    )
     monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: state_root)
     monkeypatch.setattr(
         hive_runtime,
@@ -514,7 +587,9 @@ def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
     status = hive_status(runtime_evidence=evidence)
     doctor = hive_doctor(runtime_evidence=evidence)
 
-    def runner(_entrypoint: Path, _namespace: str, command: str) -> tuple[dict[str, object], bool]:
+    def runner(
+        _entrypoint: Path, _namespace: str, command: str
+    ) -> tuple[dict[str, object], bool]:
         return (dict(status) if command == "status" else dict(doctor), True)
 
     probe = run_probe(
@@ -570,7 +645,11 @@ def test_missing_runtime_image_config_fails_closed_without_external_checkout(
     monkeypatch.chdir(external_checkout)
     monkeypatch.setenv("CODEX_HOME", str(external_checkout / "attacker-codex-home"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(external_checkout))
-    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "the_hive" / "hive" / "runtime.py"))
+    monkeypatch.setattr(
+        hive_runtime,
+        "__file__",
+        str(stage / "src" / "the_hive" / "hive" / "runtime.py"),
+    )
     monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: state_root)
 
     evidence = read_hive_runtime_evidence(now=lambda: NOW)
@@ -592,7 +671,9 @@ def test_implicit_image_evidence_never_falls_back_to_a_checkout(
     monkeypatch.chdir(external_checkout)
     monkeypatch.setenv("CODEX_HOME", str(external_checkout / "attacker-codex-home"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(external_checkout))
-    monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(
+        hive_runtime, "_default_hive_state_root", lambda: tmp_path / "state"
+    )
 
     evidence = read_hive_runtime_evidence(now=lambda: NOW)
 
@@ -611,11 +692,15 @@ def test_image_diagnostics_reject_conflicting_authority_profile_capabilities(
     """The private image path keeps the normal authority conflict contract."""
 
     stage, state_root, installer = _p2_runtime_image(tmp_path)
-    catalog = json.loads((stage / "codex-agent-classes.json").read_text(encoding="utf-8"))
+    catalog = json.loads(
+        (stage / "codex-agent-classes.json").read_text(encoding="utf-8")
+    )
     for item in catalog["classes"]:
         if item["class_id"] == "teamleiterin":
             item["authority_profile"] = "specialist"
-    (stage / "codex-agent-classes.json").write_text(json.dumps(catalog), encoding="utf-8")
+    (stage / "codex-agent-classes.json").write_text(
+        json.dumps(catalog), encoding="utf-8"
+    )
     (stage / "codex-agent-classes.json").chmod(0o644)
     (stage / ".the-hive-runtime-manifest.json").unlink()
     installer["_write_runtime_image_manifest"](
@@ -624,7 +709,11 @@ def test_image_diagnostics_reject_conflicting_authority_profile_capabilities(
         commit=TEST_STRUCTURAL_COMMIT,
     )
 
-    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "the_hive" / "hive" / "runtime.py"))
+    monkeypatch.setattr(
+        hive_runtime,
+        "__file__",
+        str(stage / "src" / "the_hive" / "hive" / "runtime.py"),
+    )
     monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: state_root)
 
     evidence = read_hive_runtime_evidence(now=lambda: NOW)

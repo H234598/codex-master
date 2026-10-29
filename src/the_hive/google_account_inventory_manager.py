@@ -90,9 +90,7 @@ _D321_CONSUMER_BINDING_FIELDS = frozenset(
         "key_id",
     }
 )
-_D321_BILLING_GROUP_FIELDS = frozenset(
-    {"kind", "schema_version", "billing_account_id"}
-)
+_D321_BILLING_GROUP_FIELDS = frozenset({"kind", "schema_version", "billing_account_id"})
 _D321_INVENTORY_BINDING_FIELDS = frozenset(
     {
         "kind",
@@ -362,9 +360,7 @@ def _valid_d321_digest(value: object) -> bool:
     )
 
 
-def _d321_flat_json_bytes(
-    value: object, *, expected_fields: frozenset[str]
-) -> bytes:
+def _d321_flat_json_bytes(value: object, *, expected_fields: frozenset[str]) -> bytes:
     if type(value) is not dict or set(value) != expected_fields:
         _d321_invalid()
     for field_name, field_value in value.items():
@@ -398,11 +394,7 @@ def _d321_pairs_to_flat_object(
     seen: set[str] = set()
     verified_pairs: list[tuple[str, object]] = []
     for key, value in pairs:
-        if (
-            type(key) is not str
-            or key in seen
-            or key not in expected_fields
-        ):
+        if type(key) is not str or key in seen or key not in expected_fields:
             _d321_invalid()
         seen.add(key)
         verified_pairs.append((key, value))
@@ -579,9 +571,7 @@ def _d321_validate_evidence_payload(
     payload: object, *, has_evidence_digest: bool
 ) -> None:
     expected_fields = (
-        _D321_EVIDENCE_FIELDS
-        if has_evidence_digest
-        else _D321_EVIDENCE_PREIMAGE_FIELDS
+        _D321_EVIDENCE_FIELDS if has_evidence_digest else _D321_EVIDENCE_PREIMAGE_FIELDS
     )
     _d321_flat_json_bytes(payload, expected_fields=expected_fields)
     if (
@@ -652,9 +642,7 @@ class _BillingGroupQuotaEvidenceV1:
         _d321_validate_evidence_payload(payload, has_evidence_digest=True)
         self.kind = payload["kind"]
         self.schema_version = payload["schema_version"]
-        self.inventory_authority_generation = payload[
-            "inventory_authority_generation"
-        ]
+        self.inventory_authority_generation = payload["inventory_authority_generation"]
         self.inventory_content_fingerprint = payload["inventory_content_fingerprint"]
         self.inventory_binding_digest = payload["inventory_binding_digest"]
         self.consumer_binding_digest = payload["consumer_binding_digest"]
@@ -756,15 +744,11 @@ class _BillingGroupQuotaEvidenceV1:
         )
 
     @classmethod
-    def from_canonical_json_bytes(
-        cls, raw: object
-    ) -> _BillingGroupQuotaEvidenceV1:
+    def from_canonical_json_bytes(cls, raw: object) -> _BillingGroupQuotaEvidenceV1:
         payload = _d321_decode_flat_json(raw, expected_fields=_D321_EVIDENCE_FIELDS)
         _d321_validate_evidence_payload(payload, has_evidence_digest=True)
         preimage = _d321_evidence_preimage(
-            inventory_authority_generation=payload[
-                "inventory_authority_generation"
-            ],
+            inventory_authority_generation=payload["inventory_authority_generation"],
             inventory_content_fingerprint=payload["inventory_content_fingerprint"],
             inventory_binding_digest=payload["inventory_binding_digest"],
             consumer_binding_digest=payload["consumer_binding_digest"],
@@ -814,10 +798,7 @@ def _valid_d327_int64_string(value: object) -> bool:
 
 
 def _valid_d328_bounded_ascii(value: object, *, maximum_length: int) -> bool:
-    return (
-        _valid_d321_ascii_string(value)
-        and 1 <= len(value) <= maximum_length
-    )
+    return _valid_d321_ascii_string(value) and 1 <= len(value) <= maximum_length
 
 
 def _d328_refresh_interval_nanoseconds(value: object) -> int | None:
@@ -828,9 +809,8 @@ def _d328_refresh_interval_nanoseconds(value: object) -> int | None:
     ):
         return None
     seconds_text = value[:-1]
-    if (
-        seconds_text[0] == "0"
-        or not all("0" <= character <= "9" for character in seconds_text)
+    if seconds_text[0] == "0" or not all(
+        "0" <= character <= "9" for character in seconds_text
     ):
         return None
     seconds = int(seconds_text)
@@ -848,9 +828,7 @@ def _d327_validate_dimensions(value: object) -> dict[str, str]:
     for key, dimension_value in value.items():
         if not _valid_d328_bounded_ascii(
             key, maximum_length=128
-        ) or not _valid_d328_bounded_ascii(
-            dimension_value, maximum_length=256
-        ):
+        ) or not _valid_d328_bounded_ascii(dimension_value, maximum_length=256):
             _d327_invalid()
         dimensions[key] = dimension_value
     return dict(sorted(dimensions.items()))
@@ -871,13 +849,9 @@ def _d327_validate_evidence_payload(
     payload: object, *, has_evidence_digest: bool
 ) -> None:
     expected_fields = (
-        _D327_EVIDENCE_FIELDS
-        if has_evidence_digest
-        else _D327_EVIDENCE_PREIMAGE_FIELDS
+        _D327_EVIDENCE_FIELDS if has_evidence_digest else _D327_EVIDENCE_PREIMAGE_FIELDS
     )
-    payload = _d327_validate_payload_fields(
-        payload, expected_fields=expected_fields
-    )
+    payload = _d327_validate_payload_fields(payload, expected_fields=expected_fields)
     if (
         type(payload["kind"]) is not str
         or payload["kind"] != _D327_EVIDENCE_KIND
@@ -930,12 +904,8 @@ def _d327_timestamp_seconds(value: object) -> int:
     raise AssertionError("unreachable")
 
 
-def _d327_canonical_json_bytes(
-    payload: object, *, has_evidence_digest: bool
-) -> bytes:
-    _d327_validate_evidence_payload(
-        payload, has_evidence_digest=has_evidence_digest
-    )
+def _d327_canonical_json_bytes(payload: object, *, has_evidence_digest: bool) -> bytes:
+    _d327_validate_evidence_payload(payload, has_evidence_digest=has_evidence_digest)
     try:
         return json.dumps(
             payload,
@@ -1148,14 +1118,10 @@ class _ConfiguredQuotaEvidenceV1:
         _d327_validate_evidence_payload(payload, has_evidence_digest=True)
         self.kind = payload["kind"]
         self.schema_version = payload["schema_version"]
-        self.inventory_authority_generation = payload[
-            "inventory_authority_generation"
-        ]
+        self.inventory_authority_generation = payload["inventory_authority_generation"]
         self.inventory_content_fingerprint = payload["inventory_content_fingerprint"]
         self.inventory_binding_digest = payload["inventory_binding_digest"]
-        self.source_kind = _ConfiguredQuotaEvidenceSourceKindV1(
-            payload["source_kind"]
-        )
+        self.source_kind = _ConfiguredQuotaEvidenceSourceKindV1(payload["source_kind"])
         self.source_resource_digest = payload["source_resource_digest"]
         self.service = payload["service"]
         self.quota_id = payload["quota_id"]
@@ -1226,9 +1192,7 @@ class _ConfiguredQuotaEvidenceV1:
 
     @classmethod
     def from_canonical_json_bytes(cls, raw: object) -> _ConfiguredQuotaEvidenceV1:
-        payload = _d327_decode_evidence_json(
-            raw, expected_fields=_D327_EVIDENCE_FIELDS
-        )
+        payload = _d327_decode_evidence_json(raw, expected_fields=_D327_EVIDENCE_FIELDS)
         _d327_validate_evidence_payload(payload, has_evidence_digest=True)
         preimage = _d327_evidence_preimage(
             inventory_authority_generation=payload["inventory_authority_generation"],
@@ -1723,10 +1687,7 @@ class GoogleAccountInventoryManager:
         with self._lock:
             if self._state is InventoryManagerStateV1.CLOSED:
                 raise GoogleAccountInventoryError("credential.inventory_manager_closed")
-            if (
-                self._state is not InventoryManagerStateV1.READY
-                or self._active is None
-            ):
+            if self._state is not InventoryManagerStateV1.READY or self._active is None:
                 raise GoogleAccountInventoryError(
                     "credential.billing_quota_evidence_unavailable"
                 )
@@ -1741,15 +1702,11 @@ class GoogleAccountInventoryManager:
             except GoogleAccountInventoryError:
                 _d321_invalid()
             try:
-                now_seconds = _d321_timestamp_seconds(
-                    self._operator_timestamp_utc()
-                )
+                now_seconds = _d321_timestamp_seconds(self._operator_timestamp_utc())
             except (GoogleAccountInventoryError, RuntimeError):
                 _d321_invalid()
             issued_seconds = _d321_timestamp_seconds(canonical_evidence.issued_at_utc)
-            expires_seconds = _d321_timestamp_seconds(
-                canonical_evidence.expires_at_utc
-            )
+            expires_seconds = _d321_timestamp_seconds(canonical_evidence.expires_at_utc)
             if issued_seconds > now_seconds or expires_seconds <= now_seconds:
                 _d321_invalid()
             if (
@@ -1760,8 +1717,7 @@ class GoogleAccountInventoryManager:
                 _d321_invalid()
             snapshot = self._active.snapshot
             if (
-                canonical_evidence.inventory_authority_generation
-                != snapshot.generation
+                canonical_evidence.inventory_authority_generation != snapshot.generation
                 or canonical_evidence.inventory_content_fingerprint
                 != snapshot.content_fingerprint
             ):
@@ -1784,20 +1740,12 @@ class GoogleAccountInventoryManager:
             ):
                 _d321_invalid()
             try:
-                billing_account = snapshot.by_billing_ref[
-                    project.billing_account_ref
-                ]
+                billing_account = snapshot.by_billing_ref[project.billing_account_ref]
             except KeyError:
                 _d321_invalid()
-            if (
-                not any(
-                    candidate is billing_account
-                    for candidate in account.billing_accounts
-                )
-                or not _valid_d321_ascii_string(
-                    billing_account.billing_account_id
-                )
-            ):
+            if not any(
+                candidate is billing_account for candidate in account.billing_accounts
+            ) or not _valid_d321_ascii_string(billing_account.billing_account_id):
                 _d321_invalid()
             consumer_binding_digest = _d321_consumer_binding_digest(
                 inventory_authority_generation=snapshot.generation,
@@ -1817,8 +1765,7 @@ class GoogleAccountInventoryManager:
                 billing_group_digest=billing_group_digest,
             )
             if (
-                canonical_evidence.consumer_binding_digest
-                != consumer_binding_digest
+                canonical_evidence.consumer_binding_digest != consumer_binding_digest
                 or canonical_evidence.billing_group_digest != billing_group_digest
                 or canonical_evidence.inventory_binding_digest
                 != inventory_binding_digest
@@ -1844,10 +1791,7 @@ class GoogleAccountInventoryManager:
         with self._lock:
             if self._state is InventoryManagerStateV1.CLOSED:
                 raise GoogleAccountInventoryError("credential.inventory_manager_closed")
-            if (
-                self._state is not InventoryManagerStateV1.READY
-                or self._active is None
-            ):
+            if self._state is not InventoryManagerStateV1.READY or self._active is None:
                 raise GoogleAccountInventoryError(
                     "credential.configured_quota_evidence_unavailable"
                 )
@@ -1862,17 +1806,13 @@ class GoogleAccountInventoryManager:
             except GoogleAccountInventoryError:
                 _d327_invalid()
             try:
-                now_seconds = _d327_timestamp_seconds(
-                    self._operator_timestamp_utc()
-                )
+                now_seconds = _d327_timestamp_seconds(self._operator_timestamp_utc())
             except (GoogleAccountInventoryError, RuntimeError):
                 _d327_invalid()
             observed_seconds = _d327_timestamp_seconds(
                 canonical_evidence.observed_at_utc
             )
-            expires_seconds = _d327_timestamp_seconds(
-                canonical_evidence.expires_at_utc
-            )
+            expires_seconds = _d327_timestamp_seconds(canonical_evidence.expires_at_utc)
             if observed_seconds > now_seconds or expires_seconds <= now_seconds:
                 _d327_invalid()
             if (
@@ -1883,8 +1823,7 @@ class GoogleAccountInventoryManager:
                 _d327_invalid()
             snapshot = self._active.snapshot
             if (
-                canonical_evidence.inventory_authority_generation
-                != snapshot.generation
+                canonical_evidence.inventory_authority_generation != snapshot.generation
                 or canonical_evidence.inventory_content_fingerprint
                 != snapshot.content_fingerprint
             ):
@@ -1907,20 +1846,12 @@ class GoogleAccountInventoryManager:
             ):
                 _d327_invalid()
             try:
-                billing_account = snapshot.by_billing_ref[
-                    project.billing_account_ref
-                ]
+                billing_account = snapshot.by_billing_ref[project.billing_account_ref]
             except KeyError:
                 _d327_invalid()
-            if (
-                not any(
-                    candidate is billing_account
-                    for candidate in account.billing_accounts
-                )
-                or not _valid_d321_ascii_string(
-                    billing_account.billing_account_id
-                )
-            ):
+            if not any(
+                candidate is billing_account for candidate in account.billing_accounts
+            ) or not _valid_d321_ascii_string(billing_account.billing_account_id):
                 _d327_invalid()
             consumer_binding_digest = _d321_consumer_binding_digest(
                 inventory_authority_generation=snapshot.generation,
@@ -1939,10 +1870,7 @@ class GoogleAccountInventoryManager:
                 consumer_binding_digest=consumer_binding_digest,
                 billing_group_digest=billing_group_digest,
             )
-            if (
-                canonical_evidence.inventory_binding_digest
-                != inventory_binding_digest
-            ):
+            if canonical_evidence.inventory_binding_digest != inventory_binding_digest:
                 _d327_invalid()
             source_preimage = _d328_source_preimage(
                 inventory_authority_generation=snapshot.generation,
@@ -1955,9 +1883,8 @@ class GoogleAccountInventoryManager:
                 metric=canonical_evidence.metric,
                 dimensions=dict(canonical_evidence.dimensions),
             )
-            if (
-                canonical_evidence.source_resource_digest
-                != _d327_sha256_digest(source_preimage)
+            if canonical_evidence.source_resource_digest != _d327_sha256_digest(
+                source_preimage
             ):
                 _d327_invalid()
             return evidence

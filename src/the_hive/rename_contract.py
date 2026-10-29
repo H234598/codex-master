@@ -60,7 +60,9 @@ _CANONICAL_KEYS = frozenset(
         "cinnamon_uuid",
     }
 )
-_LEGACY_FORM_IDENTIFIERS = frozenset({"display", "slug", "python", "environment", "compact"})
+_LEGACY_FORM_IDENTIFIERS = frozenset(
+    {"display", "slug", "python", "environment", "compact"}
+)
 _CHARACTERIZATION_IDENTIFIERS = frozenset(
     {
         "distribution",
@@ -148,7 +150,9 @@ class LegacyForm:
     @property
     def expression(self) -> re.Pattern[bytes]:
         value = re.escape(self.value.encode("ascii"))
-        return re.compile(rb"(?<![A-Za-z0-9])" + value + rb"(?![A-Za-z0-9])", re.IGNORECASE)
+        return re.compile(
+            rb"(?<![A-Za-z0-9])" + value + rb"(?![A-Za-z0-9])", re.IGNORECASE
+        )
 
 
 @dataclass(frozen=True)
@@ -245,12 +249,16 @@ class RenameMatrix:
         return path
 
     def render_value(self, template: str) -> str:
-        values = {f"legacy_{key}": form.value for key, form in self.legacy_forms.items()}
+        values = {
+            f"legacy_{key}": form.value for key, form in self.legacy_forms.items()
+        }
         values.update({f"target_{key}": value for key, value in self.canonical.items()})
         try:
             return template.format_map(values)
         except (KeyError, ValueError) as error:
-            raise RenameContractError("rename contract has an unknown template token") from error
+            raise RenameContractError(
+                "rename contract has an unknown template token"
+            ) from error
 
 
 @dataclass(frozen=True)
@@ -290,7 +298,11 @@ def load_rename_matrix() -> RenameMatrix:
 def parse_rename_matrix(raw: object) -> RenameMatrix:
     """Fail closed for any structural or value-level contract drift."""
 
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1 or set(raw) != _TOP_LEVEL_KEYS:
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema_version") != 1
+        or set(raw) != _TOP_LEVEL_KEYS
+    ):
         raise RenameContractError("rename contract schema version is unsupported")
     encoded = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if hashlib.sha256(encoded).hexdigest() != _CONTRACT_SHA256:
@@ -319,9 +331,14 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
         raise RenameContractError("rename contract collections are malformed")
     if not all(isinstance(term, str) and term for term in protected_terms):
         raise RenameContractError("rename contract protected terms are malformed")
-    if not isinstance(canonical, dict) or not all(
-        isinstance(key, str) and isinstance(value, str) and value for key, value in canonical.items()
-    ) or set(canonical) != _CANONICAL_KEYS:
+    if (
+        not isinstance(canonical, dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str) and value
+            for key, value in canonical.items()
+        )
+        or set(canonical) != _CANONICAL_KEYS
+    ):
         raise RenameContractError("rename contract canonical values are malformed")
 
     parsed_forms: dict[str, LegacyForm] = {}
@@ -358,7 +375,9 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
                 "target_values",
                 "callers",
             }:
-                raise RenameContractError("rename contract characterization is malformed")
+                raise RenameContractError(
+                    "rename contract characterization is malformed"
+                )
             identifier = item.get("id")
             kind = item.get("kind")
             path = item.get("path")
@@ -375,7 +394,10 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
                 or not isinstance(path, str)
                 or not isinstance(form_identifiers, list)
                 or not form_identifiers
-                or not all(isinstance(form, str) and form in parsed_forms for form in form_identifiers)
+                or not all(
+                    isinstance(form, str) and form in parsed_forms
+                    for form in form_identifiers
+                )
                 or not isinstance(legacy_values, list)
                 or not legacy_values
                 or not all(isinstance(value, str) and value for value in legacy_values)
@@ -396,7 +418,9 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
                     for caller in callers
                 )
             ):
-                raise RenameContractError("rename contract characterization is malformed")
+                raise RenameContractError(
+                    "rename contract characterization is malformed"
+                )
             seen.add(identifier)
             parsed.append(
                 SurfaceExpectation(
@@ -416,13 +440,16 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
         return tuple(parsed)
 
     parsed_characterization = parse_expectations(characterization)
-    if {entry.identifier for entry in parsed_characterization} != _CHARACTERIZATION_IDENTIFIERS:
+    if {
+        entry.identifier for entry in parsed_characterization
+    } != _CHARACTERIZATION_IDENTIFIERS:
         raise RenameContractError("rename contract characterization is incomplete")
 
     cinnamon = raw.get("cinnamon_surface")
     if (
         not isinstance(cinnamon, dict)
-        or set(cinnamon) != {
+        or set(cinnamon)
+        != {
             "id",
             "legacy_path_prefix",
             "target_path_prefix",
@@ -443,7 +470,9 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
         or not isinstance(cinnamon.get("metadata_name"), str)
         or not isinstance(cinnamon.get("metadata_field"), list)
         or not cinnamon["metadata_field"]
-        or not all(isinstance(part, str) and part for part in cinnamon["metadata_field"])
+        or not all(
+            isinstance(part, str) and part for part in cinnamon["metadata_field"]
+        )
         or not isinstance(cinnamon.get("legacy_metadata_value"), str)
         or not isinstance(cinnamon.get("target_metadata_value"), str)
         or not isinstance(cinnamon.get("applet_name"), str)
@@ -480,7 +509,13 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
     seen_families: set[str] = set()
     for item in bounded_families:
         if not isinstance(item, dict) or set(item) != {
-            "id", "kind", "legacy_paths", "target_paths", "caller_path", "caller_symbol", "target_content_forms"
+            "id",
+            "kind",
+            "legacy_paths",
+            "target_paths",
+            "caller_path",
+            "caller_symbol",
+            "target_content_forms",
         }:
             raise RenameContractError("rename contract bounded family is malformed")
         identifier = item.get("id")
@@ -505,7 +540,10 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
             or not isinstance(caller_symbol, str)
             or not caller_symbol
             or not isinstance(target_content_forms, list)
-            or not all(isinstance(form, str) and form in canonical for form in target_content_forms)
+            or not all(
+                isinstance(form, str) and form in canonical
+                for form in target_content_forms
+            )
             or (not target_content_forms and identifier != "hook_artifacts")
         ):
             raise RenameContractError("rename contract bounded family is malformed")
@@ -537,7 +575,9 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
             "disposition",
             "generator_status",
         }:
-            raise RenameContractError("rename contract retirement artifact is malformed")
+            raise RenameContractError(
+                "rename contract retirement artifact is malformed"
+            )
         identifier = item.get("id")
         path = item.get("path")
         caller_path = item.get("caller_path")
@@ -559,7 +599,9 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
             or disposition != "remove_from_product_tree_only"
             or generator_status != "no_production_generator_attested"
         ):
-            raise RenameContractError("rename contract retirement artifact is malformed")
+            raise RenameContractError(
+                "rename contract retirement artifact is malformed"
+            )
         seen_retirements.add(identifier)
         parsed_retirements.append(
             RetirementArtifact(
@@ -573,13 +615,21 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
                 generator_status,
             )
         )
-    if {artifact.identifier for artifact in parsed_retirements} != _RETIREMENT_ARTIFACT_IDENTIFIERS:
+    if {
+        artifact.identifier for artifact in parsed_retirements
+    } != _RETIREMENT_ARTIFACT_IDENTIFIERS:
         raise RenameContractError("rename contract retirement artifacts are incomplete")
 
     parsed_aliases: list[ProvenProductAlias] = []
     seen_aliases: set[str] = set()
     for item in proven_product_aliases:
-        if not isinstance(item, dict) or set(item) != {"id", "path", "field", "legacy_phrase", "caller_symbol"}:
+        if not isinstance(item, dict) or set(item) != {
+            "id",
+            "path",
+            "field",
+            "legacy_phrase",
+            "caller_symbol",
+        }:
             raise RenameContractError("rename contract proven alias is malformed")
         identifier = item.get("id")
         path = item.get("path")
@@ -600,8 +650,12 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
         ):
             raise RenameContractError("rename contract proven alias is malformed")
         seen_aliases.add(identifier)
-        parsed_aliases.append(ProvenProductAlias(identifier, path, tuple(field), phrase, caller_symbol))
-    if {alias.identifier for alias in parsed_aliases} != _PROVEN_PRODUCT_ALIAS_IDENTIFIERS:
+        parsed_aliases.append(
+            ProvenProductAlias(identifier, path, tuple(field), phrase, caller_symbol)
+        )
+    if {
+        alias.identifier for alias in parsed_aliases
+    } != _PROVEN_PRODUCT_ALIAS_IDENTIFIERS:
         raise RenameContractError("rename contract proven aliases are incomplete")
 
     parsed_readiness: list[TargetReadiness] = []
@@ -640,7 +694,9 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
     for expectation in matrix.legacy_characterization:
         matrix.render_template(expectation.path_template)
         matrix.render_template(expectation.target_path_template)
-        for template in expectation.legacy_value_templates + expectation.target_value_templates:
+        for template in (
+            expectation.legacy_value_templates + expectation.target_value_templates
+        ):
             matrix.render_value(template)
         for caller in expectation.caller_locators:
             if not caller.path_template.startswith("external:"):
@@ -691,23 +747,40 @@ class RenameReleaseValidator:
             relative_path = matrix.render_template(expectation.path_template).as_posix()
             content = paths_to_blobs.get(relative_path)
             if content is None:
-                failures.append(CharacterizationFailure(expectation.identifier, "missing_path"))
+                failures.append(
+                    CharacterizationFailure(expectation.identifier, "missing_path")
+                )
                 continue
-            if not self._semantic_surface_is_valid(matrix, expectation, relative_path, content, target=False):
-                failures.append(CharacterizationFailure(expectation.identifier, "invalid_structured_surface"))
+            if not self._semantic_surface_is_valid(
+                matrix, expectation, relative_path, content, target=False
+            ):
+                failures.append(
+                    CharacterizationFailure(
+                        expectation.identifier, "invalid_structured_surface"
+                    )
+                )
                 continue
             path_bytes = relative_path.encode("utf-8")
             for form_identifier in expectation.form_identifiers:
                 expression = matrix.legacy_forms[form_identifier].expression
                 if not expression.search(path_bytes) and not expression.search(content):
-                    failures.append(CharacterizationFailure(expectation.identifier, "missing_legacy_form"))
+                    failures.append(
+                        CharacterizationFailure(
+                            expectation.identifier, "missing_legacy_form"
+                        )
+                    )
                     break
             else:
                 if any(
-                    matrix.render_value(template).casefold().encode("utf-8") not in content.lower()
+                    matrix.render_value(template).casefold().encode("utf-8")
+                    not in content.lower()
                     for template in expectation.legacy_value_templates
                 ):
-                    failures.append(CharacterizationFailure(expectation.identifier, "missing_legacy_value"))
+                    failures.append(
+                        CharacterizationFailure(
+                            expectation.identifier, "missing_legacy_value"
+                        )
+                    )
             for caller in expectation.caller_locators:
                 if caller.path_template.startswith("external:"):
                     continue
@@ -715,60 +788,110 @@ class RenameReleaseValidator:
                 caller_content = paths_to_blobs.get(caller_path)
                 if (
                     caller_content is None
-                    or matrix.render_value(caller.symbol).encode("utf-8") not in caller_content
+                    or matrix.render_value(caller.symbol).encode("utf-8")
+                    not in caller_content
                 ):
-                    failures.append(CharacterizationFailure(expectation.identifier, "missing_caller_locator"))
+                    failures.append(
+                        CharacterizationFailure(
+                            expectation.identifier, "missing_caller_locator"
+                        )
+                    )
                     break
         for family in matrix.bounded_families:
-            legacy_paths = tuple(matrix.render_template(path).as_posix() for path in family.legacy_path_templates)
+            legacy_paths = tuple(
+                matrix.render_template(path).as_posix()
+                for path in family.legacy_path_templates
+            )
             caller_path = family.caller_path_template
             caller_content = None
             if not caller_path.startswith("external:"):
-                caller_content = paths_to_blobs.get(matrix.render_template(caller_path).as_posix())
-            caller_is_present = caller_path.startswith("external:") or caller_content is not None
+                caller_content = paths_to_blobs.get(
+                    matrix.render_template(caller_path).as_posix()
+                )
+            caller_is_present = (
+                caller_path.startswith("external:") or caller_content is not None
+            )
             if (
                 not caller_is_present
                 or any(path not in paths_to_blobs for path in legacy_paths)
                 or any(
-                    not self._family_member_is_structurally_valid(family.semantic_kind, path, paths_to_blobs[path])
+                    not self._family_member_is_structurally_valid(
+                        family.semantic_kind, path, paths_to_blobs[path]
+                    )
                     for path in legacy_paths
                 )
             ):
-                failures.append(CharacterizationFailure(family.identifier, "missing_family_member"))
-            elif caller_content is not None and matrix.render_value(family.caller_symbol).encode("utf-8") not in caller_content:
-                failures.append(CharacterizationFailure(family.identifier, "missing_family_caller"))
+                failures.append(
+                    CharacterizationFailure(family.identifier, "missing_family_member")
+                )
+            elif (
+                caller_content is not None
+                and matrix.render_value(family.caller_symbol).encode("utf-8")
+                not in caller_content
+            ):
+                failures.append(
+                    CharacterizationFailure(family.identifier, "missing_family_caller")
+                )
         for artifact in matrix.retirement_artifacts:
             path = matrix.render_template(artifact.path_template).as_posix()
-            caller_path = matrix.render_template(artifact.caller_path_template).as_posix()
+            caller_path = matrix.render_template(
+                artifact.caller_path_template
+            ).as_posix()
             caller_content = paths_to_blobs.get(caller_path)
             if (
                 path not in paths_to_blobs
                 or caller_content is None
-                or matrix.render_value(artifact.caller_symbol).encode("utf-8") not in caller_content
+                or matrix.render_value(artifact.caller_symbol).encode("utf-8")
+                not in caller_content
             ):
-                failures.append(CharacterizationFailure(artifact.identifier, "missing_retirement_artifact_provenance"))
+                failures.append(
+                    CharacterizationFailure(
+                        artifact.identifier, "missing_retirement_artifact_provenance"
+                    )
+                )
         for alias in matrix.proven_product_aliases:
             path = matrix.render_template(alias.path_template).as_posix()
             value = self._json_field(paths_to_blobs.get(path), alias.field)
             if not self._alias_phrase_is_present(value, alias.legacy_phrase):
-                failures.append(CharacterizationFailure(alias.identifier, "missing_alias_provenance"))
+                failures.append(
+                    CharacterizationFailure(
+                        alias.identifier, "missing_alias_provenance"
+                    )
+                )
         cinnamon = matrix.cinnamon_surface
-        legacy_prefix = matrix.render_template(cinnamon.legacy_path_prefix_template + "/placeholder").parent.as_posix()
+        legacy_prefix = matrix.render_template(
+            cinnamon.legacy_path_prefix_template + "/placeholder"
+        ).parent.as_posix()
         legacy_metadata = f"{legacy_prefix}/{cinnamon.metadata_name}"
         legacy_applet = f"{legacy_prefix}/{cinnamon.applet_name}"
-        if sum(path.startswith(legacy_prefix + "/") for path in paths_to_blobs) != cinnamon.member_count:
-            failures.append(CharacterizationFailure(cinnamon.identifier, "legacy_member_count_drift"))
-        elif self._json_field(paths_to_blobs.get(legacy_metadata), cinnamon.metadata_field) != matrix.render_value(
-            cinnamon.legacy_metadata_value_template
+        if (
+            sum(path.startswith(legacy_prefix + "/") for path in paths_to_blobs)
+            != cinnamon.member_count
         ):
-            failures.append(CharacterizationFailure(cinnamon.identifier, "legacy_metadata_uuid_drift"))
-        elif matrix.render_value(cinnamon.legacy_applet_value_template).encode("utf-8") not in paths_to_blobs.get(
-            legacy_applet, b""
-        ):
-            failures.append(CharacterizationFailure(cinnamon.identifier, "legacy_applet_uuid_drift"))
+            failures.append(
+                CharacterizationFailure(
+                    cinnamon.identifier, "legacy_member_count_drift"
+                )
+            )
+        elif self._json_field(
+            paths_to_blobs.get(legacy_metadata), cinnamon.metadata_field
+        ) != matrix.render_value(cinnamon.legacy_metadata_value_template):
+            failures.append(
+                CharacterizationFailure(
+                    cinnamon.identifier, "legacy_metadata_uuid_drift"
+                )
+            )
+        elif matrix.render_value(cinnamon.legacy_applet_value_template).encode(
+            "utf-8"
+        ) not in paths_to_blobs.get(legacy_applet, b""):
+            failures.append(
+                CharacterizationFailure(cinnamon.identifier, "legacy_applet_uuid_drift")
+            )
         return tuple(failures)
 
-    def validate_tree(self, repository_root: Path, treeish: str = "HEAD") -> RenameGateReport:
+    def validate_tree(
+        self, repository_root: Path, treeish: str = "HEAD"
+    ) -> RenameGateReport:
         """Inspect only tracked paths and raw blobs from a deterministic Git tree."""
 
         blobs = self._tracked_blobs(repository_root, treeish)
@@ -785,47 +908,80 @@ class RenameReleaseValidator:
 
         missing_targets: list[str] = []
         for family in matrix.bounded_families:
-            target_paths = tuple(matrix.render_template(path).as_posix() for path in family.target_path_templates)
-            target_markers = tuple(matrix.canonical[identifier].encode("utf-8") for identifier in family.target_content_identifiers)
+            target_paths = tuple(
+                matrix.render_template(path).as_posix()
+                for path in family.target_path_templates
+            )
+            target_markers = tuple(
+                matrix.canonical[identifier].encode("utf-8")
+                for identifier in family.target_content_identifiers
+            )
             if any(
                 path not in paths_to_blobs
-                or (target_markers and not any(marker in paths_to_blobs[path] for marker in target_markers))
-                or not self._family_member_is_structurally_valid(family.semantic_kind, path, paths_to_blobs[path])
+                or (
+                    target_markers
+                    and not any(
+                        marker in paths_to_blobs[path] for marker in target_markers
+                    )
+                )
+                or not self._family_member_is_structurally_valid(
+                    family.semantic_kind, path, paths_to_blobs[path]
+                )
                 for path in target_paths
             ):
                 missing_targets.append(f"family:{family.identifier}")
         for artifact in matrix.retirement_artifacts:
-            target_caller = paths_to_blobs.get(matrix.render_template(artifact.target_caller_path_template).as_posix())
+            target_caller = paths_to_blobs.get(
+                matrix.render_template(artifact.target_caller_path_template).as_posix()
+            )
             if (
-                matrix.render_template(artifact.path_template).as_posix() in paths_to_blobs
+                matrix.render_template(artifact.path_template).as_posix()
+                in paths_to_blobs
                 or target_caller is None
-                or matrix.render_value(artifact.target_forbidden_symbol).encode("utf-8") in target_caller
+                or matrix.render_value(artifact.target_forbidden_symbol).encode("utf-8")
+                in target_caller
             ):
                 missing_targets.append(f"retire:{artifact.identifier}")
         for alias in matrix.proven_product_aliases:
             path = matrix.render_template(alias.path_template).as_posix()
-            if self._alias_phrase_is_present(self._json_field(paths_to_blobs.get(path), alias.field), alias.legacy_phrase):
+            if self._alias_phrase_is_present(
+                self._json_field(paths_to_blobs.get(path), alias.field),
+                alias.legacy_phrase,
+            ):
                 missing_targets.append(f"alias:{alias.identifier}")
         cinnamon = matrix.cinnamon_surface
-        target_prefix = matrix.render_template(cinnamon.target_path_prefix_template + "/placeholder").parent.as_posix()
+        target_prefix = matrix.render_template(
+            cinnamon.target_path_prefix_template + "/placeholder"
+        ).parent.as_posix()
         target_metadata = f"{target_prefix}/{cinnamon.metadata_name}"
         target_applet = f"{target_prefix}/{cinnamon.applet_name}"
         if (
-            sum(path.startswith(target_prefix + "/") for path in paths_to_blobs) != cinnamon.member_count
-            or self._json_field(paths_to_blobs.get(target_metadata), cinnamon.metadata_field)
+            sum(path.startswith(target_prefix + "/") for path in paths_to_blobs)
+            != cinnamon.member_count
+            or self._json_field(
+                paths_to_blobs.get(target_metadata), cinnamon.metadata_field
+            )
             != matrix.render_value(cinnamon.target_metadata_value_template)
-            or matrix.render_value(cinnamon.target_applet_value_template).encode("utf-8")
+            or matrix.render_value(cinnamon.target_applet_value_template).encode(
+                "utf-8"
+            )
             not in paths_to_blobs.get(target_applet, b"")
         ):
             missing_targets.append(cinnamon.identifier)
         for expectation in matrix.legacy_characterization:
-            target_path = matrix.render_template(expectation.target_path_template).as_posix()
+            target_path = matrix.render_template(
+                expectation.target_path_template
+            ).as_posix()
             content = paths_to_blobs.get(target_path)
-            if content is None or not self._semantic_surface_is_valid(
-                matrix, expectation, target_path, content, target=True
-            ) or any(
-                matrix.render_value(template).encode("utf-8") not in content
-                for template in expectation.target_value_templates
+            if (
+                content is None
+                or not self._semantic_surface_is_valid(
+                    matrix, expectation, target_path, content, target=True
+                )
+                or any(
+                    matrix.render_value(template).encode("utf-8") not in content
+                    for template in expectation.target_value_templates
+                )
             ):
                 missing_targets.append(f"surface:{expectation.identifier}")
         for readiness in matrix.target_readiness:
@@ -833,15 +989,24 @@ class RenameReleaseValidator:
             content = paths_to_blobs.get(target_path)
             target = matrix.canonical[readiness.target_identifier].encode("utf-8")
             if content is None or (
-                target not in target_path.encode("utf-8", "surrogateescape") and target not in content
+                target not in target_path.encode("utf-8", "surrogateescape")
+                and target not in content
             ):
                 missing_targets.append(readiness.identifier)
 
-        findings.sort(key=lambda finding: (finding.location, finding.path, finding.form_identifier))
+        findings.sort(
+            key=lambda finding: (
+                finding.location,
+                finding.path,
+                finding.form_identifier,
+            )
+        )
         return RenameGateReport(tuple(findings), tuple(sorted(missing_targets)))
 
     @staticmethod
-    def _family_member_is_structurally_valid(kind: str, path: str, content: bytes) -> bool:
+    def _family_member_is_structurally_valid(
+        kind: str, path: str, content: bytes
+    ) -> bool:
         if not content:
             return False
         try:
@@ -887,15 +1052,24 @@ class RenameReleaseValidator:
                     return True
                 return text.startswith("#!")
             if "/sysusers.d/" in path:
-                return any(line.startswith(("g ", "u ", "m ")) for line in text.splitlines())
+                return any(
+                    line.startswith(("g ", "u ", "m ")) for line in text.splitlines()
+                )
             if "/tmpfiles.d/" in path:
-                return any(line.startswith(("d ", "D ", "f ")) for line in text.splitlines())
+                return any(
+                    line.startswith(("d ", "D ", "f ")) for line in text.splitlines()
+                )
             return bool(text.strip())
         return False
 
     @staticmethod
     def _semantic_surface_is_valid(
-        matrix: RenameMatrix, expectation: SurfaceExpectation, path: str, content: bytes, *, target: bool
+        matrix: RenameMatrix,
+        expectation: SurfaceExpectation,
+        path: str,
+        content: bytes,
+        *,
+        target: bool,
     ) -> bool:
         try:
             data: object
@@ -932,7 +1106,9 @@ class RenameReleaseValidator:
         if expectation.semantic_kind == "mcp_manifest":
             servers = data.get("mcpServers")
             mcp_name = canonical["mcp_name"] if target else f"{legacy['slug']}-mcp"
-            runtime_root = canonical["runtime_root"] if target else f"{legacy['slug']}-runtime"
+            runtime_root = (
+                canonical["runtime_root"] if target else f"{legacy['slug']}-runtime"
+            )
             server = servers.get(mcp_name) if isinstance(servers, dict) else None
             return isinstance(server, dict) and server.get("command") == (
                 f"/home/teladi/.local/lib/{runtime_root}/{mcp_name}"
@@ -979,34 +1155,72 @@ class RenameReleaseValidator:
 
     @staticmethod
     def _matrix_from_tracked_blobs(blobs: Sequence[tuple[str, bytes]]) -> RenameMatrix:
-        candidates = [(path, content) for path, content in blobs if PurePosixPath(path).name == _CONTRACT_FILE_NAME]
+        candidates = [
+            (path, content)
+            for path, content in blobs
+            if PurePosixPath(path).name == _CONTRACT_FILE_NAME
+        ]
         if len(candidates) != 1:
-            raise RenameContractError("Git tree must contain exactly one rename contract")
+            raise RenameContractError(
+                "Git tree must contain exactly one rename contract"
+            )
         try:
             path, content = candidates[0]
             raw = json.loads(content.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RenameContractError("tracked rename contract is unreadable") from error
+            raise RenameContractError(
+                "tracked rename contract is unreadable"
+            ) from error
         matrix = parse_rename_matrix(raw)
         expected_path = f"src/{matrix.canonical['python']}/{_CONTRACT_FILE_NAME}"
         if path != expected_path:
-            raise RenameContractError("tracked rename contract is not packaged at the target path")
+            raise RenameContractError(
+                "tracked rename contract is not packaged at the target path"
+            )
         return matrix
 
     @staticmethod
-    def _tracked_blobs(repository_root: Path, treeish: str) -> tuple[tuple[str, bytes], ...]:
+    def _tracked_blobs(
+        repository_root: Path, treeish: str
+    ) -> tuple[tuple[str, bytes], ...]:
         root = repository_root.resolve()
-        top_level = RenameReleaseValidator._git(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"]
-        ).decode("utf-8", "surrogateescape").strip()
+        top_level = (
+            RenameReleaseValidator._git(
+                ["git", "-C", str(root), "rev-parse", "--show-toplevel"]
+            )
+            .decode("utf-8", "surrogateescape")
+            .strip()
+        )
         if Path(top_level).resolve() != root:
             raise RenameContractError("repository root must be the Git top level")
-        tree = RenameReleaseValidator._git(
-            ["git", "-C", str(root), "rev-parse", "--verify", "--end-of-options", f"{treeish}^{{tree}}"]
-        ).decode("ascii").strip()
+        tree = (
+            RenameReleaseValidator._git(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    f"{treeish}^{{tree}}",
+                ]
+            )
+            .decode("ascii")
+            .strip()
+        )
         if not re.fullmatch(r"[0-9a-f]{40,64}", tree):
             raise RenameContractError("treeish does not resolve to a local Git tree")
-        command = ["git", "-C", str(root), "ls-tree", "-rz", "--full-tree", "-r", "--", tree]
+        command = [
+            "git",
+            "-C",
+            str(root),
+            "ls-tree",
+            "-rz",
+            "--full-tree",
+            "-r",
+            "--",
+            tree,
+        ]
         listing = RenameReleaseValidator._git(command)
         blobs: list[tuple[str, bytes]] = []
         for record in listing.split(b"\0"):
@@ -1021,7 +1235,14 @@ class RenameReleaseValidator:
                 continue
             path = raw_path.decode("utf-8", "surrogateescape")
             blob = RenameReleaseValidator._git(
-                ["git", "-C", str(repository_root), "cat-file", "blob", object_id.decode("ascii")]
+                [
+                    "git",
+                    "-C",
+                    str(repository_root),
+                    "cat-file",
+                    "blob",
+                    object_id.decode("ascii"),
+                ]
             )
             blobs.append((path, blob))
         return tuple(blobs)
@@ -1029,11 +1250,12 @@ class RenameReleaseValidator:
     @staticmethod
     def _git(command: Sequence[str]) -> bytes:
         if any(
-            key in _UNSAFE_GIT_ENVIRONMENT
-            or key.startswith("GIT_CONFIG_")
+            key in _UNSAFE_GIT_ENVIRONMENT or key.startswith("GIT_CONFIG_")
             for key in os.environ
         ):
-            raise RenameContractError("Git environment is not permitted for rename validation")
+            raise RenameContractError(
+                "Git environment is not permitted for rename validation"
+            )
         completed = subprocess.run(
             command,
             check=False,

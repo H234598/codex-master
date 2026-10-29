@@ -18,7 +18,13 @@ from the_hive.fleet_inplace import (
 TX_ID = "a" * 32
 OLD_GENERATION = 8
 NEW_GENERATION = 9
-MANAGED = ("codex", "config.toml", "AGENTS.md", "AGENTS.class-teamleiterin.md", ".codex-fleet-agent.json")
+MANAGED = (
+    "codex",
+    "config.toml",
+    "AGENTS.md",
+    "AGENTS.class-teamleiterin.md",
+    ".codex-fleet-agent.json",
+)
 
 
 class Crash(BaseException):
@@ -38,7 +44,9 @@ def write_file(path: Path, data: bytes, mode: int = 0o600) -> None:
     path.chmod(mode)
 
 
-def make_home(tmp_path: Path, home_id: str, *, absent: str | None = None) -> QHomeUpdate:
+def make_home(
+    tmp_path: Path, home_id: str, *, absent: str | None = None
+) -> QHomeUpdate:
     home = private_dir(tmp_path / home_id)
     old = {
         "codex": f"old wrapper {home_id}\n".encode(),
@@ -73,9 +81,13 @@ def make_home(tmp_path: Path, home_id: str, *, absent: str | None = None) -> QHo
     )
 
 
-def series(tmp_path: Path, *, absent: str | None = None) -> tuple[tuple[QHomeUpdate, ...], Path]:
+def series(
+    tmp_path: Path, *, absent: str | None = None
+) -> tuple[tuple[QHomeUpdate, ...], Path]:
     transaction_root = private_dir(tmp_path / "transactions")
-    homes = tuple(make_home(tmp_path, f"q{number}", absent=absent) for number in range(1, 4))
+    homes = tuple(
+        make_home(tmp_path, f"q{number}", absent=absent) for number in range(1, 4)
+    )
     return homes, transaction_root
 
 
@@ -150,7 +162,9 @@ def crashed_series(tmp_path: Path, point: str, *, absent: str | None = None):
             homes,
             transactions,
             lambda _a, _b: True,
-            fault=lambda event: (_ for _ in ()).throw(Crash) if event == point else None,
+            fault=lambda event: (_ for _ in ()).throw(Crash)
+            if event == point
+            else None,
         )
     return homes, transactions, before
 
@@ -172,21 +186,24 @@ def test_partial_transaction_cleanup_removes_only_declared_owned_files(
     write_file(transaction / "stage-a", b"stage")
     write_file(transaction / "backup-a", b"backup")
 
-    inplace._cleanup_partial(
-        transaction, [{"stage": "stage-a", "backup": "backup-a"}]
-    )
+    inplace._cleanup_partial(transaction, [{"stage": "stage-a", "backup": "backup-a"}])
 
     assert not transaction.exists()
     assert parent.exists()
 
 
-def test_q1_q3_update_uses_one_cas_and_preserves_home_and_runtime_identity(tmp_path: Path) -> None:
+def test_q1_q3_update_uses_one_cas_and_preserves_home_and_runtime_identity(
+    tmp_path: Path,
+) -> None:
     homes, transactions = series(tmp_path)
     home_inodes = {item.home_id: item.home.stat().st_ino for item in homes}
     unknown = {item.home_id: unknown_snapshot(item.home) for item in homes}
     calls: list[tuple[int, int]] = []
 
-    assert apply(homes, transactions, lambda old, new: calls.append((old, new)) or True) == 9
+    assert (
+        apply(homes, transactions, lambda old, new: calls.append((old, new)) or True)
+        == 9
+    )
     assert calls == [(8, 9)]
     for item in homes:
         assert item.home.stat().st_ino == home_inodes[item.home_id]
@@ -215,7 +232,9 @@ def test_precommit_failure_rolls_back_all_homes(tmp_path: Path, failure: str) ->
             lambda a, b: calls.append((a, b)) or failure != "conflict",
             fault=fault,
         )
-    assert caught.value.code == ("materialization_failed" if failure == "partial" else "registry_conflict")
+    assert caught.value.code == (
+        "materialization_failed" if failure == "partial" else "registry_conflict"
+    )
     assert calls == ([] if failure == "partial" else [(8, 9)])
     for item in homes:
         assert_snapshot(item.home, old[item.home_id])
@@ -229,7 +248,9 @@ def test_precommit_failure_rolls_back_all_homes(tmp_path: Path, failure: str) ->
 def test_crash_recovery_follows_authoritative_generation(
     tmp_path: Path, crash_point: str, generation: int, expected: str
 ) -> None:
-    homes, transactions, old = crashed_series(tmp_path, crash_point, absent="config.toml")
+    homes, transactions, old = crashed_series(
+        tmp_path, crash_point, absent="config.toml"
+    )
     assert recover(homes, transactions, generation) == generation
     for item in homes:
         if expected == "old":
@@ -240,7 +261,9 @@ def test_crash_recovery_follows_authoritative_generation(
     assert list(transactions.iterdir()) == []
 
 
-def test_third_generation_blocks_and_uncertain_cas_remains_recoverable(tmp_path: Path) -> None:
+def test_third_generation_blocks_and_uncertain_cas_remains_recoverable(
+    tmp_path: Path,
+) -> None:
     homes, transactions = series(tmp_path)
 
     def uncertain(_old: int, _new: int) -> bool:
@@ -308,7 +331,9 @@ def test_home_inode_race_fails_before_materialization(tmp_path: Path) -> None:
     assert (original / "codex").read_bytes() == b"old wrapper q1\n"
 
 
-@pytest.mark.parametrize("operation", ["replace_inode", "replace_digest", "rollback_unlink"])
+@pytest.mark.parametrize(
+    "operation", ["replace_inode", "replace_digest", "rollback_unlink"]
+)
 def test_leaf_race_is_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
@@ -362,8 +387,7 @@ def test_markers_are_last_and_journal_contains_no_user_data(tmp_path: Path) -> N
             events.append(point)
             if point == "after:q3:config.toml":
                 assert all(
-                    (item.home / ".codex-fleet-agent.json").read_bytes()
-                    != item.marker
+                    (item.home / ".codex-fleet-agent.json").read_bytes() != item.marker
                     for item in homes
                 )
         if point == "before_cas":
@@ -382,7 +406,9 @@ def test_markers_are_last_and_journal_contains_no_user_data(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("entry", ["module_temp", "foreign"])
-def test_recovery_cleanup_handles_only_module_owned_temps(tmp_path: Path, entry: str) -> None:
+def test_recovery_cleanup_handles_only_module_owned_temps(
+    tmp_path: Path, entry: str
+) -> None:
     homes, transactions, _old = crashed_series(tmp_path, "before_cas")
     transaction = transactions / TX_ID
     extra = transaction / (
@@ -405,7 +431,9 @@ def test_recovery_cleanup_handles_only_module_owned_temps(tmp_path: Path, entry:
             assert_snapshot(item.home, managed_before[item.home_id])
 
 
-def test_corrupt_global_marker_order_and_tight_bounds_are_rejected(tmp_path: Path) -> None:
+def test_corrupt_global_marker_order_and_tight_bounds_are_rejected(
+    tmp_path: Path,
+) -> None:
     homes, transactions, _old = crashed_series(tmp_path, "before_cas")
     journal_path = transactions / TX_ID / "journal.json"
     raw = json.loads(journal_path.read_bytes())
@@ -430,7 +458,9 @@ def test_corrupt_global_marker_order_and_tight_bounds_are_rejected(tmp_path: Pat
     assert caught.value.code == "invalid_request"
 
 
-def test_committed_journal_with_old_authoritative_generation_blocks_unchanged(tmp_path: Path) -> None:
+def test_committed_journal_with_old_authoritative_generation_blocks_unchanged(
+    tmp_path: Path,
+) -> None:
     homes, transactions, _old = crashed_series(tmp_path, "after_cas")
     before = {item.home_id: managed_snapshot(item.home) for item in homes}
     journal = transactions / TX_ID / "journal.json"
@@ -447,7 +477,9 @@ def test_semantically_foreign_journal_state_is_rejected_without_mutation(
     tmp_path: Path, corruption: str
 ) -> None:
     homes, transactions, _old = crashed_series(
-        tmp_path, "before_cas", absent="config.toml" if corruption == "restored_absent" else None
+        tmp_path,
+        "before_cas",
+        absent="config.toml" if corruption == "restored_absent" else None,
     )
     journal = transactions / TX_ID / "journal.json"
     raw = json.loads(journal.read_bytes())
@@ -455,12 +487,15 @@ def test_semantically_foreign_journal_state_is_rejected_without_mutation(
         item
         for item in raw["entries"]
         if item["home_id"] == "q1"
-        and item["name"] == ("config.toml" if corruption == "restored_absent" else "codex")
+        and item["name"]
+        == ("config.toml" if corruption == "restored_absent" else "codex")
     )
     if corruption == "installed":
         entry["installed"]["digest"] = "f" * 64
     else:
-        entry["restored"] = dict(entry["installed"] if entry["old"] is None else entry["old"])
+        entry["restored"] = dict(
+            entry["installed"] if entry["old"] is None else entry["old"]
+        )
         if corruption == "restored":
             entry["restored"]["digest"] = "f" * 64
     journal.write_text(json.dumps(raw, separators=(",", ":")) + "\n")

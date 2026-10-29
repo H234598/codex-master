@@ -32,9 +32,7 @@ def test_plan_cli_does_not_mutate_fixture_and_prints_canonical_plan(capsys):
     ["-oProxyCommand=x", "-h", "--help", "--ProxyCommand=x"],
 )
 def test_plan_cli_rejects_option_like_ssh_target(target, capsys):
-    exit_code, captured = _run_plan(
-        target, FIXTURE_DIR / "host-empty.json", capsys
-    )
+    exit_code, captured = _run_plan(target, FIXTURE_DIR / "host-empty.json", capsys)
 
     assert exit_code == 2
     assert captured.out == ""

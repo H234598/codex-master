@@ -168,9 +168,7 @@ class RootOwnedDynamicTeamleadStartPort:
 
     __str__ = __repr__
 
-    def execute_dynamic_teamlead_runner(
-        self, plan: DynamicTeamleadRunnerPlan
-    ) -> None:
+    def execute_dynamic_teamlead_runner(self, plan: DynamicTeamleadRunnerPlan) -> None:
         self._executor.execute_dynamic_teamlead_runner(plan)
 
 

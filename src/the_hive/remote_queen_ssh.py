@@ -14,9 +14,7 @@ MAX_SSH_OPERATION_TIMEOUT_SECONDS = 30
 MAX_SSH_STDOUT_BYTES = 64 * 1024
 MAX_SSH_STDERR_BYTES = 8 * 1024
 
-SSH_HOST_KEY_TYPES = frozenset(
-    {"ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"}
-)
+SSH_HOST_KEY_TYPES = frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"})
 
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 
@@ -138,9 +136,7 @@ class SshOperationResultV1:
 
 
 class RemoteQueenSshOperations(Protocol):
-    def known_host_keys(
-        self, target: SshTargetV1
-    ) -> tuple[KnownHostKeyV1, ...]: ...
+    def known_host_keys(self, target: SshTargetV1) -> tuple[KnownHostKeyV1, ...]: ...
 
     def presented_host_key(
         self,

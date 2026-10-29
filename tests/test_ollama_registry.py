@@ -79,10 +79,15 @@ def test_shared_registry_reuses_group_owned_directory_and_lock_without_chmod(
             raise PermissionError
         original_fchmod(descriptor, mode)
 
-    monkeypatch.setattr("the_hive.ollama_registry.os.chmod", deny_existing_directory_chmod)
+    monkeypatch.setattr(
+        "the_hive.ollama_registry.os.chmod", deny_existing_directory_chmod
+    )
     monkeypatch.setattr("the_hive.ollama_registry.os.fchmod", deny_existing_lock_chmod)
 
-    assert OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation == 0
+    assert (
+        OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation
+        == 0
+    )
 
 
 def test_shared_registry_lock_creation_race_never_fchmods_other_owner(
@@ -113,7 +118,10 @@ def test_shared_registry_lock_creation_race_never_fchmods_other_owner(
     monkeypatch.setattr("the_hive.ollama_registry.os.open", race_open)
     monkeypatch.setattr("the_hive.ollama_registry.os.fchmod", deny_foreign_fchmod)
 
-    assert OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation == 0
+    assert (
+        OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation
+        == 0
+    )
 
 
 def test_instance_requires_at_least_one_model():
@@ -147,7 +155,9 @@ def test_registry_rejects_unknown_major_schema_version(tmp_path):
     store = OllamaRegistryStore.for_test(tmp_path)
     document = tmp_path / "ollama-registry.json"
     document.write_text(
-        json.dumps({"schema_version": 2, "generation": 0, "models": [], "instances": []}),
+        json.dumps(
+            {"schema_version": 2, "generation": 0, "models": [], "instances": []}
+        ),
         encoding="utf-8",
     )
     document.chmod(0o600)
@@ -207,10 +217,18 @@ def test_registry_rejects_more_than_four_local_instances(tmp_path):
 
 def test_replace_rejects_stale_generation(tmp_path):
     store = OllamaRegistryStore.for_test(tmp_path)
-    store.replace(models=(valid_model(),), instances=(valid_instance(),), expected_generation=0)
+    store.replace(
+        models=(valid_model(),), instances=(valid_instance(),), expected_generation=0
+    )
 
-    with pytest.raises(OllamaRegistryError, match="ollama.registry_generation_conflict"):
-        store.replace(models=(valid_model(),), instances=(valid_instance(),), expected_generation=0)
+    with pytest.raises(
+        OllamaRegistryError, match="ollama.registry_generation_conflict"
+    ):
+        store.replace(
+            models=(valid_model(),),
+            instances=(valid_instance(),),
+            expected_generation=0,
+        )
 
 
 def test_concurrent_replace_allows_exactly_one_matching_generation(tmp_path):
@@ -245,9 +263,7 @@ def test_concurrent_replace_allows_exactly_one_matching_generation(tmp_path):
     assert sum(isinstance(result, OllamaRegistryV1) for result in results) == 1
     assert (
         next(
-            result.code
-            for result in results
-            if isinstance(result, OllamaRegistryError)
+            result.code for result in results if isinstance(result, OllamaRegistryError)
         )
         == "ollama.registry_generation_conflict"
     )

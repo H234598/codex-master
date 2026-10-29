@@ -29,7 +29,9 @@ def test_service_plans_run_then_reuses_real_passed_receipt(tmp_path: Path) -> No
 
     before = evidence_service.plan(request, now_monotonic_ns=1)
     receipt = evidence_service.run(test_id, expected_index_digest=request.index_digest)
-    after = evidence_service.plan(request, now_monotonic_ns=receipt.finished_monotonic_ns)
+    after = evidence_service.plan(
+        request, now_monotonic_ns=receipt.finished_monotonic_ns
+    )
 
     assert before.tests[0].action == "run"
     assert after.tests[0].action == "reuse"
@@ -40,8 +42,12 @@ def test_service_invalidation_turns_reuse_back_into_run(tmp_path: Path) -> None:
     request = evidence_service.request(changed_paths=("src/example.py",))
     receipt = evidence_service.run(test_id, expected_index_digest=request.index_digest)
 
-    evidence_service.invalidate(receipt.evidence_id, expected_index_digest=request.index_digest)
-    plan = evidence_service.plan(request, now_monotonic_ns=receipt.finished_monotonic_ns)
+    evidence_service.invalidate(
+        receipt.evidence_id, expected_index_digest=request.index_digest
+    )
+    plan = evidence_service.plan(
+        request, now_monotonic_ns=receipt.finished_monotonic_ns
+    )
 
     assert (plan.tests[0].action, plan.tests[0].reason_code) == (
         "run",

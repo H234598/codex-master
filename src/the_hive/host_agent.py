@@ -142,10 +142,7 @@ def open_host_agent_credentials(
     try:
         directory_fd = os.open(
             raw_directory,
-            os.O_RDONLY
-            | os.O_CLOEXEC
-            | os.O_DIRECTORY
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
         )
         directory_stat = os.fstat(directory_fd)
         if (
@@ -369,11 +366,11 @@ class HostAgentClient:
             remote = value.get("kind") == "ollama.instance"
             remote_fields = (
                 {"plan_precondition_digest", "resource_generation", "envelope_digest"}
-                if remote else set()
+                if remote
+                else set()
             )
-            if (
-                set(value) != required | remote_fields
-                or value["schema_version"] != (2 if remote else 1)
+            if set(value) != required | remote_fields or value["schema_version"] != (
+                2 if remote else 1
             ):
                 _fail("resource.host_response_invalid")
             deadline = datetime.strptime(
@@ -432,7 +429,9 @@ class HostAgentClient:
                 with self._opener.open(request, timeout=35) as response:
                     content_types = response.headers.get_all("Content-Type") or []
                     content_lengths = response.headers.get_all("Content-Length") or []
-                    transfer_encodings = response.headers.get_all("Transfer-Encoding") or []
+                    transfer_encodings = (
+                        response.headers.get_all("Transfer-Encoding") or []
+                    )
                     if response.status != 200 or response.geturl() != request.full_url:
                         _fail("resource.host_response_invalid")
                     if (
@@ -616,9 +615,7 @@ class HostAgentExecutor:
                 )
             )
         except AgentOllamaNoEffectError:
-            result = AgentResultV1(
-                lease.kind, lease.action, {"status": "failed"}
-            )
+            result = AgentResultV1(lease.kind, lease.action, {"status": "failed"})
             return self._state.finish(
                 lease,
                 state="failed",

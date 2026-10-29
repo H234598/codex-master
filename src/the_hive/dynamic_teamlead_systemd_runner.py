@@ -114,7 +114,10 @@ def _validate_plan(plan: object) -> str:
         _invalid()
     if type(home) is not AttestedHome:
         _invalid()
-    if type(home.reply) is not BrokerReply or type(home.attestation) is not HomeAttestation:
+    if (
+        type(home.reply) is not BrokerReply
+        or type(home.attestation) is not HomeAttestation
+    ):
         _invalid()
     if type(home.fd) is not int or home.fd < 0:
         _invalid()

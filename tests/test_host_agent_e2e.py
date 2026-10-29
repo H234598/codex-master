@@ -92,15 +92,19 @@ def _certificate(
     builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
-        .issuer_name(issuer.subject if issuer is not None else x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, name)
-        ]))
+        .issuer_name(
+            issuer.subject
+            if issuer is not None
+            else x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+        )
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_before)
         .not_valid_after(not_after)
         .add_extension(
-            x509.BasicConstraints(ca=issuer is None, path_length=0 if issuer is None else None),
+            x509.BasicConstraints(
+                ca=issuer is None, path_length=0 if issuer is None else None
+            ),
             critical=True,
         )
         .add_extension(
@@ -122,24 +126,26 @@ def _certificate(
             critical=False,
         )
         .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                issuer_key.public_key()
-            ),
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
             critical=False,
         )
     )
     if issuer is not None:
         builder = builder.add_extension(
-            x509.ExtendedKeyUsage([
-                ExtendedKeyUsageOID.CLIENT_AUTH if client else ExtendedKeyUsageOID.SERVER_AUTH
-            ]),
+            x509.ExtendedKeyUsage(
+                [
+                    ExtendedKeyUsageOID.CLIENT_AUTH
+                    if client
+                    else ExtendedKeyUsageOID.SERVER_AUTH
+                ]
+            ),
             critical=True,
         )
     if not client:
         builder = builder.add_extension(
-            x509.SubjectAlternativeName([
-                x509.IPAddress(ipaddress.ip_address("127.0.0.1"))
-            ]),
+            x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+            ),
             critical=False,
         )
     return builder.sign(issuer_key, hashes.SHA256())
@@ -172,7 +178,9 @@ def _create_pki(tmp_path: Path) -> _Pki:
     root = tmp_path / "pki"
     root.mkdir(mode=0o700)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ca = _certificate("agent-test-ca", key=ca_key, issuer=None, issuer_key=ca_key, client=False)
+    ca = _certificate(
+        "agent-test-ca", key=ca_key, issuer=None, issuer_key=ca_key, client=False
+    )
     server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     worker_one_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     worker_two_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -194,8 +202,12 @@ def _create_pki(tmp_path: Path) -> _Pki:
         ).public_bytes(serialization.Encoding.PEM),
         "worker-two.key": _pem_private_key(worker_two_key),
         "expired.crt": _certificate(
-            "expired-worker", key=expired_key, issuer=ca, issuer_key=ca_key,
-            client=True, expired=True,
+            "expired-worker",
+            key=expired_key,
+            issuer=ca,
+            issuer_key=ca_key,
+            client=True,
+            expired=True,
         ).public_bytes(serialization.Encoding.PEM),
         "expired.key": _pem_private_key(expired_key),
     }
@@ -264,23 +276,31 @@ class _E2E:
         return self.agent_request(
             client=client,
             target="/agent/v1/polls",
-            body=json.dumps({
-                "schema_version": 1,
-                "registry_generation": self.registry.document_generation(),
-                "lease_epoch": 3,
-                "capabilities_digest": _CAPABILITIES_DIGEST,
-                "max_wait_seconds": 0,
-            }).encode(),
+            body=json.dumps(
+                {
+                    "schema_version": 1,
+                    "registry_generation": self.registry.document_generation(),
+                    "lease_epoch": 3,
+                    "capabilities_digest": _CAPABILITIES_DIGEST,
+                    "max_wait_seconds": 0,
+                }
+            ).encode(),
         )
 
-    def agent_request(self, *, client: str | None, target: str, body: bytes) -> _Response:
+    def agent_request(
+        self, *, client: str | None, target: str, body: bytes
+    ) -> _Response:
         connection = http.client.HTTPSConnection(
-            "127.0.0.1", self.server.server_address[1],
-            context=self.pki.context(client), timeout=2,
+            "127.0.0.1",
+            self.server.server_address[1],
+            context=self.pki.context(client),
+            timeout=2,
         )
         try:
             connection.request(
-                "POST", target, body=body,
+                "POST",
+                target,
+                body=body,
                 headers={"Content-Type": "application/json"},
             )
             response = connection.getresponse()
@@ -350,7 +370,10 @@ class _E2E:
                 timeout=2,
             )
             connection.request(
-                "POST", "/admin/v1", body=b"{}", headers={
+                "POST",
+                "/admin/v1",
+                body=b"{}",
+                headers={
                     "Host": "admin.test",
                     "X-Forwarded-Host": "admin.test",
                     "X-Forwarded-Proto": "https",
@@ -497,7 +520,9 @@ def test_remote_host_probe_updates_once_and_rejects_stale_or_cross_host_receipts
     agent = HostAgent(
         client=client,
         executor=HostAgentExecutor(
-            state=HostAgentState.for_test(e2e.root / "agent-state", host_ref="worker-one"),
+            state=HostAgentState.for_test(
+                e2e.root / "agent-state", host_ref="worker-one"
+            ),
             ollama=object(),
             host_probe=HostProbeExecutor(
                 collector=LocalHostProbeCollector(
@@ -688,9 +713,7 @@ def _remote_instance(tmp_path: Path, *, host_ref: str) -> OllamaInstanceV1:
     )
 
 
-def _fleet(
-    e2e: _E2E, registry: OllamaRegistryStore
-) -> FleetService:
+def _fleet(e2e: _E2E, registry: OllamaRegistryStore) -> FleetService:
     paths = FleetPaths.from_state_root(e2e.root / "fleet-owner")
     return FleetService(
         paths,
@@ -718,9 +741,7 @@ def _install_remote_owner(e2e: _E2E, fleet: FleetService) -> None:
 
 def _poll(client: HostAgentClient, e2e: _E2E) -> AgentLeaseV1:
     lease = client.poll(
-        AgentPollV1(
-            e2e.registry.document_generation(), 3, _CAPABILITIES_DIGEST, 0
-        )
+        AgentPollV1(e2e.registry.document_generation(), 3, _CAPABILITIES_DIGEST, 0)
     )
     assert type(lease) is AgentLeaseV1
     return lease
@@ -767,11 +788,14 @@ def test_remote_ollama_survives_master_restart_and_only_opens_ready_lanes(
         target=f"/agent/v1/operations/{planned.id}/receipts",
         body=_receipt_wire(drifted),
     ).status in {400, 409}
-    assert e2e.agent_request(
-        client="worker-two",
-        target=f"/agent/v1/operations/{planned.id}/receipts",
-        body=_receipt_wire(plan_receipt),
-    ).status == 403
+    assert (
+        e2e.agent_request(
+            client="worker-two",
+            target=f"/agent/v1/operations/{planned.id}/receipts",
+            body=_receipt_wire(plan_receipt),
+        ).status
+        == 403
+    )
     assert e2e.operations.get(planned.id).state == "leased"
 
     # A fresh owner reconstructs the persisted remote plan before it receives
@@ -893,7 +917,9 @@ def _run_host_agent_until_sigterm(
     )
     original_open = host_agent_module.open_host_agent_credentials
     original_assemble = host_agent_module.assemble_host_agent
-    host_agent_module.open_host_agent_credentials = lambda _environment: _NoCredentials()
+    host_agent_module.open_host_agent_credentials = (
+        lambda _environment: _NoCredentials()
+    )
     host_agent_module.assemble_host_agent = lambda _credentials: (
         agent,
         _HostAgentMainConfig(),
@@ -958,7 +984,9 @@ def test_real_sigterm_stops_agent_api_listener(e2e: _E2E) -> None:
         context=e2e.pki.context("worker-one"),
         sleep=lambda _seconds: None,
     )
-    assert type(client.poll(AgentPollV1(1, 3, _CAPABILITIES_DIGEST, 0))) is AgentNoWorkV1
+    assert (
+        type(client.poll(AgentPollV1(1, 3, _CAPABILITIES_DIGEST, 0))) is AgentNoWorkV1
+    )
 
     os.kill(process.pid, signal.SIGTERM)
     process.join(7)
@@ -1033,10 +1061,11 @@ def test_real_sigterm_finishes_current_host_agent_receipt_without_repoll(
     assert e2e.operations.get(first.operation_id).state == "succeeded"
     queued = e2e.operations.get(second.operation_id)
     assert (queued.state, queued.attempt) == ("queued", 0)
-    assert HostAgentState.for_test(state_root, host_ref="worker-one").receipt_count() == 1
+    assert (
+        HostAgentState.for_test(state_root, host_ref="worker-one").receipt_count() == 1
+    )
     assert all(
-        ".tmp" not in path.name
-        for path in (state_root / "host-agent").iterdir()
+        ".tmp" not in path.name for path in (state_root / "host-agent").iterdir()
     )
 
 
@@ -1050,9 +1079,7 @@ def _poll_then_crash(
         context=_Pki(pki_root, "").context("worker-one"),
         sleep=lambda _seconds: None,
     )
-    lease = client.poll(
-        AgentPollV1(registry_generation, 3, _CAPABILITIES_DIGEST, 0)
-    )
+    lease = client.poll(AgentPollV1(registry_generation, 3, _CAPABILITIES_DIGEST, 0))
     if type(lease) is not AgentLeaseV1:
         os._exit(2)
     os._exit(23)
@@ -1106,7 +1133,9 @@ def test_agent_crash_before_effect_redelivers_over_the_real_mtls_queue(
     )
 
     receipt = HostAgentExecutor(
-        state=HostAgentState.for_test(e2e.root / "redelivery-state", host_ref="worker-one"),
+        state=HostAgentState.for_test(
+            e2e.root / "redelivery-state", host_ref="worker-one"
+        ),
         ollama=object(),
         host_probe=HostProbeExecutor(
             collector=LocalHostProbeCollector(
@@ -1128,7 +1157,9 @@ class _NoEffectRuntime:
         self, plan_ref: object, plan_digest: object, resource_generation: object
     ) -> None:
         del plan_ref, plan_digest, resource_generation
-        raise AssertionError("a recovered unknown receipt must never validate a new effect")
+        raise AssertionError(
+            "a recovered unknown receipt must never validate a new effect"
+        )
 
 
 def _crash_after_begin_effect(state_root: Path, lease: AgentLeaseV1) -> None:
@@ -1142,9 +1173,12 @@ def test_agent_crash_after_begin_effect_recovers_unknown_without_runtime_call(
 ) -> None:
     """A process death after the durable mutation boundary is intentionally unknown."""
     arguments = {"plan_ref": "plan-one"}
-    arguments_digest = "sha256:" + hashlib.sha256(
-        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    arguments_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     plan_digest = "sha256:" + "a" * 64
     lease = AgentLeaseV1(
         operation_id="crash-after-effect",

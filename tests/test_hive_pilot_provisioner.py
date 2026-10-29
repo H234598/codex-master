@@ -35,9 +35,12 @@ def make_repository(
         (ROOT / "codex-agent-classes.json").read_bytes()
     )
     (repository / "codex-hive.json").write_bytes(SHADOW_CONFIG.read_bytes())
-    subprocess.run(["git", "-C", str(repository), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
-        ["git", "-C", str(repository), "config", "remote.origin.url", remote], check=True
+        ["git", "-C", str(repository), "init", "-q", "-b", "main"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "remote.origin.url", remote],
+        check=True,
     )
     if with_commit:
         subprocess.run(
@@ -83,11 +86,15 @@ def test_plan_is_read_only_and_redacted(tmp_path: Path) -> None:
     assert str(state_root) not in str(plan)
 
 
-def test_apply_is_atomic_idempotent_and_runtime_rejects_a_caller_pool_mapping(tmp_path: Path) -> None:
+def test_apply_is_atomic_idempotent_and_runtime_rejects_a_caller_pool_mapping(
+    tmp_path: Path,
+) -> None:
     repository = make_repository(tmp_path)
     state_root = tmp_path / "private-state"
 
-    applied = apply_pilot_provisioning(repository_root=repository, state_root=state_root)
+    applied = apply_pilot_provisioning(
+        repository_root=repository, state_root=state_root
+    )
 
     assert applied == {
         "operation": "apply",
@@ -113,7 +120,9 @@ def test_apply_is_atomic_idempotent_and_runtime_rejects_a_caller_pool_mapping(tm
     assert (state_root / "principals.json").stat().st_mode & 0o777 == 0o600
     assert (state_root / "pilot-provisioner.json").stat().st_mode & 0o777 == 0o600
 
-    verified = verify_pilot_provisioning(repository_root=repository, state_root=state_root)
+    verified = verify_pilot_provisioning(
+        repository_root=repository, state_root=state_root
+    )
     assert verified == {
         "operation": "verify",
         "configured": True,
@@ -125,7 +134,9 @@ def test_apply_is_atomic_idempotent_and_runtime_rejects_a_caller_pool_mapping(tm
         "raw_output": "not_returned",
     }
 
-    repeated = apply_pilot_provisioning(repository_root=repository, state_root=state_root)
+    repeated = apply_pilot_provisioning(
+        repository_root=repository, state_root=state_root
+    )
     assert repeated["applied"] is False
 
     evidence = read_hive_runtime_evidence(
@@ -154,26 +165,41 @@ def test_apply_recovers_a_prepared_crash_without_exposing_partial_config(
     def crash(*_args: object, **_kwargs: object) -> None:
         raise PilotProvisionerError("config_write_failed")
 
-    monkeypatch.setattr("the_hive.hive.pilot_provisioner._replace_config_atomically", crash)
+    monkeypatch.setattr(
+        "the_hive.hive.pilot_provisioner._replace_config_atomically", crash
+    )
     with pytest.raises(PilotProvisionerError, match="config_write_failed"):
         apply_pilot_provisioning(repository_root=repository, state_root=state_root)
 
     assert (repository / "codex-hive.json").read_bytes() == original
-    journal = json.loads((state_root / "pilot-provisioner.json").read_text(encoding="utf-8"))
+    journal = json.loads(
+        (state_root / "pilot-provisioner.json").read_text(encoding="utf-8")
+    )
     assert journal["phase"] == "prepared"
 
     monkeypatch.undo()
-    recovered = apply_pilot_provisioning(repository_root=repository, state_root=state_root)
+    recovered = apply_pilot_provisioning(
+        repository_root=repository, state_root=state_root
+    )
     assert recovered["applied"] is True
-    assert json.loads((state_root / "pilot-provisioner.json").read_text(encoding="utf-8"))["phase"] == "committed"
+    assert (
+        json.loads((state_root / "pilot-provisioner.json").read_text(encoding="utf-8"))[
+            "phase"
+        ]
+        == "committed"
+    )
 
 
-def test_kill_switch_is_an_atomic_safe_config_cutover_before_rollback(tmp_path: Path) -> None:
+def test_kill_switch_is_an_atomic_safe_config_cutover_before_rollback(
+    tmp_path: Path,
+) -> None:
     repository = make_repository(tmp_path)
     state_root = tmp_path / "private-state"
     apply_pilot_provisioning(repository_root=repository, state_root=state_root)
 
-    killed = kill_switch_pilot_provisioning(repository_root=repository, state_root=state_root)
+    killed = kill_switch_pilot_provisioning(
+        repository_root=repository, state_root=state_root
+    )
 
     assert killed == {
         "operation": "kill-switch",
@@ -187,7 +213,9 @@ def test_kill_switch_is_an_atomic_safe_config_cutover_before_rollback(tmp_path: 
     assert config["principals"] == []
     assert (state_root / "principals.json").exists()
 
-    rolled_back = rollback_pilot_provisioning(repository_root=repository, state_root=state_root)
+    rolled_back = rollback_pilot_provisioning(
+        repository_root=repository, state_root=state_root
+    )
     assert rolled_back == {
         "operation": "rollback",
         "applied": True,
@@ -255,11 +283,15 @@ def test_plan_rejects_wrong_host_root_and_wrong_config_mode(tmp_path: Path) -> N
         plan_pilot_provisioning(repository_root=repository, state_root=state_root)
 
 
-def test_atomic_config_cutover_rechecks_the_bound_repository_identity(tmp_path: Path) -> None:
+def test_atomic_config_cutover_rechecks_the_bound_repository_identity(
+    tmp_path: Path,
+) -> None:
     repository = make_repository(tmp_path)
     descriptor, root_identity = pilot_provisioner._open_repository_root(repository)
     try:
-        payload, config_identity = pilot_provisioner._read_regular(descriptor, "codex-hive.json")
+        payload, config_identity = pilot_provisioner._read_regular(
+            descriptor, "codex-hive.json"
+        )
         catalog, _catalog_identity = pilot_provisioner._read_regular(
             descriptor, "codex-agent-classes.json"
         )
@@ -283,7 +315,9 @@ def test_atomic_config_cutover_rejects_an_in_place_replay(tmp_path: Path) -> Non
     repository = make_repository(tmp_path)
     descriptor, root_identity = pilot_provisioner._open_repository_root(repository)
     try:
-        payload, config_identity = pilot_provisioner._read_regular(descriptor, "codex-hive.json")
+        payload, config_identity = pilot_provisioner._read_regular(
+            descriptor, "codex-hive.json"
+        )
         catalog, _catalog_identity = pilot_provisioner._read_regular(
             descriptor, "codex-agent-classes.json"
         )
@@ -303,7 +337,9 @@ def test_atomic_config_cutover_rejects_an_in_place_replay(tmp_path: Path) -> Non
         os.close(descriptor)
 
 
-def test_verify_rejects_principal_drift_and_rollback_rejects_replayed_config(tmp_path: Path) -> None:
+def test_verify_rejects_principal_drift_and_rollback_rejects_replayed_config(
+    tmp_path: Path,
+) -> None:
     repository = make_repository(tmp_path)
     state_root = tmp_path / "private-state"
     apply_pilot_provisioning(repository_root=repository, state_root=state_root)
@@ -319,7 +355,9 @@ def test_verify_rejects_principal_drift_and_rollback_rejects_replayed_config(tmp
         rollback_pilot_provisioning(repository_root=repository, state_root=state_root)
 
 
-def test_apply_rejects_an_existing_nonprivate_state_root_without_repair(tmp_path: Path) -> None:
+def test_apply_rejects_an_existing_nonprivate_state_root_without_repair(
+    tmp_path: Path,
+) -> None:
     repository = make_repository(tmp_path)
     state_root = tmp_path / "private-state"
     state_root.mkdir(mode=0o755)
@@ -331,21 +369,37 @@ def test_apply_rejects_an_existing_nonprivate_state_root_without_repair(tmp_path
     assert state_root.stat().st_mode & 0o777 == 0o755
 
 
-def test_tracked_admin_cli_requires_confirmation_and_has_no_hidden_path(tmp_path: Path) -> None:
+def test_tracked_admin_cli_requires_confirmation_and_has_no_hidden_path(
+    tmp_path: Path,
+) -> None:
     repository = make_repository(tmp_path)
     state_root = tmp_path / "private-state"
     command = ROOT / "scripts" / "the-hive-hive-pilot-provisioner"
     assert not (ROOT / "scripts" / "codex-master-hive-pilot-provisioner").exists()
 
     planned = subprocess.run(
-        [str(command), "plan", "--repository-root", str(repository), "--state-root", str(state_root)],
+        [
+            str(command),
+            "plan",
+            "--repository-root",
+            str(repository),
+            "--state-root",
+            str(state_root),
+        ],
         check=True,
         capture_output=True,
         text=True,
     )
     assert json.loads(planned.stdout)["operation"] == "plan"
     missing_confirmation = subprocess.run(
-        [str(command), "apply", "--repository-root", str(repository), "--state-root", str(state_root)],
+        [
+            str(command),
+            "apply",
+            "--repository-root",
+            str(repository),
+            "--state-root",
+            str(state_root),
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -368,7 +422,10 @@ def test_tracked_admin_cli_help_uses_the_canonical_program_name(
 
 def _set_nonmain_head(repository: Path, kind: str) -> None:
     if kind == "feature":
-        subprocess.run(["git", "-C", str(repository), "checkout", "-q", "-b", "feature"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repository), "checkout", "-q", "-b", "feature"],
+            check=True,
+        )
         return
     subprocess.run(
         [
@@ -388,7 +445,9 @@ def _set_nonmain_head(repository: Path, kind: str) -> None:
         ],
         check=True,
     )
-    subprocess.run(["git", "-C", str(repository), "checkout", "-q", "--detach", "HEAD"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "checkout", "-q", "--detach", "HEAD"], check=True
+    )
 
 
 @pytest.mark.parametrize("head_kind", ("feature", "detached"))
@@ -411,7 +470,9 @@ def test_plan_apply_and_verify_require_the_canonical_main_head(
         command(repository_root=repository, state_root=state_root)
 
 
-@pytest.mark.parametrize("operation", (kill_switch_pilot_provisioning, rollback_pilot_provisioning))
+@pytest.mark.parametrize(
+    "operation", (kill_switch_pilot_provisioning, rollback_pilot_provisioning)
+)
 @pytest.mark.parametrize("binding_mutation", ("origin", "branch", "config_digest"))
 def test_recovery_operations_require_the_same_repository_binding_as_apply_and_verify(
     tmp_path: Path, operation, binding_mutation: str
@@ -444,7 +505,9 @@ def test_recovery_operations_require_the_same_repository_binding_as_apply_and_ve
         operation(repository_root=repository, state_root=state_root)
 
 
-def test_plan_rejects_an_unsafe_state_parent_without_creating_state(tmp_path: Path) -> None:
+def test_plan_rejects_an_unsafe_state_parent_without_creating_state(
+    tmp_path: Path,
+) -> None:
     repository = make_repository(tmp_path)
     state_parent = tmp_path / "unsafe-parent"
     state_parent.mkdir(mode=0o777)
@@ -502,8 +565,13 @@ def test_plan_redacts_parent_io_failure_at_cli_boundary_without_mutation(
     assert (repository / "codex-hive.json").read_bytes() == before
 
 
-@pytest.mark.parametrize("operation", (plan_pilot_provisioning, apply_pilot_provisioning, verify_pilot_provisioning))
-def test_plan_apply_and_verify_require_a_real_local_main_commit(tmp_path: Path, operation) -> None:
+@pytest.mark.parametrize(
+    "operation",
+    (plan_pilot_provisioning, apply_pilot_provisioning, verify_pilot_provisioning),
+)
+def test_plan_apply_and_verify_require_a_real_local_main_commit(
+    tmp_path: Path, operation
+) -> None:
     repository = make_repository(tmp_path, with_commit=False)
 
     with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
@@ -521,7 +589,9 @@ def test_pilot_repository_validation_ignores_ambient_git_binding_environment(
     if environment_kind == "config":
         monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
         monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
-        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/H234598/codex-master.git")
+        monkeypatch.setenv(
+            "GIT_CONFIG_VALUE_0", "https://github.com/H234598/codex-master.git"
+        )
     else:
         reference_parent = tmp_path / "reference"
         reference_parent.mkdir()
@@ -530,10 +600,19 @@ def test_pilot_repository_validation_ignores_ambient_git_binding_environment(
         monkeypatch.setenv("GIT_WORK_TREE", str(repository))
 
     with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
-        plan_pilot_provisioning(repository_root=repository, state_root=tmp_path / "private-state")
+        plan_pilot_provisioning(
+            repository_root=repository, state_root=tmp_path / "private-state"
+        )
 
 
-@pytest.mark.parametrize("operation", (apply_pilot_provisioning, rollback_pilot_provisioning, kill_switch_pilot_provisioning))
+@pytest.mark.parametrize(
+    "operation",
+    (
+        apply_pilot_provisioning,
+        rollback_pilot_provisioning,
+        kill_switch_pilot_provisioning,
+    ),
+)
 @pytest.mark.parametrize("binding_mutation", ("head", "origin"))
 def test_mutations_revalidate_the_repository_binding_inside_the_state_lock(
     tmp_path: Path,
@@ -564,13 +643,17 @@ def test_mutations_revalidate_the_repository_binding_inside_the_state_lock(
             )
         return open_writable_state(path)
 
-    monkeypatch.setattr(pilot_provisioner, "_open_writable_state", mutate_between_initial_check_and_lock)
+    monkeypatch.setattr(
+        pilot_provisioner, "_open_writable_state", mutate_between_initial_check_and_lock
+    )
 
     with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
         operation(repository_root=repository, state_root=state_root)
 
 
-@pytest.mark.parametrize("operation", (rollback_pilot_provisioning, kill_switch_pilot_provisioning))
+@pytest.mark.parametrize(
+    "operation", (rollback_pilot_provisioning, kill_switch_pilot_provisioning)
+)
 def test_recovery_revalidates_the_config_binding_inside_the_state_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation
 ) -> None:
@@ -586,7 +669,9 @@ def test_recovery_revalidates_the_config_binding_inside_the_state_lock(
         config_path.write_text(json.dumps(payload), encoding="utf-8")
         return open_writable_state(path)
 
-    monkeypatch.setattr(pilot_provisioner, "_open_writable_state", mutate_between_initial_check_and_lock)
+    monkeypatch.setattr(
+        pilot_provisioner, "_open_writable_state", mutate_between_initial_check_and_lock
+    )
 
     with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
         operation(repository_root=repository, state_root=state_root)

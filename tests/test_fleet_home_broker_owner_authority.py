@@ -86,7 +86,11 @@ def _fixture_payload(*, mutate=None) -> bytes:
     if mutate is not None:
         mutate(document)
     return json.dumps(
-        document, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True
+        document,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
     ).encode("ascii")
 
 
@@ -119,11 +123,15 @@ def offline_selinux_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(selinux, "fgetfilecon_raw", read_context)
     monkeypatch.setattr(
-        selinux, "security_check_context_raw", lambda raw: 0 if raw == raw_context else -1
+        selinux,
+        "security_check_context_raw",
+        lambda raw: 0 if raw == raw_context else -1,
     )
 
 
-def test_layout_schema_accepts_only_all_explicit_fixture_roles_and_canonical_bytes() -> None:
+def test_layout_schema_accepts_only_all_explicit_fixture_roles_and_canonical_bytes() -> (
+    None
+):
     payload = _fixture_payload()
 
     layout = RootBrokerOwnerLayoutV1.from_canonical_bytes(payload)
@@ -159,7 +167,9 @@ def test_layout_direct_construction_fails_closed_without_the_factory() -> None:
         lambda document: document["roles"][0].pop("release_id"),
         lambda document: document["roles"][0].__setitem__("purpose", "free-purpose"),
         lambda document: document["roles"][0].__setitem__("object_type", "socket"),
-        lambda document: document["roles"][0].__setitem__("path", "/fixture-layout/../drift"),
+        lambda document: document["roles"][0].__setitem__(
+            "path", "/fixture-layout/../drift"
+        ),
         lambda document: document["roles"][0].__setitem__("uid", -1),
         lambda document: document["roles"][0].__setitem__("gid", "10000"),
         lambda document: document["roles"][0].__setitem__("mode", 0o10000),
@@ -173,7 +183,9 @@ def test_layout_direct_construction_fails_closed_without_the_factory() -> None:
         lambda document: document["roles"][0].__setitem__("extra", None),
     ],
 )
-def test_layout_schema_rejects_missing_duplicate_unknown_or_unbound_values(mutate) -> None:
+def test_layout_schema_rejects_missing_duplicate_unknown_or_unbound_values(
+    mutate,
+) -> None:
     with pytest.raises(OwnerAuthorityError, match="owner layout is invalid"):
         RootBrokerOwnerLayoutV1.from_canonical_bytes(_fixture_payload(mutate=mutate))
 
@@ -244,8 +256,12 @@ def test_loader_rejects_layout_or_joint_release_drift_before_authority_issue(
     }
     arguments.update(change(digest))
     try:
-        with pytest.raises(OwnerAuthorityError, match="owner layout binding is invalid"):
-            load_root_broker_owner_authority_from_open_fds(root_fd, layout_fd, **arguments)
+        with pytest.raises(
+            OwnerAuthorityError, match="owner layout binding is invalid"
+        ):
+            load_root_broker_owner_authority_from_open_fds(
+                root_fd, layout_fd, **arguments
+            )
     finally:
         os.close(layout_fd)
         os.close(root_fd)
@@ -256,7 +272,9 @@ def test_loader_rejects_wrong_fd_kinds_and_never_closes_caller_fds(tmp_path) -> 
     digest = root_broker_owner_layout_digest(payload)
     root_fd, layout_fd = _open_fixture_layout(tmp_path, payload)
     try:
-        with pytest.raises(OwnerAuthorityError, match="owner layout file descriptor is invalid"):
+        with pytest.raises(
+            OwnerAuthorityError, match="owner layout file descriptor is invalid"
+        ):
             load_root_broker_owner_authority_from_open_fds(
                 root_fd,
                 root_fd,
@@ -264,7 +282,9 @@ def test_loader_rejects_wrong_fd_kinds_and_never_closes_caller_fds(tmp_path) -> 
                 expected_layout_digest=digest,
                 release=_release(digest),
             )
-        with pytest.raises(OwnerAuthorityError, match="owner layout file descriptor is invalid"):
+        with pytest.raises(
+            OwnerAuthorityError, match="owner layout file descriptor is invalid"
+        ):
             load_root_broker_owner_authority_from_open_fds(
                 layout_fd,
                 root_fd,
@@ -327,7 +347,9 @@ def test_issued_authority_repr_and_str_are_fixed_and_redacted(tmp_path) -> None:
     selinux.is_selinux_enabled() != 1,
     reason="native FD label observation requires an active kernel SELinux policy",
 )
-def test_fd_selinux_label_uses_native_fd_observation_without_closing_fd(tmp_path) -> None:
+def test_fd_selinux_label_uses_native_fd_observation_without_closing_fd(
+    tmp_path,
+) -> None:
     fixture = tmp_path / "label-fixture"
     fixture.write_bytes(b"fixture")
     fd = os.open(fixture, os.O_RDONLY | os.O_NOFOLLOW)
@@ -389,7 +411,9 @@ def test_fd_selinux_label_rejects_type_or_range_drift_without_fallback(
             ("wrong_type_t", expected_range),
             (expected_type, "s999"),
         ):
-            with pytest.raises(OwnerAuthorityError, match="SELinux object label is invalid"):
+            with pytest.raises(
+                OwnerAuthorityError, match="SELinux object label is invalid"
+            ):
                 FdSelinuxObjectLabelV1.observe(
                     fd,
                     expected_type=expected_type_value,
@@ -411,7 +435,9 @@ def test_fd_selinux_label_rejects_type_or_range_drift_without_fallback(
         lambda monkeypatch: monkeypatch.setattr(
             selinux, "security_check_context_raw", lambda _raw: -1
         ),
-        lambda monkeypatch: monkeypatch.setattr(selinux, "context_new", lambda _raw: None),
+        lambda monkeypatch: monkeypatch.setattr(
+            selinux, "context_new", lambda _raw: None
+        ),
         lambda monkeypatch: monkeypatch.setattr(
             selinux,
             "context_type_get",
@@ -434,7 +460,9 @@ def test_fd_selinux_label_fails_closed_for_native_read_or_context_failures(
         expected_type, expected_range = _native_label(fd)
         patch(monkeypatch)
 
-        with pytest.raises(OwnerAuthorityError, match="SELinux object label is invalid"):
+        with pytest.raises(
+            OwnerAuthorityError, match="SELinux object label is invalid"
+        ):
             FdSelinuxObjectLabelV1.observe(
                 fd,
                 expected_type=expected_type,
@@ -457,7 +485,9 @@ def test_fd_selinux_label_fails_closed_when_policy_is_unavailable(
 
     monkeypatch.setattr(selinux, "security_check_context_raw", policy_unavailable)
     try:
-        with pytest.raises(OwnerAuthorityError, match="SELinux object label is invalid"):
+        with pytest.raises(
+            OwnerAuthorityError, match="SELinux object label is invalid"
+        ):
             FdSelinuxObjectLabelV1.observe(
                 fd, expected_type="fixture_object_t", expected_mls_range="s0"
             )
@@ -466,7 +496,9 @@ def test_fd_selinux_label_fails_closed_when_policy_is_unavailable(
         os.close(fd)
 
 
-def test_owner_authority_module_has_no_path_xattr_ctypes_shell_or_fallback_adapter() -> None:
+def test_owner_authority_module_has_no_path_xattr_ctypes_shell_or_fallback_adapter() -> (
+    None
+):
     module_path = os.path.join(
         os.path.dirname(__file__),
         "..",

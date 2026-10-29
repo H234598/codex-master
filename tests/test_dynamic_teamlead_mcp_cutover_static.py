@@ -154,9 +154,7 @@ def test_dynamic_teamlead_start_static_tool_contract_and_catalog_risk() -> None:
         "DynamicTeamleadStartA3Port",
         "RootOwnedDynamicTeamleadStartPort",
         "dynamic_teamlead_control",
-    } & {
-        node.id for node in ast.walk(call_tool) if isinstance(node, ast.Name)
-    }
+    } & {node.id for node in ast.walk(call_tool) if isinstance(node, ast.Name)}
 
     runtime_parameter = next(
         (

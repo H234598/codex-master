@@ -126,7 +126,9 @@ def test_constructor_rejects_missing_identity_arguments():
 )
 def test_constructor_rejects_none_identity_arguments(kwargs):
     with pytest.raises(BrokerClientError, match="identity"):
-        SeqpacketBrokerClientOperations(FakeExchangeOperations(response_frame()), **kwargs)
+        SeqpacketBrokerClientOperations(
+            FakeExchangeOperations(response_frame()), **kwargs
+        )
 
 
 def test_identity_properties_preserve_equal_but_distinct_references():

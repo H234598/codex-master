@@ -37,7 +37,9 @@ OLLAMA_OPERATION_TYPE = "ollama.instance"
 _PLAN_SEAL = object()
 _EXECUTION_SEAL = object()
 _RECORD_LOCK = threading.RLock()
-_PLAN_RECORDS: dict[bytes, tuple[weakref.ReferenceType[object], tuple[object, ...]]] = {}
+_PLAN_RECORDS: dict[
+    bytes, tuple[weakref.ReferenceType[object], tuple[object, ...]]
+] = {}
 _EXECUTION_RECORDS: dict[
     bytes, tuple[weakref.ReferenceType[object], tuple[object, ...]]
 ] = {}
@@ -62,8 +64,7 @@ def _safe_token(value: object, *, maximum: int = 128) -> bool:
         type(value) is str
         and 0 < len(value) <= maximum
         and all(
-            character.isascii()
-            and (character.isalnum() or character in "._-")
+            character.isascii() and (character.isalnum() or character in "._-")
             for character in value
         )
     )
@@ -212,7 +213,9 @@ class OllamaRemotePlanRequestV1:
     cpu_quota_percent: int
     cpu_weight: int
     resource_generation: int | None = None
-    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
+    owner_instance: Mapping[str, object] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +229,9 @@ class OllamaRemoteApplyRequestV1:
     plan_ref: str
     plan_precondition_digest: str | None = None
     owner_plan_id: str | None = None
-    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
+    owner_instance: Mapping[str, object] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +244,9 @@ class OllamaRemoteProbeRequestV1:
     plan_digest: str
     plan_precondition_digest: str | None = None
     owner_plan_id: str | None = None
-    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
+    owner_instance: Mapping[str, object] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,7 +259,9 @@ class OllamaRemoteStopRequestV1:
     plan_digest: str
     plan_precondition_digest: str | None = None
     owner_plan_id: str | None = None
-    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
+    owner_instance: Mapping[str, object] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 class RemoteOllamaOperationPort(Protocol):
@@ -306,14 +315,20 @@ class AgentQueueRemoteOllamaOperationPort:
         return self._enqueue(
             "probe",
             request,
-            {"instance_ref": request.instance_ref, "generation": request.registry_generation},
+            {
+                "instance_ref": request.instance_ref,
+                "generation": request.registry_generation,
+            },
         )
 
     def stop(self, request: OllamaRemoteStopRequestV1) -> OperationV1:
         return self._enqueue(
             "stop",
             request,
-            {"instance_ref": request.instance_ref, "generation": request.registry_generation},
+            {
+                "instance_ref": request.instance_ref,
+                "generation": request.registry_generation,
+            },
         )
 
     def _enqueue(
@@ -445,9 +460,7 @@ class Task3LocalOllamaHostAdapter:
     def __init__(self, runtime: OllamaRuntime | None = None) -> None:
         self._runtime = runtime
 
-    def plan(
-        self, instance: OllamaInstanceV1, registry: OllamaRegistryV1
-    ) -> object:
+    def plan(self, instance: OllamaInstanceV1, registry: OllamaRegistryV1) -> object:
         local_instance = replace(instance, host_ref="local")
         local_registry = _registry_with_instance(registry, local_instance)
         host = probe_ollama_host(runtime=self._runtime)
@@ -514,9 +527,7 @@ class OllamaHostTransport:
         _registry_with_instance(current, instance)
         lease = self._lease(instance.host_ref)
         idempotency_key = secrets.token_hex(32)
-        document = _plan_document(
-            instance, current.generation, lease, idempotency_key
-        )
+        document = _plan_document(instance, current.generation, lease, idempotency_key)
         plan_digest = _digest(document)
         document["plan_digest"] = plan_digest
         local_plan = None
@@ -619,12 +630,12 @@ class OllamaHostTransport:
             _EXECUTION_RECORDS,
             getattr(execution, "_provenance", b""),
             execution,
-            _execution_state(execution) if isinstance(execution, OllamaHostExecution) else (),
+            _execution_state(execution)
+            if isinstance(execution, OllamaHostExecution)
+            else (),
         ):
             _fail("provider.instance_invalid")
-        instance, lease = self._revalidate(
-            execution.plan, current_fence=current_fence
-        )
+        instance, lease = self._revalidate(execution.plan, current_fence=current_fence)
         if execution.plan.host_ref == CONTROL_HOST_REF:
             if execution._runtime_value is None:
                 _fail("provider.instance_invalid")
@@ -688,7 +699,9 @@ class OllamaHostTransport:
                         lease.fence,
                         execution.plan.plan_digest,
                         owner_plan_id=execution.plan.idempotency_key,
-                        owner_instance=_owner_instance_document(execution.plan._instance),
+                        owner_instance=_owner_instance_document(
+                            execution.plan._instance
+                        ),
                     )
                 )
                 if type(remote) is not OperationV1:
@@ -936,9 +949,8 @@ def _validate_remote_request(
         request.plan_ref
     ):
         _fail("provider.operation_not_allowed")
-    if (
-        not isinstance(request, OllamaRemotePlanRequestV1)
-        and not _safe_token(request.owner_plan_id)
+    if not isinstance(request, OllamaRemotePlanRequestV1) and not _safe_token(
+        request.owner_plan_id
     ):
         _fail("provider.operation_not_allowed")
     if (
@@ -1019,7 +1031,9 @@ def _operation_from_agent_view(value: object) -> OperationV1:
         1 if state == "succeeded" else 0,
         1 if state in {"failed", "unknown"} else 0,
         0 if state in {"succeeded", "failed", "unknown"} else 1,
-        reasons if state in {"succeeded", "failed", "unknown"} else ("control.operation_queued",),
+        reasons
+        if state in {"succeeded", "failed", "unknown"}
+        else ("control.operation_queued",),
     )
 
 

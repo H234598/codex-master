@@ -7,9 +7,16 @@ import traceback
 import pytest
 
 import the_hive.usage_snapshot as usage_snapshot
-from the_hive.hive.config import load_agent_class_catalog, load_agent_class_catalog_snapshot, load_hive_config
+from the_hive.hive.config import (
+    load_agent_class_catalog,
+    load_agent_class_catalog_snapshot,
+    load_hive_config,
+)
 from the_hive.hive.runtime import GlobalPilotReadinessV1
-from the_hive.dynamic_pool import AccountPoolBindingV1, exact_pool_authority_revalidation
+from the_hive.dynamic_pool import (
+    AccountPoolBindingV1,
+    exact_pool_authority_revalidation,
+)
 from the_hive.hive.events import HiveEventStore
 from the_hive.hive.runtime import (
     HiveRuntimeError,
@@ -34,6 +41,7 @@ from the_hive.usage_snapshot import (
     ModelInvocabilityV1,
 )
 from the_hive.selection.model_policy import load_model_policy
+
 ROOT = Path(__file__).resolve().parents[1]
 SHADOW_CONFIG = ROOT / "tests" / "fixtures" / "hive" / "hive-shadow-valid.json"
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -50,7 +58,14 @@ def repo(tmp_path: Path) -> Path:
     root.mkdir()
     subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
-        ["git", "-C", str(root), "config", "remote.origin.url", "https://github.com/example/repo.git"],
+        [
+            "git",
+            "-C",
+            str(root),
+            "config",
+            "remote.origin.url",
+            "https://github.com/example/repo.git",
+        ],
         check=True,
     )
     subprocess.run(
@@ -76,7 +91,9 @@ def repo(tmp_path: Path) -> Path:
 
 def config_bundle():
     classes = load_agent_class_catalog(ROOT / "tests/fixtures/hive/classes-valid.json")
-    config = load_hive_config(ROOT / "tests/fixtures/hive/hive-enforced-valid.json", classes)
+    config = load_hive_config(
+        ROOT / "tests/fixtures/hive/hive-enforced-valid.json", classes
+    )
     return classes, config
 
 
@@ -84,13 +101,21 @@ def snapshot_bundle(tmp_path: Path):
     catalog = tmp_path / "classes.json"
     catalog.write_bytes((ROOT / "tests/fixtures/hive/classes-valid.json").read_bytes())
     snapshot = load_agent_class_catalog_snapshot(catalog)
-    config = load_hive_config(ROOT / "tests/fixtures/hive/hive-enforced-valid.json", snapshot.classes)
+    config = load_hive_config(
+        ROOT / "tests/fixtures/hive/hive-enforced-valid.json", snapshot.classes
+    )
     return snapshot, config
 
 
-def test_snapshot_composer_pins_digest_and_reuses_immutable_classes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_snapshot_composer_pins_digest_and_reuses_immutable_classes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     snapshot, config = snapshot_bundle(tmp_path)
-    monkeypatch.setattr(Path, "read_bytes", lambda _: (_ for _ in ()).throw(AssertionError("composer_read")))
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _: (_ for _ in ()).throw(AssertionError("composer_read")),
+    )
     runtime = _compose_hive_runtime_from_catalog_snapshot(
         config,
         snapshot,
@@ -105,10 +130,14 @@ def test_snapshot_composer_pins_digest_and_reuses_immutable_classes(tmp_path: Pa
     assert isinstance(runtime.events, HiveEventStore)
 
 
-def test_snapshot_composer_rejects_digest_mismatch_type_length_and_case(tmp_path: Path) -> None:
+def test_snapshot_composer_rejects_digest_mismatch_type_length_and_case(
+    tmp_path: Path,
+) -> None:
     snapshot, config = snapshot_bundle(tmp_path)
     drifted_path = tmp_path / "classes-drifted.json"
-    drifted_path.write_bytes((ROOT / "tests/fixtures/hive/classes-valid.json").read_bytes() + b"\n")
+    drifted_path.write_bytes(
+        (ROOT / "tests/fixtures/hive/classes-valid.json").read_bytes() + b"\n"
+    )
     drifted = load_agent_class_catalog_snapshot(drifted_path)
     with pytest.raises(HiveRuntimeError, match="catalog_digest_mismatch"):
         _compose_hive_runtime_from_catalog_snapshot(
@@ -135,8 +164,12 @@ def test_snapshot_composer_rejects_digest_mismatch_type_length_and_case(tmp_path
             )
 
 
-def test_snapshot_composer_rejects_invalid_snapshot_without_public_secret(tmp_path: Path) -> None:
-    marker = "catalog-payload-class-member-principal-repo-home-session-journal-path-secret"
+def test_snapshot_composer_rejects_invalid_snapshot_without_public_secret(
+    tmp_path: Path,
+) -> None:
+    marker = (
+        "catalog-payload-class-member-principal-repo-home-session-journal-path-secret"
+    )
 
     with pytest.raises(HiveRuntimeError) as raised:
         _compose_hive_runtime_from_catalog_snapshot(
@@ -151,7 +184,9 @@ def test_snapshot_composer_rejects_invalid_snapshot_without_public_secret(tmp_pa
     assert marker not in rendered
 
 
-def test_runtime_materializes_and_reloads_exact_authoritative_principal_set(tmp_path: Path) -> None:
+def test_runtime_materializes_and_reloads_exact_authoritative_principal_set(
+    tmp_path: Path,
+) -> None:
     classes, config = config_bundle()
     roots = {"repo-one": repo(tmp_path)}
 
@@ -191,7 +226,9 @@ def test_runtime_materializes_and_reloads_exact_authoritative_principal_set(tmp_
     ]
 
 
-def test_runtime_requires_explicit_materialization_and_rejects_root_mismatch(tmp_path: Path) -> None:
+def test_runtime_requires_explicit_materialization_and_rejects_root_mismatch(
+    tmp_path: Path,
+) -> None:
     classes, config = config_bundle()
     roots = {"repo-one": repo(tmp_path)}
 
@@ -226,9 +263,14 @@ def test_runtime_rejects_principal_state_drift(tmp_path: Path) -> None:
         now=lambda: NOW,
     )
     state_file = tmp_path / "state" / "principals.json"
-    payload = state_file.read_text(encoding="utf-8").replace("queen-repo-one", "queen-drifted")
+    payload = state_file.read_text(encoding="utf-8").replace(
+        "queen-repo-one", "queen-drifted"
+    )
     state_file.write_text(payload, encoding="utf-8")
-    with pytest.raises(HiveRuntimeError, match="hive_principal_state_invalid|hive_principal_set_mismatch"):
+    with pytest.raises(
+        HiveRuntimeError,
+        match="hive_principal_state_invalid|hive_principal_set_mismatch",
+    ):
         build_hive_runtime(
             config,
             classes,
@@ -238,7 +280,9 @@ def test_runtime_rejects_principal_state_drift(tmp_path: Path) -> None:
         )
 
 
-def test_server_factory_accepts_one_bundle_and_rejects_split_authority_state(tmp_path: Path) -> None:
+def test_server_factory_accepts_one_bundle_and_rejects_split_authority_state(
+    tmp_path: Path,
+) -> None:
     classes, config = config_bundle()
     bundle = build_hive_runtime(
         config,
@@ -263,7 +307,9 @@ def test_server_factory_accepts_one_bundle_and_rejects_split_authority_state(tmp
         )
 
 
-def test_runtime_evidence_is_read_only_and_data_sparse_when_state_is_missing(tmp_path: Path) -> None:
+def test_runtime_evidence_is_read_only_and_data_sparse_when_state_is_missing(
+    tmp_path: Path,
+) -> None:
     catalog = ROOT / "codex-agent-classes.json"
     config = SHADOW_CONFIG
     state_root = tmp_path / "state"
@@ -285,14 +331,20 @@ def test_runtime_evidence_is_read_only_and_data_sparse_when_state_is_missing(tmp
         "authority": "fail_closed",
         "state": "not_configured",
         "pilot": "blocked",
-        "reason_codes": ["repository_not_configured", "principal_not_configured", "state_not_configured"],
+        "reason_codes": [
+            "repository_not_configured",
+            "principal_not_configured",
+            "state_not_configured",
+        ],
         "mutation_performed": False,
         "raw_output": "not_returned",
     }
     assert not state_root.exists()
 
 
-def test_runtime_evidence_returns_schema_complete_fail_closed_dto_for_bad_inputs(tmp_path: Path) -> None:
+def test_runtime_evidence_returns_schema_complete_fail_closed_dto_for_bad_inputs(
+    tmp_path: Path,
+) -> None:
     catalog = ROOT / "codex-agent-classes.json"
     config = SHADOW_CONFIG
 
@@ -330,7 +382,9 @@ def test_runtime_evidence_returns_schema_complete_fail_closed_dto_for_bad_inputs
         }
 
 
-def test_runtime_evidence_reuses_read_only_assembled_runtime_without_materializing_state(tmp_path: Path) -> None:
+def test_runtime_evidence_reuses_read_only_assembled_runtime_without_materializing_state(
+    tmp_path: Path,
+) -> None:
     classes, config = config_bundle()
     roots = {"repo-one": repo(tmp_path)}
     state_root = tmp_path / "state"
@@ -360,7 +414,9 @@ def test_runtime_evidence_reuses_read_only_assembled_runtime_without_materializi
     assert (state_root / "principals.json").read_bytes() == before
 
 
-def test_runtime_evidence_fails_closed_for_untrusted_principal_state(tmp_path: Path) -> None:
+def test_runtime_evidence_fails_closed_for_untrusted_principal_state(
+    tmp_path: Path,
+) -> None:
     classes, config = config_bundle()
     roots = {"repo-one": repo(tmp_path)}
     state_root = tmp_path / "state"
@@ -390,7 +446,9 @@ def test_runtime_evidence_fails_closed_for_untrusted_principal_state(tmp_path: P
     assert "hive_runtime_invalid" in evidence.reason_codes
 
 
-def test_runtime_evidence_does_not_treat_unlocked_state_directory_as_ready(tmp_path: Path) -> None:
+def test_runtime_evidence_does_not_treat_unlocked_state_directory_as_ready(
+    tmp_path: Path,
+) -> None:
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
     evidence = read_hive_runtime_evidence(
@@ -412,7 +470,11 @@ def _attested_usage_evidence(
         accounts=(
             AccountUsageEvidenceV2(
                 "attested-pool",
-                (UsageLimitV2("main", 18000, generation, 0.0, 100.0, now + timedelta(hours=1)),),
+                (
+                    UsageLimitV2(
+                        "main", 18000, generation, 0.0, 100.0, now + timedelta(hours=1)
+                    ),
+                ),
                 (
                     UsageTrendV2(
                         "main",
@@ -448,7 +510,9 @@ def _attested_usage_evidence(
     )
 
 
-def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_evidence() -> None:
+def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_evidence() -> (
+    None
+):
     classes, source_config = config_bundle()
     classes = {
         **classes,
@@ -473,8 +537,18 @@ def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_ev
             },
         ),
         principals=(
-            {"principal_id": "godbee-main", "class_id": "gottbiene", "parent_principal_id": None, "repo_id": None},
-            {"principal_id": "queen-codex-master", "class_id": "koenigin", "parent_principal_id": "godbee-main", "repo_id": "codex-master"},
+            {
+                "principal_id": "godbee-main",
+                "class_id": "gottbiene",
+                "parent_principal_id": None,
+                "repo_id": None,
+            },
+            {
+                "principal_id": "queen-codex-master",
+                "class_id": "koenigin",
+                "parent_principal_id": "godbee-main",
+                "repo_id": "codex-master",
+            },
         ),
     )
 
@@ -485,7 +559,11 @@ def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_ev
     assert usage_with_authority.status == "complete"
     assert usage_with_authority.pool_authorities[0].account_id == "attested-pool"
 
-    assert enforced_pilot_gate(config, classes, {"fresh": True, "model_family": "sol", "reasoning": "max", "long_lived": True}) == {
+    assert enforced_pilot_gate(
+        config,
+        classes,
+        {"fresh": True, "model_family": "sol", "reasoning": "max", "long_lived": True},
+    ) == {
         "allowed": False,
         "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
@@ -500,7 +578,9 @@ def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_ev
         "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
     }
-    assert enforced_pilot_gate(config, classes, usage_with_authority, now=lambda: NOW) == {
+    assert enforced_pilot_gate(
+        config, classes, usage_with_authority, now=lambda: NOW
+    ) == {
         "allowed": False,
         "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
@@ -508,9 +588,14 @@ def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_ev
 
 
 def _pilot_readiness_evidence(
-    *, status: str = "complete", runner_invocable: bool = True, supported_in_api: bool = True
+    *,
+    status: str = "complete",
+    runner_invocable: bool = True,
+    supported_in_api: bool = True,
 ) -> UsageEvidenceV2:
-    authority_evidence = _attested_usage_evidence(now=NOW, status=status, with_authority=True)
+    authority_evidence = _attested_usage_evidence(
+        now=NOW, status=status, with_authority=True
+    )
     return UsageEvidenceV2(
         accounts=authority_evidence.accounts,
         status=authority_evidence.status,
@@ -577,7 +662,10 @@ def test_global_pilot_readiness_is_a_redacted_policy_validated_diagnostic(
     assert "gpt-6.1-sol" not in public_text
     assert "codex_cli" not in public_text
 
-    assert enforced_pilot_gate(config, classes, readiness, now=lambda: NOW)["allowed"] is False
+    assert (
+        enforced_pilot_gate(config, classes, readiness, now=lambda: NOW)["allowed"]
+        is False
+    )
     caller_readiness = global_pilot_readiness_from_evidence(
         readiness_evidence,
         config=config,
@@ -596,12 +684,15 @@ def test_global_pilot_readiness_is_a_redacted_policy_validated_diagnostic(
     )
     assert pseudo_readiness.pilot == "blocked"
     assert pseudo_readiness.reason_codes == ("usage_unattested",)
-    assert enforced_pilot_gate(
-        config,
-        classes,
-        readiness,
-        now=lambda: NOW,
-    )["allowed"] is False
+    assert (
+        enforced_pilot_gate(
+            config,
+            classes,
+            readiness,
+            now=lambda: NOW,
+        )["allowed"]
+        is False
+    )
 
 
 def test_global_pilot_readiness_rejects_subclassed_reader_return(
@@ -642,7 +733,11 @@ def test_global_pilot_readiness_rejects_subclassed_reader_return(
 
 @pytest.mark.parametrize(
     ("status", "reason"),
-    (("unavailable", "usage_missing"), ("partial", "usage_partial"), ("stale", "usage_stale")),
+    (
+        ("unavailable", "usage_missing"),
+        ("partial", "usage_partial"),
+        ("stale", "usage_stale"),
+    ),
 )
 def test_global_pilot_readiness_blocks_missing_partial_or_stale_v2(
     status: str, reason: str, monkeypatch: pytest.MonkeyPatch
@@ -660,7 +755,9 @@ def test_global_pilot_readiness_blocks_missing_partial_or_stale_v2(
     )
 
     assert readiness.pilot == "blocked"
-    assert readiness.freshness == ("fresh" if status == "complete" else "stale" if status == "stale" else "unknown")
+    assert readiness.freshness == (
+        "fresh" if status == "complete" else "stale" if status == "stale" else "unknown"
+    )
     assert reason in readiness.reason_codes
     assert readiness.candidate_count == 0
 
@@ -751,7 +848,9 @@ def test_global_pilot_diagnostic_readiness_never_turns_runtime_authority_green(
     assert evidence.authority == "fail_closed"
 
 
-def test_external_ready_object_cannot_open_enforced_gate_or_bypass_exact_request_revalidation() -> None:
+def test_external_ready_object_cannot_open_enforced_gate_or_bypass_exact_request_revalidation() -> (
+    None
+):
     classes, config, models = _pilot_configuration()
     external = GlobalPilotReadinessV1(
         pilot="ready",

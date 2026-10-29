@@ -1,4 +1,5 @@
 <!-- codex-master-common-policy:{"generation":12,"schema_version":1} -->
+
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -344,6 +345,8 @@ Quelldatei nicht geändert. Die Regeln für `color1` bis `color6`,
 `data-annotation-note` als User-Notiz und `data-annotation-id` als eindeutige
 Marker-ID bleiben bindend; Marker und ihre Notizen werden erhalten.
 
+<!-- prettier-ignore-start -->
+
 <!-- hive-runtime-migration-policy-v1:begin {"source_digest":"sha256:90a0c560b9ea18708d64aee609a3c34c7e5f9b3f6e555de662434db164cf9e53","version":1} -->
 ## Hive Runtime- und Release-Migrationspolicy v1
 
@@ -444,3 +447,118 @@ Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `{"baselines":{"claim_with
 - `compatibility-matrix-before-generate-or-mutate` (enforcement: machine): Vor Generierung oder Mutation prüft eine Kompatibilitätsmatrix Manager-, Runtime- und Clientversionen sowie unterstützte Eigenschaften; nicht belegte Kombinationen blockieren.
 
 <!-- hive-runtime-migration-policy-v1:end -->
+
+<!-- prettier-ignore-end -->
+
+## Verbindliche lokale Qlty-Arbeits- und Prüfkette
+
+Jede lokale Coding- und Reviewbiene verwendet die Qlty-CLI tatsächlich. Vor
+der ersten Arbeit `qlty --version` prüfen. Das Benutzerhome dafür ist immer
+`pwd.getpwuid(os.getuid()).pw_dir`, nicht ein privates Bienen-`HOME`. Die
+zugehörige CLI liegt unter `<UID-Home>/.qlty/bin`; der PATH-Eintrag wird bei
+Bedarf genau einmal in `<UID-Home>/.bashrc` ergänzt. Auf diesem Host lautet
+das Beispiel `/home/teladi/.qlty/bin`, nicht auf jedem anderen Host.
+Fehlt die CLI, die Operation `upgrade` des geprüften Qualitätshelpers
+verwenden. Dieser setzt das tatsächliche OS-Benutzerhome auch für den
+manuellen Installationsaufruf und verwendet ausschließlich das vollständig
+gelesene und geprüfte `scripts/install-qlty.sh` desselben Toolings. Das Script
+löst die aktuelle stabile Version aus der offiziellen Release-API auf,
+verhindert Downgrades und installiert nur nach erfolgreicher
+repositorygebundener Attestierung. Keine zweite Installerlogik, neue
+Root-/Accountrechte oder Authentifizierungsdateikopien einführen.
+Ist die CLI konkret nicht nutzbar oder nicht sicher installierbar, den
+tatsächlichen Fehler an die zuständige Leitung berichten und den vorhandenen
+PR-Pfad mit Qltychecks verwenden. Fehlende CLIprüfung ist kein grüner Check.
+
+Der gemeinsame lokale Qualitätsowner ist der geprüfte Runner
+`<UID-Home>/the_hive/scripts/the-hive-qlty-maintenance`, auf diesem Host also
+`python3 /home/teladi/the_hive/scripts/the-hive-qlty-maintenance`. Er verwendet
+das Betriebssystem-Benutzerhome der tatsächlichen UID für CLI und Zustand;
+ein privates Bienen-`HOME` eröffnet keinen zweiten Tagesledger. Produktive
+Aufrufe dürfen `--state-root` oder `--qlty` nicht auf einen frischen Ersatzpfad
+umlenken, um eine Sperre oder den Tagesclaim zu umgehen. Abweichende Pfade
+sind ausschließlich in ausdrücklich privaten Tests zulässig.
+
+Vor tatsächlicher Coding- oder Reviewarbeit am bestätigten Git-Repository
+`begin --repo <absoluter Repositorypfad> --owner <tatsächliche Assignmentkennung>
+--phase work` aufrufen und die zurückgegebene `guard_id` dauerhaft beim
+Assignment sichern. Dieser lokale Owner erhebt seine Zeit selbst und bindet
+das Ereignis an Git-TopLevel, Git-CommonDir sowie Dateisystemidentität. Die
+Quelle heißt ausdrücklich `declared_local_work`; sie ist keine native
+CWD-Attestierung, kein Historybeleg und keine zusätzliche Hive-Autorität.
+Die vorhandene Task-, Scope- und Schreibkoordination bleibt verbindlich.
+
+Vor Sourcefreeze oder Tests den eigenen Arbeitsguard tatsächlich beenden
+und einen Guard mit `--phase freeze` beziehungsweise `--phase test` beginnen.
+Ein Freeze-/Testguard verhindert neue erklärte Schreiber; ein noch aktiver
+Schreiber verhindert den Beginn dieses Freeze-/Testguards. Solche Guards
+schreiben keine neue Arbeitsaktivität. Vorhandene fremde oder unklare Guards
+bleiben geschützt. Alter, Prozessschweigen und ein abgelaufener selbst
+gewählter Beobachtungszeitraum sind keine Freigabe und beenden keinen Guard.
+Bei einem Crash oder einer unbekannten Formatierungsphase die zuständige
+Leitung mit dem konkreten Zustand befassen; keinen Zustand blind löschen.
+
+Ein tatsächliches Arbeits- oder Testende wird mit
+`end --repo <Repositorypfad> --owner <dieselbe Assignmentkennung>
+--guard-id <tatsächlich erhaltene guard_id>` gespeichert. Nur an einer mit der
+zuständigen Schreib-/Taskleitung bestätigten sicheren Grenze zusätzlich
+`--approve-format` setzen. Dies erlaubt genau einen an die aktuelle lokale
+Bindung, Revision und den erfassten Sourcezustand gebundenen Qualitätslauf.
+Die Freigabe ersetzt weder einen vollständigen Testnachweis noch einen
+Nachweis universeller Ruhe. Nicht beteiligte oder unbekannte Schreiber sind
+durch den erklärten lokalen Owner nicht automatisch abgedeckt.
+
+Sind andere Guards noch aktiv, speichert `end --approve-format` trotzdem das
+eigene Ende und meldet `approval: deferred`. Das ist keine Freigabe. Die
+verbrauchte eigene Guardkennung nicht in einer Schleife erneut beenden.
+Der letzte tatsächlich zuständige, freigebende Owner kann sein eigenes Ende
+mit der einmaligen Freigabe verbinden. Jede neue Arbeit sowie jeder neue
+Freeze-/Testguard verwirft eine ältere Freigabe.
+
+Ein Repository ist für diese Automatik nur nach einem tatsächlich erklärten
+Arbeitsereignis innerhalb der letzten 24 Stunden aktiv. Schedulerlauf,
+Upgrade, Scan, Formatierung, Ingestion, Dateizeitstempel und Selfchecks
+reaktivieren es nicht. Unbekannte oder nicht angeschlossene Repositorys nicht
+als inaktiv oder vollständig geprüft ausgeben. Der Benutzer-Timer prüft
+stündlich mit `daily` nur die Fälligkeit. Die tatsächlichen teuren Aktionen
+bleiben durch ihre persistenten rollenden Tagesclaims begrenzt; eine bloße
+stündliche Prüfung ist keine neue Qlty-Kette. Der gesonderte Upgradeclaim führt
+bei Fälligkeit tatsächlich
+`qlty upgrade --verify-attestations` aus; ein fehlender Repositoryguard
+blockiert nicht diese unabhängige Upgradephase.
+
+Die vollständige Kette `qlty metrics --all`, `qlty smells --all`,
+`qlty check --all` und `qlty fmt --all` ausschließlich über `run --repo ...`
+beziehungsweise `daily` dieses Owners ausführen. Der persistente,
+parallel sichere Tagesclaim gilt gemeinsam für alle Worktrees desselben
+Git-CommonDir und höchstens einmal pro rollenden 24 Stunden, auch nach einem
+Fehler oder Crash. Ein übersprungener erneuter Aufruf beweist keine neue
+Prüfung. Die exklusive Formatierungsphase braucht zusätzlich die tatsächliche
+einmalige Freigabe und schützt nur die ausdrücklich erklärte Writerabdeckung.
+Eine unabhängige zweite vollständige Kette, ein neuer Ledger oder ein
+Formatierungslauf über aktive Sourcefreezes hinweg ist nicht erlaubt.
+
+Kleine relevante Prüfungen wie
+`qlty check --all --filter=shellcheck --no-fix` an sinnvollen Arbeitsgrenzen
+häufig ausführen; sie sind keine zweite vollständige Tageskette. Benötigte
+Sprachplugins anhand des tatsächlichen Katalogs und der Repositorydateien
+auswählen. Duplikate und ungültige Namen klären; pro Dateibereich keine
+konkurrierenden Formatter unbesehen aktivieren. Relevante Findings beheben
+und risikoarme Quickfixes im freigegebenen Scope umsetzen. Änderungen müssen
+an einer sicheren Schreibgrenze erfolgen und anschließend passend geprüft
+werden. Findings mit Sourcebindung, Befehlsstatus und vollständigem Log über
+den vorhandenen Assignment-/Dispatchowner an die zuständige Leitung geben;
+der Qualitätsrunner startet keine Ersatzbienen und schafft keinen Broker.
+
+Wenn die vorhandene Tageskette nach genau `metrics`, `smells` und `check` mit
+`source_changed` endete und `fmt` nachweislich nicht gestartet wurde, darf
+ausschließlich `finish-fmt --repo <Repository> --attempted-at <ursprünglicher Wert>`
+die fehlende Formatphase nachholen. Dafür müssen alle beteiligten Owner ihre
+Arbeit regulär beenden und eine neue einmalige Formatfreigabe erteilen. Der
+Runner bindet die Fortsetzung ausdrücklich an den neuen Sourcezustand; der
+ursprüngliche Tageszeitpunkt und die bisherigen drei Prüfbefunde bleiben
+erhalten. Ein erfolgreiches `finish-fmt` bestätigt nur die Formatphase. Frühere
+Checkfehler und die historische Sourceabweichung bleiben dokumentiert. Eine
+bereits gestartete oder unklar abgebrochene Formatfortsetzung wird nicht
+automatisch wiederholt. Weder die gesamte Kette noch frühere Prüfschritte
+werden dadurch erneut freigegeben.

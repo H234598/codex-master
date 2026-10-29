@@ -19,7 +19,11 @@ def write_project(root: Path, *, asserted: bool = True) -> dict[str, tuple[str, 
         "        return _normalize(value)\n",
         encoding="utf-8",
     )
-    assertion = "    assert _normalize(' x ') == 'x'\n" if asserted else "    _normalize(' x ')\n"
+    assertion = (
+        "    assert _normalize(' x ') == 'x'\n"
+        if asserted
+        else "    _normalize(' x ')\n"
+    )
     (root / "tests/test_example.py").write_text(
         "from example import Example, _normalize\n\n"
         "def test_normalize():\n"
@@ -38,7 +42,9 @@ def write_project(root: Path, *, asserted: bool = True) -> dict[str, tuple[str, 
     }
 
 
-def test_builder_inventories_private_functions_tests_and_assertions(tmp_path: Path) -> None:
+def test_builder_inventories_private_functions_tests_and_assertions(
+    tmp_path: Path,
+) -> None:
     bindings = write_project(tmp_path)
 
     index = PythonTestIndexBuilder(tmp_path).build(
@@ -130,7 +136,9 @@ def test_builder_digest_changes_with_function_semantics(tmp_path: Path) -> None:
     assert before.functions[1].source_digest != after.functions[1].source_digest
 
 
-def test_builder_excludes_protocol_declarations_and_indexes_async_class_tests(tmp_path: Path) -> None:
+def test_builder_excludes_protocol_declarations_and_indexes_async_class_tests(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()
     (tmp_path / "src/example.py").write_text(

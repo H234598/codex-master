@@ -35,31 +35,77 @@ def report(
     correlation_id: str = "request-one",
     message_type: str = "progress.report",
 ):
-    return validate_message({
-        "schema_version": 1,
-        "message_id": message_id,
-        "correlation_id": correlation_id,
-        "causation_id": None,
-        "message_type": message_type,
-        "sender": {"principal_id": "specialist-one", "class_id": "spezialistin"},
-        "recipient": {"principal_id": "lead-one", "class_id": "teamleiterin"},
-        "repo_id": "codex-master",
-        "dispatch_id": dispatch_id,
-        "workpackage_id": workpackage_id,
-        "dispatch_priority": "DP1",
-        "created_at_utc": NOW.isoformat(),
-        "expires_at_utc": (NOW + timedelta(hours=1)).isoformat(),
-        "authorization": {"grant_id": "grant-one", "scope_digest": "sha256:scope", "principal_version": 1},
-        "payload": {"status": status, "raw_output": "not_returned", "private": "not_returned"},
-        "raw_output": "not_returned",
-    })
+    return validate_message(
+        {
+            "schema_version": 1,
+            "message_id": message_id,
+            "correlation_id": correlation_id,
+            "causation_id": None,
+            "message_type": message_type,
+            "sender": {"principal_id": "specialist-one", "class_id": "spezialistin"},
+            "recipient": {"principal_id": "lead-one", "class_id": "teamleiterin"},
+            "repo_id": "codex-master",
+            "dispatch_id": dispatch_id,
+            "workpackage_id": workpackage_id,
+            "dispatch_priority": "DP1",
+            "created_at_utc": NOW.isoformat(),
+            "expires_at_utc": (NOW + timedelta(hours=1)).isoformat(),
+            "authorization": {
+                "grant_id": "grant-one",
+                "scope_digest": "sha256:scope",
+                "principal_version": 1,
+            },
+            "payload": {
+                "status": status,
+                "raw_output": "not_returned",
+                "private": "not_returned",
+            },
+            "raw_output": "not_returned",
+        }
+    )
 
 
 def principal_registry() -> PrincipalRegistry:
     registry = PrincipalRegistry()
-    registry.create(Principal("godbee-main", "gottbiene", None, "profile", "global", None, "active", DIGEST, 1))
-    registry.create(Principal("queen-repo", "koenigin", "godbee-main", "profile", "repository", "repo-one", "active", DIGEST, 1))
-    registry.create(Principal("lead-one", "teamleiterin", "queen-repo", "profile", "repository", "repo-one", "active", DIGEST, 1))
+    registry.create(
+        Principal(
+            "godbee-main",
+            "gottbiene",
+            None,
+            "profile",
+            "global",
+            None,
+            "active",
+            DIGEST,
+            1,
+        )
+    )
+    registry.create(
+        Principal(
+            "queen-repo",
+            "koenigin",
+            "godbee-main",
+            "profile",
+            "repository",
+            "repo-one",
+            "active",
+            DIGEST,
+            1,
+        )
+    )
+    registry.create(
+        Principal(
+            "lead-one",
+            "teamleiterin",
+            "queen-repo",
+            "profile",
+            "repository",
+            "repo-one",
+            "active",
+            DIGEST,
+            1,
+        )
+    )
     return registry
 
 
@@ -98,7 +144,9 @@ def test_queen_status_rejects_non_queen_principals() -> None:
 
 
 def test_queue_status_filters_non_mappings_before_pagination() -> None:
-    result = queue_status(offset=1, limit=1, items=({"id": "first"}, object(), {"id": "second"}))
+    result = queue_status(
+        offset=1, limit=1, items=({"id": "first"}, object(), {"id": "second"})
+    )
     assert result["items"] == [{"id": "second"}]
     with pytest.raises(ValueError, match="invalid_status_pagination"):
         queue_status(offset=0, limit=True)
@@ -112,12 +160,22 @@ def test_selection_status_is_preview_only() -> None:
     }
 
 
-def test_hierarchical_aggregates_keep_teamlead_queen_and_godbee_scopes_separate() -> None:
+def test_hierarchical_aggregates_keep_teamlead_queen_and_godbee_scopes_separate() -> (
+    None
+):
     progress = report("report-one", status="executing")
     escalation = report("report-two", status="blocked", message_type="escalation")
-    foreign = report("report-three", status="failed", workpackage_id="workpackage-two", dispatch_id="dispatch-two", correlation_id="request-two")
+    foreign = report(
+        "report-three",
+        status="failed",
+        workpackage_id="workpackage-two",
+        dispatch_id="dispatch-two",
+        correlation_id="request-two",
+    )
 
-    teamlead = aggregate_teamlead_status("workpackage-one", (progress, escalation, foreign))
+    teamlead = aggregate_teamlead_status(
+        "workpackage-one", (progress, escalation, foreign)
+    )
     queen = aggregate_queen_status("dispatch-one", (progress, escalation, foreign))
     godbee = aggregate_godbee_status("request-one", (progress, escalation, foreign))
 
@@ -132,25 +190,43 @@ def test_hierarchical_aggregates_keep_teamlead_queen_and_godbee_scopes_separate(
 def test_aggregate_failure_and_decision_statuses_dominate_progress() -> None:
     reports = (
         report("report-one", status="executing"),
-        report("report-two", status="decision_required", message_type="decision.request"),
+        report(
+            "report-two", status="decision_required", message_type="decision.request"
+        ),
         report("report-three", status="failed", message_type="result.report"),
     )
     result = aggregate_teamlead_status("workpackage-one", reports)
     assert result["status"] == "failed"
-    assert result["status_counts"] == {"decision_required": 1, "executing": 1, "failed": 1}
+    assert result["status_counts"] == {
+        "decision_required": 1,
+        "executing": 1,
+        "failed": 1,
+    }
     assert result["payload_digest_count"] == 3
 
 
 def test_aggregate_defaults_to_unknown_and_rejects_invalid_report_inputs() -> None:
     assert aggregate_queen_status("dispatch-one") == {
-        "scope": "dispatch", "dispatch_id": "dispatch-one", "status": "unknown", "report_count": 0,
-        "status_counts": {}, "blocked_count": 0, "escalation_count": 0, "correlation_ids": [],
-        "payload_digest_count": 0, "raw_output": "not_returned",
+        "scope": "dispatch",
+        "dispatch_id": "dispatch-one",
+        "status": "unknown",
+        "report_count": 0,
+        "status_counts": {},
+        "blocked_count": 0,
+        "escalation_count": 0,
+        "correlation_ids": [],
+        "payload_digest_count": 0,
+        "raw_output": "not_returned",
     }
     with pytest.raises(HiveMessageError, match="invalid_child_report"):
         aggregate_teamlead_status("workpackage-one", (object(),))
     with pytest.raises(ValueError, match="invalid_aggregate_reports"):
-        aggregate_teamlead_status("workpackage-one", tuple(report(f"report-{index}", status="executing") for index in range(257)))
+        aggregate_teamlead_status(
+            "workpackage-one",
+            tuple(
+                report(f"report-{index}", status="executing") for index in range(257)
+            ),
+        )
 
 
 def test_proactive_anchor_status_is_dry_run_only_by_default() -> None:
@@ -172,7 +248,11 @@ def test_status_and_doctor_project_one_canonical_runtime_evidence() -> None:
         authority="fail_closed",
         state="not_configured",
         pilot="blocked",
-        reason_codes=("repository_not_configured", "principal_not_configured", "state_not_configured"),
+        reason_codes=(
+            "repository_not_configured",
+            "principal_not_configured",
+            "state_not_configured",
+        ),
         mutation_performed=False,
     )
 
@@ -212,15 +292,19 @@ def test_status_and_doctor_include_only_the_bounded_global_pilot_diagnostic() ->
     status = hive_status(runtime_evidence=evidence, global_pilot_readiness=readiness)
     doctor = hive_doctor(runtime_evidence=evidence, global_pilot_readiness=readiness)
 
-    assert status["global_pilot_readiness"] == doctor["global_pilot_readiness"] == {
-        "schema_version": 1,
-        "pilot": "blocked",
-        "generation_id": None,
-        "freshness": "unknown",
-        "candidate_count": 0,
-        "reason_codes": ["usage_missing"],
-        "raw_output": "not_returned",
-    }
+    assert (
+        status["global_pilot_readiness"]
+        == doctor["global_pilot_readiness"]
+        == {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "unknown",
+            "candidate_count": 0,
+            "reason_codes": ["usage_missing"],
+            "raw_output": "not_returned",
+        }
+    )
     rendered = str(status) + str(doctor)
     assert "account_id" not in rendered
     assert "pool_id" not in rendered

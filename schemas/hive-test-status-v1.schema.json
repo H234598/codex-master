@@ -4,16 +4,33 @@
   "title": "Hive Test Status V1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "repository_id", "index_generation", "index_digest", "counts", "items"],
+  "required": [
+    "schema_version",
+    "repository_id",
+    "index_generation",
+    "index_digest",
+    "counts",
+    "items"
+  ],
   "properties": {
     "schema_version": { "const": 1 },
-    "repository_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "repository_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
     "index_generation": { "type": "integer", "minimum": 1 },
     "index_digest": { "$ref": "#/$defs/digest" },
     "counts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["unverified", "running", "passed", "failed", "stale", "blocked"],
+      "required": [
+        "unverified",
+        "running",
+        "passed",
+        "failed",
+        "stale",
+        "blocked"
+      ],
       "properties": {
         "unverified": { "$ref": "#/$defs/count" },
         "running": { "$ref": "#/$defs/count" },
@@ -40,16 +57,37 @@
         ],
         "properties": {
           "test_id": { "type": "string", "minLength": 1, "maxLength": 2048 },
-          "status": { "enum": ["unverified", "running", "passed", "failed", "stale", "blocked"] },
+          "status": {
+            "enum": [
+              "unverified",
+              "running",
+              "passed",
+              "failed",
+              "stale",
+              "blocked"
+            ]
+          },
           "last_duration_ms": {
             "oneOf": [
               { "type": "integer", "minimum": 0, "maximum": 86400000 },
               { "type": "null" }
             ]
           },
-          "cooldown_class": { "enum": ["deterministic", "integration", "environmental", "external", "mandatory"] },
+          "cooldown_class": {
+            "enum": [
+              "deterministic",
+              "integration",
+              "environmental",
+              "external",
+              "mandatory"
+            ]
+          },
           "reuse_eligible": { "type": "boolean" },
-          "remaining_cooldown_seconds": { "type": "integer", "minimum": 0, "maximum": 1800 },
+          "remaining_cooldown_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1800
+          },
           "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 }
         }
       }

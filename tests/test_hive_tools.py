@@ -3,7 +3,10 @@ import argparse
 import pytest
 
 from the_hive.hive.cli import add_hive_cli_parsers, run_hive_cli
-from the_hive.hive.migration import compare_legacy_and_hive_assignment, rollback_hive_state
+from the_hive.hive.migration import (
+    compare_legacy_and_hive_assignment,
+    rollback_hive_state,
+)
 from the_hive.hive.tools import call_hive_tool, hive_tool_definitions
 from the_hive.hive.runtime import HiveRuntimeEvidence
 
@@ -11,10 +14,14 @@ from the_hive.hive.runtime import HiveRuntimeEvidence
 def test_read_only_hive_tools_have_closed_schemas_and_bounded_output() -> None:
     definitions = hive_tool_definitions()
     assert len(definitions) == 17
-    assert all(item["inputSchema"]["additionalProperties"] is False for item in definitions)
-    assert not {"execute_global_request", "retry_repo_dispatch", "cancel_global_request"} & {
-        item["name"] for item in definitions
-    }
+    assert all(
+        item["inputSchema"]["additionalProperties"] is False for item in definitions
+    )
+    assert not {
+        "execute_global_request",
+        "retry_repo_dispatch",
+        "cancel_global_request",
+    } & {item["name"] for item in definitions}
     assert call_hive_tool("hive_status")["raw_output"] == "not_returned"
     with pytest.raises(ValueError, match="hive_tool_arguments_not_allowed"):
         call_hive_tool("hive_status", {"write": True})
@@ -40,7 +47,11 @@ def test_mcp_status_projects_the_supplied_canonical_runtime_evidence() -> None:
         authority="fail_closed",
         state="not_configured",
         pilot="blocked",
-        reason_codes=("repository_not_configured", "principal_not_configured", "state_not_configured"),
+        reason_codes=(
+            "repository_not_configured",
+            "principal_not_configured",
+            "state_not_configured",
+        ),
         mutation_performed=False,
     )
     status = call_hive_tool("hive_status", runtime_evidence=evidence)

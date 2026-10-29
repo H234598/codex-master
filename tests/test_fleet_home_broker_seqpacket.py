@@ -64,9 +64,7 @@ PID_FD = 73
 PROC_FD = 83
 CGROUP_FD = 97
 START_TIME = 7
-PRINCIPAL = PrincipalBinding(
-    "bee_1", 3, 9, 17, 29, "1" * 32, "c0,c1", 4
-)
+PRINCIPAL = PrincipalBinding("bee_1", 3, 9, 17, 29, "1" * 32, "c0,c1", 4)
 EXPECTED_LABEL = b"system_u:system_r:the_hive_agent_t:s0:c0,c1\0"
 SO_PEERSEC_NAME_MAX_BYTES = 255
 WAL_MAGIC = b"CHPB/2-WAL-Magic"
@@ -139,12 +137,8 @@ def agent_start_envelope() -> AgentStartEnvelope:
         PRINCIPAL,
         BindingExpectation("bee_1", 3, 9, 7, "a" * 64, 4),
         "the-hive-agent@c0\\x2cc1.service",
-        BrokerIdentity(
-            "bee_1", 3, "c0,c1", "slot-1", 7, "a" * 64, "b" * 64, 4
-        ),
-        AgentStartExecutablePin(
-            "/usr/libexec/the-hive-agent-launcher", "b" * 64
-        ),
+        BrokerIdentity("bee_1", 3, "c0,c1", "slot-1", 7, "a" * 64, "b" * 64, 4),
+        AgentStartExecutablePin("/usr/libexec/the-hive-agent-launcher", "b" * 64),
         AgentStartEnvironmentProjection(
             (
                 ("CODEX_HOME", "/run/the-hive-agent/home"),
@@ -282,9 +276,7 @@ class RecordingLinuxOperations:
         self.events = events
         self.reuse_checks = 0
         self.drift_at = values.pop("drift_at", None)
-        self.fresh_identity_per_reuse = values.pop(
-            "fresh_identity_per_reuse", False
-        )
+        self.fresh_identity_per_reuse = values.pop("fresh_identity_per_reuse", False)
         self.observed_identities: list[PidfdIdentity] = []
         self.values = {
             "pid_identity": PidfdIdentity(PEER_PID, START_TIME),
@@ -466,7 +458,9 @@ def assert_denied(
     with pytest.raises(SeqpacketPeerError) as caught:
         reattest_seqpacket_peer(operations, linux_operations, expected, release)
     assert str(caught.value) == "seqpacket peer attestation failed"
-    assert repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
+    assert (
+        repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
+    )
     assert caught.value.__cause__ is None
     return caught.value
 
@@ -484,7 +478,9 @@ def assert_wal_composition_denied(
             release_spec(),
         )
     assert str(caught.value) == "seqpacket peer attestation failed"
-    assert repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
+    assert (
+        repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
+    )
     assert caught.value.__cause__ is None
     return caught.value
 
@@ -528,7 +524,10 @@ def test_connected_socket_adapter_socket_family_requires_exact_socket(
     connection = RecordingConnectedSocket(events)
     enforcement_operations = RecordingEnforcementOperations(events)
 
-    assert adapter_type(connection, enforcement_operations).socket_family() is socket.AF_UNIX
+    assert (
+        adapter_type(connection, enforcement_operations).socket_family()
+        is socket.AF_UNIX
+    )
     assert events == [("family",)]
 
     class SocketProxy:
@@ -556,7 +555,10 @@ def test_connected_socket_adapter_socket_type_returns_kernel_kind(
     connection = RecordingConnectedSocket(events, kind=socket.SOCK_STREAM)
     enforcement_operations = RecordingEnforcementOperations(events)
 
-    assert adapter_type(connection, enforcement_operations).socket_type() is socket.SOCK_STREAM
+    assert (
+        adapter_type(connection, enforcement_operations).socket_type()
+        is socket.SOCK_STREAM
+    )
     assert events == [("type",)]
 
     events.clear()
@@ -729,9 +731,7 @@ def test_admit_connected_seqpacket_peer_is_real_single_caller_and_returns_wal_bo
     events: list[tuple[object, ...]] = []
     connection = RecordingConnectedSocket(events)
     enforcement_operations = RecordingEnforcementOperations(events)
-    linux_operations = RecordingLinuxOperations(
-        events, fresh_identity_per_reuse=True
-    )
+    linux_operations = RecordingLinuxOperations(events, fresh_identity_per_reuse=True)
     wal_operations = seeded_active_wal(PRINCIPAL)
     calls: list[tuple[object, ...]] = []
     returned: list[tuple[KernelPeerEvidence, PrincipalBinding]] = []
@@ -804,9 +804,7 @@ def test_private_wal_composition_uses_one_root_owned_key_and_original_principal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[object, ...]] = []
-    linux_operations = RecordingLinuxOperations(
-        events, fresh_identity_per_reuse=True
-    )
+    linux_operations = RecordingLinuxOperations(events, fresh_identity_per_reuse=True)
     wal_operations = seeded_active_wal(PRINCIPAL)
     observed_keys: list[tuple[object, int, int, str, int, str]] = []
     returned_principals: list[PrincipalBinding | None] = []
@@ -827,10 +825,8 @@ def test_private_wal_composition_uses_one_root_owned_key_and_original_principal(
 
     monkeypatch.setattr(wal, "_validated_chain", capture_validated_chain)
     monkeypatch.setattr(seqpacket, "_lookup_active_principal_binding", capture)
-    evidence, principal = (
-        seqpacket._reattest_seqpacket_peer_from_active_wal_binding(
-            RecordingOperations(events), linux_operations, wal_operations, release_spec()
-        )
+    evidence, principal = seqpacket._reattest_seqpacket_peer_from_active_wal_binding(
+        RecordingOperations(events), linux_operations, wal_operations, release_spec()
     )
 
     assert len(observed_keys) == 1
@@ -1014,16 +1010,22 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
         "tuple[KernelPeerEvidence, PrincipalBinding]"
     )
     calls = [node for node in ast.walk(coordinator) if isinstance(node, ast.Call)]
-    assert sum(
-        isinstance(node.func, ast.Name)
-        and node.func.id == "_observe_peer_snapshot_with_identity"
-        for node in calls
-    ) == 1
-    assert sum(
-        isinstance(node.func, ast.Name)
-        and node.func.id == "_lookup_active_principal_binding"
-        for node in calls
-    ) == 1
+    assert (
+        sum(
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_observe_peer_snapshot_with_identity"
+            for node in calls
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_lookup_active_principal_binding"
+            for node in calls
+        )
+        == 1
+    )
     assert not any(
         isinstance(node.func, ast.Name) and node.func.id == "PrincipalBinding"
         for node in calls
@@ -1066,16 +1068,22 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
     admission_calls = [
         node for node in ast.walk(admission) if isinstance(node, ast.Call)
     ]
-    assert sum(
-        isinstance(node.func, ast.Name)
-        and node.func.id == "_ConnectedSeqpacketSocketOptions"
-        for node in admission_calls
-    ) == 1
-    assert sum(
-        isinstance(node.func, ast.Name)
-        and node.func.id == "_reattest_seqpacket_peer_from_active_wal_binding"
-        for node in admission_calls
-    ) == 1
+    assert (
+        sum(
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_ConnectedSeqpacketSocketOptions"
+            for node in admission_calls
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_reattest_seqpacket_peer_from_active_wal_binding"
+            for node in admission_calls
+        )
+        == 1
+    )
 
     production_calls = {"coordinator": 0, "lookup": 0, "admission": 0}
     coordinator_callers: list[str] = []
@@ -1118,16 +1126,21 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
     ]
     assert len(entries) == 1
     entry_calls = [node for node in ast.walk(entries[0]) if isinstance(node, ast.Call)]
-    assert sum(
-        isinstance(node.func, ast.Name)
-        and node.func.id == "admit_connected_seqpacket_peer"
-        for node in entry_calls
-    ) == 1
-    assert sum(
-        isinstance(node.func, ast.Name)
-        and node.func.id == "decode_chpb_message"
-        for node in entry_calls
-    ) == 1
+    assert (
+        sum(
+            isinstance(node.func, ast.Name)
+            and node.func.id == "admit_connected_seqpacket_peer"
+            for node in entry_calls
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(node.func, ast.Name) and node.func.id == "decode_chpb_message"
+            for node in entry_calls
+        )
+        == 1
+    )
     assert "receive_admitted_seqpacket_packet" not in source
 
 
@@ -1228,9 +1241,7 @@ def test_seqpacket_binds_one_final_pidfd_identity_without_capture_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[object, ...]] = []
-    linux_operations = RecordingLinuxOperations(
-        events, fresh_identity_per_reuse=True
-    )
+    linux_operations = RecordingLinuxOperations(events, fresh_identity_per_reuse=True)
     captured: list[tuple[object, object]] = []
     original = seqpacket._attest_peer_principal_with_identity
 
@@ -1294,7 +1305,9 @@ def test_malformed_or_unbound_peer_security_context_is_denied(
     operations = RecordingOperations(events, context=context)
     assert_denied(operations, RecordingLinuxOperations(events))
     assert events[-2:] == [("selinux_enforcing",), ("peer_security_context",)]
-    assert repr(context) not in repr(SeqpacketPeerError("seqpacket peer attestation failed"))
+    assert repr(context) not in repr(
+        SeqpacketPeerError("seqpacket peer attestation failed")
+    )
 
 
 def test_peer_security_context_accepts_linux_name_max_bytes() -> None:
@@ -1502,11 +1515,12 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            called_name = node.func.attr if isinstance(node.func, ast.Attribute) else (
-                node.func.id if isinstance(node.func, ast.Name) else None
+            called_name = (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else (node.func.id if isinstance(node.func, ast.Name) else None)
             )
             assert called_name not in forbidden_call_names
-
 
     receive_functions = [
         node
@@ -1617,7 +1631,13 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         and ast.unparse(node.value)
         == "(evidence, BrokerDispatchCommand(principal, message, sha256(payload).hexdigest(), None))"
     ]
-    assert len(role_gates) == len(request_raises) == len(command_calls) == len(returns) == 1
+    assert (
+        len(role_gates)
+        == len(request_raises)
+        == len(command_calls)
+        == len(returns)
+        == 1
+    )
     assert decode_calls[0].lineno < role_gates[0].lineno
     assert role_gates[0].lineno <= request_raises[0].lineno
     assert request_raises[0].lineno < command_calls[0].lineno
@@ -1654,7 +1674,10 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
     assert receive_callers == ["receive_admitted_seqpacket_request"]
 
     assert not any(
-        isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Await, ast.Yield, ast.YieldFrom))
+        isinstance(
+            node,
+            (ast.For, ast.AsyncFor, ast.While, ast.Await, ast.Yield, ast.YieldFrom),
+        )
         for node in ast.walk(receive_function)
     )
     forbidden_receive_call_names = {
@@ -1689,13 +1712,14 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
     for node in ast.walk(receive_function):
         if not isinstance(node, ast.Call):
             continue
-        called_name = node.func.attr if isinstance(node.func, ast.Attribute) else (
-            node.func.id if isinstance(node.func, ast.Name) else None
+        called_name = (
+            node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else (node.func.id if isinstance(node.func, ast.Name) else None)
         )
         assert called_name not in forbidden_receive_call_names
     for term in ("SCM_RIGHTS", "CMSG_", "schema", "request_type"):
         assert term not in receive_source
-
 
     getpeername_calls = [
         node
@@ -1821,10 +1845,13 @@ def test_receive_admitted_seqpacket_request_accepts_exact_agent_route_set_after_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
-    assert get_type_hints(receive)["return"] == tuple[
-        KernelPeerEvidence,
-        BrokerDispatchCommand,
-    ]
+    assert (
+        get_type_hints(receive)["return"]
+        == tuple[
+            KernelPeerEvidence,
+            BrokerDispatchCommand,
+        ]
+    )
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
     expected = BindingExpectation(
         PRINCIPAL.agent_id,
@@ -1918,12 +1945,8 @@ def test_receive_admitted_seqpacket_request_accepts_exact_agent_route_set_after_
         assert command.request == request
         assert command.request_digest == sha256(payload).hexdigest()
         assert command.plan is None
-        assert [event for event in events if event[0] == "recvmsg"] == [
-            recv_event
-        ]
-        assert [event for event in events if event[0] == "decode"] == [
-            decode_event
-        ]
+        assert [event for event in events if event[0] == "recvmsg"] == [recv_event]
+        assert [event for event in events if event[0] == "decode"] == [decode_event]
         assert events.index(
             ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255)
         ) < events.index(recv_event)
@@ -2092,9 +2115,7 @@ def test_receive_admitted_seqpacket_request_admits_reads_once_then_decodes_canon
     assert command.plan is None
     recv_events = [event for event in events if event[0] == "recvmsg"]
     assert recv_events == [("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0)]
-    assert [event for event in events if event[0] == "decode"] == [
-        ("decode", payload)
-    ]
+    assert [event for event in events if event[0] == "decode"] == [("decode", payload)]
     assert events.index(
         ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255)
     ) < events.index(recv_events[0])
@@ -2180,15 +2201,11 @@ def test_receive_admitted_seqpacket_request_stops_before_read_and_decode_when_ad
 
     for case in cases:
         events: list[tuple[object, ...]] = []
-        connection = RecordingConnectedSocket(
-            events, **case.get("connection", {})
-        )
+        connection = RecordingConnectedSocket(events, **case.get("connection", {}))
         enforcement_operations = RecordingEnforcementOperations(
             events, **case.get("enforcement", {})
         )
-        linux_operations = RecordingLinuxOperations(
-            events, **case.get("linux", {})
-        )
+        linux_operations = RecordingLinuxOperations(events, **case.get("linux", {}))
         wal_operations = case.get("wal", seeded_active_wal(PRINCIPAL))
         release = case.get("release", release_spec())
 
@@ -2352,9 +2369,7 @@ def test_receive_admitted_seqpacket_request_enforces_packet_size_boundaries_befo
     for payload in (b"x", b"x" * MAX_CHPB_MESSAGE_BYTES):
         events: list[tuple[object, ...]] = []
         result = receive(
-            RecordingConnectedSocket(
-                events, recv_result=(payload, [], 0, object())
-            ),
+            RecordingConnectedSocket(events, recv_result=(payload, [], 0, object())),
             RecordingEnforcementOperations(events),
             RecordingLinuxOperations(events),
             seeded_active_wal(PRINCIPAL),
@@ -2445,9 +2460,7 @@ def test_receive_admitted_seqpacket_request_repeats_fresh_admission_read_and_dec
         events, recv_result=(payload_two, [], 0, object())
     )
     enforcement_operations = RecordingEnforcementOperations(events)
-    linux_operations = RecordingLinuxOperations(
-        events, fresh_identity_per_reuse=True
-    )
+    linux_operations = RecordingLinuxOperations(events, fresh_identity_per_reuse=True)
     wal_operations = seeded_active_wal(PRINCIPAL)
 
     result_one = receive(
@@ -2647,9 +2660,7 @@ def test_agent_start_peer_reattestation_rejects_socket_credential_and_label_drif
     )
 
     with pytest.raises(SeqpacketPeerError):
-        reattest_agent_start_peer(
-            operations, linux_operations, agent_start_envelope()
-        )
+        reattest_agent_start_peer(operations, linux_operations, agent_start_envelope())
 
 
 @pytest.mark.parametrize(
@@ -2677,9 +2688,7 @@ def test_agent_start_peer_reattestation_rejects_inexact_full_peersec(context):
     )
 
     with pytest.raises(SeqpacketPeerError) as caught:
-        reattest_agent_start_peer(
-            operations, linux_operations, agent_start_envelope()
-        )
+        reattest_agent_start_peer(operations, linux_operations, agent_start_envelope())
 
     assert str(caught.value) == "agent start peer attestation failed"
     assert caught.value.__cause__ is None

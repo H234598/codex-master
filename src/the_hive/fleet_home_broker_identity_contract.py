@@ -194,7 +194,9 @@ def validate_peer_cgroup_evidence(value: object) -> PeerCgroupEvidence:
     return value
 
 
-def principal_for_attested_peer(manifest: BrokerManifestV1, peer: PeerCgroupEvidence) -> PrincipalBinding:
+def principal_for_attested_peer(
+    manifest: BrokerManifestV1, peer: PeerCgroupEvidence
+) -> PrincipalBinding:
     validate_broker_manifest(manifest)
     validate_peer_cgroup_evidence(peer)
     if manifest.mcs_pair != peer.mcs_pair:
@@ -220,7 +222,11 @@ def validate_empty_capability_model(value: object) -> BrokerCapabilityModel:
         _fail(BrokerIdentityCode.INVALID_TYPE)
     if type(value.euid) is not int or value.euid != 0:
         _fail(BrokerIdentityCode.INVALID_CAPABILITY_MODEL)
-    if type(value.bounding) is not tuple or type(value.ambient) is not tuple or type(value.inheritable) is not tuple:
+    if (
+        type(value.bounding) is not tuple
+        or type(value.ambient) is not tuple
+        or type(value.inheritable) is not tuple
+    ):
         _fail(BrokerIdentityCode.INVALID_TYPE)
     if value.bounding or value.ambient or value.inheritable:
         _fail(BrokerIdentityCode.INVALID_CAPABILITY_MODEL)

@@ -4,7 +4,11 @@ import math
 from collections.abc import Mapping
 from datetime import datetime
 
-from .fleet_overview import FleetOverviewAgentRow, FleetOverviewSeriesRow, FleetOverviewSnapshot
+from .fleet_overview import (
+    FleetOverviewAgentRow,
+    FleetOverviewSeriesRow,
+    FleetOverviewSnapshot,
+)
 
 
 class HiveMetricsError(ValueError):
@@ -12,18 +16,41 @@ class HiveMetricsError(ValueError):
 
 
 _PROVIDER_METRIC = {
-    "openai": "codex", "openai_api": "codex", "openai_chatgpt": "codex", "codex_cli": "codex",
-    "gemini": "gemini", "gemini_api": "gemini", "gemini_cli": "gemini", "google": "gemini",
-    "anthropic": "claude", "anthropic_api": "claude", "claude": "claude",
-    "huggingface": "huggingface", "huggingface_inference": "huggingface", "hf": "huggingface",
-    "ollama": "ollama", "ollama_local": "ollama", "deepseek": "deepseek", "deepseek_api": "deepseek",
+    "openai": "codex",
+    "openai_api": "codex",
+    "openai_chatgpt": "codex",
+    "codex_cli": "codex",
+    "gemini": "gemini",
+    "gemini_api": "gemini",
+    "gemini_cli": "gemini",
+    "google": "gemini",
+    "anthropic": "claude",
+    "anthropic_api": "claude",
+    "claude": "claude",
+    "huggingface": "huggingface",
+    "huggingface_inference": "huggingface",
+    "hf": "huggingface",
+    "ollama": "ollama",
+    "ollama_local": "ollama",
+    "deepseek": "deepseek",
+    "deepseek_api": "deepseek",
 }
 _ROLE_METRIC = {
-    "goddess": "goddess", "gottbiene": "goddess", "gottesbiene": "goddess",
-    "koenigin": "queen", "königin": "queen", "queen": "queen",
-    "teamlead": "teamleader", "teamleader": "teamleader", "teamleiterin": "teamleader",
-    "arbeitsbiene": "worker", "explorer": "worker", "exploriererin": "worker", "worker": "worker",
-    "rogue": "rogue", "rouge": "rogue",
+    "goddess": "goddess",
+    "gottbiene": "goddess",
+    "gottesbiene": "goddess",
+    "koenigin": "queen",
+    "königin": "queen",
+    "queen": "queen",
+    "teamlead": "teamleader",
+    "teamleader": "teamleader",
+    "teamleiterin": "teamleader",
+    "arbeitsbiene": "worker",
+    "explorer": "worker",
+    "exploriererin": "worker",
+    "worker": "worker",
+    "rogue": "rogue",
+    "rouge": "rogue",
 }
 _PROVIDER_KEYS = ("codex", "gemini", "claude", "huggingface", "ollama", "deepseek")
 _ROLE_KEYS = ("goddess", "queen", "teamleader", "worker", "rogue")
@@ -57,15 +84,23 @@ def _registered_homes(overview: FleetOverviewSnapshot) -> int:
 
 
 def fleet_metric_values(
-    overview: FleetOverviewSnapshot, *, native_active: int, observed_at: datetime,
+    overview: FleetOverviewSnapshot,
+    *,
+    native_active: int,
+    observed_at: datetime,
 ) -> dict[str, int | float]:
     if (
-        type(overview) is not FleetOverviewSnapshot or type(native_active) is not int
-        or native_active < 0 or native_active > 100_000
+        type(overview) is not FleetOverviewSnapshot
+        or type(native_active) is not int
+        or native_active < 0
+        or native_active > 100_000
         or type(overview.generation) is not int
-        or not isinstance(observed_at, datetime) or observed_at.tzinfo is None
-        or not isinstance(overview.created_at, datetime) or overview.created_at.tzinfo is None
-        or type(overview.agents) is not tuple or type(overview.series) is not tuple
+        or not isinstance(observed_at, datetime)
+        or observed_at.tzinfo is None
+        or not isinstance(overview.created_at, datetime)
+        or overview.created_at.tzinfo is None
+        or type(overview.agents) is not tuple
+        or type(overview.series) is not tuple
         or any(
             type(row) is not FleetOverviewAgentRow
             or not _valid_token(row.provider)
@@ -101,7 +136,11 @@ def fleet_metric_values(
             values[f"the_hive_bees_{provider_key}"] += 1
         else:
             values["the_hive_bees_provider_unknown"] += 1
-        role_key = _ROLE_METRIC.get(row.principal_role.lower()) if row.principal_role is not None else None
+        role_key = (
+            _ROLE_METRIC.get(row.principal_role.lower())
+            if row.principal_role is not None
+            else None
+        )
         if role_key is not None:
             values[f"the_hive_bees_{role_key}"] += 1
         else:
@@ -116,9 +155,12 @@ def render_openmetrics(values: Mapping[str, int | float]) -> str:
     for name in sorted(values):
         value = values[name]
         if (
-            not isinstance(name, str) or not name.startswith("the_hive_")
-            or not name.replace("_", "").isalnum() or isinstance(value, bool)
-            or not isinstance(value, (int, float)) or not math.isfinite(value)
+            not isinstance(name, str)
+            or not name.startswith("the_hive_")
+            or not name.replace("_", "").isalnum()
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
         ):
             _invalid()
         rendered = str(value) if isinstance(value, int) else format(value, ".6g")

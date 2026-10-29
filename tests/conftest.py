@@ -17,7 +17,9 @@ def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> No
     witness = root / "src" / "the_hive" / "dynamic_pool.py"
     if not witness.exists():
         witness.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        witness.write_bytes((ROOT / "src" / "the_hive" / "dynamic_pool.py").read_bytes())
+        witness.write_bytes(
+            (ROOT / "src" / "the_hive" / "dynamic_pool.py").read_bytes()
+        )
         witness.chmod(0o644)
     helper = root / "src" / "the_hive" / "_runtime_spawn_helper.so"
     helper.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

@@ -20,9 +20,7 @@ from the_hive.runtime_layout import RuntimeLayout
 
 
 @pytest.fixture(autouse=True)
-def runtime_probe_record(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def runtime_probe_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Materialize the canonical green record; never replace the gate or lock."""
 
     state_directory = tmp_path / "probe-state"
@@ -45,15 +43,26 @@ def runtime_probe_record(
         "mutation_performed": False,
         "raw_output": "not_returned",
         "global_pilot_readiness": {
-            "schema_version": 1, "pilot": "ready", "generation_id": "c" * 32,
-            "freshness": "fresh", "candidate_count": 1,
-            "reason_codes": [], "raw_output": "not_returned",
+            "schema_version": 1,
+            "pilot": "ready",
+            "generation_id": "c" * 32,
+            "freshness": "fresh",
+            "candidate_count": 1,
+            "reason_codes": [],
+            "raw_output": "not_returned",
         },
     }
     healthy = {
         "hive status": (runtime, True),
         "hive doctor": (
-            {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
+            {
+                "healthy": True,
+                "checks": {
+                    "authority": "ready",
+                    "repository": "ready",
+                    "state": "ready",
+                },
+            },
             True,
         ),
     }
@@ -81,7 +90,8 @@ def runtime_probe_record(
             },
             True,
             {
-                "code": "ok", "exit_code": 0,
+                "code": "ok",
+                "exit_code": 0,
                 "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
             },
         ),
@@ -92,7 +102,9 @@ def runtime_probe_record(
         now=lambda: datetime.now(UTC),
         runner=lambda _command, *arguments: healthy[" ".join(arguments)],
     )
-    monkeypatch.setattr(hourly_probe_module, "_probe_state_root", lambda: state_directory)
+    monkeypatch.setattr(
+        hourly_probe_module, "_probe_state_root", lambda: state_directory
+    )
     monkeypatch.setenv("CODEX_MASTER_MCP_STATE", str(state_directory))
     monkeypatch.delenv("CODEX_AGENT_MCP_STATE", raising=False)
 
@@ -101,12 +113,19 @@ def test_v1_series_apply_remains_compatible_with_dual_schema_reader() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             result = server.fleet_series_apply(
-                prefix="d", count=2, runner="codex_cli", provider="ollama_local",
-                model="local-model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=2,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="local-model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             snapshot = server.current_fleet_service().load()
@@ -126,12 +145,18 @@ def _runner(root: Path) -> Path:
 def test_series_plan_is_read_only_and_redacted() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
         ):
             result = server.fleet_series_plan(
-                prefix="d", count=3, runner="codex_cli", provider="ollama_local",
-                model="local-model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=3,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="local-model",
+                account_id=None,
+                expected_generation=1,
             )
         assert result["mutation_performed"] is False
         assert result["create_count"] == 3
@@ -144,25 +169,45 @@ def test_series_apply_grows_only_the_tail_and_publishes_inventory() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             first = server.fleet_series_apply(
-                prefix="d", count=3, runner="codex_cli", provider="ollama_local",
-                model="local-model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=3,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="local-model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             before = {
-                path.name: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+                path.name: (
+                    path.stat().st_ino,
+                    path.stat().st_mtime_ns,
+                    path.read_bytes(),
+                )
                 for path in (root / "pool" / "d1").iterdir()
             }
             second = server.fleet_series_apply(
-                prefix="d", count=5, runner="codex_cli", provider="ollama_local",
-                model="local-model", account_id=None, expected_generation=2,
+                prefix="d",
+                count=5,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="local-model",
+                account_id=None,
+                expected_generation=2,
                 codex_executable=executable,
             )
             after = {
-                path.name: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+                path.name: (
+                    path.stat().st_ino,
+                    path.stat().st_mtime_ns,
+                    path.read_bytes(),
+                )
                 for path in (root / "pool" / "d1").iterdir()
             }
             inventory = server.current_agent_inventory()
@@ -170,21 +215,31 @@ def test_series_apply_grows_only_the_tail_and_publishes_inventory() -> None:
         assert second["created_count"] == 2
         assert before == after
         assert inventory.agent_ids == ("d1", "d2", "d3", "d4", "d5")
-        assert json.loads((root / "pool" / server.FLEET_POOL_MARKER_FILE).read_text())[
-            "kind"
-        ] == "codex_master_fleet_pool"
+        assert (
+            json.loads((root / "pool" / server.FLEET_POOL_MARKER_FILE).read_text())[
+                "kind"
+            ]
+            == "codex_master_fleet_pool"
+        )
 
 
 def test_ollama_home_uses_bounded_codex_profile_and_model_catalog() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                model="llama3.2:3b", account_id=None, expected_generation=1,
+                prefix="d",
+                count=1,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="llama3.2:3b",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
         home = root / "pool" / "d1"
@@ -203,12 +258,19 @@ def test_series_disable_is_registry_only_and_removes_from_dispatch_inventory() -
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                model="local-model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=1,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="local-model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             result = server.fleet_series_disable(prefix="d", expected_generation=2)
@@ -222,16 +284,32 @@ def test_series_disable_is_registry_only() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=2, runner="codex_cli", provider="ollama_local",
-                model="local-model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=2,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="local-model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
-            with patch.object(server, "stop_agent", side_effect=AssertionError("stop I/O attempted")), patch.object(
-                server, "update_watchdog_marker", side_effect=AssertionError("watchdog I/O attempted")
+            with (
+                patch.object(
+                    server,
+                    "stop_agent",
+                    side_effect=AssertionError("stop I/O attempted"),
+                ),
+                patch.object(
+                    server,
+                    "update_watchdog_marker",
+                    side_effect=AssertionError("watchdog I/O attempted"),
+                ),
             ):
                 result = server.fleet_series_disable(prefix="d", expected_generation=2)
             snapshot = server.current_fleet_service().load()
@@ -244,8 +322,17 @@ def test_provider_wrapper_keeps_only_provider_secret() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         agent = AgentDescriptor(
-            "d1", "d", 1, "D 1", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-            "model", "SENTINEL-ACCOUNT-ID", root / "home", "session", True,
+            "d1",
+            "d",
+            1,
+            "D 1",
+            RunnerKind.GEMINI_CLI,
+            Provider.GEMINI_API,
+            "model",
+            "SENTINEL-ACCOUNT-ID",
+            root / "home",
+            "session",
+            True,
         )
         text = server.fleet_wrapper_text(agent, root / "gemini")
     assert "GEMINI_CLI_HOME" in text
@@ -258,23 +345,40 @@ def test_series_apply_updates_overlapping_homes_and_recreates_missing_homes() ->
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=2, runner="codex_cli", provider="ollama_local",
-                model="model-one", account_id=None, expected_generation=1,
+                prefix="d",
+                count=2,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="model-one",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             updated = server.fleet_series_apply(
-                prefix="d", count=2, runner="codex_cli", provider="ollama_local",
-                model="model-two", account_id=None, expected_generation=2,
+                prefix="d",
+                count=2,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="model-two",
+                account_id=None,
+                expected_generation=2,
                 codex_executable=executable,
             )
             (root / "pool" / "d2").rename(root / "pool" / "d2-missing")
             recreated = server.fleet_series_apply(
-                prefix="d", count=2, runner="codex_cli", provider="ollama_local",
-                model="model-two", account_id=None, expected_generation=3,
+                prefix="d",
+                count=2,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="model-two",
+                account_id=None,
+                expected_generation=3,
                 codex_executable=executable,
             )
         assert updated["updated_count"] == 2
@@ -286,18 +390,31 @@ def test_series_shrink_and_delete_reap_tombstones_after_commit() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=2, runner="codex_cli", provider="ollama_local",
-                model="model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=2,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             shrunk = server.fleet_series_apply(
-                prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                model="model", account_id=None, expected_generation=2,
-                confirmed_remove_ids=["d2"], codex_executable=executable,
+                prefix="d",
+                count=1,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="model",
+                account_id=None,
+                expected_generation=2,
+                confirmed_remove_ids=["d2"],
+                codex_executable=executable,
             )
             server.fleet_series_disable(prefix="d", expected_generation=3)
             deleted = server.fleet_series_delete(
@@ -313,12 +430,19 @@ def test_series_update_restores_home_when_registry_commit_conflicts() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                model="old-model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=1,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="old-model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             config = root / "pool" / "d1" / "config.toml"
@@ -332,8 +456,13 @@ def test_series_update_restores_home_when_registry_commit_conflicts() -> None:
             ):
                 try:
                     server.fleet_series_apply(
-                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                        model="new-model", account_id=None, expected_generation=2,
+                        prefix="d",
+                        count=1,
+                        runner="codex_cli",
+                        provider="ollama_local",
+                        model="new-model",
+                        account_id=None,
+                        expected_generation=2,
                         codex_executable=executable,
                     )
                 except server.AgentError as exc:
@@ -349,12 +478,19 @@ def test_series_retry_finishes_after_crash_between_verify_and_publish() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                model="model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=1,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             with patch.object(
@@ -364,8 +500,13 @@ def test_series_retry_finishes_after_crash_between_verify_and_publish() -> None:
             ):
                 try:
                     server.fleet_series_apply(
-                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                        model="new-model", account_id=None, expected_generation=2,
+                        prefix="d",
+                        count=1,
+                        runner="codex_cli",
+                        provider="ollama_local",
+                        model="new-model",
+                        account_id=None,
+                        expected_generation=2,
                         codex_executable=executable,
                     )
                 except BaseException as exc:
@@ -381,12 +522,19 @@ def test_series_retry_restores_durable_update_backup_before_cas() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             server.fleet_series_apply(
-                prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                model="old-model", account_id=None, expected_generation=1,
+                prefix="d",
+                count=1,
+                runner="codex_cli",
+                provider="ollama_local",
+                model="old-model",
+                account_id=None,
+                expected_generation=1,
                 codex_executable=executable,
             )
             config = root / "pool" / "d1" / "config.toml"
@@ -398,8 +546,13 @@ def test_series_retry_restores_durable_update_backup_before_cas() -> None:
             ):
                 try:
                     server.fleet_series_apply(
-                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                        model="new-model", account_id=None, expected_generation=2,
+                        prefix="d",
+                        count=1,
+                        runner="codex_cli",
+                        provider="ollama_local",
+                        model="new-model",
+                        account_id=None,
+                        expected_generation=2,
                         codex_executable=executable,
                     )
                 except BaseException as exc:
@@ -416,9 +569,11 @@ def test_series_retry_discards_create_intent_before_home_creation() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None):
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+        ):
             with patch.object(
                 server,
                 "_fleet_create_home",
@@ -426,8 +581,13 @@ def test_series_retry_discards_create_intent_before_home_creation() -> None:
             ):
                 try:
                     server.fleet_series_apply(
-                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                        model="model", account_id=None, expected_generation=1,
+                        prefix="d",
+                        count=1,
+                        runner="codex_cli",
+                        provider="ollama_local",
+                        model="model",
+                        account_id=None,
+                        expected_generation=1,
                         codex_executable=executable,
                     )
                 except BaseException as exc:
@@ -452,7 +612,7 @@ CRASH_POINTS = (
 )
 
 
-_FRESH_RECOVERY_CHILD = r'''
+_FRESH_RECOVERY_CHILD = r"""
 from datetime import UTC, datetime
 import json
 import os
@@ -572,7 +732,7 @@ with patch.object(server, "STATE_ROOT", state_root), patch.object(
         print(json.dumps({"mode": mode, "state": second["state"]}, sort_keys=True))
     else:
         raise AssertionError("unknown child mode")
-'''
+"""
 
 
 @pytest.mark.parametrize("crash_point", CRASH_POINTS)
@@ -593,16 +753,22 @@ def test_series_crash_points_recover_idempotently(crash_point: str) -> None:
                 crashed = True
                 raise BaseException("simulated_process_crash")
 
-        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
-            server, "AGENT_POOL_ROOT", root / "pool"
-        ), server.temporary_agent_inventory(None), patch.object(
-            server, "_fleet_recovery_crash_point", side_effect=crash_hook
+        with (
+            patch.object(server, "STATE_ROOT", root / "state"),
+            patch.object(server, "AGENT_POOL_ROOT", root / "pool"),
+            server.temporary_agent_inventory(None),
+            patch.object(server, "_fleet_recovery_crash_point", side_effect=crash_hook),
         ):
             try:
                 server.fleet_series_apply(
-                    prefix="d", count=2 if crash_point == "between_reconciliation_actions" else 1,
-                    runner="codex_cli", provider="ollama_local", model="model",
-                    account_id=None, expected_generation=1, codex_executable=executable,
+                    prefix="d",
+                    count=2 if crash_point == "between_reconciliation_actions" else 1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="model",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
                 )
             except BaseException as exc:
                 assert str(exc) == "simulated_process_crash"
@@ -623,7 +789,9 @@ def test_series_crash_points_recover_idempotently(crash_point: str) -> None:
                     assert str(exc) == "simulated_process_crash"
                 else:
                     raise AssertionError("crash hook did not raise during retry")
-                assert crashed is True, "crash hook never fired for between_reconciliation_actions"
+                assert crashed is True, (
+                    "crash hook never fired for between_reconciliation_actions"
+                )
             first_retry = server.fleet_recovery_retry()
             second_retry = server.fleet_recovery_retry()
 
@@ -652,8 +820,13 @@ def test_series_crash_points_recover_across_fresh_processes(crash_point: str) ->
         def child(mode: str) -> dict[str, object]:
             completed = subprocess.run(
                 [
-                    sys.executable, "-c", _FRESH_RECOVERY_CHILD,
-                    mode, str(root), str(executable), crash_point,
+                    sys.executable,
+                    "-c",
+                    _FRESH_RECOVERY_CHILD,
+                    mode,
+                    str(root),
+                    str(executable),
+                    crash_point,
                 ],
                 cwd=repo_root,
                 env=environment,
@@ -667,7 +840,9 @@ def test_series_crash_points_recover_across_fresh_processes(crash_point: str) ->
         assert child("recover") == {"mode": "recover", "state": "ready"}
 
 
-def test_rollback_keeps_recovery_backups_when_home_restore_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rollback_keeps_recovery_backups_when_home_restore_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pool = tmp_path / "pool"
     pool.mkdir(mode=0o700)
     monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")

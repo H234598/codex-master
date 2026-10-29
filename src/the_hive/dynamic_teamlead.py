@@ -122,7 +122,9 @@ def _valid_profile_binding(value: object) -> ProfileBinding:
 
 
 def _account(snapshot: FleetSnapshotV2, account_id: str) -> FleetAccountV2:
-    account = next((item for item in snapshot.accounts if item.account_id == account_id), None)
+    account = next(
+        (item for item in snapshot.accounts if item.account_id == account_id), None
+    )
     if type(account) is not FleetAccountV2:
         _fail(DynamicTeamleadCode.ACCOUNT_NOT_FOUND)
     return account
@@ -140,7 +142,9 @@ def _eligible_account(account: FleetAccountV2) -> FleetAccountV2:
     return account
 
 
-def _runtime_principal(snapshot: FleetSnapshotV2, agent_id: str) -> FleetRuntimePrincipalV2:
+def _runtime_principal(
+    snapshot: FleetSnapshotV2, agent_id: str
+) -> FleetRuntimePrincipalV2:
     principals = snapshot.runtime_principals
     matches = tuple(
         item
@@ -226,7 +230,8 @@ def require_committed_home_attestation(
         or attestation is None
         or transaction.checkpoint is not BrokerCheckpoint.COMMITTED
         or transaction.binding.principal.agent_id != expected.agent_id
-        or transaction.binding.principal.manifest_generation != expected.manifest_generation
+        or transaction.binding.principal.manifest_generation
+        != expected.manifest_generation
         or transaction.binding.principal.unit_generation != expected.unit_generation
         or transaction.binding.principal.fencing_epoch != expected.fencing_epoch
         or transaction.binding.policy.policy_generation != expected.policy_generation

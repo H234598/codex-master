@@ -560,12 +560,14 @@ def test_active_probe_digest_depends_only_on_fresh_observation(tmp_path: Path) -
     registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
 
     first = registry.record_active_probe(
-        "worker-one", generation=2,
+        "worker-one",
+        generation=2,
         resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
         observed_at="2026-08-30T12:00:00Z",
     )
     second = registry.record_active_probe(
-        "worker-one", generation=2,
+        "worker-one",
+        generation=2,
         resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
         observed_at="2026-08-30T12:00:00Z",
     )
@@ -788,6 +790,7 @@ def test_active_probe_owns_one_lock_and_rejects_contending_stale_cas(
     assert payload["generation"] == 3
     assert document.read_bytes() == after
 
+
 def test_equal_generation_is_idempotent_only_for_identical_bound_evidence(
     tmp_path: Path,
 ) -> None:
@@ -899,9 +902,7 @@ def test_existing_schema3_document_migrates_private_generation_and_epoch_history
     migrated = json.loads(document.read_text())
 
     assert migrated["generation"] == 1
-    assert migrated["agent_epoch_history"] == [
-        {"ref": "worker-one", "lease_epoch": 7}
-    ]
+    assert migrated["agent_epoch_history"] == [{"ref": "worker-one", "lease_epoch": 7}]
     assert migrated_registry.resolve_agent_spki(SPKI_ONE).lease_epoch == 7
 
 
@@ -1045,7 +1046,9 @@ def test_agent_binding_rotation_at_max_epoch_fails_without_mutation(
     )
 
 
-def test_agent_sync_partial_removal_advances_document_generation(tmp_path: Path) -> None:
+def test_agent_sync_partial_removal_advances_document_generation(
+    tmp_path: Path,
+) -> None:
     registry = registry_at(tmp_path)
     desired = (
         (static_registration("worker-one"), agent_binding("worker-one")),
@@ -1108,9 +1111,7 @@ def test_agent_sync_last_removal_prunes_owned_active_observation_atomically(
     assert payload["registrations"] == []
     assert payload["bindings"] == {"ssh": [], "agent": []}
     assert payload["observations"] == []
-    assert payload["agent_epoch_history"] == [
-        {"ref": "worker-one", "lease_epoch": 1}
-    ]
+    assert payload["agent_epoch_history"] == [{"ref": "worker-one", "lease_epoch": 1}]
     reopened = registry_at(tmp_path)
     assert reopened.document_generation() == 3
     assert reopened.list() == ()
@@ -1134,9 +1135,7 @@ def test_agent_sync_removal_preserves_observation_when_ssh_domain_remains(
     assert after["bindings"]["ssh"] == before["bindings"]["ssh"]
     assert after["bindings"]["agent"] == []
     assert after["observations"] == before["observations"]
-    assert after["agent_epoch_history"] == [
-        {"ref": "worker-one", "lease_epoch": 1}
-    ]
+    assert after["agent_epoch_history"] == [{"ref": "worker-one", "lease_epoch": 1}]
     assert registry.get("worker-one").generation == 1
     assert registry_at(tmp_path).get("worker-one") == registry.get("worker-one")
 
@@ -1262,9 +1261,7 @@ def test_identical_probe_is_byte_identical_at_max_document_generation(
     document.chmod(0o600)
     before = document.read_bytes()
 
-    host = registry.record_probe(
-        "worker-one", generation=4, evidence=valid_evidence()
-    )
+    host = registry.record_probe("worker-one", generation=4, evidence=valid_evidence())
 
     assert host.generation == 4
     assert document.read_bytes() == before

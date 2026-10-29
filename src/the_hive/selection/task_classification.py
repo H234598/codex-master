@@ -34,11 +34,18 @@ class TaskClassificationRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.objective, str) or not 1 <= len(self.objective) <= 8192:
             raise TaskClassificationError("invalid_task_objective")
-        if not isinstance(self.scope_kind, str) or self.scope_kind not in {"read", "write", "unknown"}:
+        if not isinstance(self.scope_kind, str) or self.scope_kind not in {
+            "read",
+            "write",
+            "unknown",
+        }:
             raise TaskClassificationError("invalid_task_scope")
         if not isinstance(self.changed_files, tuple) or len(self.changed_files) > 256:
             raise TaskClassificationError("invalid_changed_files")
-        if any(not isinstance(value, str) or not 1 <= len(value) <= 512 for value in self.changed_files):
+        if any(
+            not isinstance(value, str) or not 1 <= len(value) <= 512
+            for value in self.changed_files
+        ):
             raise TaskClassificationError("invalid_changed_files")
         for value in (
             self.security_sensitive,
@@ -56,9 +63,15 @@ class TaskClassificationRequest:
         ):
             if not isinstance(value, bool):
                 raise TaskClassificationError("invalid_task_evidence")
-        if not isinstance(self.task_phase, str) or self.task_phase not in {"atomic_fix", "diagnosis", "unknown"}:
+        if not isinstance(self.task_phase, str) or self.task_phase not in {
+            "atomic_fix",
+            "diagnosis",
+            "unknown",
+        }:
             raise TaskClassificationError("invalid_task_phase")
-        if self.complexity_override is not None and not isinstance(self.complexity_override, TaskComplexity):
+        if self.complexity_override is not None and not isinstance(
+            self.complexity_override, TaskComplexity
+        ):
             raise TaskClassificationError("invalid_complexity_override")
 
 
@@ -132,7 +145,10 @@ class TaskClassifier:
             elif request.task_phase == "unknown":
                 reasons.append("task_phase_unknown")
 
-        if request.complexity_override is TaskComplexity.SIMPLE and complexity is not TaskComplexity.SIMPLE:
+        if (
+            request.complexity_override is TaskComplexity.SIMPLE
+            and complexity is not TaskComplexity.SIMPLE
+        ):
             reasons.append("simple_override_rejected")
 
         spark_eligible = False
@@ -158,7 +174,8 @@ class TaskClassifier:
             and request.reversible
             and request.low_risk
             and request.root_cause_known
-            and request.complexity_override not in {TaskComplexity.MEDIUM, TaskComplexity.COMPLEX}
+            and request.complexity_override
+            not in {TaskComplexity.MEDIUM, TaskComplexity.COMPLEX}
             and not any(
                 (
                     request.security_sensitive,
@@ -174,4 +191,9 @@ class TaskClassifier:
         )
 
 
-__all__ = ["TaskClassificationError", "TaskClassificationRequest", "TaskClassifier", "TaskProfile"]
+__all__ = [
+    "TaskClassificationError",
+    "TaskClassificationRequest",
+    "TaskClassifier",
+    "TaskProfile",
+]

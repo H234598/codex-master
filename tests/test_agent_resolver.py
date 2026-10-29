@@ -31,25 +31,40 @@ from the_hive.server import (
     resolve_runtime_agent_selection,
     validate_codex_usage_routing_decision,
 )
-from the_hive.selection.task_classification import TaskClassificationRequest, TaskClassifier
+from the_hive.selection.task_classification import (
+    TaskClassificationRequest,
+    TaskClassifier,
+)
 import pytest
 
 
 MODELS = (
     ModelPolicy(
-        "gpt-5.3-codex-spark", "spark", 10, ("low", "medium", "high"),
+        "gpt-5.3-codex-spark",
+        "spark",
+        10,
+        ("low", "medium", "high"),
         ("write", "simple_task_eligible"),
     ),
     ModelPolicy(
-        "gpt-5.6-luna", "luna", 20, ("low", "medium", "high", "xhigh"),
+        "gpt-5.6-luna",
+        "luna",
+        20,
+        ("low", "medium", "high", "xhigh"),
         ("read", "write", "complex_task_eligible"),
     ),
     ModelPolicy(
-        "gpt-5.6-terra", "terra", 30, ("high", "xhigh"),
+        "gpt-5.6-terra",
+        "terra",
+        30,
+        ("high", "xhigh"),
         ("read", "write", "complex_task_eligible"),
     ),
     ModelPolicy(
-        "gpt-5.6-sol", "sol", 40, ("xhigh", "max"),
+        "gpt-5.6-sol",
+        "sol",
+        40,
+        ("xhigh", "max"),
         ("read", "write", "complex_task_eligible"),
     ),
 )
@@ -65,16 +80,40 @@ CLASSES = (
         supported_scopes=("read", "write"),
     ),
     AgentClassPolicy(
-        "goettin", "persistent", ("persistent",), ("sol",), "max", "max", ("read", "write")
+        "goettin",
+        "persistent",
+        ("persistent",),
+        ("sol",),
+        "max",
+        "max",
+        ("read", "write"),
     ),
     AgentClassPolicy(
-        "gottbiene", "persistent", ("persistent",), ("sol",), "max", "max", ("read", "write")
+        "gottbiene",
+        "persistent",
+        ("persistent",),
+        ("sol",),
+        "max",
+        "max",
+        ("read", "write"),
     ),
     AgentClassPolicy(
-        "koenigin", "persistent", ("persistent",), ("sol",), "max", "max", ("read", "write")
+        "koenigin",
+        "persistent",
+        ("persistent",),
+        ("sol",),
+        "max",
+        "max",
+        ("read", "write"),
     ),
     AgentClassPolicy(
-        "teamleiterin", "persistent", ("persistent",), ("terra",), "xhigh", "xhigh", ("read", "write"),
+        "teamleiterin",
+        "persistent",
+        ("persistent",),
+        ("terra",),
+        "xhigh",
+        "xhigh",
+        ("read", "write"),
         ("gpt-5.6-terra",),
     ),
 )
@@ -115,7 +154,13 @@ def test_agent_class_policy_post_init_validates_default_lifecycle() -> None:
     assert policy.default_lifecycle == "ephemeral"
     with pytest.raises(ValueError, match="invalid_agent_class_policy"):
         AgentClassPolicy(
-            "arbeitsbiene", "persistent", ("ephemeral",), ("luna",), "low", "high", ("read",)
+            "arbeitsbiene",
+            "persistent",
+            ("ephemeral",),
+            ("luna",),
+            "low",
+            "high",
+            ("read",),
         )
 
 
@@ -137,7 +182,9 @@ def resolve(**overrides):
     )
 
 
-def runtime_profile(*, complexity_override: TaskComplexity | None = None, scope_kind: str = "write"):
+def runtime_profile(
+    *, complexity_override: TaskComplexity | None = None, scope_kind: str = "write"
+):
     return TaskClassifier().classify(
         TaskClassificationRequest(
             "Rename one local symbol and run its focused test.",
@@ -192,7 +239,9 @@ def runtime_codex_inventory(*agents: str) -> SimpleNamespace:
                 account_id="account-resolver",
                 runner=RunnerKind.CODEX_CLI,
                 series_prefix=agent[0],
-                skill_profile="teamleiterin" if agent.startswith("q") else "arbeitsbiene",
+                skill_profile="teamleiterin"
+                if agent.startswith("q")
+                else "arbeitsbiene",
             )
             for agent in agents
         }
@@ -348,9 +397,12 @@ def test_sol_root_fixture_defaults_to_exact_profiles_green_at_baseline() -> None
 def test_goettin_fixture_defaults_to_sol_family_max_green_at_baseline() -> None:
     decision = resolve(requested_class="goettin")
 
-    assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
-        "goettin", "persistent", "gpt-5.6-sol", "max"
-    )
+    assert (
+        decision.class_id,
+        decision.lifecycle,
+        decision.model,
+        decision.reasoning,
+    ) == ("goettin", "persistent", "gpt-5.6-sol", "max")
     assert decision.fallback is False
 
 
@@ -359,24 +411,39 @@ def test_goettin_fixture_defaults_to_sol_family_max_green_at_baseline() -> None:
     (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")),
 )
 def test_sol_root_fixture_accepts_second_sol_family_member_green_at_baseline(
-    class_id: str, reasoning: str,
+    class_id: str,
+    reasoning: str,
 ) -> None:
     alternate_sol = ModelPolicy(
-        "gpt-5.6-sol-alt", "sol", 41, ("xhigh", "max"),
+        "gpt-5.6-sol-alt",
+        "sol",
+        41,
+        ("xhigh", "max"),
         ("read", "write", "complex_task_eligible"),
     )
     decision = resolve_agent_selection(
         ResolutionRequest(
-            "read", "simple", requested_class=class_id,
-            requested_model=alternate_sol.model_id, requested_reasoning=reasoning,
+            "read",
+            "simple",
+            requested_class=class_id,
+            requested_model=alternate_sol.model_id,
+            requested_reasoning=reasoning,
         ),
         classes=CLASSES,
         models=MODELS + (alternate_sol,),
         available_models={item.model_id for item in MODELS} | {alternate_sol.model_id},
     )
 
-    assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
-        class_id, "persistent", "gpt-5.6-sol-alt", reasoning,
+    assert (
+        decision.class_id,
+        decision.lifecycle,
+        decision.model,
+        decision.reasoning,
+    ) == (
+        class_id,
+        "persistent",
+        "gpt-5.6-sol-alt",
+        reasoning,
     )
     assert decision.fallback is False
 
@@ -412,26 +479,52 @@ def test_sol_root_fixture_rejects_noncanonical_explicit_profile_red_then_green(
 
 def test_teamleiterin_defaults_to_the_exact_terra_xhigh_tuple() -> None:
     decision = resolve(requested_class="teamleiterin")
-    assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
-        "teamleiterin", "persistent", "gpt-5.6-terra", "xhigh",
+    assert (
+        decision.class_id,
+        decision.lifecycle,
+        decision.model,
+        decision.reasoning,
+    ) == (
+        "teamleiterin",
+        "persistent",
+        "gpt-5.6-terra",
+        "xhigh",
     )
 
 
-@pytest.mark.parametrize("model", ["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-sol"])
-def test_teamleiterin_rejects_other_model_families_from_explicit_tuple(model: str) -> None:
-    error = "retired_model_unavailable" if model == "gpt-5.3-codex-spark" else "leadership_explicit_tuple_required"
+@pytest.mark.parametrize(
+    "model", ["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-sol"]
+)
+def test_teamleiterin_rejects_other_model_families_from_explicit_tuple(
+    model: str,
+) -> None:
+    error = (
+        "retired_model_unavailable"
+        if model == "gpt-5.3-codex-spark"
+        else "leadership_explicit_tuple_required"
+    )
     with pytest.raises(ValueError, match=rf"^{error}$"):
-        resolve(requested_class="teamleiterin", requested_model=model, requested_reasoning="xhigh")
+        resolve(
+            requested_class="teamleiterin",
+            requested_model=model,
+            requested_reasoning="xhigh",
+        )
 
 
 @pytest.mark.parametrize("reasoning", ["low", "medium", "high", "max"])
 def test_teamleiterin_rejects_every_non_xhigh_explicit_effort(reasoning: str) -> None:
     with pytest.raises(ValueError, match=r"^leadership_explicit_tuple_required$"):
-        resolve(requested_class="teamleiterin", requested_model="gpt-5.6-terra", requested_reasoning=reasoning)
+        resolve(
+            requested_class="teamleiterin",
+            requested_model="gpt-5.6-terra",
+            requested_reasoning=reasoning,
+        )
 
 
 @pytest.mark.parametrize("lifecycle", ["ephemeral", "binding", "invocation"])
-def test_teamleiterin_rejects_every_non_persistent_explicit_lifecycle(lifecycle: str) -> None:
+def test_teamleiterin_rejects_every_non_persistent_explicit_lifecycle(
+    lifecycle: str,
+) -> None:
     with pytest.raises(ValueError, match=r"^leadership_explicit_tuple_required$"):
         resolve(requested_class="teamleiterin", requested_lifecycle=lifecycle)
 
@@ -459,11 +552,14 @@ def test_teamleiterin_never_selects_a_second_terra_family_model() -> None:
 
 def test_teamleiterin_refuses_required_terra_without_xhigh() -> None:
     terra_without_xhigh = ModelPolicy("gpt-5.6-terra", "terra", 30, ("high",))
-    with pytest.raises(ValueError, match="required_model_effort_unavailable:gpt-5.6-terra:xhigh"):
+    with pytest.raises(
+        ValueError, match="required_model_effort_unavailable:gpt-5.6-terra:xhigh"
+    ):
         resolve_agent_selection(
             ResolutionRequest("write", "simple", requested_class="teamleiterin"),
             classes=CLASSES,
-            models=tuple(item for item in MODELS if item.model_id != "gpt-5.6-terra") + (terra_without_xhigh,),
+            models=tuple(item for item in MODELS if item.model_id != "gpt-5.6-terra")
+            + (terra_without_xhigh,),
             available_models={item.model_id for item in MODELS},
         )
 
@@ -481,26 +577,37 @@ def test_root_catalog_goettin_defaults_to_persistent_sol_max_red_then_green() ->
         available_models={item.model_id for item in models},
     )
 
-    assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
-        "goettin", "persistent", "gpt-6.1-sol", "max"
-    )
+    assert (
+        decision.class_id,
+        decision.lifecycle,
+        decision.model,
+        decision.reasoning,
+    ) == ("goettin", "persistent", "gpt-6.1-sol", "max")
     assert decision.fallback is False
 
 
-def test_root_catalog_goettin_accepts_explicit_second_sol_with_max_red_then_green() -> None:
+def test_root_catalog_goettin_accepts_explicit_second_sol_with_max_red_then_green() -> (
+    None
+):
     root = Path(__file__).resolve().parents[1]
     classes, models = policies_from_catalogs(
         load_agent_class_catalog(root / "codex-agent-classes.json"),
         load_model_policy(root / "codex-model-policy.json"),
     )
     alternate_sol = ModelPolicy(
-        "gpt-5.6-sol-alt", "sol", 41, ("xhigh", "max"),
+        "gpt-5.6-sol-alt",
+        "sol",
+        41,
+        ("xhigh", "max"),
         ("read", "write", "complex_task_eligible"),
     )
     decision = resolve_agent_selection(
         ResolutionRequest(
-            "read", "simple", requested_class="goettin",
-            requested_model="gpt-5.6-sol-alt", requested_reasoning="max",
+            "read",
+            "simple",
+            requested_class="goettin",
+            requested_model="gpt-5.6-sol-alt",
+            requested_reasoning="max",
         ),
         classes=classes,
         models=tuple(models) + (alternate_sol,),
@@ -508,7 +615,9 @@ def test_root_catalog_goettin_accepts_explicit_second_sol_with_max_red_then_gree
     )
 
     assert (decision.lifecycle, decision.model, decision.reasoning) == (
-        "persistent", "gpt-5.6-sol-alt", "max"
+        "persistent",
+        "gpt-5.6-sol-alt",
+        "max",
     )
     assert decision.fallback is False
 
@@ -538,16 +647,23 @@ def test_goettin_is_never_auto_selected_from_a_goddess_only_pool() -> None:
     ),
 )
 def test_validate_canonical_agent_tuple_accepts_governance_matrix_red_then_green(
-    class_id: str, model_id: str, reasoning: str,
+    class_id: str,
+    model_id: str,
+    reasoning: str,
 ) -> None:
     alternate_sol = ModelPolicy(
-        "gpt-5.6-sol-alt", "sol", 41, ("xhigh", "max"),
+        "gpt-5.6-sol-alt",
+        "sol",
+        41,
+        ("xhigh", "max"),
         ("read", "write", "complex_task_eligible"),
     )
     classes = {item.class_id: item for item in CLASSES + WORKER_CLASSES}
     models = {item.model_id: item for item in MODELS + (alternate_sol,)}
 
-    validate_canonical_agent_tuple(classes[class_id], models[model_id], "persistent", reasoning)
+    validate_canonical_agent_tuple(
+        classes[class_id], models[model_id], "persistent", reasoning
+    )
 
 
 @pytest.mark.parametrize(
@@ -565,13 +681,18 @@ def test_validate_canonical_agent_tuple_accepts_governance_matrix_red_then_green
     ),
 )
 def test_validate_canonical_agent_tuple_rejects_noncanonical_governance_matrix_red_then_green(
-    class_id: str, model_id: str, lifecycle: str, reasoning: str,
+    class_id: str,
+    model_id: str,
+    lifecycle: str,
+    reasoning: str,
 ) -> None:
     classes = {item.class_id: item for item in CLASSES + WORKER_CLASSES}
     models = {item.model_id: item for item in MODELS}
 
     with pytest.raises(ValueError, match=r"^invalid_canonical_agent_tuple$"):
-        validate_canonical_agent_tuple(classes[class_id], models[model_id], lifecycle, reasoning)
+        validate_canonical_agent_tuple(
+            classes[class_id], models[model_id], lifecycle, reasoning
+        )
 
 
 def test_ultra_is_never_selected() -> None:
@@ -658,7 +779,11 @@ def test_missing_class_selects_specialist_when_worker_cannot_write() -> None:
 
 @pytest.mark.parametrize(
     ("complexity", "expected_class"),
-    [("simple", "arbeitsbiene"), ("medium", "spezialistin"), ("complex", "spezialistin")],
+    [
+        ("simple", "arbeitsbiene"),
+        ("medium", "spezialistin"),
+        ("complex", "spezialistin"),
+    ],
 )
 def test_missing_class_matches_worker_authority_to_task_complexity(
     complexity: str,
@@ -703,7 +828,9 @@ def test_explicit_compatible_class_keeps_precedence_over_auto_selection() -> Non
 
 
 def test_missing_class_fails_when_only_leadership_classes_are_compatible() -> None:
-    leadership_classes = tuple(item for item in CLASSES if item.class_id != "arbeitsbiene")
+    leadership_classes = tuple(
+        item for item in CLASSES if item.class_id != "arbeitsbiene"
+    )
 
     with pytest.raises(ValueError, match="no_compatible_class"):
         resolve_agent_selection(
@@ -716,19 +843,33 @@ def test_missing_class_fails_when_only_leadership_classes_are_compatible() -> No
 
 def test_offer_contains_only_valid_combinations_and_public_lifecycle_names() -> None:
     alternate_sol = ModelPolicy(
-        "gpt-5.6-sol-alt", "sol", 41, ("xhigh", "max"),
+        "gpt-5.6-sol-alt",
+        "sol",
+        41,
+        ("xhigh", "max"),
         ("read", "write", "complex_task_eligible"),
     )
     offer = build_selection_offer(
         classes=CLASSES,
         models=MODELS + (alternate_sol,),
-        available_models={model.model_id for model in MODELS} | {alternate_sol.model_id},
+        available_models={model.model_id for model in MODELS}
+        | {alternate_sol.model_id},
     )
 
     assert set(offer.lifecycles) == {"ephemeral", "binding", "persistent"}
     assert "invocation" not in offer.lifecycles
-    assert offer.classes == ("arbeitsbiene", "goettin", "gottbiene", "koenigin", "teamleiterin")
-    for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")):
+    assert offer.classes == (
+        "arbeitsbiene",
+        "goettin",
+        "gottbiene",
+        "koenigin",
+        "teamleiterin",
+    )
+    for class_id, reasoning in (
+        ("goettin", "max"),
+        ("gottbiene", "max"),
+        ("koenigin", "max"),
+    ):
         options = [item for item in offer.options if item.class_id == class_id]
         assert [(item.lifecycle, item.model, item.reasoning) for item in options] == [
             ("persistent", "gpt-5.6-sol", reasoning),
@@ -737,14 +878,22 @@ def test_offer_contains_only_valid_combinations_and_public_lifecycle_names() -> 
         assert all(item.model.startswith("gpt-5.6-sol") for item in options)
     assert all(item.reasoning != "ultra" for item in offer.options)
     assert not any(
-        item.class_id == "arbeitsbiene" and item.lifecycle == "persistent" and item.model == "gpt-5.3-codex-spark"
+        item.class_id == "arbeitsbiene"
+        and item.lifecycle == "persistent"
+        and item.model == "gpt-5.3-codex-spark"
         for item in offer.options
     )
 
 
 def test_persistent_offer_options_round_trip_through_resolver_invariants() -> None:
-    offer = build_selection_offer(classes=CLASSES, models=MODELS, available_models={model.model_id for model in MODELS})
-    persistent_options = [item for item in offer.options if item.lifecycle == "persistent"]
+    offer = build_selection_offer(
+        classes=CLASSES,
+        models=MODELS,
+        available_models={model.model_id for model in MODELS},
+    )
+    persistent_options = [
+        item for item in offer.options if item.lifecycle == "persistent"
+    ]
 
     assert persistent_options
     assert all(item.reasoning in {"xhigh", "max"} for item in persistent_options)
@@ -762,7 +911,12 @@ def test_persistent_offer_options_round_trip_through_resolver_invariants() -> No
             models=MODELS,
             available_models={model.model_id for model in MODELS},
         )
-        assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
+        assert (
+            decision.class_id,
+            decision.lifecycle,
+            decision.model,
+            decision.reasoning,
+        ) == (
             option.class_id,
             option.lifecycle,
             option.model,
@@ -797,11 +951,17 @@ def test_offer_and_resolver_reject_persistent_class_without_xhigh_capacity() -> 
 
 
 def test_offer_generation_ignores_retired_spark_availability() -> None:
-    complete = build_selection_offer(classes=CLASSES, models=MODELS, available_models={model.model_id for model in MODELS})
+    complete = build_selection_offer(
+        classes=CLASSES,
+        models=MODELS,
+        available_models={model.model_id for model in MODELS},
+    )
     without_spark = build_selection_offer(
         classes=CLASSES,
         models=MODELS,
-        available_models={model.model_id for model in MODELS if model.family != "spark"},
+        available_models={
+            model.model_id for model in MODELS if model.family != "spark"
+        },
     )
 
     assert complete.generation == without_spark.generation
@@ -822,14 +982,22 @@ def test_checked_in_catalogs_drive_resolver_without_hardcoded_model_ids() -> Non
         available_models={item.model_id for item in models},
     )
 
-    assert (decision.lifecycle, decision.model, decision.reasoning) == ("binding", "gpt-6-luna", "high")
+    assert (decision.lifecycle, decision.model, decision.reasoning) == (
+        "binding",
+        "gpt-6-luna",
+        "high",
+    )
 
 
 def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> None:
     sol = agent_base_args("gpt-6-sol", "high")
     assert sol[:3] == ["--no-daemon", "--model", "gpt-6-sol"]
     assert 'model_reasoning_effort="high"' in sol
-    for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")):
+    for class_id, reasoning in (
+        ("goettin", "max"),
+        ("gottbiene", "max"),
+        ("koenigin", "max"),
+    ):
         args = agent_base_args("gpt-6-sol", reasoning, agent_class=class_id)
         assert args[:3] == ["--no-daemon", "--model", "gpt-6-sol"]
         assert f'model_reasoning_effort="{reasoning}"' in args
@@ -852,9 +1020,15 @@ def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> 
     ),
 )
 def test_agent_base_args_rejects_noncanonical_root_and_worker_tuples(
-    model: str, reasoning: str, agent_class: str,
+    model: str,
+    reasoning: str,
+    agent_class: str,
 ) -> None:
-    error = "retired_model_unavailable" if model == "gpt-5.3-codex-spark" else "unsupported routed agent tuple"
+    error = (
+        "retired_model_unavailable"
+        if model == "gpt-5.3-codex-spark"
+        else "unsupported routed agent tuple"
+    )
     with pytest.raises(AgentError, match=rf"^{error}$"):
         agent_base_args(model, reasoning, agent_class=agent_class)
 
@@ -864,40 +1038,59 @@ def test_agent_base_args_rejects_noncanonical_root_and_worker_tuples(
     (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")),
 )
 def test_agent_base_args_accepts_second_sol_family_member_red_then_green(
-    monkeypatch: pytest.MonkeyPatch, class_id: str, reasoning: str,
+    monkeypatch: pytest.MonkeyPatch,
+    class_id: str,
+    reasoning: str,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
     base_registry = load_model_policy(root / "codex-model-policy.json")
     alternate_definition = SimpleNamespace(
-        model_id="gpt-5.6-sol-alt", enabled=True, spawn_behavior="manual",
-        family="sol", reasoning_levels=("xhigh", "max"),
+        model_id="gpt-5.6-sol-alt",
+        enabled=True,
+        spawn_behavior="manual",
+        family="sol",
+        reasoning_levels=("xhigh", "max"),
     )
     alternate_public = {
-        "model_id": "gpt-5.6-sol-alt", "family": "sol", "rank": 41,
+        "model_id": "gpt-5.6-sol-alt",
+        "family": "sol",
+        "rank": 41,
         "reasoning_levels": ["xhigh", "max"],
         "capabilities": ["read", "write", "complex_task_eligible"],
-        "enabled": True, "spawn_behavior": "manual",
+        "enabled": True,
+        "spawn_behavior": "manual",
     }
     registry = SimpleNamespace(
         get_exact=lambda model_id: (
-            alternate_definition if model_id == alternate_definition.model_id
+            alternate_definition
+            if model_id == alternate_definition.model_id
             else base_registry.get_exact(model_id)
         ),
         public=lambda: base_registry.public() + (alternate_public,),
     )
     monkeypatch.setattr("the_hive.server.load_model_policy", lambda _path: registry)
 
-    args = agent_base_args(alternate_definition.model_id, reasoning, agent_class=class_id)
+    args = agent_base_args(
+        alternate_definition.model_id, reasoning, agent_class=class_id
+    )
     assert args[:3] == [
-        "--no-daemon", "--model", alternate_definition.model_id,
+        "--no-daemon",
+        "--model",
+        alternate_definition.model_id,
     ]
     assert f'model_reasoning_effort="{reasoning}"' in args
 
 
-def test_assign_write_cli_rejects_ultra_before_dispatch(capsys: pytest.CaptureFixture[str]) -> None:
+def test_assign_write_cli_rejects_ultra_before_dispatch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     argv = [
-        "assign-write", "a1", "--task", "P0 parser-only negative",
-        "--reasoning-effort", "ultra",
+        "assign-write",
+        "a1",
+        "--task",
+        "P0 parser-only negative",
+        "--reasoning-effort",
+        "ultra",
     ]
     with patch("the_hive.server.call_validated_tool") as call_validated_tool:
         with pytest.raises(SystemExit) as raised:
@@ -933,11 +1126,14 @@ def test_legacy_codex_usage_main_model_is_normalized_to_luna_with_reason() -> No
     }
 
 
-def test_runtime_resolver_does_not_materialize_attested_spark_id_from_usage_routing() -> None:
+def test_runtime_resolver_does_not_materialize_attested_spark_id_from_usage_routing() -> (
+    None
+):
     inventory = runtime_codex_inventory("a1")
     evidence = runtime_model_invocability_evidence()
-    with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
-        "the_hive.server.read_usage_evidence_v2", return_value=evidence
+    with (
+        patch("the_hive.server.current_agent_inventory", return_value=inventory),
+        patch("the_hive.server.read_usage_evidence_v2", return_value=evidence),
     ):
         simple = resolve_runtime_agent_selection(
             agent="a1",
@@ -969,7 +1165,9 @@ def test_runtime_resolver_does_not_materialize_attested_spark_id_from_usage_rout
         "high",
     )
     assert (no_spark.class_id, no_spark.model, no_spark.reasoning) == (
-        "arbeitsbiene", "gpt-6-luna", "medium",
+        "arbeitsbiene",
+        "gpt-6-luna",
+        "medium",
     )
     assert "default_model_unavailable" not in simple.reason_codes
     assert "default_model_unavailable" not in no_spark.reason_codes
@@ -979,14 +1177,17 @@ def test_runtime_resolver_does_not_materialize_attested_spark_id_from_usage_rout
 
 def test_selection_options_keeps_q_target_bound_to_requester_authority() -> None:
     inventory = runtime_codex_inventory("q1")
-    with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
-        "the_hive.server.current_agent_inventory", return_value=inventory
-    ), patch(
-        "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
-        return_value={"blocked": False},
-    ), patch(
-        "the_hive.server.read_usage_evidence_v2",
-        return_value=runtime_model_invocability_evidence(),
+    with (
+        patch("the_hive.server.canonical_agent_id", return_value="q1"),
+        patch("the_hive.server.current_agent_inventory", return_value=inventory),
+        patch(
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
+            return_value={"blocked": False},
+        ),
+        patch(
+            "the_hive.server.read_usage_evidence_v2",
+            return_value=runtime_model_invocability_evidence(),
+        ),
     ):
         offer = agent_selection_options("q1", requester_class="teamleiterin")
         unchanged = agent_selection_options(
@@ -1004,14 +1205,17 @@ def test_selection_options_keeps_q_target_bound_to_requester_authority() -> None
 
 def test_selection_options_hides_teamlead_for_worker_authority() -> None:
     inventory = runtime_codex_inventory("q1")
-    with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
-        "the_hive.server.current_agent_inventory", return_value=inventory
-    ), patch(
-        "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
-        return_value={"blocked": False},
-    ), patch(
-        "the_hive.server.read_usage_evidence_v2",
-        return_value=runtime_model_invocability_evidence(),
+    with (
+        patch("the_hive.server.canonical_agent_id", return_value="q1"),
+        patch("the_hive.server.current_agent_inventory", return_value=inventory),
+        patch(
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
+            return_value={"blocked": False},
+        ),
+        patch(
+            "the_hive.server.read_usage_evidence_v2",
+            return_value=runtime_model_invocability_evidence(),
+        ),
     ):
         offer = agent_selection_options("q1", requester_class="arbeitsbiene")
     assert "teamleiterin" not in offer["classes"]
@@ -1056,21 +1260,27 @@ def test_q_target_does_not_bind_leadership_from_series_metadata() -> None:
         },
     )()
     with patch("the_hive.server.current_agent_inventory", return_value=inventory):
-        assert resolver_class_for_agent(
-            "q1",
-            "arbeitsbiene",
-            authority_class="teamleiterin",
-        ) == "arbeitsbiene"
+        assert (
+            resolver_class_for_agent(
+                "q1",
+                "arbeitsbiene",
+                authority_class="teamleiterin",
+            )
+            == "arbeitsbiene"
+        )
         assert resolver_class_for_agent("q1", "arbeitsbiene") == "arbeitsbiene"
 
 
 def test_unbound_leadership_request_remains_filtered_by_principal_authority() -> None:
-    with patch(
-        "the_hive.server.current_agent_inventory",
-        return_value=runtime_codex_inventory("a1"),
-    ), patch(
-        "the_hive.server.read_usage_evidence_v2",
-        return_value=runtime_model_invocability_evidence(),
+    with (
+        patch(
+            "the_hive.server.current_agent_inventory",
+            return_value=runtime_codex_inventory("a1"),
+        ),
+        patch(
+            "the_hive.server.read_usage_evidence_v2",
+            return_value=runtime_model_invocability_evidence(),
+        ),
     ):
         decision = resolve_runtime_agent_selection(
             agent="a1",
@@ -1089,13 +1299,18 @@ def test_unbound_leadership_request_remains_filtered_by_principal_authority() ->
     assert "requested_class_unavailable" in decision.reason_codes
 
 
-def test_runtime_missing_class_auto_selects_specialist_for_complex_teamlead_work() -> None:
-    with patch(
-        "the_hive.server.current_agent_inventory",
-        return_value=runtime_codex_inventory("a1"),
-    ), patch(
-        "the_hive.server.read_usage_evidence_v2",
-        return_value=runtime_model_invocability_evidence(),
+def test_runtime_missing_class_auto_selects_specialist_for_complex_teamlead_work() -> (
+    None
+):
+    with (
+        patch(
+            "the_hive.server.current_agent_inventory",
+            return_value=runtime_codex_inventory("a1"),
+        ),
+        patch(
+            "the_hive.server.read_usage_evidence_v2",
+            return_value=runtime_model_invocability_evidence(),
+        ),
     ):
         decision = resolve_runtime_agent_selection(
             agent="a1",
@@ -1111,12 +1326,15 @@ def test_runtime_missing_class_auto_selects_specialist_for_complex_teamlead_work
 
 
 def test_bound_teamlead_selection_keeps_persistent_terra_xhigh_defaults() -> None:
-    with patch(
-        "the_hive.server.current_agent_inventory",
-        return_value=runtime_codex_inventory("a1"),
-    ), patch(
-        "the_hive.server.read_usage_evidence_v2",
-        return_value=runtime_model_invocability_evidence(),
+    with (
+        patch(
+            "the_hive.server.current_agent_inventory",
+            return_value=runtime_codex_inventory("a1"),
+        ),
+        patch(
+            "the_hive.server.read_usage_evidence_v2",
+            return_value=runtime_model_invocability_evidence(),
+        ),
     ):
         decision = resolve_runtime_agent_selection(
             agent="a1",
@@ -1126,7 +1344,12 @@ def test_bound_teamlead_selection_keeps_persistent_terra_xhigh_defaults() -> Non
             requested_class="teamleiterin",
             authority_class=None,
         )
-    assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
+    assert (
+        decision.class_id,
+        decision.lifecycle,
+        decision.model,
+        decision.reasoning,
+    ) == (
         "teamleiterin",
         "persistent",
         "gpt-6-sol",

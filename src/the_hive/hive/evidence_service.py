@@ -98,8 +98,12 @@ class HiveTestEvidenceService:
             expected_index_digest=expected_index_digest,
         )
 
-    def status(self, request: PlanRequestV1, *, now_monotonic_ns: int) -> dict[str, object]:
-        return self._store.status(self._index, request, now_monotonic_ns=now_monotonic_ns)
+    def status(
+        self, request: PlanRequestV1, *, now_monotonic_ns: int
+    ) -> dict[str, object]:
+        return self._store.status(
+            self._index, request, now_monotonic_ns=now_monotonic_ns
+        )
 
     def invalidate(self, evidence_id: str, *, expected_index_digest: str) -> None:
         if expected_index_digest != self._index.digest:

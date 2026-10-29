@@ -9,7 +9,11 @@ import urllib.request
 
 import pytest
 
-from the_hive.observability_http import MAX_METRICS_BYTES, MetricsHttpServer, TimedMetricsReader
+from the_hive.observability_http import (
+    MAX_METRICS_BYTES,
+    MetricsHttpServer,
+    TimedMetricsReader,
+)
 
 
 @contextmanager
@@ -41,7 +45,9 @@ def test_metrics_http_server_only_exposes_bounded_metrics_and_health() -> None:
         base = f"http://127.0.0.1:{server.server_port}"
         with urllib.request.urlopen(f"{base}/metrics", timeout=2) as response:
             assert response.status == 200
-            assert response.headers["Content-Type"].startswith("application/openmetrics-text")
+            assert response.headers["Content-Type"].startswith(
+                "application/openmetrics-text"
+            )
             assert response.read() == b"metric 1\n# EOF\n"
         with urllib.request.urlopen(f"{base}/healthz", timeout=2) as response:
             assert response.read() == b"ok\n"
@@ -106,7 +112,9 @@ def _raising_reader() -> object:
     ),
     ids=("source-exception", "none", "empty", "oversized"),
 )
-def test_metrics_returns_exactly_503_for_unavailable_payloads(metrics_reader: object) -> None:
+def test_metrics_returns_exactly_503_for_unavailable_payloads(
+    metrics_reader: object,
+) -> None:
     with _running_server("127.0.0.1", metrics_reader) as server:
         status, body = _fetch(f"http://127.0.0.1:{server.server_port}/metrics")
     assert status == 503

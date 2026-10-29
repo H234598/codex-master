@@ -75,7 +75,10 @@ class ScopeBinding:
     def __post_init__(self) -> None:
         if self.mode not in {"read", "write"}:
             raise AdmissionError("invalid_scope_mode")
-        if not isinstance(self.paths, tuple) or not 1 <= len(self.paths) <= MAX_SCOPE_PATHS:
+        if (
+            not isinstance(self.paths, tuple)
+            or not 1 <= len(self.paths) <= MAX_SCOPE_PATHS
+        ):
             raise AdmissionError("invalid_scope_paths")
         for path in self.paths:
             if (
@@ -109,7 +112,12 @@ class ResourceBinding:
             (self.model_id, "invalid_resource_model"),
         ):
             _bounded_text(value, code, 128)
-        _bounded_int(self.expected_usage_micro, "invalid_resource_usage", 0, MAX_RESOURCE_USAGE_MICRO)
+        _bounded_int(
+            self.expected_usage_micro,
+            "invalid_resource_usage",
+            0,
+            MAX_RESOURCE_USAGE_MICRO,
+        )
         if self.account_pool_binding is not None and not isinstance(
             self.account_pool_binding, AccountPoolBindingV1
         ):
@@ -221,11 +229,18 @@ class AdmissionRecord:
         if not isinstance(target, AdmissionState):
             raise AdmissionError("invalid_admission_state")
         if target not in _ALLOWED_TRANSITIONS[self.state]:
-            raise AdmissionError(f"invalid_transition:{self.state.value}->{target.value}")
-        if self.state in _EXPIRABLE_STATES and self.is_expired(now) and target not in {
-            AdmissionState.EXPIRED,
-            AdmissionState.COMPENSATED,
-        }:
+            raise AdmissionError(
+                f"invalid_transition:{self.state.value}->{target.value}"
+            )
+        if (
+            self.state in _EXPIRABLE_STATES
+            and self.is_expired(now)
+            and target
+            not in {
+                AdmissionState.EXPIRED,
+                AdmissionState.COMPENSATED,
+            }
+        ):
             raise AdmissionError("admission_expired")
         return replace(self, state=target, revision=self.revision + 1)
 
@@ -356,7 +371,9 @@ class AdmissionStore:
             except KeyError as exc:
                 raise AdmissionError("admission_not_found") from exc
 
-    def begin_revalidation(self, admission_id: str, *, expected_revision: int, now: datetime) -> AdmissionRecord:
+    def begin_revalidation(
+        self, admission_id: str, *, expected_revision: int, now: datetime
+    ) -> AdmissionRecord:
         return self.transition(
             admission_id,
             AdmissionState.REVALIDATING,
@@ -375,9 +392,13 @@ class AdmissionStore:
         if not isinstance(valid, bool):
             raise AdmissionError("invalid_revalidation_result")
         target = AdmissionState.ADMITTED if valid else AdmissionState.DENIED
-        return self.transition(admission_id, target, expected_revision=expected_revision, now=now)
+        return self.transition(
+            admission_id, target, expected_revision=expected_revision, now=now
+        )
 
-    def begin_execution(self, admission_id: str, *, expected_revision: int, now: datetime) -> AdmissionRecord:
+    def begin_execution(
+        self, admission_id: str, *, expected_revision: int, now: datetime
+    ) -> AdmissionRecord:
         return self.transition(
             admission_id,
             AdmissionState.EXECUTING,
@@ -385,7 +406,9 @@ class AdmissionStore:
             now=now,
         )
 
-    def finalize(self, admission_id: str, *, expected_revision: int, now: datetime) -> AdmissionRecord:
+    def finalize(
+        self, admission_id: str, *, expected_revision: int, now: datetime
+    ) -> AdmissionRecord:
         record = self.get(admission_id)
         if record.state is AdmissionState.FINALIZED:
             return record
@@ -400,10 +423,15 @@ class AdmissionStore:
         self, admission_id: str, *, expected_revision: int, now: datetime
     ) -> AdmissionRecord:
         return self.transition(
-            admission_id, AdmissionState.EXECUTION_FAILED, expected_revision=expected_revision, now=now
+            admission_id,
+            AdmissionState.EXECUTION_FAILED,
+            expected_revision=expected_revision,
+            now=now,
         )
 
-    def begin_compensation(self, admission_id: str, *, expected_revision: int, now: datetime) -> AdmissionRecord:
+    def begin_compensation(
+        self, admission_id: str, *, expected_revision: int, now: datetime
+    ) -> AdmissionRecord:
         return self.transition(
             admission_id,
             AdmissionState.COMPENSATING,
@@ -411,7 +439,9 @@ class AdmissionStore:
             now=now,
         )
 
-    def compensate(self, admission_id: str, *, expected_revision: int, now: datetime) -> AdmissionRecord:
+    def compensate(
+        self, admission_id: str, *, expected_revision: int, now: datetime
+    ) -> AdmissionRecord:
         return self.transition(
             admission_id,
             AdmissionState.COMPENSATED,
@@ -423,10 +453,15 @@ class AdmissionStore:
         self, admission_id: str, *, expected_revision: int, now: datetime
     ) -> AdmissionRecord:
         return self.transition(
-            admission_id, AdmissionState.FAILED_FINAL, expected_revision=expected_revision, now=now
+            admission_id,
+            AdmissionState.FAILED_FINAL,
+            expected_revision=expected_revision,
+            now=now,
         )
 
-    def cancel(self, admission_id: str, *, expected_revision: int, now: datetime) -> AdmissionRecord:
+    def cancel(
+        self, admission_id: str, *, expected_revision: int, now: datetime
+    ) -> AdmissionRecord:
         return self.transition(
             admission_id,
             AdmissionState.CANCELLED,
@@ -434,9 +469,14 @@ class AdmissionStore:
             now=now,
         )
 
-    def recover_after_crash(self, admission_id: str, *, expected_revision: int, now: datetime) -> AdmissionRecord:
+    def recover_after_crash(
+        self, admission_id: str, *, expected_revision: int, now: datetime
+    ) -> AdmissionRecord:
         return self.transition(
-            admission_id, AdmissionState.RECOVERED_AFTER_CRASH, expected_revision=expected_revision, now=now
+            admission_id,
+            AdmissionState.RECOVERED_AFTER_CRASH,
+            expected_revision=expected_revision,
+            now=now,
         )
 
     def expire(self, *, now: datetime) -> tuple[AdmissionRecord, ...]:
@@ -464,7 +504,9 @@ class AdmissionStore:
     ) -> AdmissionRecord:
         """Apply one explicitly allowed state transition with a revision CAS."""
 
-        return self._transition(admission_id, target, expected_revision=expected_revision, now=now)
+        return self._transition(
+            admission_id, target, expected_revision=expected_revision, now=now
+        )
 
     def _transition(
         self,
@@ -479,7 +521,9 @@ class AdmissionStore:
             record = self._records.get(admission_id)
             if record is None:
                 raise AdmissionError("admission_not_found")
-            return self._transition_locked(record, target, expected_revision=expected_revision, now=now)
+            return self._transition_locked(
+                record, target, expected_revision=expected_revision, now=now
+            )
 
     def _transition_locked(
         self,
@@ -507,17 +551,25 @@ class AdmissionStore:
 
     def _reservation_conflict(self, record: AdmissionRecord) -> str | None:
         active = tuple(current for current in self._records.values() if current.active)
-        if any(current.resource.agent_id == record.resource.agent_id for current in active):
+        if any(
+            current.resource.agent_id == record.resource.agent_id for current in active
+        ):
             return "agent_conflict"
         account_key = (record.resource.account_key, record.resource.budget_key)
         account_count = sum(
-            (current.resource.account_key, current.resource.budget_key) == account_key for current in active
+            (current.resource.account_key, current.resource.budget_key) == account_key
+            for current in active
         )
         if account_count >= self._account_capacity:
             return "account_capacity_conflict"
         model_key = (*account_key, record.resource.model_id)
         model_count = sum(
-            (current.resource.account_key, current.resource.budget_key, current.resource.model_id) == model_key
+            (
+                current.resource.account_key,
+                current.resource.budget_key,
+                current.resource.model_id,
+            )
+            == model_key
             for current in active
         )
         if model_count >= self._account_model_capacity:
@@ -555,8 +607,12 @@ class FileAdmissionStore(AdmissionStore):
             account_capacity=account_capacity,
             account_model_capacity=account_model_capacity,
         )
-        self._state_path = _private_absolute_path(state_path, "invalid_admission_state_path")
-        self._lock_path = _private_absolute_path(lock_path, "invalid_admission_lock_path")
+        self._state_path = _private_absolute_path(
+            state_path, "invalid_admission_state_path"
+        )
+        self._lock_path = _private_absolute_path(
+            lock_path, "invalid_admission_lock_path"
+        )
         if self._state_path == self._lock_path:
             raise AdmissionError("admission_state_and_lock_must_differ")
         _ensure_private_parent(self._state_path.parent)
@@ -655,7 +711,10 @@ class FileAdmissionStore(AdmissionStore):
         if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
             raise AdmissionError("unsupported_admission_state_schema")
         raw_records = payload.get("records")
-        if not isinstance(raw_records, list) or len(raw_records) > MAX_STORED_ADMISSIONS:
+        if (
+            not isinstance(raw_records, list)
+            or len(raw_records) > MAX_STORED_ADMISSIONS
+        ):
             raise AdmissionError("invalid_admission_state_records")
         records: dict[str, AdmissionRecord] = {}
         for raw_record in raw_records:
@@ -668,15 +727,24 @@ class FileAdmissionStore(AdmissionStore):
     def _write_records(self) -> None:
         payload = {
             "schema_version": 1,
-            "records": [_record_to_payload(record) for record in self._records.values()],
+            "records": [
+                _record_to_payload(record) for record in self._records.values()
+            ],
         }
-        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+        encoded = (
+            json.dumps(
+                payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        )
         if len(encoded.encode("utf-8")) > MAX_ADMISSION_STATE_BYTES:
             raise AdmissionError("admission_state_too_large")
         descriptor: int | None = None
         temporary: Path | None = None
         try:
-            descriptor, name = tempfile.mkstemp(prefix=f".{self._state_path.name}.", dir=self._state_path.parent)
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{self._state_path.name}.", dir=self._state_path.parent
+            )
             temporary = Path(name)
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -720,18 +788,40 @@ _EXPIRABLE_STATES = frozenset(
 )
 
 _ALLOWED_TRANSITIONS = {
-    AdmissionState.PLANNED: frozenset({AdmissionState.RESERVED, AdmissionState.EXPIRED, AdmissionState.CANCELLED}),
+    AdmissionState.PLANNED: frozenset(
+        {AdmissionState.RESERVED, AdmissionState.EXPIRED, AdmissionState.CANCELLED}
+    ),
     AdmissionState.RESERVED: frozenset(
-        {AdmissionState.REVALIDATING, AdmissionState.CONFLICT, AdmissionState.EXPIRED, AdmissionState.CANCELLED}
+        {
+            AdmissionState.REVALIDATING,
+            AdmissionState.CONFLICT,
+            AdmissionState.EXPIRED,
+            AdmissionState.CANCELLED,
+        }
     ),
     AdmissionState.REVALIDATING: frozenset(
-        {AdmissionState.ADMITTED, AdmissionState.DENIED, AdmissionState.EXPIRED, AdmissionState.CANCELLED}
+        {
+            AdmissionState.ADMITTED,
+            AdmissionState.DENIED,
+            AdmissionState.EXPIRED,
+            AdmissionState.CANCELLED,
+        }
     ),
     AdmissionState.ADMITTED: frozenset(
-        {AdmissionState.EXECUTING, AdmissionState.EXECUTION_FAILED, AdmissionState.EXPIRED, AdmissionState.CANCELLED}
+        {
+            AdmissionState.EXECUTING,
+            AdmissionState.EXECUTION_FAILED,
+            AdmissionState.EXPIRED,
+            AdmissionState.CANCELLED,
+        }
     ),
     AdmissionState.EXECUTING: frozenset(
-        {AdmissionState.PAUSED, AdmissionState.FINALIZED, AdmissionState.RECOVERED_AFTER_CRASH, AdmissionState.EXECUTION_FAILED}
+        {
+            AdmissionState.PAUSED,
+            AdmissionState.FINALIZED,
+            AdmissionState.RECOVERED_AFTER_CRASH,
+            AdmissionState.EXECUTION_FAILED,
+        }
     ),
     AdmissionState.PAUSED: frozenset(
         {AdmissionState.EXECUTING, AdmissionState.EXPIRED, AdmissionState.CANCELLED}
@@ -756,7 +846,11 @@ def _scope_conflicts(left: AdmissionRecord, right: AdmissionRecord) -> bool:
         return False
     if left.scope.mode == "read" and right.scope.mode == "read":
         return False
-    return any(_scope_paths_overlap(left_path, right_path) for left_path in left.scope.paths for right_path in right.scope.paths)
+    return any(
+        _scope_paths_overlap(left_path, right_path)
+        for left_path in left.scope.paths
+        for right_path in right.scope.paths
+    )
 
 
 def _scope_paths_overlap(left: str, right: str) -> bool:
@@ -817,7 +911,10 @@ def _record_from_payload(payload: object) -> AdmissionRecord:
         resource = payload["resource"]
         lease_context = payload["lease_context"]
         priority = payload["priority"]
-        if not all(isinstance(value, Mapping) for value in (scope, resource, lease_context, priority)):
+        if not all(
+            isinstance(value, Mapping)
+            for value in (scope, resource, lease_context, priority)
+        ):
             raise AdmissionError("invalid_admission_state")
         raw_paths = scope["paths"]
         if not isinstance(raw_paths, list):
@@ -848,7 +945,9 @@ def _record_from_payload(payload: object) -> AdmissionRecord:
                     else None
                 ),
             ),
-            LeaseBinding(lease_context["expected_state"], lease_context.get("lease_id")),
+            LeaseBinding(
+                lease_context["expected_state"], lease_context.get("lease_id")
+            ),
             AdmissionPriority(priority["dispatch"], priority["selection_reason"]),
             AdmissionState(payload["state"]),
             _parse_timestamp(payload["created_at_utc"], "invalid_created_timestamp"),
@@ -902,18 +1001,30 @@ def _ensure_private_parent(path: Path) -> None:
 
 
 def _bounded_text(value: object, code: str, maximum: int) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= maximum or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= maximum
+        or any(ord(char) < 32 for char in value)
+    ):
         raise AdmissionError(code)
     return value
 
 
 def _bounded_int(value: object, code: str, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
         raise AdmissionError(code)
     return value
 
 
 def _aware(value: object, code: str) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
         raise AdmissionError(code)
     return value

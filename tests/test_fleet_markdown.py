@@ -47,8 +47,7 @@ _PCLOUD_ROOT_RULE = (
 ).encode("utf-8")
 _PCLOUD_GREP_RULE = "Normales GNU `grep` nicht verwenden".encode("utf-8")
 _PCLOUD_EXCEPTION_RULE = (
-    "Explizite Suche im jeweils benannten pCloud-Namensraum ist die einzige "
-    "Ausnahme"
+    "Explizite Suche im jeweils benannten pCloud-Namensraum ist die einzige Ausnahme"
 ).encode("utf-8")
 _PUBLIC_DOCUMENTATION_OPSEC_REFERENCE = (
     b"docs/development.md#public-documentation-opsec"
@@ -65,12 +64,10 @@ _RUNTIME_MIGRATION_POLICY_SOURCE = (
 )
 _RUNTIME_MIGRATION_POLICY_BEGIN = b"<!-- hive-runtime-migration-policy-v1:begin "
 _TEAMLEAD_RUNTIME_MIGRATION_MARKERS = (
-    b"Keep a small feature change separate from a runtime or installation "
-    b"migration.",
+    b"Keep a small feature change separate from a runtime or installation migration.",
     b"scope/budget gate",
     b"separate prerequisite work package",
-    b"read-only live preflight before development and before a requested "
-    b"cutover.",
+    b"read-only live preflight before development and before a requested cutover.",
     b"focused tests before a final independent review",
     b"real consumer E2E contract",
     b"bound dry run, CAS/fencing, journal, rollback/HOLD, secrecy, and "
@@ -111,8 +108,7 @@ _TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS = (
 )
 _QUEEN_RUNTIME_MIGRATION_MARKERS = (
     b"runtime-migration-policy-v1.json",
-    b"no live lifecycle authority: do not Install, Activate, Reload, or "
-    b"Cutover.",
+    b"no live lifecycle authority: do not Install, Activate, Reload, or Cutover.",
     b"only read-only, attested evidence",
     b"do not infer a live authority or a compatibility fallback.",
 )
@@ -239,7 +235,9 @@ def test_providers_share_exact_common_prefix_and_only_reference_class_body() -> 
         assert worker_body not in primary
 
 
-def test_pcloud_search_policy_projects_to_all_effective_catalog_profiles_and_provider_homes() -> None:
+def test_pcloud_search_policy_projects_to_all_effective_catalog_profiles_and_provider_homes() -> (
+    None
+):
     contract = load_common_policy()
     profiles = server_module._known_runtime_skill_profiles("test_invalid_profile")
     assert profiles == frozenset(
@@ -272,7 +270,9 @@ def test_pcloud_search_policy_projects_to_all_effective_catalog_profiles_and_pro
 
             assert primary.startswith(contract.common_bytes)
             assert projection.metadata.class_profile == profile
-            assert projection.metadata.class_artifact_name == expected_class_artifact_name
+            assert (
+                projection.metadata.class_artifact_name == expected_class_artifact_name
+            )
             for glob in _PCLOUD_RIPGREP_GLOBS:
                 assert primary.count(glob) == 1
             assert _PCLOUD_GREP_RULE in normalized_primary
@@ -305,9 +305,7 @@ def test_public_documentation_opsec_policy_is_source_linked_and_projects_to_core
             projection = fleet_markdown.fleet_markdown_projection(
                 _agent(runner, profile)
             )
-            primary = projection.artifacts[
-                projection.metadata.provider_artifact_name
-            ]
+            primary = projection.artifacts[projection.metadata.provider_artifact_name]
 
             assert primary[: len(contract.common_bytes)] == common_source
             assert _PUBLIC_DOCUMENTATION_OPSEC_REFERENCE in primary
@@ -356,23 +354,18 @@ def test_runtime_migration_policy_materializes_to_role_homes() -> None:
     contract = load_common_policy()
     class_markers = {
         "koenigin": (
-            _QUEEN_RUNTIME_MIGRATION_MARKERS
-            + _QUEEN_DIAGNOSTIC_EVIDENCE_MARKERS
+            _QUEEN_RUNTIME_MIGRATION_MARKERS + _QUEEN_DIAGNOSTIC_EVIDENCE_MARKERS
         ),
         "teamleiterin": (
-            _TEAMLEAD_RUNTIME_MIGRATION_MARKERS
-            + _TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS
+            _TEAMLEAD_RUNTIME_MIGRATION_MARKERS + _TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS
         ),
         "worker": (
-            _WORKER_RUNTIME_MIGRATION_MARKERS
-            + _WORKER_DIAGNOSTIC_EVIDENCE_MARKERS
+            _WORKER_RUNTIME_MIGRATION_MARKERS + _WORKER_DIAGNOSTIC_EVIDENCE_MARKERS
         ),
     }
 
     source_path = _MARKDOWN_ROOT / "runtime-migration-policy-v1.json"
-    source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest().encode(
-        "ascii"
-    )
+    source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest().encode("ascii")
     assert _RUNTIME_MIGRATION_POLICY_BEGIN in contract.common_bytes
     assert b'"source_digest":"sha256:' + source_digest + b'"' in contract.common_bytes
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -400,8 +393,7 @@ def test_both_teamlead_role_profiles_share_runtime_migration_contract() -> None:
         normalized_body = b" ".join(body.split())
 
         for marker in (
-            _TEAMLEAD_RUNTIME_MIGRATION_MARKERS
-            + _TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS
+            _TEAMLEAD_RUNTIME_MIGRATION_MARKERS + _TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS
         ):
             assert marker in normalized_body
 
@@ -824,32 +816,32 @@ def test_document_policies_materialize_all_profiles_without_changing_question_hi
         for meaning in required_language_contract:
             assert meaning in normalized
         required_priority_contract = (
-            'Jedes Markdown-Dokument mit Fragen an die Userin oder mit Entscheidungen',
-            'im YAML-Frontmatter genau ein top-level-Feld `priority`',
-            '`Offene-Frage`- und `codex-question`-Notizen',
-            'auch reine Entscheidungsdokumente',
-            'hiveweit für alle Rollen, Provider, Klassen, Repositories und Lifecycles',
-            'unabhängig vom Fragestatus',
-            '`priority: niedrig` gilt, wenn die Frage oder Entscheidung das Weiterarbeiten nie blockiert',
-            '`priority: mittel` setzt einen späteren, aufschiebbaren Arbeitsstopp voraus',
-            'voraussichtlich noch mindestens einen Tag weitergearbeitet werden kann',
-            'keine grundlegenden Strukturveränderungen betroffen sind',
-            '`priority: hoch` gilt bei grundlegenden Strukturveränderungen auch ohne unmittelbaren Arbeitsstopp',
-            'bei unmittelbar blockierter Weiterarbeit',
-            'realistisch innerhalb eines Tages drohenden Arbeitsstopp ohne Antwort',
-            'Die Kriterien für `hoch` haben Vorrang',
-            'höchste zutreffende Einstufung den einzigen Dokumentwert',
-            'Tagesprognose muss auf dem tatsächlichen Arbeitsplan beruhen',
-            'Keine Zeitangaben erfinden',
-            'Ein unbekannter Zeithorizont belegt weder `mittel` noch allein `hoch`',
-            'Ein bisheriger `null`-Platzhalter ersetzt keine anhand der Kriterien mögliche Einstufung',
-            'Tatsächlich fehlende Entscheidungsgrundlagen und die dadurch offene Einstufung müssen ausdrücklich benannt werden',
-            'Beim Erstellen, Bearbeiten und vor der Übergabe ist die Einstufung zu prüfen',
-            'Abweichende bestehende Werte sind nachvollziehbar zu korrigieren',
-            'Unveränderte historische Dokumente dürfen nicht pauschal rückwirkend umklassifiziert werden',
-            'Fehlende oder doppelte top-level-Felder sind unzulässig',
-            'Antworten, Fragestatus und Annotation-Marker bleiben erhalten',
-            'auch beim Fortsetzen oder Resumen',
+            "Jedes Markdown-Dokument mit Fragen an die Userin oder mit Entscheidungen",
+            "im YAML-Frontmatter genau ein top-level-Feld `priority`",
+            "`Offene-Frage`- und `codex-question`-Notizen",
+            "auch reine Entscheidungsdokumente",
+            "hiveweit für alle Rollen, Provider, Klassen, Repositories und Lifecycles",
+            "unabhängig vom Fragestatus",
+            "`priority: niedrig` gilt, wenn die Frage oder Entscheidung das Weiterarbeiten nie blockiert",
+            "`priority: mittel` setzt einen späteren, aufschiebbaren Arbeitsstopp voraus",
+            "voraussichtlich noch mindestens einen Tag weitergearbeitet werden kann",
+            "keine grundlegenden Strukturveränderungen betroffen sind",
+            "`priority: hoch` gilt bei grundlegenden Strukturveränderungen auch ohne unmittelbaren Arbeitsstopp",
+            "bei unmittelbar blockierter Weiterarbeit",
+            "realistisch innerhalb eines Tages drohenden Arbeitsstopp ohne Antwort",
+            "Die Kriterien für `hoch` haben Vorrang",
+            "höchste zutreffende Einstufung den einzigen Dokumentwert",
+            "Tagesprognose muss auf dem tatsächlichen Arbeitsplan beruhen",
+            "Keine Zeitangaben erfinden",
+            "Ein unbekannter Zeithorizont belegt weder `mittel` noch allein `hoch`",
+            "Ein bisheriger `null`-Platzhalter ersetzt keine anhand der Kriterien mögliche Einstufung",
+            "Tatsächlich fehlende Entscheidungsgrundlagen und die dadurch offene Einstufung müssen ausdrücklich benannt werden",
+            "Beim Erstellen, Bearbeiten und vor der Übergabe ist die Einstufung zu prüfen",
+            "Abweichende bestehende Werte sind nachvollziehbar zu korrigieren",
+            "Unveränderte historische Dokumente dürfen nicht pauschal rückwirkend umklassifiziert werden",
+            "Fehlende oder doppelte top-level-Felder sind unzulässig",
+            "Antworten, Fragestatus und Annotation-Marker bleiben erhalten",
+            "auch beim Fortsetzen oder Resumen",
         )
         for meaning in required_priority_contract:
             assert meaning in normalized, (provider, profile, meaning)
@@ -862,7 +854,9 @@ def test_document_policies_materialize_all_profiles_without_changing_question_hi
         )
         assert projection.metadata.class_profile == profile
         class_bytes = (home / projection.metadata.class_artifact_name).read_bytes()
-        assert class_bytes == projection.artifacts[projection.metadata.class_artifact_name]
+        assert (
+            class_bytes == projection.artifacts[projection.metadata.class_artifact_name]
+        )
         assert b"## Sprache in Dokumenten" not in class_bytes
         marker = json.loads((home / server_module.FLEET_AGENT_MARKER_FILE).read_bytes())
         assert marker["common_policy"] == {
@@ -891,7 +885,11 @@ def test_document_policies_materialize_all_profiles_without_changing_question_hi
         ), (provider, profile)
 
         preserved = {}
-        for filename, priority in (("report.md", "high"), ("plan.md", "null"), ("decision.md", "niedrig")):
+        for filename, priority in (
+            ("report.md", "high"),
+            ("plan.md", "null"),
+            ("decision.md", "niedrig"),
+        ):
             question = home / filename
             question.write_text(
                 f'---\npriority: {priority}\nstatus: answered\n---\n# Plan\n<mark data-annotation-id="question-1">Proceed?</mark>\n\n## Answer\nApproved.\n',

@@ -132,7 +132,9 @@ class CacheTelemetryValidationError(ValueError):
     """A bounded cache-telemetry value was malformed or unsafe to retain."""
 
 
-def _require_mapping(value: object, field: str, *, max_fields: int = MAX_NATIVE_MAPPING_FIELDS) -> Mapping[str, object]:
+def _require_mapping(
+    value: object, field: str, *, max_fields: int = MAX_NATIVE_MAPPING_FIELDS
+) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or len(value) > max_fields:
         raise CacheTelemetryValidationError(f"invalid_{field}")
     if any(not isinstance(key, str) for key in value):
@@ -141,19 +143,29 @@ def _require_mapping(value: object, field: str, *, max_fields: int = MAX_NATIVE_
 
 
 def _safe_identifier(value: object, field: str, *, maximum: int = 128) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= maximum or _SAFE_IDENTIFIER.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= maximum
+        or _SAFE_IDENTIFIER.fullmatch(value) is None
+    ):
         raise CacheTelemetryValidationError(f"invalid_{field}")
     return value
 
 
-def _optional_identifier(value: object, field: str, *, maximum: int = 128) -> str | None:
+def _optional_identifier(
+    value: object, field: str, *, maximum: int = 128
+) -> str | None:
     if value is None:
         return None
     return _safe_identifier(value, field, maximum=maximum)
 
 
 def _utc_datetime(value: object, field: str) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+    ):
         raise CacheTelemetryValidationError(f"invalid_{field}")
     return value.astimezone(UTC)
 
@@ -175,7 +187,11 @@ def _parse_timestamp(value: object, field: str) -> datetime:
 def _token(value: object, field: str) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_TOKEN_COUNT:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= MAX_TOKEN_COUNT
+    ):
         raise CacheTelemetryValidationError(f"invalid_{field}")
     return value
 
@@ -232,8 +248,20 @@ def _ratio(numerator: int | None, input_tokens: int | None) -> Decimal | None:
     return Decimal(numerator) / Decimal(input_tokens)
 
 
-def _coverage(*, input_tokens: int | None, cache_read_tokens: int | None, cache_write_tokens: int | None, cache_miss_tokens: int | None, uncached_input_tokens: int | None) -> str:
-    cache_values = (cache_read_tokens, cache_write_tokens, cache_miss_tokens, uncached_input_tokens)
+def _coverage(
+    *,
+    input_tokens: int | None,
+    cache_read_tokens: int | None,
+    cache_write_tokens: int | None,
+    cache_miss_tokens: int | None,
+    uncached_input_tokens: int | None,
+) -> str:
+    cache_values = (
+        cache_read_tokens,
+        cache_write_tokens,
+        cache_miss_tokens,
+        uncached_input_tokens,
+    )
     if input_tokens is None and all(value is None for value in cache_values):
         return "unknown"
     if input_tokens is not None and all(value is not None for value in cache_values):
@@ -291,13 +319,19 @@ class CacheCostEstimateV1:
     def from_dict(cls, value: object) -> CacheCostEstimateV1:
         data = _require_mapping(value, "cost_estimates", max_fields=6)
         expected = {
-            "pricing_generation", "normal_input_cost", "cache_read_cost",
-            "cache_write_cost", "output_cost", "reasoning_cost",
+            "pricing_generation",
+            "normal_input_cost",
+            "cache_read_cost",
+            "cache_write_cost",
+            "output_cost",
+            "reasoning_cost",
         }
         if set(data) != expected:
             raise CacheTelemetryValidationError("invalid_cost_estimates")
         return cls(
-            pricing_generation=_optional_identifier(data["pricing_generation"], "pricing_generation"),
+            pricing_generation=_optional_identifier(
+                data["pricing_generation"], "pricing_generation"
+            ),
             normal_input_cost=_decimal(data["normal_input_cost"], "normal_input_cost"),
             cache_read_cost=_decimal(data["cache_read_cost"], "cache_read_cost"),
             cache_write_cost=_decimal(data["cache_write_cost"], "cache_write_cost"),
@@ -329,12 +363,24 @@ class CacheTelemetryContextV1:
         for field in ("account_ref", "request_id", "session_id"):
             _safe_identifier(getattr(self, field), field)
         _utc_datetime(self.observed_at, "observed_at")
-        for field in ("requested_service_tier", "effective_service_tier", "context_class", "cache_mode"):
+        for field in (
+            "requested_service_tier",
+            "effective_service_tier",
+            "context_class",
+            "cache_mode",
+        ):
             _optional_identifier(getattr(self, field), field, maximum=96)
         _optional_pseudonym(self.cache_key_pseudonym, "cache_key_pseudonym")
-        if self.breakpoint_count is not None and (isinstance(self.breakpoint_count, bool) or not isinstance(self.breakpoint_count, int) or not 0 <= self.breakpoint_count <= 100_000):
+        if self.breakpoint_count is not None and (
+            isinstance(self.breakpoint_count, bool)
+            or not isinstance(self.breakpoint_count, int)
+            or not 0 <= self.breakpoint_count <= 100_000
+        ):
             raise CacheTelemetryValidationError("invalid_breakpoint_count")
-        if not isinstance(self.costs, CacheCostEstimateV1) or self.freshness not in _FRESHNESS:
+        if (
+            not isinstance(self.costs, CacheCostEstimateV1)
+            or self.freshness not in _FRESHNESS
+        ):
             raise CacheTelemetryValidationError("invalid_cache_context")
 
 
@@ -373,14 +419,28 @@ class CacheTelemetryV1:
     freshness: str = "fresh"
 
     def __post_init__(self) -> None:
-        if self.provider not in _PROVIDERS or self.data_source not in _DATA_SOURCES or _SOURCE_PROVIDERS[self.data_source] != self.provider:
+        if (
+            self.provider not in _PROVIDERS
+            or self.data_source not in _DATA_SOURCES
+            or _SOURCE_PROVIDERS[self.data_source] != self.provider
+        ):
             raise CacheTelemetryValidationError("invalid_provider_source")
-        for field, maximum in (("model", 192), ("account_ref", 128), ("request_id", 128), ("session_id", 128)):
+        for field, maximum in (
+            ("model", 192),
+            ("account_ref", 128),
+            ("request_id", 128),
+            ("session_id", 128),
+        ):
             _safe_identifier(getattr(self, field), field, maximum=maximum)
         _utc_datetime(self.observed_at, "observed_at")
         for field in (
-            "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
-            "cache_write_tokens", "cache_miss_tokens", "uncached_input_tokens",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cache_miss_tokens",
+            "uncached_input_tokens",
         ):
             _token(getattr(self, field), field)
         expected_ratios = (
@@ -388,34 +448,70 @@ class CacheTelemetryV1:
             _ratio(self.cache_write_tokens, self.input_tokens),
             _ratio(self.cache_miss_tokens, self.input_tokens),
         )
-        actual_ratios = (self.cache_read_ratio, self.cache_write_ratio, self.cache_miss_ratio)
-        if any(_ratio_decimal(value) != expected for value, expected in zip(actual_ratios, expected_ratios, strict=True)):
+        actual_ratios = (
+            self.cache_read_ratio,
+            self.cache_write_ratio,
+            self.cache_miss_ratio,
+        )
+        if any(
+            _ratio_decimal(value) != expected
+            for value, expected in zip(actual_ratios, expected_ratios, strict=True)
+        ):
             raise CacheTelemetryValidationError("invalid_cache_ratio")
-        for field in ("requested_service_tier", "effective_service_tier", "context_class", "cache_mode"):
+        for field in (
+            "requested_service_tier",
+            "effective_service_tier",
+            "context_class",
+            "cache_mode",
+        ):
             _optional_identifier(getattr(self, field), field, maximum=96)
         _optional_pseudonym(self.cache_key_pseudonym, "cache_key_pseudonym")
-        if self.breakpoint_count is not None and (isinstance(self.breakpoint_count, bool) or not isinstance(self.breakpoint_count, int) or not 0 <= self.breakpoint_count <= 100_000):
+        if self.breakpoint_count is not None and (
+            isinstance(self.breakpoint_count, bool)
+            or not isinstance(self.breakpoint_count, int)
+            or not 0 <= self.breakpoint_count <= 100_000
+        ):
             raise CacheTelemetryValidationError("invalid_breakpoint_count")
-        if not isinstance(self.native_field_names, tuple) or len(self.native_field_names) > 16 or tuple(sorted(set(self.native_field_names))) != self.native_field_names or not set(self.native_field_names) <= _ALLOWED_NATIVE_FIELDS or not set(self.native_field_names) <= _PROVIDER_NATIVE_FIELDS[self.provider]:
+        if (
+            not isinstance(self.native_field_names, tuple)
+            or len(self.native_field_names) > 16
+            or tuple(sorted(set(self.native_field_names))) != self.native_field_names
+            or not set(self.native_field_names) <= _ALLOWED_NATIVE_FIELDS
+            or not set(self.native_field_names)
+            <= _PROVIDER_NATIVE_FIELDS[self.provider]
+        ):
             raise CacheTelemetryValidationError("invalid_native_field_names")
         if self.uncached_input_tokens is not None:
             raise CacheTelemetryValidationError("unsupported_uncached_input_tokens")
-        expected_provenance = tuple(sorted(
-            provenance
-            for metric, provenance in _SOURCE_METRIC_PROVENANCE[self.data_source].items()
-            if getattr(self, metric) is not None
-        ))
+        expected_provenance = tuple(
+            sorted(
+                provenance
+                for metric, provenance in _SOURCE_METRIC_PROVENANCE[
+                    self.data_source
+                ].items()
+                if getattr(self, metric) is not None
+            )
+        )
         if self.native_field_names != expected_provenance:
             raise CacheTelemetryValidationError("incoherent_native_provenance")
-        if not isinstance(self.costs, CacheCostEstimateV1) or self.coverage not in _COVERAGE or self.coverage != _coverage(
-            input_tokens=self.input_tokens,
-            cache_read_tokens=self.cache_read_tokens,
-            cache_write_tokens=self.cache_write_tokens,
-            cache_miss_tokens=self.cache_miss_tokens,
-            uncached_input_tokens=self.uncached_input_tokens,
+        if (
+            not isinstance(self.costs, CacheCostEstimateV1)
+            or self.coverage not in _COVERAGE
+            or self.coverage
+            != _coverage(
+                input_tokens=self.input_tokens,
+                cache_read_tokens=self.cache_read_tokens,
+                cache_write_tokens=self.cache_write_tokens,
+                cache_miss_tokens=self.cache_miss_tokens,
+                uncached_input_tokens=self.uncached_input_tokens,
+            )
         ):
             raise CacheTelemetryValidationError("invalid_cache_coverage")
-        if self.parser_generation != PARSER_GENERATION or self.validation_status != "valid" or self.freshness not in _FRESHNESS:
+        if (
+            self.parser_generation != PARSER_GENERATION
+            or self.validation_status != "valid"
+            or self.freshness not in _FRESHNESS
+        ):
             raise CacheTelemetryValidationError("invalid_cache_validation")
 
     @property
@@ -424,23 +520,36 @@ class CacheTelemetryV1:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "record_kind": "cache_telemetry_v1", "schema_version": SCHEMA_VERSION,
-            "provider": self.provider, "model": self.model, "account_ref": self.account_ref,
-            "request_id": self.request_id, "session_id": self.session_id,
-            "observed_at": _timestamp(self.observed_at), "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens, "reasoning_tokens": self.reasoning_tokens,
-            "cache_read_tokens": self.cache_read_tokens, "cache_write_tokens": self.cache_write_tokens,
-            "cache_miss_tokens": self.cache_miss_tokens, "uncached_input_tokens": self.uncached_input_tokens,
+            "record_kind": "cache_telemetry_v1",
+            "schema_version": SCHEMA_VERSION,
+            "provider": self.provider,
+            "model": self.model,
+            "account_ref": self.account_ref,
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "observed_at": _timestamp(self.observed_at),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cache_miss_tokens": self.cache_miss_tokens,
+            "uncached_input_tokens": self.uncached_input_tokens,
             "cache_read_ratio": _decimal_text(self.cache_read_ratio),
             "cache_write_ratio": _decimal_text(self.cache_write_ratio),
             "cache_miss_ratio": _decimal_text(self.cache_miss_ratio),
             "requested_service_tier": self.requested_service_tier,
             "effective_service_tier": self.effective_service_tier,
-            "context_class": self.context_class, "cache_mode": self.cache_mode,
-            "cache_key_pseudonym": self.cache_key_pseudonym, "breakpoint_count": self.breakpoint_count,
-            "native_field_names": list(self.native_field_names), "costs": self.costs.to_dict(),
-            "coverage": self.coverage, "data_source": self.data_source,
-            "parser_generation": self.parser_generation, "validation_status": self.validation_status,
+            "context_class": self.context_class,
+            "cache_mode": self.cache_mode,
+            "cache_key_pseudonym": self.cache_key_pseudonym,
+            "breakpoint_count": self.breakpoint_count,
+            "native_field_names": list(self.native_field_names),
+            "costs": self.costs.to_dict(),
+            "coverage": self.coverage,
+            "data_source": self.data_source,
+            "parser_generation": self.parser_generation,
+            "validation_status": self.validation_status,
             "freshness": self.freshness,
         }
 
@@ -448,28 +557,59 @@ class CacheTelemetryV1:
     def from_dict(cls, value: object) -> CacheTelemetryV1:
         data = _require_mapping(value, "cache_record", max_fields=40)
         expected = set(cls.__dataclass_fields__) | {"record_kind", "schema_version"}
-        if set(data) != expected or data["record_kind"] != "cache_telemetry_v1" or data["schema_version"] != SCHEMA_VERSION:
+        if (
+            set(data) != expected
+            or data["record_kind"] != "cache_telemetry_v1"
+            or data["schema_version"] != SCHEMA_VERSION
+        ):
             raise CacheTelemetryValidationError("invalid_cache_record")
         field_names = data["native_field_names"]
-        if not isinstance(field_names, list) or any(not isinstance(item, str) for item in field_names):
+        if not isinstance(field_names, list) or any(
+            not isinstance(item, str) for item in field_names
+        ):
             raise CacheTelemetryValidationError("invalid_native_field_names")
         return cls(
-            provider=data["provider"], model=data["model"], account_ref=data["account_ref"],
-            request_id=data["request_id"], session_id=data["session_id"],
+            provider=data["provider"],
+            model=data["model"],
+            account_ref=data["account_ref"],
+            request_id=data["request_id"],
+            session_id=data["session_id"],
             observed_at=_parse_timestamp(data["observed_at"], "observed_at"),
-            input_tokens=_token(data["input_tokens"], "input_tokens"), output_tokens=_token(data["output_tokens"], "output_tokens"),
-            reasoning_tokens=_token(data["reasoning_tokens"], "reasoning_tokens"), cache_read_tokens=_token(data["cache_read_tokens"], "cache_read_tokens"),
-            cache_write_tokens=_token(data["cache_write_tokens"], "cache_write_tokens"), cache_miss_tokens=_token(data["cache_miss_tokens"], "cache_miss_tokens"),
-            uncached_input_tokens=_token(data["uncached_input_tokens"], "uncached_input_tokens"),
-            cache_read_ratio=_decimal(data["cache_read_ratio"], "cache_read_ratio"), cache_write_ratio=_decimal(data["cache_write_ratio"], "cache_write_ratio"),
+            input_tokens=_token(data["input_tokens"], "input_tokens"),
+            output_tokens=_token(data["output_tokens"], "output_tokens"),
+            reasoning_tokens=_token(data["reasoning_tokens"], "reasoning_tokens"),
+            cache_read_tokens=_token(data["cache_read_tokens"], "cache_read_tokens"),
+            cache_write_tokens=_token(data["cache_write_tokens"], "cache_write_tokens"),
+            cache_miss_tokens=_token(data["cache_miss_tokens"], "cache_miss_tokens"),
+            uncached_input_tokens=_token(
+                data["uncached_input_tokens"], "uncached_input_tokens"
+            ),
+            cache_read_ratio=_decimal(data["cache_read_ratio"], "cache_read_ratio"),
+            cache_write_ratio=_decimal(data["cache_write_ratio"], "cache_write_ratio"),
             cache_miss_ratio=_decimal(data["cache_miss_ratio"], "cache_miss_ratio"),
-            requested_service_tier=_optional_identifier(data["requested_service_tier"], "requested_service_tier", maximum=96),
-            effective_service_tier=_optional_identifier(data["effective_service_tier"], "effective_service_tier", maximum=96),
-            context_class=_optional_identifier(data["context_class"], "context_class", maximum=96),
-            cache_mode=_optional_identifier(data["cache_mode"], "cache_mode", maximum=96),
-            cache_key_pseudonym=_optional_pseudonym(data["cache_key_pseudonym"], "cache_key_pseudonym"), breakpoint_count=data["breakpoint_count"],
-            native_field_names=tuple(field_names), costs=CacheCostEstimateV1.from_dict(data["costs"]), coverage=data["coverage"],
-            data_source=data["data_source"], parser_generation=data["parser_generation"], validation_status=data["validation_status"], freshness=data["freshness"],
+            requested_service_tier=_optional_identifier(
+                data["requested_service_tier"], "requested_service_tier", maximum=96
+            ),
+            effective_service_tier=_optional_identifier(
+                data["effective_service_tier"], "effective_service_tier", maximum=96
+            ),
+            context_class=_optional_identifier(
+                data["context_class"], "context_class", maximum=96
+            ),
+            cache_mode=_optional_identifier(
+                data["cache_mode"], "cache_mode", maximum=96
+            ),
+            cache_key_pseudonym=_optional_pseudonym(
+                data["cache_key_pseudonym"], "cache_key_pseudonym"
+            ),
+            breakpoint_count=data["breakpoint_count"],
+            native_field_names=tuple(field_names),
+            costs=CacheCostEstimateV1.from_dict(data["costs"]),
+            coverage=data["coverage"],
+            data_source=data["data_source"],
+            parser_generation=data["parser_generation"],
+            validation_status=data["validation_status"],
+            freshness=data["freshness"],
         )
 
 
@@ -514,18 +654,36 @@ class ContextResetTelemetryV1:
     freshness: str = "fresh"
 
     def __post_init__(self) -> None:
-        for field, maximum in (("event_id", 128), ("session_id", 128), ("assignment_ref", 128), ("model", 192), ("account_ref", 128)):
+        for field, maximum in (
+            ("event_id", 128),
+            ("session_id", 128),
+            ("assignment_ref", 128),
+            ("model", 192),
+            ("account_ref", 128),
+        ):
             _safe_identifier(getattr(self, field), field, maximum=maximum)
         if self.provider not in _PROVIDERS or self.reset_kind not in _RESET_KINDS:
             raise CacheTelemetryValidationError("invalid_reset_kind")
         _utc_datetime(self.occurred_at, "occurred_at")
-        for field in ("context_class", "lifecycle", "native_cause", "related_pre_reset_request_id", "related_post_reset_request_id"):
+        for field in (
+            "context_class",
+            "lifecycle",
+            "native_cause",
+            "related_pre_reset_request_id",
+            "related_post_reset_request_id",
+        ):
             _optional_identifier(getattr(self, field), field, maximum=128)
         for field in (
-            "pre_reset_context_tokens", "preserved_tokens", "first_post_reset_input_tokens",
-            "first_post_reset_cache_read_tokens", "first_post_reset_cache_write_tokens",
-            "first_post_reset_cache_miss_tokens", "first_post_reset_reasoning_tokens",
-            "first_post_reset_output_tokens", "recovery_reread_tokens", "recovery_replayed_tokens",
+            "pre_reset_context_tokens",
+            "preserved_tokens",
+            "first_post_reset_input_tokens",
+            "first_post_reset_cache_read_tokens",
+            "first_post_reset_cache_write_tokens",
+            "first_post_reset_cache_miss_tokens",
+            "first_post_reset_reasoning_tokens",
+            "first_post_reset_output_tokens",
+            "recovery_reread_tokens",
+            "recovery_replayed_tokens",
             "recovery_tool_calls",
         ):
             _token(getattr(self, field), field)
@@ -533,29 +691,61 @@ class ContextResetTelemetryV1:
         _decimal_instance(self.recovery_cost, "recovery_cost")
         if not isinstance(self.recovery_checkpoint_reached, bool):
             raise CacheTelemetryValidationError("invalid_recovery_checkpoint")
-        if not self.recovery_checkpoint_reached and (self.recovery_duration_seconds is not None or self.recovery_cost is not None):
+        if not self.recovery_checkpoint_reached and (
+            self.recovery_duration_seconds is not None or self.recovery_cost is not None
+        ):
             raise CacheTelemetryValidationError("unproven_recovery_checkpoint")
-        _optional_pseudonym(self.previous_cache_key_pseudonym, "previous_cache_key_pseudonym")
+        _optional_pseudonym(
+            self.previous_cache_key_pseudonym, "previous_cache_key_pseudonym"
+        )
         _optional_pseudonym(self.next_cache_key_pseudonym, "next_cache_key_pseudonym")
-        if self.resume_capsule_generation is not None and (isinstance(self.resume_capsule_generation, bool) or not isinstance(self.resume_capsule_generation, int) or not 1 <= self.resume_capsule_generation <= 2**31 - 1):
+        if self.resume_capsule_generation is not None and (
+            isinstance(self.resume_capsule_generation, bool)
+            or not isinstance(self.resume_capsule_generation, int)
+            or not 1 <= self.resume_capsule_generation <= 2**31 - 1
+        ):
             raise CacheTelemetryValidationError("invalid_resume_capsule_generation")
-        if not isinstance(self.native_field_names, tuple) or len(self.native_field_names) > 16 or tuple(sorted(set(self.native_field_names))) != self.native_field_names or not set(self.native_field_names) <= _ALLOWED_NATIVE_FIELDS or not set(self.native_field_names) <= _PROVIDER_NATIVE_FIELDS[self.provider]:
+        if (
+            not isinstance(self.native_field_names, tuple)
+            or len(self.native_field_names) > 16
+            or tuple(sorted(set(self.native_field_names))) != self.native_field_names
+            or not set(self.native_field_names) <= _ALLOWED_NATIVE_FIELDS
+            or not set(self.native_field_names)
+            <= _PROVIDER_NATIVE_FIELDS[self.provider]
+        ):
             raise CacheTelemetryValidationError("invalid_native_field_names")
-        if self.related_pre_reset_request_id is None and self.related_post_reset_request_id is None:
+        if (
+            self.related_pre_reset_request_id is None
+            and self.related_post_reset_request_id is None
+        ):
             raise CacheTelemetryValidationError("unlinked_reset_telemetry")
-        expected_reset_coverage = _reset_coverage((
-            self.pre_reset_context_tokens, self.preserved_tokens,
-            self.first_post_reset_input_tokens, self.first_post_reset_cache_read_tokens,
-            self.first_post_reset_cache_write_tokens, self.first_post_reset_cache_miss_tokens,
-            self.first_post_reset_reasoning_tokens, self.first_post_reset_output_tokens,
-        ))
-        expected_recovery_coverage = _reset_coverage((
-            self.recovery_reread_tokens, self.recovery_replayed_tokens,
-            self.recovery_tool_calls,
-            None if self.recovery_duration_seconds is None else 0,
-            None if self.recovery_cost is None else 0,
-        ))
-        if self.reset_coverage != expected_reset_coverage or self.recovery_coverage != expected_recovery_coverage or self.parser_generation != PARSER_GENERATION or self.freshness not in _FRESHNESS:
+        expected_reset_coverage = _reset_coverage(
+            (
+                self.pre_reset_context_tokens,
+                self.preserved_tokens,
+                self.first_post_reset_input_tokens,
+                self.first_post_reset_cache_read_tokens,
+                self.first_post_reset_cache_write_tokens,
+                self.first_post_reset_cache_miss_tokens,
+                self.first_post_reset_reasoning_tokens,
+                self.first_post_reset_output_tokens,
+            )
+        )
+        expected_recovery_coverage = _reset_coverage(
+            (
+                self.recovery_reread_tokens,
+                self.recovery_replayed_tokens,
+                self.recovery_tool_calls,
+                None if self.recovery_duration_seconds is None else 0,
+                None if self.recovery_cost is None else 0,
+            )
+        )
+        if (
+            self.reset_coverage != expected_reset_coverage
+            or self.recovery_coverage != expected_recovery_coverage
+            or self.parser_generation != PARSER_GENERATION
+            or self.freshness not in _FRESHNESS
+        ):
             raise CacheTelemetryValidationError("invalid_reset_telemetry")
 
     @property
@@ -564,29 +754,42 @@ class ContextResetTelemetryV1:
 
     def to_dict(self) -> dict[str, object]:
         values = {name: getattr(self, name) for name in self.__dataclass_fields__}
-        values.update({
-            "record_kind": "context_reset_telemetry_v1", "schema_version": SCHEMA_VERSION,
-            "occurred_at": _timestamp(self.occurred_at),
-            "recovery_duration_seconds": _decimal_text(self.recovery_duration_seconds),
-            "recovery_cost": _decimal_text(self.recovery_cost),
-            "native_field_names": list(self.native_field_names),
-        })
+        values.update(
+            {
+                "record_kind": "context_reset_telemetry_v1",
+                "schema_version": SCHEMA_VERSION,
+                "occurred_at": _timestamp(self.occurred_at),
+                "recovery_duration_seconds": _decimal_text(
+                    self.recovery_duration_seconds
+                ),
+                "recovery_cost": _decimal_text(self.recovery_cost),
+                "native_field_names": list(self.native_field_names),
+            }
+        )
         return values
 
     @classmethod
     def from_dict(cls, value: object) -> ContextResetTelemetryV1:
         data = _require_mapping(value, "reset_record", max_fields=48)
         expected = set(cls.__dataclass_fields__) | {"record_kind", "schema_version"}
-        if set(data) != expected or data["record_kind"] != "context_reset_telemetry_v1" or data["schema_version"] != SCHEMA_VERSION:
+        if (
+            set(data) != expected
+            or data["record_kind"] != "context_reset_telemetry_v1"
+            or data["schema_version"] != SCHEMA_VERSION
+        ):
             raise CacheTelemetryValidationError("invalid_reset_record")
         names = data["native_field_names"]
-        if not isinstance(names, list) or any(not isinstance(item, str) for item in names):
+        if not isinstance(names, list) or any(
+            not isinstance(item, str) for item in names
+        ):
             raise CacheTelemetryValidationError("invalid_native_field_names")
         fields = dict(data)
         fields.pop("record_kind")
         fields.pop("schema_version")
         fields["occurred_at"] = _parse_timestamp(fields["occurred_at"], "occurred_at")
-        fields["recovery_duration_seconds"] = _decimal(fields["recovery_duration_seconds"], "recovery_duration_seconds")
+        fields["recovery_duration_seconds"] = _decimal(
+            fields["recovery_duration_seconds"], "recovery_duration_seconds"
+        )
         fields["recovery_cost"] = _decimal(fields["recovery_cost"], "recovery_cost")
         fields["native_field_names"] = tuple(names)
         return cls(**fields)  # type: ignore[arg-type]
@@ -600,13 +803,17 @@ def _usage(payload: object) -> Mapping[str, object] | None:
     return _require_mapping(usage, "native_usage")
 
 
-def _nested(usage: Mapping[str, object] | None, name: str) -> Mapping[str, object] | None:
+def _nested(
+    usage: Mapping[str, object] | None, name: str
+) -> Mapping[str, object] | None:
     if usage is None or usage.get(name) is None:
         return None
     return _require_mapping(usage[name], f"native_{name}", max_fields=32)
 
 
-def _number(usage: Mapping[str, object] | None, name: str, provenance: str, fields: list[str]) -> int | None:
+def _number(
+    usage: Mapping[str, object] | None, name: str, provenance: str, fields: list[str]
+) -> int | None:
     if usage is None or name not in usage:
         return None
     fields.append(provenance)
@@ -633,7 +840,13 @@ def _number_alias(
     return _token(usage[present[0]], provenance)
 
 
-def _detail_number(usage: Mapping[str, object] | None, detail: str, name: str, provenance: str, fields: list[str]) -> int | None:
+def _detail_number(
+    usage: Mapping[str, object] | None,
+    detail: str,
+    name: str,
+    provenance: str,
+    fields: list[str],
+) -> int | None:
     details = _nested(usage, detail)
     if details is None or name not in details:
         return None
@@ -641,57 +854,141 @@ def _detail_number(usage: Mapping[str, object] | None, detail: str, name: str, p
     return _token(details[name], provenance)
 
 
-def _build(context: CacheTelemetryContextV1, *, provider: str, data_source: str, input_tokens: int | None, output_tokens: int | None, reasoning_tokens: int | None, cache_read_tokens: int | None, cache_write_tokens: int | None, cache_miss_tokens: int | None, native_field_names: list[str]) -> CacheTelemetryV1:
+def _build(
+    context: CacheTelemetryContextV1,
+    *,
+    provider: str,
+    data_source: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    reasoning_tokens: int | None,
+    cache_read_tokens: int | None,
+    cache_write_tokens: int | None,
+    cache_miss_tokens: int | None,
+    native_field_names: list[str],
+) -> CacheTelemetryV1:
     if not isinstance(context, CacheTelemetryContextV1):
         raise CacheTelemetryValidationError("invalid_cache_context")
     return CacheTelemetryV1(
-        provider=provider, model=context.model, account_ref=context.account_ref,
-        request_id=context.request_id, session_id=context.session_id, observed_at=context.observed_at,
-        input_tokens=input_tokens, output_tokens=output_tokens, reasoning_tokens=reasoning_tokens,
-        cache_read_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens,
-        cache_miss_tokens=cache_miss_tokens, uncached_input_tokens=None,
+        provider=provider,
+        model=context.model,
+        account_ref=context.account_ref,
+        request_id=context.request_id,
+        session_id=context.session_id,
+        observed_at=context.observed_at,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_miss_tokens=cache_miss_tokens,
+        uncached_input_tokens=None,
         cache_read_ratio=_ratio(cache_read_tokens, input_tokens),
         cache_write_ratio=_ratio(cache_write_tokens, input_tokens),
         cache_miss_ratio=_ratio(cache_miss_tokens, input_tokens),
         requested_service_tier=context.requested_service_tier,
         effective_service_tier=context.effective_service_tier,
-        context_class=context.context_class, cache_mode=context.cache_mode,
-        cache_key_pseudonym=context.cache_key_pseudonym, breakpoint_count=context.breakpoint_count,
-        native_field_names=tuple(sorted(set(native_field_names))), costs=context.costs,
-        coverage=_coverage(input_tokens=input_tokens, cache_read_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens, cache_miss_tokens=cache_miss_tokens, uncached_input_tokens=None),
-        data_source=data_source, freshness=context.freshness,
+        context_class=context.context_class,
+        cache_mode=context.cache_mode,
+        cache_key_pseudonym=context.cache_key_pseudonym,
+        breakpoint_count=context.breakpoint_count,
+        native_field_names=tuple(sorted(set(native_field_names))),
+        costs=context.costs,
+        coverage=_coverage(
+            input_tokens=input_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_miss_tokens=cache_miss_tokens,
+            uncached_input_tokens=None,
+        ),
+        data_source=data_source,
+        freshness=context.freshness,
     )
 
 
-def normalize_openai_responses(payload: object, context: CacheTelemetryContextV1) -> CacheTelemetryV1:
+def normalize_openai_responses(
+    payload: object, context: CacheTelemetryContextV1
+) -> CacheTelemetryV1:
     """Normalize a completed OpenAI Responses usage payload without retaining it."""
 
     usage = _usage(payload)
     fields: list[str] = []
-    return _build(context, provider="openai", data_source="openai_responses",
+    return _build(
+        context,
+        provider="openai",
+        data_source="openai_responses",
         input_tokens=_number(usage, "input_tokens", "usage.input_tokens", fields),
         output_tokens=_number(usage, "output_tokens", "usage.output_tokens", fields),
-        reasoning_tokens=_detail_number(usage, "output_tokens_details", "reasoning_tokens", "usage.output_tokens_details.reasoning_tokens", fields),
-        cache_read_tokens=_detail_number(usage, "input_tokens_details", "cached_tokens", "usage.input_tokens_details.cached_tokens", fields),
-        cache_write_tokens=_detail_number(usage, "input_tokens_details", "cache_write_tokens", "usage.input_tokens_details.cache_write_tokens", fields),
-        cache_miss_tokens=None, native_field_names=fields)
+        reasoning_tokens=_detail_number(
+            usage,
+            "output_tokens_details",
+            "reasoning_tokens",
+            "usage.output_tokens_details.reasoning_tokens",
+            fields,
+        ),
+        cache_read_tokens=_detail_number(
+            usage,
+            "input_tokens_details",
+            "cached_tokens",
+            "usage.input_tokens_details.cached_tokens",
+            fields,
+        ),
+        cache_write_tokens=_detail_number(
+            usage,
+            "input_tokens_details",
+            "cache_write_tokens",
+            "usage.input_tokens_details.cache_write_tokens",
+            fields,
+        ),
+        cache_miss_tokens=None,
+        native_field_names=fields,
+    )
 
 
-def normalize_openai_chat_completions(payload: object, context: CacheTelemetryContextV1) -> CacheTelemetryV1:
+def normalize_openai_chat_completions(
+    payload: object, context: CacheTelemetryContextV1
+) -> CacheTelemetryV1:
     """Normalize a non-streaming OpenAI Chat Completions usage payload."""
 
     usage = _usage(payload)
     fields: list[str] = []
-    return _build(context, provider="openai", data_source="openai_chat_completions",
+    return _build(
+        context,
+        provider="openai",
+        data_source="openai_chat_completions",
         input_tokens=_number(usage, "prompt_tokens", "usage.prompt_tokens", fields),
-        output_tokens=_number(usage, "completion_tokens", "usage.completion_tokens", fields),
-        reasoning_tokens=_detail_number(usage, "completion_tokens_details", "reasoning_tokens", "usage.completion_tokens_details.reasoning_tokens", fields),
-        cache_read_tokens=_detail_number(usage, "prompt_tokens_details", "cached_tokens", "usage.prompt_tokens_details.cached_tokens", fields),
-        cache_write_tokens=_detail_number(usage, "prompt_tokens_details", "cache_write_tokens", "usage.prompt_tokens_details.cache_write_tokens", fields),
-        cache_miss_tokens=None, native_field_names=fields)
+        output_tokens=_number(
+            usage, "completion_tokens", "usage.completion_tokens", fields
+        ),
+        reasoning_tokens=_detail_number(
+            usage,
+            "completion_tokens_details",
+            "reasoning_tokens",
+            "usage.completion_tokens_details.reasoning_tokens",
+            fields,
+        ),
+        cache_read_tokens=_detail_number(
+            usage,
+            "prompt_tokens_details",
+            "cached_tokens",
+            "usage.prompt_tokens_details.cached_tokens",
+            fields,
+        ),
+        cache_write_tokens=_detail_number(
+            usage,
+            "prompt_tokens_details",
+            "cache_write_tokens",
+            "usage.prompt_tokens_details.cache_write_tokens",
+            fields,
+        ),
+        cache_miss_tokens=None,
+        native_field_names=fields,
+    )
 
 
-def normalize_openai_chat_stream_final(payload: object, context: CacheTelemetryContextV1) -> CacheTelemetryV1:
+def normalize_openai_chat_stream_final(
+    payload: object, context: CacheTelemetryContextV1
+) -> CacheTelemetryV1:
     """Accept only the usage-bearing terminal Chat Completions stream chunk.
 
     Request construction is intentionally outside this module.  Callers must
@@ -706,59 +1003,142 @@ def normalize_openai_chat_stream_final(payload: object, context: CacheTelemetryC
     return normalize_openai_chat_completions(root, context)
 
 
-def normalize_gemini_interactions(payload: object, context: CacheTelemetryContextV1) -> CacheTelemetryV1:
+def normalize_gemini_interactions(
+    payload: object, context: CacheTelemetryContextV1
+) -> CacheTelemetryV1:
     usage = _usage(payload)
     fields: list[str] = []
-    return _build(context, provider="gemini", data_source="gemini_interactions",
+    return _build(
+        context,
+        provider="gemini",
+        data_source="gemini_interactions",
         input_tokens=_number(usage, "input_tokens", "usage.input_tokens", fields),
         output_tokens=_number(usage, "output_tokens", "usage.output_tokens", fields),
-        reasoning_tokens=None, cache_read_tokens=_number(usage, "total_cached_tokens", "usage.total_cached_tokens", fields),
-        cache_write_tokens=None, cache_miss_tokens=None, native_field_names=fields)
+        reasoning_tokens=None,
+        cache_read_tokens=_number(
+            usage, "total_cached_tokens", "usage.total_cached_tokens", fields
+        ),
+        cache_write_tokens=None,
+        cache_miss_tokens=None,
+        native_field_names=fields,
+    )
 
 
-def normalize_gemini_generate_content(payload: object, context: CacheTelemetryContextV1) -> CacheTelemetryV1:
+def normalize_gemini_generate_content(
+    payload: object, context: CacheTelemetryContextV1
+) -> CacheTelemetryV1:
     root = _require_mapping(payload, "native_payload")
     containers = [name for name in ("usage_metadata", "usageMetadata") if name in root]
     if len(containers) > 1:
         raise CacheTelemetryValidationError("ambiguous_native_usage")
     usage_value = root.get(containers[0]) if containers else None
-    usage = None if usage_value is None else _require_mapping(usage_value, "native_usage")
+    usage = (
+        None if usage_value is None else _require_mapping(usage_value, "native_usage")
+    )
     fields: list[str] = []
-    return _build(context, provider="gemini", data_source="gemini_generate_content",
-        input_tokens=_number_alias(usage, "prompt_token_count", "promptTokenCount", "usage_metadata.prompt_token_count", fields),
-        output_tokens=_number_alias(usage, "candidates_token_count", "candidatesTokenCount", "usage_metadata.candidates_token_count", fields),
-        reasoning_tokens=_number_alias(usage, "thoughts_token_count", "thoughtsTokenCount", "usage_metadata.thoughts_token_count", fields),
-        cache_read_tokens=_number_alias(usage, "cached_content_token_count", "cachedContentTokenCount", "usage_metadata.cached_content_token_count", fields),
-        cache_write_tokens=None, cache_miss_tokens=None, native_field_names=fields)
+    return _build(
+        context,
+        provider="gemini",
+        data_source="gemini_generate_content",
+        input_tokens=_number_alias(
+            usage,
+            "prompt_token_count",
+            "promptTokenCount",
+            "usage_metadata.prompt_token_count",
+            fields,
+        ),
+        output_tokens=_number_alias(
+            usage,
+            "candidates_token_count",
+            "candidatesTokenCount",
+            "usage_metadata.candidates_token_count",
+            fields,
+        ),
+        reasoning_tokens=_number_alias(
+            usage,
+            "thoughts_token_count",
+            "thoughtsTokenCount",
+            "usage_metadata.thoughts_token_count",
+            fields,
+        ),
+        cache_read_tokens=_number_alias(
+            usage,
+            "cached_content_token_count",
+            "cachedContentTokenCount",
+            "usage_metadata.cached_content_token_count",
+            fields,
+        ),
+        cache_write_tokens=None,
+        cache_miss_tokens=None,
+        native_field_names=fields,
+    )
 
 
-def normalize_anthropic(payload: object, context: CacheTelemetryContextV1) -> CacheTelemetryV1:
+def normalize_anthropic(
+    payload: object, context: CacheTelemetryContextV1
+) -> CacheTelemetryV1:
     usage = _usage(payload)
     fields: list[str] = []
-    return _build(context, provider="anthropic", data_source="anthropic_messages",
+    return _build(
+        context,
+        provider="anthropic",
+        data_source="anthropic_messages",
         input_tokens=_number(usage, "input_tokens", "usage.input_tokens", fields),
         output_tokens=_number(usage, "output_tokens", "usage.output_tokens", fields),
-        reasoning_tokens=None, cache_read_tokens=_number(usage, "cache_read_input_tokens", "usage.cache_read_input_tokens", fields),
-        cache_write_tokens=_number(usage, "cache_creation_input_tokens", "usage.cache_creation_input_tokens", fields),
-        cache_miss_tokens=None, native_field_names=fields)
+        reasoning_tokens=None,
+        cache_read_tokens=_number(
+            usage, "cache_read_input_tokens", "usage.cache_read_input_tokens", fields
+        ),
+        cache_write_tokens=_number(
+            usage,
+            "cache_creation_input_tokens",
+            "usage.cache_creation_input_tokens",
+            fields,
+        ),
+        cache_miss_tokens=None,
+        native_field_names=fields,
+    )
 
 
-def normalize_deepseek(payload: object, context: CacheTelemetryContextV1) -> CacheTelemetryV1:
+def normalize_deepseek(
+    payload: object, context: CacheTelemetryContextV1
+) -> CacheTelemetryV1:
     usage = _usage(payload)
     fields: list[str] = []
-    return _build(context, provider="deepseek", data_source="deepseek_chat_completions",
+    return _build(
+        context,
+        provider="deepseek",
+        data_source="deepseek_chat_completions",
         input_tokens=_number(usage, "prompt_tokens", "usage.prompt_tokens", fields),
-        output_tokens=_number(usage, "completion_tokens", "usage.completion_tokens", fields),
-        reasoning_tokens=None, cache_read_tokens=_number(usage, "prompt_cache_hit_tokens", "usage.prompt_cache_hit_tokens", fields),
-        cache_write_tokens=None, cache_miss_tokens=_number(usage, "prompt_cache_miss_tokens", "usage.prompt_cache_miss_tokens", fields),
-        native_field_names=fields)
+        output_tokens=_number(
+            usage, "completion_tokens", "usage.completion_tokens", fields
+        ),
+        reasoning_tokens=None,
+        cache_read_tokens=_number(
+            usage, "prompt_cache_hit_tokens", "usage.prompt_cache_hit_tokens", fields
+        ),
+        cache_write_tokens=None,
+        cache_miss_tokens=_number(
+            usage, "prompt_cache_miss_tokens", "usage.prompt_cache_miss_tokens", fields
+        ),
+        native_field_names=fields,
+    )
 
 
 __all__ = [
-    "CacheCostEstimateV1", "CacheTelemetryContextV1", "CacheTelemetryV1",
-    "CacheTelemetryValidationError", "ContextResetTelemetryV1", "MAX_NATIVE_MAPPING_FIELDS",
-    "PARSER_GENERATION", "SCHEMA_VERSION", "normalize_anthropic", "normalize_deepseek",
-    "normalize_gemini_generate_content", "normalize_gemini_interactions",
-    "normalize_openai_chat_completions", "normalize_openai_chat_stream_final",
+    "CacheCostEstimateV1",
+    "CacheTelemetryContextV1",
+    "CacheTelemetryV1",
+    "CacheTelemetryValidationError",
+    "ContextResetTelemetryV1",
+    "MAX_NATIVE_MAPPING_FIELDS",
+    "PARSER_GENERATION",
+    "SCHEMA_VERSION",
+    "normalize_anthropic",
+    "normalize_deepseek",
+    "normalize_gemini_generate_content",
+    "normalize_gemini_interactions",
+    "normalize_openai_chat_completions",
+    "normalize_openai_chat_stream_final",
     "normalize_openai_responses",
 ]

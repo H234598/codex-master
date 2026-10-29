@@ -74,7 +74,9 @@ def test_process_source_worker_guard_cancel_releases_only_reserved_worker() -> N
     assert guard.reserve(unrelated, timeout_seconds=0.0) is True
 
 
-def test_metrics_http_server_suppresses_request_error_output(capsys: pytest.CaptureFixture[str]) -> None:
+def test_metrics_http_server_suppresses_request_error_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     server = MetricsHttpServer(("127.0.0.1", 0), lambda: "# EOF\n")
     try:
         with socket.socket() as request_socket:
@@ -89,7 +91,7 @@ def test_metrics_http_server_suppresses_request_error_output(capsys: pytest.Capt
 
 def test_metrics_passthroughs_stale_openmetrics_body_byte_for_byte() -> None:
     payload = (
-        "the_hive_snapshot_state{state=\"stale\"} 1\n"
+        'the_hive_snapshot_state{state="stale"} 1\n'
         "the_hive_snapshot_age_seconds 61\n"
         "# EOF\n"
     )
@@ -99,13 +101,18 @@ def test_metrics_passthroughs_stale_openmetrics_body_byte_for_byte() -> None:
         status, headers, body = get(server, "/metrics")
 
     assert status == 200
-    assert headers["Content-Type"] == "application/openmetrics-text; version=1.0.0; charset=utf-8"
+    assert (
+        headers["Content-Type"]
+        == "application/openmetrics-text; version=1.0.0; charset=utf-8"
+    )
     assert headers["Cache-Control"] == "no-store"
     assert headers["Content-Length"] == str(len(payload.encode("utf-8")))
     assert body == payload.encode("utf-8")
 
 
-@pytest.mark.parametrize("host", ("localhost", "0.0.0.0", "::", "192.0.2.1", "bad host"))
+@pytest.mark.parametrize(
+    "host", ("localhost", "0.0.0.0", "::", "192.0.2.1", "bad host")
+)
 def test_rejects_nonliteral_or_nonloopback_bind_address(host: str) -> None:
     server: MetricsHttpServer | None = None
     try:
@@ -308,7 +315,7 @@ def test_http_error_response_redacts_internal_details() -> None:
 
 def test_http_passthroughs_valid_stale_openmetrics_without_fresh_header() -> None:
     payload = (
-        "the_hive_snapshot_state{state=\"stale\"} 1\n"
+        'the_hive_snapshot_state{state="stale"} 1\n'
         "the_hive_snapshot_age_seconds 61\n"
         "# EOF\n"
     )
@@ -405,7 +412,9 @@ def test_timed_metrics_reader_reuses_valid_value_until_exact_ttl_expiry() -> Non
     ("", None, "\ud800", "x" * 1_048_577),
     ids=("empty", "non-string", "invalid-utf8", "oversize"),
 )
-def test_timed_metrics_reader_never_caches_invalid_refresh_value(invalid: object) -> None:
+def test_timed_metrics_reader_never_caches_invalid_refresh_value(
+    invalid: object,
+) -> None:
     values = iter(("valid", invalid, "fresh"))
 
     def source() -> str:
@@ -424,11 +433,14 @@ def test_timed_metrics_reader_never_caches_invalid_refresh_value(invalid: object
     assert reader() == "fresh"
 
 
-@pytest.mark.parametrize("ttl_seconds", (0, -1, 60.1, float("inf"), float("nan"), True, "5"))
+@pytest.mark.parametrize(
+    "ttl_seconds", (0, -1, 60.1, float("inf"), float("nan"), True, "5")
+)
 def test_timed_metrics_reader_rejects_invalid_ttl(ttl_seconds: object) -> None:
     with pytest.raises(ValueError, match="invalid ttl_seconds"):
         observability_http.TimedMetricsReader(
-            lambda: "# EOF\n", ttl_seconds=ttl_seconds  # type: ignore[arg-type]
+            lambda: "# EOF\n",
+            ttl_seconds=ttl_seconds,  # type: ignore[arg-type]
         )
 
 
@@ -445,7 +457,8 @@ def test_server_rejects_invalid_port_before_binding(port: object) -> None:
     try:
         with pytest.raises(ValueError, match="invalid port"):
             server = MetricsHttpServer(
-                ("127.0.0.1", port), lambda: "# EOF\n"  # type: ignore[arg-type]
+                ("127.0.0.1", port),
+                lambda: "# EOF\n",  # type: ignore[arg-type]
             )
     finally:
         if server is not None:
@@ -460,7 +473,8 @@ def test_server_rejects_noncallable_metrics_reader_before_binding() -> None:
 def test_server_rejects_nonstring_loopback_object_before_binding() -> None:
     with pytest.raises(ValueError, match="loopback address required"):
         MetricsHttpServer(
-            (ipaddress.ip_address("127.0.0.1"), 0), lambda: "# EOF\n"  # type: ignore[arg-type]
+            (ipaddress.ip_address("127.0.0.1"), 0),
+            lambda: "# EOF\n",  # type: ignore[arg-type]
         )
 
 
@@ -519,7 +533,9 @@ def test_timed_metrics_reader_coordinates_concurrent_expired_refresh() -> None:
     assert calls == 2
 
 
-def test_timed_metrics_reader_does_not_mask_expired_value_after_source_failure() -> None:
+def test_timed_metrics_reader_does_not_mask_expired_value_after_source_failure() -> (
+    None
+):
     now = 0.0
     calls = 0
 
@@ -566,9 +582,7 @@ def test_timed_metrics_reader_rechecks_clock_after_waiting_for_refresh_lock() ->
         clock_calls += 1
         return now
 
-    reader = observability_http.TimedMetricsReader(
-        source, ttl_seconds=1.0, clock=clock
-    )
+    reader = observability_http.TimedMetricsReader(source, ttl_seconds=1.0, clock=clock)
     assert reader() == "initial"
     now = 1.0
 
@@ -629,7 +643,9 @@ def test_partial_request_times_out_and_releases_handler_slot() -> None:
     assert calls == 1
 
 
-def test_full_parallel_limit_returns_static_service_unavailable_without_sourcecall() -> None:
+def test_full_parallel_limit_returns_static_service_unavailable_without_sourcecall() -> (
+    None
+):
     calls = 0
     source_started = threading.Event()
     release_source = threading.Event()
@@ -679,7 +695,9 @@ def test_full_parallel_limit_returns_static_service_unavailable_without_sourceca
     assert calls == 2
 
 
-def test_health_endpoints_keep_reserved_capacity_during_blocked_metrics_request() -> None:
+def test_health_endpoints_keep_reserved_capacity_during_blocked_metrics_request() -> (
+    None
+):
     calls = 0
     source_started = threading.Event()
     release_source = threading.Event()
@@ -948,7 +966,9 @@ def test_silent_prefaces_do_not_stall_health_or_shutdown() -> None:
     health = threading.Thread(target=request_health)
     try:
         for _ in range(4):
-            silent_clients.append(socket.create_connection(server.server_address[:2], timeout=1))
+            silent_clients.append(
+                socket.create_connection(server.server_address[:2], timeout=1)
+            )
         health.start()
         health.join(timeout=0.1)
         assert not health.is_alive()
@@ -969,7 +989,9 @@ def test_silent_prefaces_do_not_stall_health_or_shutdown() -> None:
         server.server_close()
 
 
-def test_overloaded_metrics_with_long_complete_header_returns_static_service_unavailable() -> None:
+def test_overloaded_metrics_with_long_complete_header_returns_static_service_unavailable() -> (
+    None
+):
     calls = 0
     source_started = threading.Event()
     release_source = threading.Event()
@@ -1210,9 +1232,7 @@ def test_shutdown_prevents_timed_reader_late_result_from_becoming_cache() -> Non
         return "fresh-after-shutdown\n"
 
     reader = observability_http.TimedMetricsReader(raw_source, ttl_seconds=60.0)
-    server = MetricsHttpServer(
-        ("127.0.0.1", 0), reader, request_timeout_seconds=0.05
-    )
+    server = MetricsHttpServer(("127.0.0.1", 0), reader, request_timeout_seconds=0.05)
     try:
         with running(server):
             first = get(server, "/metrics")
@@ -1258,7 +1278,9 @@ def test_rejects_scoped_ipv6_loopbacks_before_binding(host: str) -> None:
 @pytest.mark.parametrize(
     "request_timeout_seconds", (0, 0.01, 5.1, float("inf"), float("nan"), True, "1")
 )
-def test_server_rejects_invalid_request_timeout(request_timeout_seconds: object) -> None:
+def test_server_rejects_invalid_request_timeout(
+    request_timeout_seconds: object,
+) -> None:
     with pytest.raises(ValueError, match="invalid request timeout"):
         MetricsHttpServer(
             ("127.0.0.1", 0),
@@ -1288,9 +1310,7 @@ def test_partial_preface_waits_for_new_bytes_then_routes_once() -> None:
         calls += 1
         return "# EOF\n"
 
-    server = MetricsHttpServer(
-        ("127.0.0.1", 0), source, request_timeout_seconds=1.0
-    )
+    server = MetricsHttpServer(("127.0.0.1", 0), source, request_timeout_seconds=1.0)
     original_handle_preface = server._handle_preface_request
 
     def observe_preface(request: socket.socket) -> None:
@@ -1312,7 +1332,9 @@ def test_partial_preface_waits_for_new_bytes_then_routes_once() -> None:
 
             # The selector gets multiple chances to repeat stale readability; no
             # additional preface work is valid until the client makes progress.
-            threading.Event().wait(observability_http.PREFACE_SELECTOR_TIMEOUT_SECONDS * 3)
+            threading.Event().wait(
+                observability_http.PREFACE_SELECTOR_TIMEOUT_SECONDS * 3
+            )
             with preface_lock:
                 assert preface_calls == preface_calls_after_partial_read
 
@@ -1325,6 +1347,7 @@ def test_partial_preface_waits_for_new_bytes_then_routes_once() -> None:
                 response.extend(client.recv(4096))
             assert b" 200 " in response
             assert response.endswith(b"ok\n")
+
             def preface_call_completed() -> bool:
                 with preface_lock:
                     return preface_calls == preface_calls_after_partial_read + 1

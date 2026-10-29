@@ -62,7 +62,9 @@ def context() -> EvidenceContextV1:
 
 
 def test_passed_fresh_identical_evidence_is_reused() -> None:
-    decision = evaluate_evidence_reuse(receipt(), context(), now_monotonic_ns=2_000_000_000)
+    decision = evaluate_evidence_reuse(
+        receipt(), context(), now_monotonic_ns=2_000_000_000
+    )
 
     assert decision.action == "reuse"
     assert decision.reason_code == "test.evidence_reused"
@@ -79,7 +81,9 @@ def test_passed_fresh_identical_evidence_is_reused() -> None:
         ({"expires_monotonic_ns": 1_999_999_999}, "test.cooldown_expired"),
     ],
 )
-def test_any_failed_or_stale_identity_forces_real_run(changed: dict[str, object], reason: str) -> None:
+def test_any_failed_or_stale_identity_forces_real_run(
+    changed: dict[str, object], reason: str
+) -> None:
     decision = evaluate_evidence_reuse(
         receipt(**changed), context(), now_monotonic_ns=2_000_000_000
     )
@@ -97,7 +101,10 @@ def test_mandatory_gate_and_higher_risk_context_never_reuse() -> None:
     )
 
     assert (mandatory.action, mandatory.reason_code) == ("run", "test.gate_required")
-    assert (higher_risk.action, higher_risk.reason_code) == ("run", "test.evidence_stale")
+    assert (higher_risk.action, higher_risk.reason_code) == (
+        "run",
+        "test.evidence_stale",
+    )
 
 
 def test_zero_ttl_classes_cannot_mint_reusable_evidence() -> None:
@@ -105,5 +112,7 @@ def test_zero_ttl_classes_cannot_mint_reusable_evidence() -> None:
         value = replace(
             receipt(), cooldown_class=cooldown_class, expires_monotonic_ns=2_000_000_000
         )
-        decision = evaluate_evidence_reuse(value, context(), now_monotonic_ns=2_000_000_000)
+        decision = evaluate_evidence_reuse(
+            value, context(), now_monotonic_ns=2_000_000_000
+        )
         assert decision.action == "run"

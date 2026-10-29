@@ -601,8 +601,7 @@ def test_source_uses_only_allowed_imports_and_contains_no_forbidden_transport_to
         "validate_chpb_message",
     ):
         assert (
-            getattr(transport, name).__module__
-            == "the_hive.fleet_home_broker_protocol"
+            getattr(transport, name).__module__ == "the_hive.fleet_home_broker_protocol"
         )
     forbidden = (
         "socket",

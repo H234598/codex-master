@@ -116,8 +116,11 @@ def _wire_time(value: datetime) -> str:
 
 
 def remote_envelope_digest(
-    *, registry_generation: int, lease_epoch: int,
-    resource_generation: int | None, plan_precondition_digest: str,
+    *,
+    registry_generation: int,
+    lease_epoch: int,
+    resource_generation: int | None,
+    plan_precondition_digest: str,
 ) -> str:
     """Seal the remote-only lease fences into the V2 lease/receipt contract."""
     if resource_generation is not None:
@@ -135,7 +138,9 @@ def remote_envelope_digest(
 def _reason_codes(value: object) -> tuple[str, ...]:
     if type(value) not in {list, tuple}:
         _invalid()
-    items = tuple(_token(item) for item in cast(list[object] | tuple[object, ...], value))
+    items = tuple(
+        _token(item) for item in cast(list[object] | tuple[object, ...], value)
+    )
     if len(items) > _MAX_REASON_CODES or len(set(items)) != len(items):
         _invalid()
     return items
@@ -162,7 +167,11 @@ def _freeze_json(value: object) -> object:
         return _integer(value)
     if type(value) is str:
         encoded = value.encode("utf-8")
-        if not value or len(encoded) > MAX_AGENT_RESULT_BYTES or any(ord(char) < 32 for char in value):
+        if (
+            not value
+            or len(encoded) > MAX_AGENT_RESULT_BYTES
+            or any(ord(char) < 32 for char in value)
+        ):
             _invalid()
         if _UTC_TIMESTAMP.fullmatch(value) is not None:
             try:
@@ -175,7 +184,10 @@ def _freeze_json(value: object) -> object:
                 _invalid()
         return value
     if type(value) in {list, tuple}:
-        return tuple(_freeze_json(item) for item in cast(list[object] | tuple[object, ...], value))
+        return tuple(
+            _freeze_json(item)
+            for item in cast(list[object] | tuple[object, ...], value)
+        )
     if type(value) is dict:
         result: dict[str, object] = {}
         for key, item in cast(dict[object, object], value).items():
@@ -308,9 +320,7 @@ class AgentLeaseV1:
         object.__setattr__(self, "lease_epoch", _integer(self.lease_epoch))
         object.__setattr__(self, "attempt", _integer(self.attempt, low=1))
         object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
-        object.__setattr__(
-            self, "arguments_digest", _digest(self.arguments_digest)
-        )
+        object.__setattr__(self, "arguments_digest", _digest(self.arguments_digest))
         if self.arguments_digest != _canonical_digest(_public_json(arguments)):
             _invalid()
         object.__setattr__(self, "deadline", _utc(self.deadline))
@@ -363,9 +373,7 @@ class AgentReceiptV1:
         object.__setattr__(self, "lease_epoch", _integer(self.lease_epoch))
         object.__setattr__(self, "attempt", _integer(self.attempt, low=1))
         object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
-        object.__setattr__(
-            self, "arguments_digest", _digest(self.arguments_digest)
-        )
+        object.__setattr__(self, "arguments_digest", _digest(self.arguments_digest))
         state = _token(self.state)
         if state not in _RECEIPT_STATES:
             _invalid()
@@ -406,9 +414,8 @@ def parse_agent_receipt(value: object) -> AgentReceiptV1:
     result = _mapping(payload.get("result"))
     is_remote = result.get("kind") == "ollama.instance"
     if (
-        (is_remote and (schema_version != 2 or set(payload) != _REMOTE_RECEIPT_FIELDS))
-        or (not is_remote and (schema_version != 1 or set(payload) != _RECEIPT_FIELDS))
-    ):
+        is_remote and (schema_version != 2 or set(payload) != _REMOTE_RECEIPT_FIELDS)
+    ) or (not is_remote and (schema_version != 1 or set(payload) != _RECEIPT_FIELDS)):
         _invalid()
     if set(result) != _RESULT_FIELDS:
         _invalid()

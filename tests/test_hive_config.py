@@ -53,12 +53,42 @@ def test_public_class_and_hive_examples_load_with_stable_digest() -> None:
 def test_public_classes_expose_resolver_profiles() -> None:
     classes = load_agent_class_catalog(ROOT / "codex-agent-classes.json")
 
-    assert classes["goettin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
-    assert classes["gottbiene"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
-    assert classes["koenigin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
-    assert classes["teamleiterin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "xhigh", "xhigh")
+    assert classes["goettin"].resolver_profile == (
+        "persistent",
+        ("persistent",),
+        ("sol",),
+        "max",
+        "max",
+    )
+    assert classes["gottbiene"].resolver_profile == (
+        "persistent",
+        ("persistent",),
+        ("sol",),
+        "max",
+        "max",
+    )
+    assert classes["koenigin"].resolver_profile == (
+        "persistent",
+        ("persistent",),
+        ("sol",),
+        "max",
+        "max",
+    )
+    assert classes["teamleiterin"].resolver_profile == (
+        "persistent",
+        ("persistent",),
+        ("sol",),
+        "xhigh",
+        "xhigh",
+    )
     assert classes["teamleiterin"].allowed_model_ids == ("gpt-6-sol",)
-    assert classes["spezialistin"].resolver_profile == ("binding", ("binding",), ("luna", "sol", "astra"), "high", "xhigh")
+    assert classes["spezialistin"].resolver_profile == (
+        "binding",
+        ("binding",),
+        ("luna", "sol", "astra"),
+        "high",
+        "xhigh",
+    )
     assert classes["arbeitsbiene"].resolver_profile[0] == "ephemeral"
 
 
@@ -66,23 +96,35 @@ def test_checked_in_example_configs_are_public_and_loadable() -> None:
     examples = ROOT / "examples"
     classes = load_agent_class_catalog(examples / "codex-agent-classes.json")
     config = load_hive_config(examples / "codex-hive.json", classes)
-    policy = json.loads((examples / "codex-model-policy.json").read_text(encoding="utf-8"))
+    policy = json.loads(
+        (examples / "codex-model-policy.json").read_text(encoding="utf-8")
+    )
     assert config.mode == "shadow"
     assert policy["schema_version"] == 1
     assert all("token" not in json.dumps(item).lower() for item in policy["models"])
 
 
-def test_hive_loader_rejects_unknown_class_and_global_repository_scope(tmp_path: Path) -> None:
+def test_hive_loader_rejects_unknown_class_and_global_repository_scope(
+    tmp_path: Path,
+) -> None:
     classes_path = tmp_path / "classes.json"
-    classes_path.write_text((ROOT / "codex-agent-classes.json").read_text(encoding="utf-8"), encoding="utf-8")
+    classes_path.write_text(
+        (ROOT / "codex-agent-classes.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     classes = load_agent_class_catalog(classes_path)
     config_path = tmp_path / "hive.json"
-    config_path.write_text('{"schema_version":1,"mode":"shadow","repositories":[],"principals":[{"principal_id":"god","class_id":"unknown","parent_principal_id":null,"repo_id":null}],"feature_flags":{}}', encoding="utf-8")
+    config_path.write_text(
+        '{"schema_version":1,"mode":"shadow","repositories":[],"principals":[{"principal_id":"god","class_id":"unknown","parent_principal_id":null,"repo_id":null}],"feature_flags":{}}',
+        encoding="utf-8",
+    )
     with pytest.raises(HiveConfigError, match="unknown_principal_class"):
         load_hive_config(config_path, classes)
 
 
-def test_catalog_snapshot_reads_exactly_once_and_hashes_that_same_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_catalog_snapshot_reads_exactly_once_and_hashes_that_same_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     catalog = tmp_path / "classes.json"
     raw = (ROOT / "codex-agent-classes.json").read_bytes()
     calls = 0
@@ -116,7 +158,9 @@ def test_attested_catalog_and_hive_config_bytes_use_the_same_strict_contract() -
 
 
 def test_catalog_snapshot_is_deeply_immutable_after_direct_construction() -> None:
-    profile = load_agent_class_catalog(ROOT / "codex-agent-classes.json")["teamleiterin"]
+    profile = load_agent_class_catalog(ROOT / "codex-agent-classes.json")[
+        "teamleiterin"
+    ]
     source = {"teamleiterin": profile}
     snapshot = AgentClassCatalogSnapshot(source, "sha256:" + "a" * 64)
     source.clear()
@@ -131,8 +175,12 @@ def test_catalog_snapshot_is_deeply_immutable_after_direct_construction() -> Non
         replace(profile, allowed_lifecycles=["persistent"])
 
 
-def test_catalog_snapshot_missing_file_is_fail_closed_and_publicly_redacted(tmp_path: Path) -> None:
-    marker = "catalog-payload-class-member-principal-repo-home-session-journal-path-secret"
+def test_catalog_snapshot_missing_file_is_fail_closed_and_publicly_redacted(
+    tmp_path: Path,
+) -> None:
+    marker = (
+        "catalog-payload-class-member-principal-repo-home-session-journal-path-secret"
+    )
     missing = tmp_path / f"{marker}.json"
 
     with pytest.raises(HiveConfigError) as raised:
@@ -148,8 +196,14 @@ def test_catalog_snapshot_missing_file_is_fail_closed_and_publicly_redacted(tmp_
 @pytest.mark.parametrize(
     ("raw", "reason"),
     [
-        (b'{"catalog-payload-class-member-principal-repo-home-session-journal-secret":"\\xff"}', "class_catalog_unavailable"),
-        (b'{"catalog-payload-class-member-principal-repo-home-session-journal-secret":[]}', "invalid_class_catalog"),
+        (
+            b'{"catalog-payload-class-member-principal-repo-home-session-journal-secret":"\\xff"}',
+            "class_catalog_unavailable",
+        ),
+        (
+            b'{"catalog-payload-class-member-principal-repo-home-session-journal-secret":[]}',
+            "invalid_class_catalog",
+        ),
     ],
 )
 def test_catalog_snapshot_invalid_input_is_fail_closed_and_publicly_redacted(

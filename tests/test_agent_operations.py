@@ -81,10 +81,17 @@ def remote_owner_context(action: str) -> dict[str, object]:
         "queue_plan_digest": DIGEST_A,
         "plan_precondition_digest": DIGEST_A,
         "instance": {
-            "ref": "ollama-one", "label": "Ollama One", "host_ref": "worker-one",
-            "ollama_executable": "/private/ollama", "models_directory": "/private/models",
-            "selected_model_refs": ["model-one"], "allowed_cpus": "1", "cpu_quota_percent": 100,
-            "cpu_weight": 50, "lifecycle_state": "planned", "readiness_state": "unknown",
+            "ref": "ollama-one",
+            "label": "Ollama One",
+            "host_ref": "worker-one",
+            "ollama_executable": "/private/ollama",
+            "models_directory": "/private/models",
+            "selected_model_refs": ["model-one"],
+            "allowed_cpus": "1",
+            "cpu_quota_percent": 100,
+            "cpu_weight": 50,
+            "lifecycle_state": "planned",
+            "readiness_state": "unknown",
         },
     }
     if action != "plan":
@@ -348,6 +355,7 @@ def test_target_host_fence_never_leases_to_another_host(tmp_path: Path) -> None:
     assert isinstance(leased, AgentLeaseV1)
     assert leased.host_ref == "worker-one"
 
+
 def test_queue_limit_is_1024_records(tmp_path: Path) -> None:
     store = store_at(tmp_path)
     for index in range(MAX_AGENT_OPERATION_RECORDS):
@@ -520,7 +528,11 @@ def test_legacy_remote_record_without_v2_envelope_terminalizes_before_lease(
     queued = store.enqueue(request)
     with store._state.locked():  # noqa: SLF001 - production-format migration fixture
         document = store._read_locked()  # noqa: SLF001
-        record = next(item for item in document["operations"] if item["operation_id"] == queued.operation_id)
+        record = next(
+            item
+            for item in document["operations"]
+            if item["operation_id"] == queued.operation_id
+        )
         record.pop("envelope_digest")
         store._write_locked(document)  # noqa: SLF001
 
@@ -531,7 +543,9 @@ def test_legacy_remote_record_without_v2_envelope_terminalizes_before_lease(
     assert terminal.reason_codes == ("host.operation_envelope_stale",)
 
 
-def test_remote_owner_context_survives_restart_before_index_projection(tmp_path: Path) -> None:
+def test_remote_owner_context_survives_restart_before_index_projection(
+    tmp_path: Path,
+) -> None:
     store = store_at(tmp_path)
     request = AgentOperationRequestV1(
         key="owner-crash-boundary",
@@ -690,9 +704,7 @@ def test_persisted_attempt_exhaustion_is_discovered_by_same_host_owner(
 ) -> None:
     clock = Clock()
     store = store_at(tmp_path, clock)
-    queued = store.enqueue(
-        replace(operation_request(), target_host_ref="worker-one")
-    )
+    queued = store.enqueue(replace(operation_request(), target_host_ref="worker-one"))
 
     for attempt in range(1, 9):
         leased = store.poll(principal(), poll(epoch=3))
@@ -879,9 +891,7 @@ def test_ownerless_poll_terminalizes_queued_operation_deadline(
 ) -> None:
     clock = Clock()
     store = store_at(tmp_path, clock)
-    queued = store.enqueue(
-        operation_request(deadline=NOW + timedelta(minutes=5))
-    )
+    queued = store.enqueue(operation_request(deadline=NOW + timedelta(minutes=5)))
     clock.advance(seconds=301)
 
     assert isinstance(store.poll(principal(), poll(epoch=3)), AgentNoWorkV1)
@@ -931,9 +941,7 @@ def test_mixed_lifecycle_candidates_share_budget_scope_and_ack_after_durable_wri
             "host_ref": "worker-one",
             "registry_generation": 7,
             "lease_epoch": 3,
-            "deadline": (NOW + timedelta(minutes=1)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
+            "deadline": (NOW + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     document_path.write_text(
         json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
@@ -988,8 +996,7 @@ def test_mixed_lifecycle_candidates_share_budget_scope_and_ack_after_durable_wri
     assert persisted["schema_version"] == 1
     assert len(durable) <= MAX_AGENT_OPERATION_STATE_BYTES
     assert {
-        record["operation_id"]: frozenset(record)
-        for record in persisted["operations"]
+        record["operation_id"]: frozenset(record) for record in persisted["operations"]
     } == record_fields
 
 
@@ -1050,9 +1057,7 @@ def test_completion_at_exhausted_metadata_bound_leaves_no_result_sidecar(
         len(before),
     )
 
-    with pytest.raises(
-        AgentOperationError, match="host.operation_store_unavailable"
-    ):
+    with pytest.raises(AgentOperationError, match="host.operation_store_unavailable"):
         store.complete(principal(), receipt_for(lease))
 
     assert document_path.read_bytes() == before

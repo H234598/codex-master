@@ -196,11 +196,7 @@ def host_card_text(result: object, host_ref: str) -> str:
     if type(hosts) is not list or len(hosts) > 256:
         raise AgentError("control-center host result is invalid")
     host = next(
-        (
-            item
-            for item in hosts
-            if type(item) is dict and item.get("ref") == host_ref
-        ),
+        (item for item in hosts if type(item) is dict and item.get("ref") == host_ref),
         None,
     )
     if type(host) is not dict:
@@ -291,11 +287,19 @@ def _normalize_agent_row(value: Any) -> AgentRow:
     else:
         auth_state = "blocked"
     raw_lease_state = lease.get("state")
-    lease_state = raw_lease_state if raw_lease_state in {"unclaimed", "held", "expired", "unreadable"} else "unreadable"
+    lease_state = (
+        raw_lease_state
+        if raw_lease_state in {"unclaimed", "held", "expired", "unreadable"}
+        else "unreadable"
+    )
     identity_state = "verified" if identity.get("ok") is True else "blocked"
     if usage.get("blocked") is True:
         limit_state = "blocked"
-    elif usage.get("blocked") is False and usage.get("state") in {"clear", "ok", "released"}:
+    elif usage.get("blocked") is False and usage.get("state") in {
+        "clear",
+        "ok",
+        "released",
+    }:
         limit_state = "clear"
     else:
         limit_state = "unknown"
@@ -303,9 +307,17 @@ def _normalize_agent_row(value: Any) -> AgentRow:
     role = assignment.get("role")
     if role not in {"exploriererin", "arbeitsbiene"}:
         role = "unknown"
-    last_assignment_at = _bounded_optional_text(assignment.get("created_at_utc"), max_chars=40)
+    last_assignment_at = _bounded_optional_text(
+        assignment.get("created_at_utc"), max_chars=40
+    )
     lease_free = lease_state in {"unclaimed", "expired"}
-    can_start = not running and auth_state == "ready" and identity_state == "verified" and lease_free and limit_state == "clear"
+    can_start = (
+        not running
+        and auth_state == "ready"
+        and identity_state == "verified"
+        and lease_free
+        and limit_state == "clear"
+    )
     can_stop = running and identity_state == "verified" and lease_free
     return AgentRow(
         agent=agent,
@@ -335,7 +347,10 @@ def normalize_status_page(payload: Any) -> StatusPage:
     limit = payload.get("agents_limit")
     truncated = payload.get("truncated")
     if (
-        not all(_non_negative_int(item) for item in (result_count, total_count, offset, limit))
+        not all(
+            _non_negative_int(item)
+            for item in (result_count, total_count, offset, limit)
+        )
         or not isinstance(truncated, bool)
         or payload.get("raw_output") != "not_returned"
         or result_count != len(results)
@@ -392,7 +407,11 @@ def bounded_public_result_text(payload: Any) -> str:
         if isinstance(value, int) and not isinstance(value, bool):
             return value
         if isinstance(value, float):
-            return value if value == value and abs(value) != float("inf") else "<ungültige Zahl>"
+            return (
+                value
+                if value == value and abs(value) != float("inf")
+                else "<ungültige Zahl>"
+            )
         if isinstance(value, str):
             return value[:MAX_RESULT_STRING_CHARS]
         if isinstance(value, list):
@@ -405,7 +424,9 @@ def bounded_public_result_text(payload: Any) -> str:
                 if not isinstance(key, str) or not key or len(key) > 80:
                     continue
                 normalized = key.lower()
-                if normalized in PRIVATE_RESULT_KEYS or normalized.endswith(("_token", "_secret", "_password", "_path")):
+                if normalized in PRIVATE_RESULT_KEYS or normalized.endswith(
+                    ("_token", "_secret", "_password", "_path")
+                ):
                     continue
                 result[key] = clean(item, depth + 1)
             return result
@@ -422,7 +443,11 @@ def backend_timeout_seconds(tool_name: str, args: dict[str, Any]) -> int:
         requested = args.get("timeout_seconds", 120)
         if isinstance(requested, int) and not isinstance(requested, bool):
             return min(MAX_BACKEND_TIMEOUT_SECONDS, max(30, requested + 30))
-    if tool_name in {"agent_pool_copy_auth", "agent_pool_destroy_pool", "agent_pool_install"}:
+    if tool_name in {
+        "agent_pool_copy_auth",
+        "agent_pool_destroy_pool",
+        "agent_pool_install",
+    }:
         return 600
     return DEFAULT_BACKEND_TIMEOUT_SECONDS
 
@@ -484,7 +509,9 @@ class SubprocessToolDispatcher:
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": args},
             }
-            encoded = (json.dumps(request, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+            encoded = (
+                json.dumps(request, ensure_ascii=True, separators=(",", ":")) + "\n"
+            ).encode("ascii")
             if len(encoded) > MAX_BACKEND_STDOUT_BYTES:
                 raise AgentError("control-center backend request exceeded limit")
             timeout = self._timeout_seconds
@@ -517,7 +544,9 @@ class SubprocessToolDispatcher:
                 cancel_before_exchange = self._cancel_requested
             if cancel_before_exchange:
                 self._kill_process_group(process)
-                raise AgentError("control-center backend outcome unknown after cancellation")
+                raise AgentError(
+                    "control-center backend outcome unknown after cancellation"
+                )
             stdout, stderr = self._bounded_exchange(process, encoded, timeout)
         except subprocess.TimeoutExpired as exc:
             if process is not None:
@@ -525,7 +554,9 @@ class SubprocessToolDispatcher:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=5)
             self._close_process_pipes(process)
-            raise AgentError("control-center backend outcome unknown after timeout") from exc
+            raise AgentError(
+                "control-center backend outcome unknown after timeout"
+            ) from exc
         except AgentError:
             if process is not None and process.poll() is None:
                 self._kill_process_group(process)
@@ -556,7 +587,9 @@ class SubprocessToolDispatcher:
                 self._state = "idle"
         if process.returncode != 0:
             if cancelled:
-                raise AgentError("control-center backend outcome unknown after cancellation")
+                raise AgentError(
+                    "control-center backend outcome unknown after cancellation"
+                )
             raise AgentError("control-center backend failed")
         return self._decode_response(stdout)
 
@@ -597,8 +630,14 @@ class SubprocessToolDispatcher:
         try:
             response = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-            raise AgentError("control-center backend returned invalid response") from exc
-        if not isinstance(response, dict) or response.get("jsonrpc") != "2.0" or response.get("id") != 1:
+            raise AgentError(
+                "control-center backend returned invalid response"
+            ) from exc
+        if (
+            not isinstance(response, dict)
+            or response.get("jsonrpc") != "2.0"
+            or response.get("id") != 1
+        ):
             raise AgentError("control-center backend returned invalid response")
         result = response.get("result")
         if not isinstance(result, dict) or not isinstance(result.get("isError"), bool):
@@ -615,7 +654,9 @@ class SubprocessToolDispatcher:
         try:
             payload = json.loads(content[0]["text"])
         except (json.JSONDecodeError, RecursionError) as exc:
-            raise AgentError("control-center backend returned invalid response") from exc
+            raise AgentError(
+                "control-center backend returned invalid response"
+            ) from exc
         if not isinstance(payload, dict):
             raise AgentError("control-center backend returned invalid response")
         if result["isError"] and "error" not in payload:
@@ -642,7 +683,9 @@ class SubprocessToolDispatcher:
         pending = memoryview(request)
         try:
             os.set_blocking(stdin_fd, False)
-            selector.register(process.stdin, selectors.EVENT_WRITE, data=("input", stdin_fd))
+            selector.register(
+                process.stdin, selectors.EVENT_WRITE, data=("input", stdin_fd)
+            )
             for fd, (stream, _buffer, _limit) in streams.items():
                 os.set_blocking(fd, False)
                 selector.register(stream, selectors.EVENT_READ, data=("output", fd))
@@ -661,7 +704,9 @@ class SubprocessToolDispatcher:
                         except BlockingIOError:
                             continue
                         except (BrokenPipeError, OSError) as exc:
-                            raise AgentError("control-center backend input failed") from exc
+                            raise AgentError(
+                                "control-center backend input failed"
+                            ) from exc
                         pending = pending[written:]
                         if not pending:
                             selector.unregister(process.stdin)
@@ -700,7 +745,9 @@ class OperationController:
     ) -> None:
         self._dispatch = dispatch or SubprocessToolDispatcher()
         self._schedule = schedule
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="the-hive-control")
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="the-hive-control"
+        )
         self._lock = threading.Lock()
         self._busy = False
         self._closed = False
@@ -735,7 +782,9 @@ class OperationController:
                     abort_prepare()
                 self._busy = False
                 raise
-        future.add_done_callback(lambda done: self._finished(generation, callback, done))
+        future.add_done_callback(
+            lambda done: self._finished(generation, callback, done)
+        )
         return True
 
     def _execute(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -765,7 +814,11 @@ class OperationController:
         except BaseException:
             self._close_after_schedule_failure(generation, callback)
             return
-        if isinstance(source_id, bool) or not isinstance(source_id, int) or source_id <= 0:
+        if (
+            isinstance(source_id, bool)
+            or not isinstance(source_id, int)
+            or source_id <= 0
+        ):
             self._close_after_schedule_failure(generation, callback)
 
     def _close_after_schedule_failure(
@@ -923,7 +976,9 @@ class ControlCenterWindow:
             self.catalog_error = None
         except (AgentError, CatalogError) as exc:
             self.tool_catalog = ()
-            self.catalog_error = str(public_error_payload(exc).get("error", "Katalog nicht verfügbar"))[:160]
+            self.catalog_error = str(
+                public_error_payload(exc).get("error", "Katalog nicht verfügbar")
+            )[:160]
         self.window = Gtk.ApplicationWindow(application=application)
         self.window.set_title("Flottenmanagement – Steuerzentrale")
         self.window.set_default_size(980, 640)
@@ -963,7 +1018,9 @@ class ControlCenterWindow:
         self.notebook = Gtk.Notebook()
         self.notebook.append_page(outer, Gtk.Label(label="Übersicht"))
         self.notebook.append_page(self._build_hosts_page(), Gtk.Label(label="Hosts"))
-        self.notebook.append_page(self._build_tools_page(), Gtk.Label(label="Werkzeuge"))
+        self.notebook.append_page(
+            self._build_tools_page(), Gtk.Label(label="Werkzeuge")
+        )
         self.notebook.append_page(self._build_ollama_page(), Gtk.Label(label="Ollama"))
         self.window.add(self.notebook)
 
@@ -1017,14 +1074,10 @@ class ControlCenterWindow:
         form.attach(Gtk.Label(label="Host-Ref"), 0, 0, 1, 1)
         self.host_ref_entry = Gtk.Entry()
         self.host_ref_entry.set_max_length(64)
-        self.host_ref_entry.connect(
-            "activate", lambda _entry: self.refresh_host_card()
-        )
+        self.host_ref_entry.connect("activate", lambda _entry: self.refresh_host_card())
         form.attach(self.host_ref_entry, 1, 0, 1, 1)
         form.attach(Gtk.Label(label="Generation"), 0, 1, 1, 1)
-        self.host_generation_spin = Gtk.SpinButton.new_with_range(
-            0, 2**31 - 1, 1
-        )
+        self.host_generation_spin = Gtk.SpinButton.new_with_range(0, 2**31 - 1, 1)
         form.attach(self.host_generation_spin, 1, 1, 1, 1)
         outer.pack_start(form, False, False, 0)
         self.host_load_button = Gtk.Button.new_with_label("Host laden")
@@ -1063,9 +1116,7 @@ class ControlCenterWindow:
             self.refresh_host_card()
             self._host_probe_operation_id = None
             self._host_probe_poll_attempts = 0
-        elif state.state in {"QUEUED", "RUNNING"} and isinstance(
-            operation_id, str
-        ):
+        elif state.state in {"QUEUED", "RUNNING"} and isinstance(operation_id, str):
             if self._host_probe_poll_attempts >= MAX_HOST_PROBE_POLLS:
                 self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
                 return
@@ -1114,9 +1165,7 @@ class ControlCenterWindow:
             submitted = self.controller.submit(
                 "fleet_hosts",
                 {},
-                lambda result, selected=host_ref: self._hosts_loaded(
-                    selected, result
-                ),
+                lambda result, selected=host_ref: self._hosts_loaded(selected, result),
             )
         except Exception:
             submitted = False
@@ -1227,7 +1276,9 @@ class ControlCenterWindow:
             label.set_xalign(0.0)
             entry = Gtk.Entry()
             entry.set_text(default)
-            entry.set_max_length(1024 if "path" in attribute or "executable" in attribute else 128)
+            entry.set_max_length(
+                1024 if "path" in attribute or "executable" in attribute else 128
+            )
             setattr(self, attribute, entry)
             form.attach(label, 0, index, 1, 1)
             form.attach(entry, 1, index, 1, 1)
@@ -1264,7 +1315,9 @@ class ControlCenterWindow:
         actions.pack_start(plan, False, False, 0)
         self.ollama_apply_button = Gtk.Button.new_with_label("Anwenden")
         self.ollama_apply_button.set_sensitive(False)
-        self.ollama_apply_button.connect("clicked", lambda _button: self._apply_ollama())
+        self.ollama_apply_button.connect(
+            "clicked", lambda _button: self._apply_ollama()
+        )
         actions.pack_start(self.ollama_apply_button, False, False, 0)
         instances_page.pack_start(actions, False, False, 0)
         self.ollama_status_label = Gtk.Label(label="Noch nicht geladen")
@@ -1292,7 +1345,9 @@ class ControlCenterWindow:
 
     def _ollama_models_loaded(self, result: dict[str, Any]) -> None:
         if "error" in result:
-            self.render_ollama(OllamaPageState(0, (), (), error_code="models_unavailable"))
+            self.render_ollama(
+                OllamaPageState(0, (), (), error_code="models_unavailable")
+            )
             self._set_busy(False, "Ollama-Modelle nicht verfügbar")
             self.ollama_status_label.set_text("Ollama-Modelle nicht verfügbar")
             return
@@ -1376,7 +1431,9 @@ class ControlCenterWindow:
         self._ollama_plan = {"plan_id": plan_id, "plan_digest": digest}
         self.ollama_plan_view.get_buffer().set_text(bounded_public_result_text(result))
         self._set_busy(False, "Ollama-Instanzplan bereit")
-        self.ollama_status_label.set_text("Plan geprüft; Anwenden ist jetzt freigegeben")
+        self.ollama_status_label.set_text(
+            "Plan geprüft; Anwenden ist jetzt freigegeben"
+        )
         self.render_ollama(state)
 
     def _apply_ollama(self) -> None:
@@ -1411,7 +1468,9 @@ class ControlCenterWindow:
             or not isinstance(instance_ref, str)
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", instance_ref) is None
         ):
-            self.ollama_status_label.set_text("Gültige Ollama-Instanz und Status erforderlich")
+            self.ollama_status_label.set_text(
+                "Gültige Ollama-Instanz und Status erforderlich"
+            )
             return
         if not self._confirm_message(f"Ollama-Instanz {instance_ref} jetzt prüfen?"):
             self.ollama_status_label.set_text("Ollama-Prüfung abgebrochen")
@@ -1429,9 +1488,7 @@ class ControlCenterWindow:
         ):
             self._set_busy(True, "Backendoperation läuft bereits")
 
-    def _ollama_mutation_finished(
-        self, action: str, result: dict[str, Any]
-    ) -> None:
+    def _ollama_mutation_finished(self, action: str, result: dict[str, Any]) -> None:
         if "error" in result:
             self._set_busy(False, f"Ollama-{action} fehlgeschlagen")
             self.ollama_status_label.set_text(f"Ollama-{action} fehlgeschlagen")
@@ -1444,7 +1501,9 @@ class ControlCenterWindow:
     def _set_busy(self, busy: bool, text: str) -> None:
         self.refresh_button.set_sensitive(not busy)
         self.previous_button.set_sensitive(not busy and self.page > 0)
-        self.next_button.set_sensitive(not busy and bool(self.last_page and self.last_page.truncated))
+        self.next_button.set_sensitive(
+            not busy and bool(self.last_page and self.last_page.truncated)
+        )
         self.search.set_sensitive(not busy)
         if hasattr(self, "tool_run_button"):
             self.tool_run_button.set_sensitive(
@@ -1466,10 +1525,14 @@ class ControlCenterWindow:
         for category in TOOL_CATEGORIES:
             self.tool_category_combo.append_text(category)
         self.tool_category_combo.set_active(0)
-        self.tool_category_combo.connect("changed", lambda _combo: self._refresh_tool_selector())
+        self.tool_category_combo.connect(
+            "changed", lambda _combo: self._refresh_tool_selector()
+        )
         selectors.pack_start(self.tool_category_combo, False, False, 0)
         self.tool_selector = Gtk.ComboBoxText()
-        self.tool_selector.connect("changed", lambda _combo: self._tool_selection_changed())
+        self.tool_selector.connect(
+            "changed", lambda _combo: self._tool_selection_changed()
+        )
         selectors.pack_start(self.tool_selector, True, True, 0)
         outer.pack_start(selectors, False, False, 0)
 
@@ -1489,7 +1552,9 @@ class ControlCenterWindow:
 
         action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.tool_run_button = Gtk.Button.new_with_label("Ausführen")
-        self.tool_run_button.connect("clicked", lambda _button: self._run_selected_tool())
+        self.tool_run_button.connect(
+            "clicked", lambda _button: self._run_selected_tool()
+        )
         action_row.pack_end(self.tool_run_button, False, False, 0)
         self.tool_status_label = Gtk.Label(label="Bereit")
         self.tool_status_label.set_xalign(0.0)
@@ -1516,14 +1581,18 @@ class ControlCenterWindow:
     def _refresh_tool_selector(self) -> None:
         selected = self.tool_category_combo.get_active_text() or "Alle"
         self.visible_tools = tuple(
-            tool for tool in self.tool_catalog if selected == "Alle" or tool_category(tool.name) == selected
+            tool
+            for tool in self.tool_catalog
+            if selected == "Alle" or tool_category(tool.name) == selected
         )
         self._suppress_tool_auto_run = True
         try:
             self.tool_selector.remove_all()
             for index, tool in enumerate(self.visible_tools):
                 suffix = "" if tool.enabled else " · gesperrt"
-                self.tool_selector.append(str(index), f"{tool.name} · {tool.risk.value}{suffix}")
+                self.tool_selector.append(
+                    str(index), f"{tool.name} · {tool.risk.value}{suffix}"
+                )
             self.tool_selector.set_active(0 if self.visible_tools else -1)
         finally:
             self._suppress_tool_auto_run = False
@@ -1537,7 +1606,9 @@ class ControlCenterWindow:
             index = int(active) if active is not None else -1
         except ValueError:
             index = -1
-        self.selected_tool = self.visible_tools[index] if 0 <= index < len(self.visible_tools) else None
+        self.selected_tool = (
+            self.visible_tools[index] if 0 <= index < len(self.visible_tools) else None
+        )
         self._render_tool_form()
         if (
             not self._suppress_tool_auto_run
@@ -1598,14 +1669,22 @@ class ControlCenterWindow:
             widget = Gtk.ComboBoxText()
             for index, value in enumerate(field.enum):
                 widget.append(str(index), str(value))
-            default_index = field.enum.index(field.default) if field.has_default and field.default in field.enum else 0
+            default_index = (
+                field.enum.index(field.default)
+                if field.has_default and field.default in field.enum
+                else 0
+            )
             widget.set_active(default_index)
             widget_kind = "enum"
         elif field.kind is FieldKind.BOOLEAN:
             widget = Gtk.CheckButton.new_with_label("aktiv")
             widget.set_active(bool(field.default) if field.has_default else False)
             widget_kind = "boolean"
-        elif field.kind is FieldKind.INTEGER and field.minimum is not None and field.maximum is not None:
+        elif (
+            field.kind is FieldKind.INTEGER
+            and field.minimum is not None
+            and field.maximum is not None
+        ):
             adjustment = Gtk.Adjustment(
                 value=int(field.default) if field.has_default else field.minimum,
                 lower=field.minimum,
@@ -1626,14 +1705,22 @@ class ControlCenterWindow:
             widget = Gtk.TextView()
             widget.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
             if field.has_default:
-                default = "\n".join(field.default) if isinstance(field.default, tuple) else str(field.default)
+                default = (
+                    "\n".join(field.default)
+                    if isinstance(field.default, tuple)
+                    else str(field.default)
+                )
                 widget.get_buffer().set_text(default)
             field_scroller = Gtk.ScrolledWindow()
-            field_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            field_scroller.set_policy(
+                Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
+            )
             field_scroller.set_min_content_height(80)
             field_scroller.add(widget)
             row.pack_start(field_scroller, False, True, 0)
-            widget_kind = "string_array" if field.kind is FieldKind.STRING_ARRAY else "text"
+            widget_kind = (
+                "string_array" if field.kind is FieldKind.STRING_ARRAY else "text"
+            )
             self.tool_inputs[field.name] = (field, use_field, widget, widget_kind)
             self.tool_form.pack_start(row, False, False, 0)
             return
@@ -1666,10 +1753,18 @@ class ControlCenterWindow:
                 if not isinstance(raw, str) or not re.fullmatch(r"-?[0-9]+", raw):
                     raise CatalogError(f"{name} muss Ganzzahl sein")
                 values[name] = int(raw)
-            elif widget_kind in {"text", "string_array"} and hasattr(widget, "get_buffer"):
+            elif widget_kind in {"text", "string_array"} and hasattr(
+                widget, "get_buffer"
+            ):
                 buffer = widget.get_buffer()
-                raw = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
-                values[name] = [line for line in raw.splitlines() if line] if widget_kind == "string_array" else raw
+                raw = buffer.get_text(
+                    buffer.get_start_iter(), buffer.get_end_iter(), True
+                )
+                values[name] = (
+                    [line for line in raw.splitlines() if line]
+                    if widget_kind == "string_array"
+                    else raw
+                )
             else:
                 values[name] = widget.get_text()
         return serialize_arguments(tool, values)
@@ -1691,7 +1786,9 @@ class ControlCenterWindow:
 
     def _confirm_destructive(self, tool: ToolDescriptor) -> bool:
         phrase = f"AUSFÜHREN {tool.name}"
-        dialog = self.Gtk.Dialog(title="Destruktive Aktion", transient_for=self.window, modal=True)
+        dialog = self.Gtk.Dialog(
+            title="Destruktive Aktion", transient_for=self.window, modal=True
+        )
         dialog.add_button("Abbrechen", self.Gtk.ResponseType.CANCEL)
         dialog.add_button("Ausführen", self.Gtk.ResponseType.OK)
         box = dialog.get_content_area()
@@ -1706,16 +1803,22 @@ class ControlCenterWindow:
         dialog.destroy()
         return accepted
 
-    def _confirm_tool_run(self, tool: ToolDescriptor, risk: Risk, argument_count: int) -> bool:
+    def _confirm_tool_run(
+        self, tool: ToolDescriptor, risk: Risk, argument_count: int
+    ) -> bool:
         if risk is Risk.READ_ONLY:
             return True
         if risk is Risk.MUTATING:
-            return self._confirm_message(f"{tool.name} mit {argument_count} Argument(en) ausführen?")
+            return self._confirm_message(
+                f"{tool.name} mit {argument_count} Argument(en) ausführen?"
+            )
         if risk is Risk.BROAD:
             preview = self._confirm_message(
                 f"Breite Aktion {tool.name}\nArgumente: {argument_count}\nZusammenfassung geprüft?"
             )
-            return preview and self._confirm_message(f"{tool.name} jetzt wirklich ausführen?")
+            return preview and self._confirm_message(
+                f"{tool.name} jetzt wirklich ausführen?"
+            )
         if risk is Risk.DESTRUCTIVE:
             return self._confirm_destructive(tool)
         return False
@@ -1731,18 +1834,24 @@ class ControlCenterWindow:
             self.tool_status_label.set_text(f"Formularfehler: {str(exc)[:160]}")
             return
         if tool.name == "agent_pool_destroy_pool":
-            if not self._confirm_message("Poolstatus als verpflichtende Vorschau laden?"):
+            if not self._confirm_message(
+                "Poolstatus als verpflichtende Vorschau laden?"
+            ):
                 self.tool_status_label.set_text("Aktion abgebrochen")
                 return
             preview_arguments = {
-                key: value for key, value in arguments.items() if key in {"spec", "target_dir", "codex_bin"}
+                key: value
+                for key, value in arguments.items()
+                if key in {"spec", "target_dir", "codex_bin"}
             }
             self._set_busy(True, "Pool-Löschvorschau wird geladen …")
             self.tool_status_label.set_text("Pool-Löschvorschau wird geladen …")
             if not self.controller.submit(
                 "agent_pool_status",
                 preview_arguments,
-                lambda result, selected=tool, selected_args=arguments: self._destroy_preview_finished(
+                lambda result,
+                selected=tool,
+                selected_args=arguments: self._destroy_preview_finished(
                     selected, selected_args, result
                 ),
             ):
@@ -1756,7 +1865,9 @@ class ControlCenterWindow:
         if not self.controller.submit(
             tool.name,
             arguments,
-            lambda result, selected=tool, selected_risk=risk: self._tool_finished(selected, selected_risk, result),
+            lambda result, selected=tool, selected_risk=risk: self._tool_finished(
+                selected, selected_risk, result
+            ),
         ):
             self._set_busy(True, "Backendoperation läuft bereits")
 
@@ -1781,11 +1892,15 @@ class ControlCenterWindow:
         if not self.controller.submit(
             tool.name,
             arguments,
-            lambda result, selected=tool: self._tool_finished(selected, Risk.DESTRUCTIVE, result),
+            lambda result, selected=tool: self._tool_finished(
+                selected, Risk.DESTRUCTIVE, result
+            ),
         ):
             self._set_busy(True, "Backendoperation läuft bereits")
 
-    def _tool_finished(self, tool: ToolDescriptor, risk: Risk, result: dict[str, Any]) -> None:
+    def _tool_finished(
+        self, tool: ToolDescriptor, risk: Risk, result: dict[str, Any]
+    ) -> None:
         self._set_tool_result(result)
         if "error" in result:
             self._set_busy(False, f"{tool.name}: fehlgeschlagen")
@@ -1815,7 +1930,9 @@ class ControlCenterWindow:
         try:
             args = status_query(self._filter_text(), self.page)
         except AgentError:
-            self._set_busy(False, "Filter ungültig: erlaubt sind a, b, c oder konkrete IDs wie a12")
+            self._set_busy(
+                False, "Filter ungültig: erlaubt sind a, b, c oder konkrete IDs wie a12"
+            )
             return
         self._set_busy(True, "Status wird geladen …")
         if not self.controller.submit("agent_status", args, self._status_loaded):
@@ -1853,7 +1970,9 @@ class ControlCenterWindow:
                     button.set_tooltip_text(reason)
                 button.connect(
                     "clicked",
-                    lambda _button, selected=action, agent=row.agent: self._confirm_mutation(selected, agent),
+                    lambda _button,
+                    selected=action,
+                    agent=row.agent: self._confirm_mutation(selected, agent),
                 )
                 box.pack_end(button, False, False, 0)
             item.add(box)
@@ -1878,12 +1997,18 @@ class ControlCenterWindow:
         if action == "start":
             args["cwd"] = str(Path.home())
         self._set_busy(True, f"{agent} wird {verb} …")
-        if not self.controller.submit(tool, args, lambda result: self._mutation_finished(action, agent, result)):
+        if not self.controller.submit(
+            tool, args, lambda result: self._mutation_finished(action, agent, result)
+        ):
             self._set_busy(True, "Backendoperation läuft bereits")
 
-    def _mutation_finished(self, action: str, agent: str, result: dict[str, Any]) -> None:
+    def _mutation_finished(
+        self, action: str, agent: str, result: dict[str, Any]
+    ) -> None:
         if "error" in result:
-            self._set_busy(False, f"{agent}: Aktion fehlgeschlagen: {str(result['error'])[:120]}")
+            self._set_busy(
+                False, f"{agent}: Aktion fehlgeschlagen: {str(result['error'])[:120]}"
+            )
             return
         verb = "Start" if action == "start" else "Stop"
         self._set_busy(False, f"{agent}: {verb} abgeschlossen; Status wird geprüft")
@@ -1900,7 +2025,11 @@ class ControlCenterWindow:
             return False
         else:
             cancelled = self.controller.cancel()
-            detail = "Abbruch angefordert" if cancelled else "warte auf begrenztes Backendzeitlimit"
+            detail = (
+                "Abbruch angefordert"
+                if cancelled
+                else "warte auf begrenztes Backendzeitlimit"
+            )
             self.status_label.set_text(f"Backendoperation läuft; {detail}")
             self.tool_status_label.set_text(f"Backendoperation läuft; {detail}")
             if not self._close_poll_id:

@@ -299,7 +299,9 @@ def test_digest_requires_lowercase_hex_of_requested_size():
 
 
 def test_enum_requires_the_exact_enum_class():
-    assert protocol._enum(ChpbMessageKind.REPLY, ChpbMessageKind) is ChpbMessageKind.REPLY
+    assert (
+        protocol._enum(ChpbMessageKind.REPLY, ChpbMessageKind) is ChpbMessageKind.REPLY
+    )
 
     with pytest.raises(ChpbValidationError) as error:
         protocol._enum(BrokerResultCode.OK, ChpbMessageKind)

@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import contextlib
+import ctypes
 from datetime import UTC, datetime
 import fcntl
 import hashlib
@@ -17,7 +19,10 @@ import json
 import os
 from pathlib import Path
 import posixpath
+import re
 import secrets
+import selectors
+import signal
 import stat
 import subprocess
 import runpy
@@ -29,10 +34,6 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
-from the_hive.hook_session_pin_store import (
-    HookSessionPinStoreError,
-    HookSessionPinStoreV1,
-)
 from the_hive.runtime_process import BoundedProcessError, run_bounded
 
 
@@ -52,9 +53,7 @@ _HOURLY_PROBE_RUNTIME_ROOT_BINDING = (
 )
 _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY = "RuntimeDirectory=the-hive-hourly-runtime"
 _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE = "RuntimeDirectoryMode=0700"
-_HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING = (
-    "BindReadOnlyPaths=%t/bus:%t/bus:norbind"
-)
+_HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING = "BindReadOnlyPaths=%t/bus:%t/bus:norbind"
 _HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING = (
     "BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind"
 )
@@ -67,6 +66,12 @@ _HOURLY_PROBE_STATE_WRITE_PATH = "ReadWritePaths=%h/.local/state/codex-master-mc
 _MAX_UNIT_BYTES = 128 * 1024
 _MAX_HEALTH_BYTES = 256 * 1024
 _LOCK_NAME = ".runtime-lifecycle.lock"
+_ROOT_HOOK_ABI_PARENT = Path("/usr/local/libexec/the-hive/hook-abi")
+_ROOT_HOOK_ABI_UID = 0
+_ROOT_HOOK_ABI_GID = 0
+_ROOT_HOOK_EFFECT_RECEIPT = "root-hook-effect-receipt-v1.json"
+_PLUGIN_EFFECT_RECEIPT = "plugin-release-effect-receipt-v1.json"
+_OWNER_RECEIPT_FRESHNESS_NS = 3_600 * 1_000_000_000
 _OBSERVATION_NAME = "runtime-lifecycle-probe-observation.json"
 _MAX_OBSERVATION_BYTES = 4096
 _PROBE_OBSERVATION_SECONDS = 120.0
@@ -74,10 +79,26 @@ _PROBE_OUTPUT_BYTES = 16 * 1024
 _CANARY_UNIT_PREFIX = "the-hive-runtime-canary-"
 _CANARY_RUNTIME_ROOT_NAME = "the-hive-runtime-canary"
 _CANARY_LOCK_NAME = ".canary.lock"
+_CANARY_QUALIFICATION_NAME = "qualification-v1.json"
+_MAX_CANARY_QUALIFICATION_BYTES = 32 * 1024
+_CANARY_QUALIFICATION_CRITERIA = frozenset(
+    {
+        "client_compatibility",
+        "client_behavior",
+        "client_probe",
+        "manager_api_contract",
+        "manager_actions",
+        "runtime_canary",
+        "runtime_features",
+    }
+)
+_CANONICAL_CODEX_WRAPPER = Path("/usr/local/bin/codex")
 _CANARY_RUN_PREFIX = "run-"
 _CANARY_MANAGER_START_SECONDS = 15.0
 _CANARY_RESULT_SECONDS = 112.0
 _CANARY_CLEANUP_SECONDS = 5.0
+_CANARY_CLIENT_COMMAND_SECONDS = 10.0
+_CANARY_CLIENT_OUTPUT_BYTES = 16 * 1024
 _CANARY_HEALTH_BYTES = 64 * 1024
 _USER_RUNTIME_DIRECTORY_ROOT = Path("/run/user")
 _CANARY_STAGE_CODES = frozenset(
@@ -91,8 +112,7 @@ _CANARY_STAGE_CODES = frozenset(
     }
 )
 _CANARY_SHOW_PROPERTIES = (
-    "--property=LoadState,ActiveState,Description,Transient,Result,"
-    "ExecMainStatus"
+    "--property=LoadState,ActiveState,Description,Transient,Result,ExecMainStatus"
 )
 _CANARY_SYSTEMD_RUN_FAILURES = {
     "Failed to start transient service unit: Invalid argument\n": (
@@ -184,9 +204,7 @@ class _CutoverMutationError(RuntimeLifecycleError):
         status = str(error)
         self.status_whitelisted = status in _CUTOVER_MUTATION_STATUSES
         super().__init__(
-            status
-            if self.status_whitelisted
-            else "runtime_lifecycle_systemd_failed"
+            status if self.status_whitelisted else "runtime_lifecycle_systemd_failed"
         )
         self.phase = phase
 
@@ -309,13 +327,8 @@ def _d320_carrier_bytes(value: object, *, code: str) -> bytes:
 
 
 def _d320_validate_envelope_payload_size(payload_bytes: object) -> bytes:
-    payload_bytes = _d320_bytes_copy(
-        payload_bytes, code="d320_envelope_too_large"
-    )
-    if (
-        len(payload_bytes) + _D320_ENVELOPE_FIXED_BYTES
-        > _D320_MAX_ENVELOPE_BYTES
-    ):
+    payload_bytes = _d320_bytes_copy(payload_bytes, code="d320_envelope_too_large")
+    if len(payload_bytes) + _D320_ENVELOPE_FIXED_BYTES > _D320_MAX_ENVELOPE_BYTES:
         _d320_fail("d320_envelope_too_large")
     return payload_bytes
 
@@ -587,9 +600,7 @@ def _d320_immutable_mapping(
     payload_bytes: object,
     validator: Callable[[object], Mapping[str, object]],
 ) -> dict[str, object]:
-    payload_bytes = _d320_bytes_copy(
-        payload_bytes, code="d320_wrapper_bytes_invalid"
-    )
+    payload_bytes = _d320_bytes_copy(payload_bytes, code="d320_wrapper_bytes_invalid")
     if len(payload_bytes) > _D320_MAX_ENVELOPE_BYTES:
         _d320_fail("d320_wrapper_bytes_invalid")
     parsed = _d320_parse_json(payload_bytes)
@@ -628,9 +639,7 @@ def _d320_sequence_copy(
             _d320_visit_json_entry(traversal_budget)
             if index == length:
                 _d320_fail(code)
-            result.append(
-                _d320_normalize_json_value(item, budget=traversal_budget)
-            )
+            result.append(_d320_normalize_json_value(item, budget=traversal_budget))
     except D320CutoverJournalError:
         raise
     except MemoryError as exc:
@@ -1287,9 +1296,8 @@ def _d320_validate_pins(value: object) -> Mapping[str, object]:
             _d320_fail("d320_pin_list_invalid")
         for generation in generations:
             _d320_text(generation, maximum=128, ascii_only=True)
-        if (
-            generations != sorted(generations)
-            or len(generations) != len(set(generations))
+        if generations != sorted(generations) or len(generations) != len(
+            set(generations)
         ):
             _d320_fail("d320_pin_list_not_canonical")
     return pins
@@ -1433,9 +1441,7 @@ def _d320_validate_payload(
     _d320_validate_native(payload["native"], aggregate=aggregate)
     precutover = _d320_validate_cutover(payload["precutover"], aggregate=aggregate)
     postcutover = _d320_validate_cutover(payload["postcutover"], aggregate=aggregate)
-    if all(
-        precutover[name] == postcutover[name] for name in _D320_ARTIFACT_NAMES
-    ):
+    if all(precutover[name] == postcutover[name] for name in _D320_ARTIFACT_NAMES):
         _d320_fail("d320_cutover_artifacts_ambiguous")
     _d320_validate_history(
         payload["history"],
@@ -1487,13 +1493,7 @@ def _d320_journal_payload_from_carrier(
 
 def _d320_journal_envelope(payload_bytes: bytes) -> bytes:
     digest = hashlib.sha256(payload_bytes).hexdigest().encode("ascii")
-    return (
-        b'{"content_sha256":"'
-        + digest
-        + b'","payload":'
-        + payload_bytes
-        + b"}\n"
-    )
+    return b'{"content_sha256":"' + digest + b'","payload":' + payload_bytes + b"}\n"
 
 
 class D320CutoverJournalV1(bytes):
@@ -1578,6 +1578,1203 @@ class D320CutoverJournalV1(bytes):
     def to_bytes(self) -> bytes:
         payload_bytes, _ = _d320_journal_payload_from_carrier(self)
         return _d320_journal_envelope(payload_bytes)
+
+
+_V2_FILE_PATHS = (
+    ".local/lib/the-hive-runtime/.the-hive-release-pointers.json",
+    ".local/lib/the-hive-runtime/the-hive-mcp",
+    ".local/libexec/codex_master_hive_hourly_probe.py",
+    ".local/bin/the-hive-openai-pricing-inventory",
+    ".local/state/codex-master-mcp/runtime-lifecycle-probe-observation.json",
+    *(
+        ".config/systemd/user/" + name
+        for name in (
+            _NEW_SERVICE,
+            _NEW_TIMER,
+            *_PRICING_UNITS,
+            _LEGACY_SERVICE,
+            _LEGACY_TIMER,
+        )
+    ),
+)
+_V2_MANAGER_UNITS = (
+    _NEW_SERVICE,
+    _NEW_TIMER,
+    _LEGACY_SERVICE,
+    _LEGACY_TIMER,
+    *_PRICING_UNITS,
+)
+_V2_PHASES = frozenset(
+    {
+        "INTENT",
+        "SEALED",
+        "INSTALLED",
+        "ACTIVATED",
+        "OBSERVED",
+        "COMMITTED",
+        "RECOVERING",
+        "ROLLED_BACK",
+        "BLOCKED",
+    }
+)
+
+
+def _v2_expected_effects(
+    home: Path, source_commit: str, stage_name: str
+) -> dict[str, str]:
+    return {
+        str(home / relative): kind
+        for kind, relative in (
+            ("state_parent", ".local/state"),
+            ("install_state", ".local/state/codex-master-mcp"),
+            ("local_bin", ".local/bin"),
+            ("local_libexec", ".local/libexec"),
+            ("hook_pin_authority", ".local/state/the-hive/hook-session-pins-v1"),
+            ("hook_pin_parent", ".local/state/the-hive"),
+            (
+                "hook_pin_lock",
+                ".local/state/the-hive/hook-session-pins-v1/.hook-session-pins-v1.lock",
+            ),
+            ("probe_lock", ".local/state/codex-master-mcp/.hive-hourly-probe.lock"),
+            ("config", ".config"),
+            ("config_systemd", ".config/systemd"),
+            ("units", ".config/systemd/user"),
+            ("library", ".local/lib"),
+            ("release_root", ".local/lib/the-hive-runtime"),
+            ("generations", ".local/lib/the-hive-runtime/generations"),
+            ("stage", ".local/lib/" + stage_name),
+            (
+                "generation",
+                ".local/lib/the-hive-runtime/generations/" + source_commit,
+            ),
+            (
+                "publish_lock",
+                ".local/lib/the-hive-runtime/.the-hive-release-publish.lock",
+            ),
+            (
+                "lifecycle_lock",
+                ".local/state/codex-master-mcp/hive/.runtime-lifecycle.lock",
+            ),
+            (
+                "journal",
+                ".local/state/codex-master-mcp/hive/runtime-lifecycle-journal-v2.json",
+            ),
+        )
+    }
+
+
+def _v2_plan_effects(home: Path, source_commit: str) -> list[dict[str, str]]:
+    stage_name = ".the-hive-runtime.stage.<transaction-id>"
+    stage_path = str(home / ".local" / "lib" / stage_name)
+    effects = _v2_expected_effects(home, source_commit, stage_name)
+    return [
+        (
+            {"kind": kind, "path_template": path}
+            if path == stage_path
+            else {"kind": kind, "path": path}
+        )
+        for path, kind in sorted(effects.items())
+    ]
+
+
+def _v2_validate_identity(
+    kind: str, value: object, *, owner_uid: int
+) -> Mapping[str, object]:
+    identity = _d320_object(
+        value,
+        ("type", "dev", "ino", "uid", "gid", "mode", "nlink", "children"),
+        code="d320_v2_identity_invalid",
+    )
+    if identity["type"] == "absent":
+        if (
+            any(
+                identity[key] is not None
+                for key in ("dev", "ino", "uid", "gid", "mode", "nlink")
+            )
+            or identity["children"] != []
+        ):
+            _d320_fail("d320_v2_identity_invalid")
+        return identity
+    expected_type = (
+        "directory"
+        if kind
+        in {
+            "state_parent",
+            "install_state",
+            "local_bin",
+            "local_libexec",
+            "config",
+            "config_systemd",
+            "units",
+            "hook_pin_authority",
+            "hook_pin_parent",
+            "library",
+            "release_root",
+            "generations",
+            "stage",
+            "generation",
+        }
+        else "file"
+    )
+    if identity["type"] != expected_type:
+        _d320_fail("d320_v2_identity_invalid")
+    for key in ("dev", "ino", "uid", "gid", "mode", "nlink"):
+        _d320_int(identity[key], minimum=0)
+    if identity["uid"] != owner_uid:
+        _d320_fail("d320_v2_identity_owner_invalid")
+    if expected_type == "file" and (
+        identity["nlink"] != 1 or identity["mode"] != 0o600
+    ):
+        _d320_fail("d320_v2_identity_file_invalid")
+    if expected_type == "directory" and identity["mode"] != 0o700:
+        _d320_fail("d320_v2_identity_directory_invalid")
+    children = identity["children"]
+    if (
+        not isinstance(children, list)
+        or children != sorted(set(children))
+        or not all(
+            isinstance(name, str) and name not in {".", ".."} for name in children
+        )
+    ):
+        _d320_fail("d320_v2_identity_children_invalid")
+    if kind == "generations" and any(
+        re.fullmatch(r"[0-9a-f]{40}", name) is None for name in children
+    ):
+        _d320_fail("d320_v2_identity_children_invalid")
+    return identity
+
+
+def _v2_validate_files(
+    value: object, *, home: Path, aggregate: list[int]
+) -> list[Mapping[str, object]]:
+    if not isinstance(value, list) or len(value) != len(_V2_FILE_PATHS):
+        _d320_fail("d320_v2_files_invalid")
+    expected_files = {str(home / relative) for relative in _V2_FILE_PATHS}
+    seen: set[str] = set()
+    result: list[Mapping[str, object]] = []
+    for item in value:
+        snapshot = _d320_validate_snapshot(item, aggregate=aggregate)
+        path = snapshot["path"]
+        if (
+            path not in expected_files
+            or path in seen
+            or snapshot["name"] != Path(path).name
+        ):
+            _d320_fail("d320_v2_files_invalid")
+        seen.add(path)
+        result.append(snapshot)
+    if seen != expected_files:
+        _d320_fail("d320_v2_files_invalid")
+    return result
+
+
+def _v2_validate_effects(
+    value: object,
+    *,
+    home: Path,
+    source_commit: str,
+    stage_name: str,
+    owner_uid: int,
+) -> list[Mapping[str, object]]:
+    expected = _v2_expected_effects(home, source_commit, stage_name)
+    if not isinstance(value, list) or len(value) != len(expected):
+        _d320_fail("d320_v2_effects_invalid")
+    seen: set[str] = set()
+    result: list[Mapping[str, object]] = []
+    for item in value:
+        effect = _d320_object(
+            item,
+            ("kind", "path", "present", "identity"),
+            code="d320_v2_effect_invalid",
+        )
+        path = effect["path"]
+        kind = expected.get(path) if isinstance(path, str) else None
+        if (
+            kind is None
+            or path in seen
+            or effect["kind"] != kind
+            or type(effect["present"]) is not bool
+        ):
+            _d320_fail("d320_v2_effect_invalid")
+        identity = _v2_validate_identity(kind, effect["identity"], owner_uid=owner_uid)
+        if effect["present"] != (identity["type"] != "absent"):
+            _d320_fail("d320_v2_effect_invalid")
+        seen.add(path)
+        result.append(effect)
+    if seen != set(expected):
+        _d320_fail("d320_v2_effects_invalid")
+    return result
+
+
+def _v2_validate_manager_states(value: object) -> Mapping[str, Mapping[str, str]]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(_V2_MANAGER_UNITS)
+        or any(
+            not isinstance(state, dict) or not _valid_bound_unit_state(state)
+            for state in value.values()
+        )
+    ):
+        _d320_fail("d320_v2_manager_invalid")
+    return value
+
+
+_V2_STEP_ACTIONS = {
+    "INTENT": {"intent_persisted", "effect_created"},
+    "SEALED": {"stage_sealed"},
+    "INSTALLED": {"effect_installed", "generation_published"},
+    "ACTIVATED": {"manager_mutation", "effect_installed", "owner_evidence_readback"},
+    "OBSERVED": {"effect_readback", "manager_readback", "owner_evidence_readback"},
+    "COMMITTED": {"commit_verified"},
+    "RECOVERING": {"recovery_started", "inverse_reserved", "inverse_applied"},
+    "ROLLED_BACK": {"rollback_verified"},
+    "BLOCKED": {"blocked"},
+}
+_V2_PHASE_ORDER = {phase: index for index, phase in enumerate(_V2_STEP_ACTIONS)}
+_V2_JOURNAL_ACTIONS = {
+    "intent_persisted",
+    "commit_verified",
+    "recovery_started",
+    "rollback_verified",
+    "blocked",
+}
+
+
+def _v2_validate_steps(
+    value: object,
+    *,
+    phase: str,
+    sequence: int,
+    journal_path: str,
+    expected_files: set[str],
+    expected_effects: Mapping[str, str],
+    expected_setup_temps: Mapping[str, str],
+) -> list[Mapping[str, object]]:
+    home = Path(journal_path).parents[4]
+    if not isinstance(value, list) or not 1 <= len(value) <= 128:
+        _d320_fail("d320_v2_steps_invalid")
+    result: list[Mapping[str, object]] = []
+    prior_sequence = 0
+    prior_phase_index = -1
+    seen_events: set[tuple[str, str, str]] = set()
+    for item in value:
+        step = _d320_object(
+            item,
+            ("sequence", "phase", "action", "effect", "sha256"),
+            code="d320_v2_step_invalid",
+        )
+        event_sequence = _d320_int(step["sequence"], minimum=1, maximum=sequence)
+        event_phase = _d320_text(step["phase"], maximum=32, ascii_only=True)
+        action = _d320_text(step["action"], maximum=32, ascii_only=True)
+        effect = _d320_text(step["effect"], maximum=4096)
+        _d320_sha256(step["sha256"])
+        if event_phase not in _V2_PHASES or action not in _V2_STEP_ACTIONS[event_phase]:
+            _d320_fail("d320_v2_step_invalid")
+        manager_name = effect.removeprefix("manager:")
+        owner_receipt_paths = {
+            str(_ROOT_HOOK_ABI_PARENT / _ROOT_HOOK_EFFECT_RECEIPT),
+            str(home / ".local/state/codex-master-mcp/hive" / _PLUGIN_EFFECT_RECEIPT),
+        }
+        path_effect = (
+            effect in expected_files
+            or effect in expected_effects
+            or effect in expected_setup_temps
+        )
+        if action == "owner_evidence_readback":
+            bound_effect = (
+                event_phase in {"ACTIVATED", "OBSERVED"}
+                and effect in owner_receipt_paths
+            )
+        elif action in _V2_JOURNAL_ACTIONS:
+            bound_effect = effect == journal_path
+        elif action == "effect_created":
+            bound_effect = effect in expected_setup_temps
+        elif action == "stage_sealed":
+            bound_effect = expected_effects.get(effect) == "stage"
+        elif action == "generation_published":
+            bound_effect = expected_effects.get(effect) == "generation"
+        elif action in {"manager_mutation", "manager_readback"}:
+            bound_effect = (
+                effect.startswith("manager:") and manager_name in _V2_MANAGER_UNITS
+            )
+        else:
+            bound_effect = path_effect
+        if not bound_effect:
+            _d320_fail("d320_v2_step_binding_invalid")
+        phase_index = _V2_PHASE_ORDER[event_phase]
+        if event_sequence != prior_sequence + 1 or phase_index < prior_phase_index:
+            _d320_fail("d320_v2_step_order_invalid")
+        event = (event_phase, action, effect)
+        if event in seen_events and action != "owner_evidence_readback":
+            _d320_fail("d320_v2_step_duplicate")
+        seen_events.add(event)
+        result.append(step)
+        prior_sequence = event_sequence
+        prior_phase_index = phase_index
+    if result[-1]["phase"] != phase or result[-1]["sequence"] != sequence:
+        _d320_fail("d320_v2_step_head_invalid")
+    if result[0]["phase"] != "INTENT" or result[0]["action"] != "intent_persisted":
+        _d320_fail("d320_v2_intent_step_missing")
+    if phase == "INTENT" and any(
+        step["action"] != "intent_persisted" and step["action"] != "effect_created"
+        for step in result
+    ):
+        _d320_fail("d320_v2_intent_step_invalid")
+    return result
+
+
+def _v2_validate_post(
+    value: object,
+    *,
+    home: Path,
+    source_commit: str,
+    stage_name: str,
+    owner_uid: int,
+    phase: str,
+    steps: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    if phase not in {"OBSERVED", "COMMITTED", "RECOVERING", "ROLLED_BACK", "BLOCKED"}:
+        _d320_fail("d320_v2_post_phase_invalid")
+    post = _d320_object(
+        value,
+        ("files", "extra_effects", "manager_states"),
+        code="d320_v2_post_invalid",
+    )
+    files = _v2_validate_files(post["files"], home=home, aggregate=[0])
+    effects = _v2_validate_effects(
+        post["extra_effects"],
+        home=home,
+        source_commit=source_commit,
+        stage_name=stage_name,
+        owner_uid=owner_uid,
+    )
+    manager = _v2_validate_manager_states(post["manager_states"])
+    readbacks = {
+        step["effect"]: step["sha256"]
+        for step in steps
+        if step["phase"] == "OBSERVED"
+        and step["action"] in {"effect_readback", "manager_readback"}
+    }
+    expected_readbacks = {
+        item["path"]: hashlib.sha256(_d320_canonical_json(item)).hexdigest()
+        for item in (*files, *effects)
+    } | {
+        "manager:" + unit: hashlib.sha256(_d320_canonical_json(state)).hexdigest()
+        for unit, state in manager.items()
+    }
+    if readbacks != expected_readbacks:
+        _d320_fail("d320_v2_post_readback_incomplete")
+    return post
+
+
+def _v2_validate_payload(value: object) -> dict[str, object]:
+    fields = {
+        "schema",
+        "mode",
+        "journal_id",
+        "transaction_id",
+        "lock_generation",
+        "sequence",
+        "phase",
+        "plan_sha256",
+        "plan",
+        "source",
+        "target",
+        "owner_uid",
+        "predecessor",
+        "stage_name",
+        "files",
+        "extra_effects",
+        "manager_pre",
+        "inverse_actions",
+        "sealed",
+        "post",
+        "recovery_count",
+        "steps",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or value["schema"] != "D320CutoverJournalV2"
+        or value["mode"] != "runtime_lifecycle"
+    ):
+        _d320_fail("d320_v2_schema_invalid")
+    _d320_text(value["journal_id"], maximum=128, ascii_only=True)
+    for key in (
+        "transaction_id",
+        "lock_generation",
+        "sequence",
+        "owner_uid",
+        "recovery_count",
+    ):
+        _d320_int(value[key])
+    _d320_sha256(value["plan_sha256"])
+    plan = _d320_object(
+        value["plan"],
+        (
+            "schema",
+            "mode",
+            "source",
+            "target",
+            "owner_uid",
+            "predecessor",
+            "compatibility",
+            "qualification",
+            "files",
+            "extra_effects",
+            "manager_states",
+            "actions",
+            "inverse_actions",
+            "output_manifest_digest",
+        ),
+        code="d320_v2_plan_invalid",
+    )
+    compatibility = _d320_object(
+        plan["compatibility"],
+        ("status", "sha256"),
+        code="d320_v2_plan_compatibility_invalid",
+    )
+    if compatibility["status"] != "qualified":
+        _d320_fail("d320_v2_plan_compatibility_invalid")
+    _d320_sha256(compatibility["sha256"])
+    qualification = plan["qualification"]
+    qualification = _d320_object(
+        qualification,
+        ("status", "issued_at_unix_ns", "sha256"),
+        code="d320_v2_plan_qualification_invalid",
+    )
+    if (
+        qualification["status"] != "qualified"
+        or type(qualification["issued_at_unix_ns"]) is not int
+        or qualification["issued_at_unix_ns"] <= 0
+    ):
+        _d320_fail("d320_v2_plan_qualification_invalid")
+    _d320_sha256(qualification["sha256"])
+    if (
+        plan["schema"] != "D320RuntimeCutoverPlanV2"
+        or plan["mode"] != "runtime_lifecycle"
+        or hashlib.sha256(_d320_canonical_json(plan)).hexdigest()
+        != value["plan_sha256"]
+    ):
+        _d320_fail("d320_v2_plan_invalid")
+    source = _d320_object(
+        value["source"], ("commit", "tree_sha256"), code="d320_v2_source_invalid"
+    )
+    _d320_git_hex(source["commit"])
+    _d320_sha256(source["tree_sha256"])
+    target = _d320_object(
+        value["target"],
+        ("realpath", "dev", "ino", "uid", "gid", "mode"),
+        code="d320_v2_target_invalid",
+    )
+    home = Path(_d320_validate_absolute_path(target["realpath"]))
+    for key in ("dev", "ino", "uid", "gid", "mode"):
+        _d320_int(target[key], minimum=0)
+    owner_uid = _d320_int(value["owner_uid"])
+    if target["uid"] != owner_uid:
+        _d320_fail("d320_v2_owner_invalid")
+    predecessor = _d320_object(
+        value["predecessor"],
+        ("generation", "manifest_digest", "consumer_sha256"),
+        code="d320_v2_predecessor_invalid",
+    )
+    plan_predecessor = _d320_object(
+        plan["predecessor"],
+        ("generation", "manifest_digest", "consumer_pin", "consumer_sha256"),
+        code="d320_v2_plan_invalid",
+    )
+    if (
+        plan["source"] != source
+        or plan["target"] != target
+        or plan["owner_uid"] != owner_uid
+        or plan_predecessor["consumer_pin"] is not True
+        or plan_predecessor["generation"] != predecessor["generation"]
+        or plan_predecessor["manifest_digest"] != predecessor["manifest_digest"]
+        or plan_predecessor["consumer_sha256"] != predecessor["consumer_sha256"]
+        or plan["actions"] != ["install", "activate", "observe", "commit"]
+        or plan["inverse_actions"]
+        != ["restore_manager", "restore_files", "discard_generation"]
+        or plan["output_manifest_digest"] != "pending"
+    ):
+        _d320_fail("d320_v2_plan_binding_invalid")
+    _d320_git_hex(predecessor["generation"])
+    digest = predecessor["manifest_digest"]
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
+        _d320_fail("d320_v2_predecessor_invalid")
+    _d320_sha256(digest[7:])
+    _d320_sha256(predecessor["consumer_sha256"])
+    stage_name = _d320_text(value["stage_name"], maximum=96, ascii_only=True)
+    if (
+        not isinstance(stage_name, str)
+        or re.fullmatch(r"\.the-hive-runtime\.stage\.[A-Za-z0-9-]{1,64}", stage_name)
+        is None
+    ):
+        _d320_fail("d320_v2_stage_invalid")
+    aggregate = [0]
+    snapshots = _v2_validate_files(value["files"], home=home, aggregate=aggregate)
+    expected_files = {snapshot["path"] for snapshot in snapshots}
+    plan_files = plan["files"]
+    if not isinstance(plan_files, list) or len(plan_files) != len(snapshots):
+        _d320_fail("d320_v2_plan_files_invalid")
+    plan_by_path = {
+        item.get("path"): item for item in plan_files if isinstance(item, dict)
+    }
+    if len(plan_by_path) != len(plan_files) or set(plan_by_path) != expected_files:
+        _d320_fail("d320_v2_plan_files_invalid")
+    for snapshot in snapshots:
+        planned = plan_by_path[snapshot["path"]]
+        if (
+            planned.get("name") != snapshot["name"]
+            or planned.get("present") != snapshot["present"]
+            or planned.get("sha256") != snapshot["sha256"]
+            or planned.get("mode") != snapshot["mode"]
+            or any(
+                planned.get(key) != snapshot[key]
+                for key in ("dev", "ino", "uid", "gid", "nlink")
+            )
+        ):
+            _d320_fail("d320_v2_plan_files_invalid")
+    expected_effects = _v2_expected_effects(home, source["commit"], stage_name)
+    if plan["extra_effects"] != _v2_plan_effects(home, source["commit"]):
+        _d320_fail("d320_v2_plan_effects_invalid")
+    _v2_validate_effects(
+        value["extra_effects"],
+        home=home,
+        source_commit=source["commit"],
+        stage_name=stage_name,
+        owner_uid=owner_uid,
+    )
+    _v2_validate_manager_states(value["manager_pre"])
+    if plan["manager_states"] != value["manager_pre"]:
+        _d320_fail("d320_v2_plan_binding_invalid")
+    if value["inverse_actions"] != [
+        "restore_manager",
+        "restore_files",
+        "discard_generation",
+    ]:
+        _d320_fail("d320_v2_inverse_invalid")
+    phase = _d320_text(value["phase"], maximum=32, ascii_only=True)
+    if phase not in _V2_PHASES:
+        _d320_fail("d320_v2_phase_invalid")
+    sealed = value["sealed"]
+    if sealed is not None:
+        seal = _d320_object(
+            sealed,
+            (
+                "generation",
+                "manifest_digest",
+                "output_sha256",
+                "stage_identity_sha256",
+                "generation_identity_sha256",
+            ),
+            code="d320_v2_seal_invalid",
+        )
+        if seal["generation"] != source["commit"]:
+            _d320_fail("d320_v2_seal_invalid")
+        manifest_digest = seal["manifest_digest"]
+        if not isinstance(manifest_digest, str) or not manifest_digest.startswith(
+            "sha256:"
+        ):
+            _d320_fail("d320_v2_seal_invalid")
+        _d320_sha256(manifest_digest[7:])
+        _d320_sha256(seal["stage_identity_sha256"])
+        _d320_sha256(seal["generation_identity_sha256"])
+        outputs = seal["output_sha256"]
+        if not isinstance(outputs, dict) or set(outputs) != {
+            "mcp_launcher",
+            "hourly_service",
+            "hourly_timer",
+            "pricing_launcher",
+            "pricing_service",
+            "pricing_timer",
+            "legacy_launcher",
+        }:
+            _d320_fail("d320_v2_seal_invalid")
+        for output_digest in outputs.values():
+            _d320_sha256(output_digest)
+    if (
+        phase in {"SEALED", "INSTALLED", "ACTIVATED", "OBSERVED", "COMMITTED"}
+        and sealed is None
+    ):
+        _d320_fail("d320_v2_phase_seal_invalid")
+    journal_path = str(
+        home
+        / ".local"
+        / "state"
+        / "codex-master-mcp"
+        / "hive"
+        / "runtime-lifecycle-journal-v2.json"
+    )
+    expected_setup_temps = {
+        str(_v2_setup_temp_path({"stage_name": stage_name}, Path(path))): path
+        for path in expected_effects
+    }
+    steps = _v2_validate_steps(
+        value["steps"],
+        phase=phase,
+        sequence=_d320_int(value["sequence"], minimum=1),
+        journal_path=journal_path,
+        expected_files=expected_files,
+        expected_effects=expected_effects,
+        expected_setup_temps=expected_setup_temps,
+    )
+    seal_digest = (
+        sealed["manifest_digest"][7:]
+        if isinstance(sealed, Mapping)
+        and isinstance(sealed.get("manifest_digest"), str)
+        else None
+    )
+    sealed_steps = [step for step in steps if step["action"] == "stage_sealed"]
+    if (sealed is None and sealed_steps) or (
+        sealed is not None
+        and (len(sealed_steps) != 1 or sealed_steps[0]["sha256"] != seal_digest)
+    ):
+        _d320_fail("d320_v2_seal_step_invalid")
+    if any(
+        step["action"] == "generation_published" and step["sha256"] != seal_digest
+        for step in steps
+    ):
+        _d320_fail("d320_v2_publish_step_invalid")
+    has_observation = any(
+        step["phase"] == "OBSERVED"
+        and step["action"] in {"effect_readback", "manager_readback"}
+        for step in steps
+    )
+    if value["post"] is None and has_observation:
+        _d320_fail("d320_v2_post_missing")
+    if value["post"] is not None:
+        _v2_validate_post(
+            value["post"],
+            home=home,
+            source_commit=source["commit"],
+            stage_name=stage_name,
+            owner_uid=owner_uid,
+            phase=phase,
+            steps=steps,
+        )
+    elif phase in {"OBSERVED", "COMMITTED"}:
+        _d320_fail("d320_v2_post_missing")
+    return value
+
+
+class D320CutoverJournalV2(bytes):
+    """A distinct runtime-lifecycle journal; it never accepts V1 payloads."""
+
+    __slots__ = ()
+
+    @classmethod
+    def from_payload(cls, value: Mapping[str, object]) -> D320CutoverJournalV2:
+        if cls is not D320CutoverJournalV2:
+            _d320_fail("d320_v2_type_invalid")
+        payload = _d320_canonical_json(value)
+        _d320_validate_envelope_payload_size(payload)
+        _v2_validate_payload(_d320_parse_json(payload))
+        if len(_d320_journal_envelope(payload)) > _D320_MAX_ENVELOPE_BYTES:
+            _d320_fail("d320_v2_envelope_too_large")
+        return bytes.__new__(cls, payload)
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> D320CutoverJournalV2:
+        copied = _d320_bytes_copy(raw, code="d320_v2_envelope_invalid")
+        if len(copied) > _D320_MAX_ENVELOPE_BYTES or not copied.endswith(b"\n"):
+            _d320_fail("d320_v2_envelope_invalid")
+        envelope = _d320_parse_json(copied[:-1])
+        if not isinstance(envelope, dict) or set(envelope) != {
+            "content_sha256",
+            "payload",
+        }:
+            _d320_fail("d320_v2_envelope_invalid")
+        result = cls.from_payload(envelope["payload"])
+        if copied != result.to_bytes():
+            _d320_fail("d320_v2_envelope_invalid")
+        return result
+
+    @property
+    def payload(self) -> dict[str, object]:
+        parsed = _d320_parse_json(bytes(self))
+        return _v2_validate_payload(parsed)
+
+    def to_bytes(self) -> bytes:
+        return _d320_journal_envelope(bytes(self))
+
+
+_V2_PHASE_SUCCESSORS = {
+    "INTENT": {"INTENT", "SEALED", "RECOVERING", "BLOCKED"},
+    "SEALED": {"INSTALLED", "RECOVERING", "BLOCKED"},
+    "INSTALLED": {"ACTIVATED", "RECOVERING", "BLOCKED"},
+    "ACTIVATED": {"ACTIVATED", "OBSERVED", "RECOVERING", "BLOCKED"},
+    "OBSERVED": {"OBSERVED", "COMMITTED", "RECOVERING", "BLOCKED"},
+    "COMMITTED": set(),
+    "RECOVERING": {"RECOVERING", "ROLLED_BACK", "BLOCKED"},
+    "ROLLED_BACK": set(),
+    "BLOCKED": set(),
+}
+_V2_IMMUTABLE_FIELDS = (
+    "schema",
+    "mode",
+    "journal_id",
+    "transaction_id",
+    "lock_generation",
+    "plan_sha256",
+    "plan",
+    "source",
+    "target",
+    "owner_uid",
+    "predecessor",
+    "stage_name",
+    "files",
+    "extra_effects",
+    "manager_pre",
+    "inverse_actions",
+)
+
+
+def validate_d320_v2_journal_successor(
+    previous: D320CutoverJournalV2 | bytes,
+    successor: D320CutoverJournalV2 | bytes,
+) -> None:
+    """Require one append-only, fenced phase transition from a valid V2 record."""
+
+    if isinstance(previous, D320CutoverJournalV2):
+        before = previous.payload
+    else:
+        before = D320CutoverJournalV2.from_bytes(previous).payload
+    if isinstance(successor, D320CutoverJournalV2):
+        after = successor.payload
+    else:
+        after = D320CutoverJournalV2.from_bytes(successor).payload
+    if any(before[key] != after[key] for key in _V2_IMMUTABLE_FIELDS):
+        _d320_fail("d320_v2_successor_identity_changed")
+    before_sequence = _d320_int(before["sequence"], minimum=1)
+    after_sequence = _d320_int(after["sequence"], minimum=1)
+    before_phase = str(before["phase"])
+    after_phase = str(after["phase"])
+    if after_phase not in _V2_PHASE_SUCCESSORS[before_phase]:
+        _d320_fail("d320_v2_successor_phase_invalid")
+    before_steps = before["steps"]
+    after_steps = after["steps"]
+    appended = (
+        after_steps[len(before_steps) :]
+        if isinstance(before_steps, list) and isinstance(after_steps, list)
+        else []
+    )
+    repeated_owner_evidence = (
+        (before_phase, after_phase) == ("OBSERVED", "OBSERVED")
+        and bool(appended)
+        and all(step.get("action") == "owner_evidence_readback" for step in appended)
+    )
+    if (
+        not isinstance(before_steps, list)
+        or not isinstance(after_steps, list)
+        or after_steps[: len(before_steps)] != before_steps
+        or not appended
+        or (
+            len(appended) > 1
+            and (before_phase, after_phase)
+            not in {
+                ("ACTIVATED", "OBSERVED"),
+                ("INTENT", "INTENT"),
+                ("SEALED", "INSTALLED"),
+            }
+            and not repeated_owner_evidence
+        )
+        or after_sequence != before_sequence + len(appended)
+        or (
+            (before_phase, after_phase) == ("OBSERVED", "OBSERVED")
+            and not repeated_owner_evidence
+        )
+        or any(
+            step["sequence"] != before_sequence + index + 1
+            or step["phase"] != after_phase
+            for index, step in enumerate(appended)
+        )
+    ):
+        _d320_fail("d320_v2_successor_steps_invalid")
+    previous_seal = before["sealed"]
+    next_seal = after["sealed"]
+    if previous_seal is not None and next_seal != previous_seal:
+        _d320_fail("d320_v2_successor_seal_rewritten")
+    if previous_seal is None and next_seal is not None and after_phase != "SEALED":
+        _d320_fail("d320_v2_successor_seal_phase_invalid")
+    previous_post = before["post"]
+    next_post = after["post"]
+    if previous_post is not None and next_post != previous_post:
+        _d320_fail("d320_v2_successor_post_rewritten")
+    if previous_post is None and next_post is not None and after_phase != "OBSERVED":
+        _d320_fail("d320_v2_successor_post_phase_invalid")
+    previous_recovery_count = _d320_int(before["recovery_count"], maximum=1024)
+    next_recovery_count = _d320_int(after["recovery_count"], maximum=1024)
+    expected_recovery_count = previous_recovery_count + int(
+        before_phase != "RECOVERING" and after_phase == "RECOVERING"
+    )
+    if next_recovery_count != expected_recovery_count:
+        _d320_fail("d320_v2_successor_recovery_count_invalid")
+
+
+def _v2_journal_path(home: Path) -> Path:
+    return (
+        home
+        / ".local"
+        / "state"
+        / "codex-master-mcp"
+        / "hive"
+        / "runtime-lifecycle-journal-v2.json"
+    )
+
+
+def _v2_load_journal(home: Path) -> D320CutoverJournalV2 | None:
+    path = _v2_journal_path(home)
+    try:
+        path.parent.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _error("runtime_lifecycle_journal_invalid") from exc
+    try:
+        _private_directory(path.parent)
+        raw = _regular_bytes(path, maximum=_D320_MAX_ENVELOPE_BYTES, mode=0o600)
+    except RuntimeLifecycleError:
+        raise _error("runtime_lifecycle_journal_invalid")
+    if raw is None:
+        return None
+    try:
+        return D320CutoverJournalV2.from_bytes(raw)
+    except D320CutoverJournalError as exc:
+        raise _error("runtime_lifecycle_journal_invalid") from exc
+
+
+def _v2_assert_lock_lease(home: Path, lease: _LifecycleLockLease) -> None:
+    if (
+        not isinstance(lease, _LifecycleLockLease)
+        or not lease.active
+        or lease.owner_pid != os.getpid()
+        or lease.home != home.resolve(strict=True)
+        or lease.lock_path
+        != home / ".local" / "state" / "codex-master-mcp" / "hive" / _LOCK_NAME
+    ):
+        raise _error("runtime_lifecycle_lock_required")
+    try:
+        held = os.fstat(lease.descriptor)
+        named = lease.lock_path.lstat()
+    except OSError as exc:
+        raise _error("runtime_lifecycle_lock_invalid") from exc
+    if (
+        (held.st_dev, held.st_ino) != lease.identity
+        or (named.st_dev, named.st_ino) != lease.identity
+        or not stat.S_ISREG(held.st_mode)
+        or held.st_uid != os.geteuid()
+        or held.st_nlink != 1
+        or stat.S_IMODE(held.st_mode) != 0o600
+    ):
+        raise _error("runtime_lifecycle_lock_invalid")
+
+
+def _v2_store_journal(
+    home: Path,
+    journal: D320CutoverJournalV2,
+    *,
+    expected_digest: str | None,
+    lease: _LifecycleLockLease,
+    previous: D320CutoverJournalV2 | None = None,
+) -> None:
+    """CAS-publish one validated journal under the shared lifecycle lock."""
+
+    _v2_assert_lock_lease(home, lease)
+    path = _v2_journal_path(home)
+    try:
+        _private_directory(path.parent)
+        current = _regular_bytes(path, maximum=_D320_MAX_ENVELOPE_BYTES, mode=0o600)
+    except RuntimeLifecycleError as exc:
+        if str(exc) == "runtime_lifecycle_binding_invalid" and not path.exists():
+            current = None
+        else:
+            raise _error("runtime_lifecycle_journal_invalid") from exc
+    current_digest = (
+        hashlib.sha256(current).hexdigest() if current is not None else None
+    )
+    if current_digest != expected_digest:
+        raise _error("runtime_lifecycle_journal_changed")
+    checked = D320CutoverJournalV2.from_bytes(journal.to_bytes())
+    if previous is None:
+        if checked.payload["phase"] != "INTENT":
+            raise _error("runtime_lifecycle_journal_transition_invalid")
+        if current is not None:
+            try:
+                terminal = D320CutoverJournalV2.from_bytes(current).payload
+            except D320CutoverJournalError as exc:
+                raise _error("runtime_lifecycle_journal_invalid") from exc
+            if (
+                terminal["phase"] not in {"COMMITTED", "ROLLED_BACK"}
+                or checked.payload["transaction_id"] <= terminal["transaction_id"]
+                or checked.payload["lock_generation"] <= terminal["lock_generation"]
+            ):
+                raise _error("runtime_lifecycle_journal_transition_invalid")
+    else:
+        if current != previous.to_bytes():
+            raise _error("runtime_lifecycle_journal_changed")
+        try:
+            validate_d320_v2_journal_successor(previous, checked)
+        except D320CutoverJournalError as exc:
+            raise _error("runtime_lifecycle_journal_transition_invalid") from exc
+    _v2_assert_lock_lease(home, lease)
+    try:
+        _atomic_restore(path, checked.to_bytes(), 0o600)
+    except RuntimeLifecycleError as exc:
+        raise _error("runtime_lifecycle_journal_write_failed") from exc
+
+
+def _v2_capture_effects(
+    home: Path, source_commit: str, stage_name: str
+) -> list[dict[str, object]]:
+    absent = {
+        "type": "absent",
+        "dev": None,
+        "ino": None,
+        "uid": None,
+        "gid": None,
+        "mode": None,
+        "nlink": None,
+        "children": [],
+    }
+    effects: list[dict[str, object]] = []
+    for path, kind in sorted(
+        _v2_expected_effects(home, source_commit, stage_name).items()
+    ):
+        target = Path(path)
+        try:
+            item = target.lstat()
+        except FileNotFoundError:
+            identity = dict(absent)
+        except OSError as exc:
+            raise _error("runtime_lifecycle_effect_unreadable") from exc
+        else:
+            if stat.S_ISLNK(item.st_mode) or item.st_uid != os.geteuid():
+                raise _error("runtime_lifecycle_effect_identity_invalid")
+            if stat.S_ISDIR(item.st_mode):
+                try:
+                    children = sorted(child.name for child in target.iterdir())
+                except OSError as exc:
+                    raise _error("runtime_lifecycle_effect_unreadable") from exc
+                if any(
+                    not name or name in {".", ".."} or "/" in name for name in children
+                ):
+                    raise _error("runtime_lifecycle_effect_identity_invalid")
+                identity = {
+                    "type": "directory",
+                    "dev": item.st_dev,
+                    "ino": item.st_ino,
+                    "uid": item.st_uid,
+                    "gid": item.st_gid,
+                    "mode": stat.S_IMODE(item.st_mode),
+                    "nlink": item.st_nlink,
+                    "children": children,
+                }
+            elif stat.S_ISREG(item.st_mode) and item.st_nlink == 1:
+                identity = {
+                    "type": "file",
+                    "dev": item.st_dev,
+                    "ino": item.st_ino,
+                    "uid": item.st_uid,
+                    "gid": item.st_gid,
+                    "mode": stat.S_IMODE(item.st_mode),
+                    "nlink": item.st_nlink,
+                    "children": [],
+                }
+            else:
+                raise _error("runtime_lifecycle_effect_identity_invalid")
+        effects.append(
+            {
+                "kind": kind,
+                "path": path,
+                "present": identity["type"] != "absent",
+                "identity": identity,
+            }
+        )
+    return effects
+
+
+def _v2_effect_identity_digest(effect: Mapping[str, object]) -> str:
+    identity = effect.get("identity")
+    if not isinstance(identity, Mapping):
+        raise _error("runtime_lifecycle_effect_identity_invalid")
+    fields = ("type", "dev", "ino", "uid", "gid", "mode")
+    if identity["type"] == "file":
+        fields += ("nlink",)
+    stable = {key: identity[key] for key in fields}
+    return hashlib.sha256(_d320_canonical_json(stable)).hexdigest()
+
+
+def _v2_initial_journal(
+    bound: _BoundCutover,
+    *,
+    plan: Mapping[str, object],
+    plan_sha256: str,
+    stage_name: str,
+    previous: D320CutoverJournalV2 | None,
+) -> D320CutoverJournalV2:
+    files: list[dict[str, object]] = []
+    for path, content, _mode in bound.files:
+        if content is None:
+            snapshot: dict[str, object] = {
+                "name": path.name,
+                "path": str(path),
+                "present": False,
+                "bytes_b64": None,
+                "sha256": None,
+                "dev": None,
+                "ino": None,
+                "uid": None,
+                "gid": None,
+                "mode": None,
+                "nlink": None,
+                "size": None,
+            }
+        else:
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
+            ):
+                raise _error("runtime_lifecycle_input_changed")
+            snapshot = {
+                "name": path.name,
+                "path": str(path),
+                "present": True,
+                "bytes_b64": base64.b64encode(content).decode("ascii"),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "dev": info.st_dev,
+                "ino": info.st_ino,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "mode": stat.S_IMODE(info.st_mode),
+                "nlink": info.st_nlink,
+                "size": len(content),
+            }
+        files.append(snapshot)
+    target = dict(plan["target"])
+    source = dict(plan["source"])
+    predecessor = plan["predecessor"]
+    manager_pre = {name: dict(value) for name, value in bound.states}
+    transaction_id = (
+        1 if previous is None else int(previous.payload["transaction_id"]) + 1
+    )
+    lock_generation = (
+        1 if previous is None else int(previous.payload["lock_generation"]) + 1
+    )
+    journal_id = "runtime-lifecycle-v2-" + secrets.token_hex(16)
+    path = str(_v2_journal_path(bound.home))
+    payload = {
+        "schema": "D320CutoverJournalV2",
+        "mode": "runtime_lifecycle",
+        "journal_id": journal_id,
+        "transaction_id": transaction_id,
+        "lock_generation": lock_generation,
+        "sequence": 1,
+        "phase": "INTENT",
+        "plan_sha256": plan_sha256,
+        "plan": dict(plan),
+        "source": source,
+        "target": target,
+        "owner_uid": os.geteuid(),
+        "predecessor": {
+            "generation": predecessor["generation"],
+            "manifest_digest": predecessor["manifest_digest"],
+            "consumer_sha256": predecessor["consumer_sha256"],
+        },
+        "stage_name": stage_name,
+        "files": files,
+        "extra_effects": _v2_capture_effects(
+            bound.home, bound.source_commit, stage_name
+        ),
+        "manager_pre": manager_pre,
+        "inverse_actions": ["restore_manager", "restore_files", "discard_generation"],
+        "sealed": None,
+        "post": None,
+        "recovery_count": 0,
+        "steps": [
+            {
+                "sequence": 1,
+                "phase": "INTENT",
+                "action": "intent_persisted",
+                "effect": path,
+                "sha256": plan_sha256,
+            }
+        ],
+    }
+    return D320CutoverJournalV2.from_payload(payload)
+
+
+def _v2_transition(
+    home: Path,
+    previous: D320CutoverJournalV2,
+    *,
+    lease: _LifecycleLockLease,
+    phase: str,
+    action: str,
+    effect: str,
+    digest: str,
+    updates: Mapping[str, object] | None = None,
+    additional_steps: Sequence[tuple[str, str, str]] = (),
+) -> D320CutoverJournalV2:
+    payload = previous.payload
+    payload.update(updates or {})
+    payload["phase"] = phase
+    steps = list(payload["steps"])
+    sequence = int(payload["sequence"])
+    for step_action, step_effect, step_digest in (
+        (action, effect, digest),
+        *additional_steps,
+    ):
+        sequence += 1
+        steps.append(
+            {
+                "sequence": sequence,
+                "phase": phase,
+                "action": step_action,
+                "effect": step_effect,
+                "sha256": step_digest,
+            }
+        )
+    payload["sequence"] = sequence
+    payload["steps"] = steps
+    successor = D320CutoverJournalV2.from_payload(payload)
+    _v2_store_journal(
+        home,
+        successor,
+        expected_digest=hashlib.sha256(previous.to_bytes()).hexdigest(),
+        previous=previous,
+        lease=lease,
+    )
+    return successor
+
+
+def _v2_record_owner_evidence(
+    home: Path,
+    journal: D320CutoverJournalV2,
+    *,
+    lease: _LifecycleLockLease,
+    phase: str,
+    effect: str,
+    digest: str,
+) -> D320CutoverJournalV2:
+    if any(
+        step["phase"] == phase
+        and step["action"] == "owner_evidence_readback"
+        and step["effect"] == effect
+        and step["sha256"] == digest
+        for step in journal.payload["steps"]
+    ):
+        return journal
+    return _v2_transition(
+        home,
+        journal,
+        lease=lease,
+        phase=phase,
+        action="owner_evidence_readback",
+        effect=effect,
+        digest=digest,
+    )
 
 
 def validate_d320_journal_successor(
@@ -1727,9 +2924,13 @@ def validate_d320_journal_successor(
                     for item_index, step in enumerate(before_steps)
                     if step["status"] != "INVERSE_VERIFIED"
                 ]
-                if not unresolved or index != unresolved[-1] or any(
-                    before_steps[item_index]["status"] != "VERIFIED"
-                    for item_index in unresolved[:-1]
+                if (
+                    not unresolved
+                    or index != unresolved[-1]
+                    or any(
+                        before_steps[item_index]["status"] != "VERIFIED"
+                        for item_index in unresolved[:-1]
+                    )
                 ):
                     _d320_fail("d320_inverse_order_invalid")
                 allowed = {
@@ -1791,9 +2992,7 @@ def validate_d324_lock_order(
         code="d320_lock_trace_invalid",
         budget=traversal_budget,
     )
-    _d320_validate_history(
-        history_value, state=state_text, sequence=sequence_value
-    )
+    _d320_validate_history(history_value, state=state_text, sequence=sequence_value)
     _d320_validate_lock_trace(
         trace_value,
         state=state_text,
@@ -1824,9 +3023,7 @@ def _d320_artifact_mapping(
             if isinstance(snapshot, ByteSnapshotV1):
                 mapping = ByteSnapshotV1.to_mapping(snapshot)
             elif isinstance(snapshot, Mapping):
-                parsed = _d320_parse_json(
-                    _d320_canonical_json(snapshot, budget=budget)
-                )
+                parsed = _d320_parse_json(_d320_canonical_json(snapshot, budget=budget))
                 if not isinstance(parsed, dict):
                     return None
                 mapping = parsed
@@ -1839,9 +3036,7 @@ def _d320_artifact_mapping(
         if isinstance(unit_status, EvidenceBlobV1):
             mapping = EvidenceBlobV1.to_mapping(unit_status)
         elif isinstance(unit_status, Mapping):
-            parsed = _d320_parse_json(
-                _d320_canonical_json(unit_status, budget=budget)
-            )
+            parsed = _d320_parse_json(_d320_canonical_json(unit_status, budget=budget))
             if not isinstance(parsed, dict):
                 return None
             mapping = parsed
@@ -1969,13 +3164,10 @@ def _d320_classify_d320_recovery(
         )
         and bool(steps)
         and all(
-            isinstance(step, Mapping) and step["status"] == "VERIFIED"
-            for step in steps
+            isinstance(step, Mapping) and step["status"] == "VERIFIED" for step in steps
         )
     ):
-        return RecoveryClassificationV1(
-            "ALL_NEW_VERIFIED", "USER_CUTOVER_VERIFIED", ()
-        )
+        return RecoveryClassificationV1("ALL_NEW_VERIFIED", "USER_CUTOVER_VERIFIED", ())
     if any(
         seen[name] != old[name] and seen[name] != new[name]
         for name in _D320_ARTIFACT_NAMES
@@ -1989,9 +3181,7 @@ def _d320_classify_d320_recovery(
     ):
         return RecoveryClassificationV1("NONINVERTIBLE_BLOCKED", "BLOCKED", ())
     inverse_indexes = tuple(
-        int(step["index"])
-        for step in reversed(steps)
-        if step["status"] == "VERIFIED"
+        int(step["index"]) for step in reversed(steps) if step["status"] == "VERIFIED"
     )
     if not inverse_indexes:
         return RecoveryClassificationV1("NONINVERTIBLE_BLOCKED", "BLOCKED", ())
@@ -2030,6 +3220,17 @@ class _BoundCutover:
     legacy_present: bool
     states: tuple[tuple[str, Mapping[str, str]], ...]
     source_tree_digest: str = ""
+    compatibility_profile: bytes | None = None
+
+
+@dataclass(slots=True)
+class _LifecycleLockLease:
+    home: Path
+    lock_path: Path
+    descriptor: int
+    identity: tuple[int, int]
+    owner_pid: int
+    active: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -2240,6 +3441,370 @@ def _regular_bytes(
     return value
 
 
+def _open_owner_directory(path: Path) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise _error("runtime_lifecycle_root_hook_effect_unverified")
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid not in {0, os.geteuid()}
+                or (
+                    stat.S_IMODE(info.st_mode) & 0o022
+                    and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
+                )
+            ):
+                raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        info = os.fstat(descriptor)
+        if (
+            info.st_uid != _ROOT_HOOK_ABI_UID
+            or info.st_gid != _ROOT_HOOK_ABI_GID
+            or stat.S_IMODE(info.st_mode) != 0o755
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_regular_at(
+    parent_fd: int, name: str, *, owner_uid: int, owner_gid: int, mode: int
+) -> tuple[bytes, os.stat_result]:
+    if not name or "/" in name or name in {".", ".."}:
+        raise _error("runtime_lifecycle_root_hook_effect_unverified")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != owner_uid
+            or before.st_gid != owner_gid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != mode
+            or before.st_size <= 0
+            or before.st_size > 65536
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        chunks = []
+        remaining = before.st_size + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            len(raw) != before.st_size
+            or before[:7] != after[:7]
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        return raw, before
+    finally:
+        os.close(descriptor)
+
+
+def _verify_root_hook_effect_receipt(
+    *, generation: str, manifest_digest: str, hold_lock: bool = False
+) -> str | tuple[str, int]:
+    parent_fd = _open_owner_directory(_ROOT_HOOK_ABI_PARENT)
+    lock_fd = -1
+    target_fd = -1
+    try:
+        lock_fd = os.open(
+            ".root-hook-abi-owner.lock",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        lock_info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != _ROOT_HOOK_ABI_UID
+            or lock_info.st_gid != _ROOT_HOOK_ABI_GID
+            or lock_info.st_nlink != 1
+            or stat.S_IMODE(lock_info.st_mode) != 0o644
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise _error("runtime_lifecycle_root_hook_effect_busy") from exc
+        raw, _receipt_info = _read_regular_at(
+            parent_fd,
+            _ROOT_HOOK_EFFECT_RECEIPT,
+            owner_uid=_ROOT_HOOK_ABI_UID,
+            owner_gid=_ROOT_HOOK_ABI_GID,
+            mode=0o644,
+        )
+        try:
+            receipt = _d320_parse_json(raw)
+        except (D320CutoverJournalError, TypeError, ValueError) as exc:
+            raise _error("runtime_lifecycle_root_hook_effect_unverified") from exc
+        expected_keys = {
+            "effect",
+            "files",
+            "generation",
+            "issued_at_unix_ns",
+            "manifest_digest",
+            "owner",
+            "root_uid",
+            "schema_version",
+            "source_uid",
+            "target",
+        }
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != expected_keys
+            or receipt.get("schema_version") != 1
+            or receipt.get("owner") != "root_hook_abi_v1"
+            or receipt.get("effect") != "root_hook_abi_verified_present"
+            or receipt.get("target") != str(_ROOT_HOOK_ABI_PARENT / "v1")
+            or receipt.get("generation") != generation
+            or receipt.get("manifest_digest") != manifest_digest
+            or receipt.get("root_uid") != _ROOT_HOOK_ABI_UID
+            or receipt.get("source_uid") != os.geteuid()
+            or type(receipt.get("issued_at_unix_ns")) is not int
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        issued = receipt["issued_at_unix_ns"]
+        now = time.time_ns()
+        if issued > now or now >= issued + _OWNER_RECEIPT_FRESHNESS_NS:
+            raise _error("runtime_lifecycle_owner_receipt_expired")
+        target_fd = os.open(
+            "v1",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        target_info = os.fstat(target_fd)
+        if (
+            target_info.st_uid != _ROOT_HOOK_ABI_UID
+            or target_info.st_gid != _ROOT_HOOK_ABI_GID
+            or stat.S_IMODE(target_info.st_mode) != 0o755
+        ):
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        files = receipt.get("files")
+        if not isinstance(files, dict) or set(files) != {
+            "launcher",
+            "hook_session_pin_store.py",
+            "hook_abi_v1_core.py",
+            *[
+                name
+                for name in files
+                if isinstance(name, str)
+                and re.fullmatch(r"allowlists/[0-9a-f]{64}\.json", name)
+            ],
+        }:
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        if len(files) != 4:
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        allowlist_names = {
+            name.split("/", 1)[1]
+            for name in files
+            if isinstance(name, str) and name.startswith("allowlists/")
+        }
+        top_level_names = {
+            name for name in files if isinstance(name, str) and "/" not in name
+        }
+        if set(os.listdir(target_fd)) != {*top_level_names, "allowlists"}:
+            raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        allowlist_fd = os.open(
+            "allowlists",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=target_fd,
+        )
+        try:
+            allowlist_info = os.fstat(allowlist_fd)
+            if (
+                allowlist_info.st_uid != _ROOT_HOOK_ABI_UID
+                or allowlist_info.st_gid != _ROOT_HOOK_ABI_GID
+                or stat.S_IMODE(allowlist_info.st_mode) != 0o755
+                or set(os.listdir(allowlist_fd)) != allowlist_names
+            ):
+                raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        finally:
+            os.close(allowlist_fd)
+        for name, member in files.items():
+            if (
+                not isinstance(member, dict)
+                or set(member) != {"mode", "nlink", "sha256", "size"}
+                or any(
+                    type(member[field]) is not int
+                    for field in ("mode", "nlink", "size")
+                )
+            ):
+                raise _error("runtime_lifecycle_root_hook_effect_unverified")
+            directory_fd = target_fd
+            member_name = name
+            if name.startswith("allowlists/"):
+                directory_fd = os.open(
+                    "allowlists",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=target_fd,
+                )
+                member_name = name.split("/", 1)[1]
+            try:
+                expected_mode = 0o755 if name == "launcher" else 0o644
+                content, info = _read_regular_at(
+                    directory_fd,
+                    member_name,
+                    owner_uid=_ROOT_HOOK_ABI_UID,
+                    owner_gid=_ROOT_HOOK_ABI_GID,
+                    mode=expected_mode,
+                )
+            finally:
+                if directory_fd != target_fd:
+                    os.close(directory_fd)
+            if (
+                member.get("mode") != expected_mode
+                or member.get("nlink") != 1
+                or member.get("size") != len(content)
+                or member.get("sha256") != hashlib.sha256(content).hexdigest()
+                or info.st_nlink != member.get("nlink")
+            ):
+                raise _error("runtime_lifecycle_root_hook_effect_unverified")
+        digest = hashlib.sha256(raw).hexdigest()
+        if hold_lock:
+            result_fd = lock_fd
+            lock_fd = -1
+            return digest, result_fd
+        return digest
+    except RuntimeLifecycleError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise _error("runtime_lifecycle_root_hook_effect_unverified") from exc
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(parent_fd)
+
+
+def _release_root_hook_effect_lock(lock_fd: int) -> None:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
+def _verify_plugin_release_effect_receipt(
+    *, home: Path, generation: str, manifest_digest: str
+) -> str:
+    state_root = home / ".local/state/codex-master-mcp/hive"
+    plugin = home / "plugins/the-hive"
+    receipt_path = state_root / _PLUGIN_EFFECT_RECEIPT
+    target = plugin / "release-binding.json"
+    marketplace_path = home / ".agents/plugins/marketplace.json"
+    try:
+        _bound_path_from_home(home, state_root)
+        _bound_path_from_home(home, plugin)
+        raw = _regular_bytes(receipt_path, maximum=65536, mode=0o600)
+        descriptor = _regular_bytes(target, maximum=65536, mode=0o644)
+        marketplace = _regular_bytes(marketplace_path, maximum=65536, mode=0o644)
+        if raw is None or descriptor is None or marketplace is None:
+            raise _error("runtime_lifecycle_plugin_effect_unverified")
+        receipt = _d320_parse_json(raw)
+    except RuntimeLifecycleError:
+        raise
+    except (D320CutoverJournalError, OSError, TypeError, ValueError) as exc:
+        raise _error("runtime_lifecycle_plugin_effect_unverified") from exc
+    expected_keys = {
+        "descriptor_sha256",
+        "effect",
+        "generation",
+        "issued_at_unix_ns",
+        "manifest_digest",
+        "marketplace_sha256",
+        "owner",
+        "plugin_identity",
+        "schema_version",
+        "target",
+        "target_identity",
+    }
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != expected_keys
+        or receipt.get("schema_version") != 1
+        or receipt.get("owner") != "plugin_release_publisher"
+        or receipt.get("effect") != "plugin_release_descriptor_verified_present"
+        or receipt.get("target") != "plugins/the-hive/release-binding.json"
+        or receipt.get("generation") != generation
+        or receipt.get("manifest_digest") != manifest_digest
+        or receipt.get("descriptor_sha256")
+        != "sha256:" + hashlib.sha256(descriptor).hexdigest()
+        or receipt.get("marketplace_sha256") != hashlib.sha256(marketplace).hexdigest()
+        or type(receipt.get("issued_at_unix_ns")) is not int
+    ):
+        raise _error("runtime_lifecycle_plugin_effect_unverified")
+    issued = receipt["issued_at_unix_ns"]
+    now = time.time_ns()
+    if issued > now or now >= issued + _OWNER_RECEIPT_FRESHNESS_NS:
+        raise _error("runtime_lifecycle_owner_receipt_expired")
+    try:
+        plugin_info = plugin.lstat()
+        target_info = target.lstat()
+        receipt_info = receipt_path.lstat()
+        marketplace_recheck = _regular_bytes(
+            marketplace_path, maximum=65536, mode=0o644
+        )
+        descriptor_recheck = _regular_bytes(target, maximum=65536, mode=0o644)
+        receipt_recheck = _regular_bytes(receipt_path, maximum=65536, mode=0o600)
+    except OSError as exc:
+        raise _error("runtime_lifecycle_plugin_effect_unverified") from exc
+    plugin_identity = receipt.get("plugin_identity")
+    target_identity = receipt.get("target_identity")
+    if (
+        not stat.S_ISDIR(plugin_info.st_mode)
+        or plugin_info.st_uid != os.geteuid()
+        or plugin_identity != {"dev": plugin_info.st_dev, "ino": plugin_info.st_ino}
+        or not stat.S_ISREG(target_info.st_mode)
+        or target_info.st_uid != os.geteuid()
+        or target_info.st_nlink != 1
+        or stat.S_IMODE(target_info.st_mode) != 0o644
+        or target_identity
+        != {
+            "dev": target_info.st_dev,
+            "gid": target_info.st_gid,
+            "ino": target_info.st_ino,
+            "mode": stat.S_IMODE(target_info.st_mode),
+            "nlink": target_info.st_nlink,
+            "size": target_info.st_size,
+            "uid": target_info.st_uid,
+        }
+        or descriptor_recheck != descriptor
+        or marketplace_recheck != marketplace
+        or receipt_recheck != raw
+        or not stat.S_ISREG(receipt_info.st_mode)
+        or receipt_info.st_uid != os.geteuid()
+        or receipt_info.st_nlink != 1
+        or stat.S_IMODE(receipt_info.st_mode) != 0o600
+    ):
+        raise _error("runtime_lifecycle_plugin_effect_unverified")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _source_digest(path: Path) -> str:
     value = _regular_bytes(path, maximum=2 * 1024 * 1024)
     if value is None:
@@ -2420,8 +3985,7 @@ def _prepare_canary_image(
                     character not in "0123456789abcdef"
                     for character in manifest_digest.removeprefix("sha256:")
                 )
-                or layout_root
-                != release_root / "generations" / source_commit
+                or layout_root != release_root / "generations" / source_commit
             ):
                 raise _error("runtime_canary_image_invalid")
             service, _timer = _attested_hourly_unit_bytes(
@@ -2555,8 +4119,7 @@ def _canary_unit_binding(
             f"BindReadOnlyPaths={release}:{release}:norbind"
         ),
         _HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING: (
-            "BindReadOnlyPaths="
-            f"{user_runtime_text}/bus:{user_runtime_text}/bus:norbind"
+            f"BindReadOnlyPaths={user_runtime_text}/bus:{user_runtime_text}/bus:norbind"
         ),
         _HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING: (
             "BindReadOnlyPaths="
@@ -2599,7 +4162,9 @@ def _canary_unit_binding(
             properties.append(directive)
     if not type_seen or not exec_seen or seen != set(replacements):
         raise _error("runtime_canary_sandbox_invalid")
-    properties.extend(("RemainAfterExit=yes", "StandardOutput=null", "StandardError=null"))
+    properties.extend(
+        ("RemainAfterExit=yes", "StandardOutput=null", "StandardError=null")
+    )
     return _CanaryUnitBinding(
         name=f"{unit_stem}.service",
         description=f"The Hive runtime canary {nonce}",
@@ -2656,7 +4221,19 @@ def _bind_cutover_inputs(home: Path) -> _BoundCutover:
         repository / "src" / "the_hive" / "limit_tracker.py",
         repository / "src" / "the_hive" / "runtime_lifecycle.py",
     )
+    profile_path = (
+        repository
+        / "src"
+        / "the_hive"
+        / "markdown"
+        / "runtime-release-compatibility-v1.json"
+    )
+    compatibility_profile = _regular_bytes(profile_path, maximum=64 * 1024, mode=0o644)
     source_digests = tuple((path, _source_digest(path)) for path in sources)
+    if compatibility_profile is not None:
+        source_digests += (
+            (profile_path, hashlib.sha256(compatibility_profile).hexdigest()),
+        )
     source_commit, source_tree_digest = _source_tree_binding(repository)
     generations = release_root / "generations"
     try:
@@ -2727,6 +4304,7 @@ def _bind_cutover_inputs(home: Path) -> _BoundCutover:
         ),
         states=(),
         source_tree_digest=source_tree_digest,
+        compatibility_profile=compatibility_profile,
     )
 
 
@@ -2755,13 +4333,514 @@ def _revalidate_cutover_inputs(bound: _BoundCutover) -> None:
             raise _error("runtime_lifecycle_input_changed")
 
 
+def _v2_verify_installed_outputs(home: Path, sealed: Mapping[str, object]) -> None:
+    outputs = sealed.get("output_sha256")
+    if not isinstance(outputs, Mapping):
+        raise _error("runtime_lifecycle_journal_invalid")
+    paths = {
+        "mcp_launcher": home / ".local" / "lib" / "the-hive-runtime" / "the-hive-mcp",
+        "hourly_service": home / ".config" / "systemd" / "user" / _NEW_SERVICE,
+        "hourly_timer": home / ".config" / "systemd" / "user" / _NEW_TIMER,
+        "pricing_launcher": home / ".local" / "bin" / _PRICING_LAUNCHER,
+        "pricing_service": home / ".config" / "systemd" / "user" / _PRICING_UNITS[0],
+        "pricing_timer": home / ".config" / "systemd" / "user" / _PRICING_UNITS[1],
+        "legacy_launcher": home
+        / ".local"
+        / "libexec"
+        / "codex_master_hive_hourly_probe.py",
+    }
+    for name, path in paths.items():
+        content = _regular_bytes(
+            path,
+            maximum=_MAX_UNIT_BYTES,
+            mode=0o644 if name.endswith(("service", "timer")) else 0o755,
+        )
+        if content is None or hashlib.sha256(content).hexdigest() != outputs[name]:
+            raise _error("runtime_lifecycle_installed_output_changed")
+
+
+def _v2_capture_post(
+    home: Path, source_commit: str, stage_name: str, bound: _BoundCutover
+) -> dict[str, object]:
+    files: list[dict[str, object]] = []
+    for path, _old_content, mode in bound.files:
+        content = _regular_bytes(
+            path,
+            maximum=(
+                _MAX_HEALTH_BYTES
+                if path.name == ".the-hive-release-pointers.json"
+                else (
+                    _MAX_OBSERVATION_BYTES
+                    if path.name == _OBSERVATION_NAME
+                    else _MAX_UNIT_BYTES
+                )
+            ),
+            mode=mode,
+        )
+        if content is None:
+            files.append(
+                {
+                    "name": path.name,
+                    "path": str(path),
+                    "present": False,
+                    "bytes_b64": None,
+                    "sha256": None,
+                    "dev": None,
+                    "ino": None,
+                    "uid": None,
+                    "gid": None,
+                    "mode": None,
+                    "nlink": None,
+                    "size": None,
+                }
+            )
+            continue
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+        ):
+            raise _error("runtime_lifecycle_observation_changed")
+        files.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "present": True,
+                "bytes_b64": base64.b64encode(content).decode("ascii"),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "dev": info.st_dev,
+                "ino": info.st_ino,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "mode": stat.S_IMODE(info.st_mode),
+                "nlink": info.st_nlink,
+                "size": len(content),
+            }
+        )
+    if bound.source_commit != source_commit:
+        raise _error("runtime_lifecycle_source_changed")
+    return {
+        "files": files,
+        "extra_effects": _v2_capture_effects(home, source_commit, stage_name),
+        "manager_states": {name: dict(state) for name, state in bound.states},
+    }
+
+
+def _v2_capture_managed_file(path: Path, mode: int) -> dict[str, object]:
+    maximum = (
+        _MAX_HEALTH_BYTES
+        if path.name == ".the-hive-release-pointers.json"
+        else (
+            _MAX_OBSERVATION_BYTES
+            if path.name == _OBSERVATION_NAME
+            else _MAX_UNIT_BYTES
+        )
+    )
+    content = _regular_bytes(path, maximum=maximum, mode=mode)
+    if content is None:
+        return {
+            "name": path.name,
+            "path": str(path),
+            "present": False,
+            "bytes_b64": None,
+            "sha256": None,
+            "dev": None,
+            "ino": None,
+            "uid": None,
+            "gid": None,
+            "mode": None,
+            "nlink": None,
+            "size": None,
+        }
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+    ):
+        raise _error("runtime_lifecycle_effect_identity_invalid")
+    return {
+        "name": path.name,
+        "path": str(path),
+        "present": True,
+        "bytes_b64": base64.b64encode(content).decode("ascii"),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "nlink": info.st_nlink,
+        "size": len(content),
+    }
+
+
+def _v2_post_matches(
+    current: Mapping[str, object], recorded: Mapping[str, object]
+) -> bool:
+    """Compare all post-state except the journal inode, which this write replaces."""
+
+    current_copy = dict(current)
+    recorded_copy = dict(recorded)
+    # The journal is an effect, not one of the managed input/output files.
+    current_copy["extra_effects"] = [
+        item for item in current_copy["extra_effects"] if item["kind"] != "journal"
+    ]
+    recorded_copy["extra_effects"] = [
+        item for item in recorded_copy["extra_effects"] if item["kind"] != "journal"
+    ]
+    return current_copy == recorded_copy
+
+
+def _v2_phase_plan(
+    *, home: Path, journal: D320CutoverJournalV2, systemctl: Systemctl
+) -> dict[str, object]:
+    payload = journal.payload
+    phase = str(payload["phase"])
+    next_phase = {
+        "INTENT": "install",
+        "INSTALLED": "activate",
+        "ACTIVATED": "observe",
+        "OBSERVED": "commit",
+    }.get(phase)
+    if next_phase is None:
+        return {
+            "status": "runtime_lifecycle_plan_blocked",
+            "reason_codes": ["runtime_lifecycle_recovery_required"],
+            "journal_phase": phase,
+            "raw_output": "not_returned",
+        }
+    try:
+        target = home.lstat()
+        binding = payload["target"]
+        if (
+            str(home.resolve(strict=True)) != binding["realpath"]
+            or (target.st_dev, target.st_ino, target.st_uid, target.st_gid)
+            != (binding["dev"], binding["ino"], binding["uid"], binding["gid"])
+            or stat.S_IMODE(target.st_mode) != binding["mode"]
+        ):
+            raise _error("runtime_lifecycle_target_changed")
+        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        if (
+            bound.source_commit != payload["source"]["commit"]
+            or bound.source_tree_digest != payload["source"]["tree_sha256"]
+        ):
+            raise _error("runtime_lifecycle_source_changed")
+        if (
+            phase in {"INTENT", "INSTALLED"}
+            and dict(bound.states) != payload["manager_pre"]
+        ):
+            raise _error("runtime_lifecycle_manager_state_changed")
+        if phase == "INTENT":
+            _revalidate_v2_predecessor(
+                bound.release_root, payload["plan"]["predecessor"]
+            )
+            effects = _v2_capture_effects(
+                home, payload["source"]["commit"], payload["stage_name"]
+            )
+            stage = next(item for item in effects if item["kind"] == "stage")
+            generation = next(item for item in effects if item["kind"] == "generation")
+            if stage["present"] or generation["present"]:
+                raise _error("runtime_lifecycle_recovery_required")
+        if phase in {"INSTALLED", "ACTIVATED", "OBSERVED"}:
+            sealed = payload["sealed"]
+            identity = _runtime_identity(bound.release_root)
+            if (
+                not isinstance(sealed, Mapping)
+                or not isinstance(identity, Mapping)
+                or identity.get("generation") != sealed["generation"]
+                or identity.get("manifest_digest") != sealed["manifest_digest"]
+            ):
+                raise _error("runtime_lifecycle_installed_runtime_changed")
+            _v2_verify_installed_outputs(home, sealed)
+        if phase == "ACTIVATED":
+            states = dict(bound.states)
+            timer = states[_NEW_TIMER]
+            legacy_timer = states[_LEGACY_TIMER]
+            legacy_service = states[_LEGACY_SERVICE]
+            if (
+                timer.get("UnitFileState") != "enabled"
+                or timer.get("ActiveState") != "active"
+                or legacy_timer.get("UnitFileState") != "disabled"
+                or legacy_timer.get("ActiveState") != "inactive"
+                or legacy_service.get("ActiveState") != "inactive"
+            ):
+                raise _error("runtime_lifecycle_manager_state_changed")
+        if phase == "OBSERVED":
+            observed = _v2_capture_post(
+                home, payload["source"]["commit"], payload["stage_name"], bound
+            )
+            if not _v2_post_matches(observed, payload["post"]):
+                raise _error("runtime_lifecycle_observation_changed")
+    except RuntimeLifecycleError as exc:
+        return {
+            "status": "runtime_lifecycle_plan_blocked",
+            "reason_codes": [str(exc)],
+            "journal_phase": phase,
+            "raw_output": "not_returned",
+        }
+    return {
+        "status": "runtime_lifecycle_plan_ready",
+        "plan": payload["plan"],
+        "plan_sha256": payload["plan_sha256"],
+        "reason_codes": [],
+        "journal_phase": phase,
+        "next_phase": next_phase,
+        "raw_output": "not_returned",
+    }
+
+
+def _v2_qualification_record_reason(plan: Mapping[str, object]) -> str | None:
+    qualification = plan.get("qualification")
+    if not isinstance(qualification, Mapping):
+        return "runtime_lifecycle_qualification_record_invalid"
+    record = _read_canary_qualification_record(_canary_runtime_root())
+    if record is None:
+        return "runtime_lifecycle_qualification_record_missing"
+    issued_at = record.get("issued_at_unix_ns")
+    if (
+        type(issued_at) is not int
+        or issued_at != qualification.get("issued_at_unix_ns")
+        or qualification.get("sha256")
+        != hashlib.sha256(_d320_canonical_json(dict(record))).hexdigest()
+    ):
+        return "runtime_lifecycle_qualification_record_changed"
+    now = time.time_ns()
+    if issued_at > now:
+        return "runtime_lifecycle_qualification_record_invalid"
+    if now >= issued_at + _OWNER_RECEIPT_FRESHNESS_NS:
+        return "runtime_lifecycle_qualification_record_expired"
+    if record.get("status") != "qualified":
+        return "runtime_lifecycle_qualification_record_unqualified"
+    criteria = record.get("criteria")
+    if not isinstance(criteria, Mapping) or any(
+        criteria.get(name) != "pass"
+        for name in (
+            "client_probe",
+            "client_compatibility",
+            "manager_api_contract",
+            "runtime_canary",
+            "runtime_features",
+        )
+    ):
+        return "runtime_lifecycle_qualification_record_unverified"
+    bindings = record.get("bindings")
+    source = plan.get("source")
+    compatibility = plan.get("compatibility")
+    predecessor = plan.get("predecessor")
+    if not all(
+        isinstance(item, Mapping)
+        for item in (bindings, source, compatibility, predecessor)
+    ):
+        return "runtime_lifecycle_qualification_record_changed"
+    if compatibility.get("status") != "qualified":
+        return "runtime_lifecycle_qualification_record_changed"
+    expected_predecessor = {
+        key: predecessor.get(key)
+        for key in ("consumer_sha256", "generation", "manifest_digest")
+    }
+    if (
+        bindings.get("source_commit") != source.get("commit")
+        or bindings.get("source_tree_sha256") != source.get("tree_sha256")
+        or bindings.get("profile_sha256") != compatibility.get("sha256")
+        or bindings.get("candidate_generation") != source.get("commit")
+        or bindings.get("predecessor") != expected_predecessor
+        or bindings.get("target") != plan.get("target")
+        or bindings.get("manager_states_sha256")
+        != _manager_states_digest(plan.get("manager_states"))
+        or bindings.get("manager_api_contract") != _manager_api_contract_snapshot()
+    ):
+        return "runtime_lifecycle_qualification_record_changed"
+    candidate_manifest = bindings.get("candidate_manifest_digest")
+    planned_manifest = plan.get("output_manifest_digest")
+    if planned_manifest != "pending" and candidate_manifest != planned_manifest:
+        return "runtime_lifecycle_qualification_record_changed"
+    client = bindings.get("client")
+    current_client_digest = _canonical_codex_client_digest()
+    if (
+        not isinstance(client, Mapping)
+        or current_client_digest is None
+        or client.get("artifact_sha256") != current_client_digest
+    ):
+        return "runtime_lifecycle_qualification_record_changed"
+    return None
+
+
+def plan(*, home: Path, systemctl: Systemctl | None = None) -> dict[str, object]:
+    """Return a deterministic, read-only binding of the currently known inputs."""
+
+    try:
+        existing = _v2_load_journal(home)
+        if existing is not None and existing.payload["phase"] not in {
+            "COMMITTED",
+            "ROLLED_BACK",
+        }:
+            qualification_reason = _v2_qualification_record_reason(
+                existing.payload["plan"]
+            )
+            if qualification_reason is not None:
+                return {
+                    "status": "runtime_lifecycle_plan_blocked",
+                    "reason_codes": [qualification_reason],
+                    "journal_phase": existing.payload["phase"],
+                    "raw_output": "not_returned",
+                }
+            return _v2_phase_plan(
+                home=home,
+                journal=existing,
+                systemctl=systemctl or _systemctl_default,
+            )
+        bound = _bind_systemd_states(
+            _bind_cutover_inputs(home), systemctl or _systemctl_default
+        )
+        target = _target_binding(home)
+        predecessor = _runtime_identity(bound.release_root)
+        reason_codes: list[str] = []
+        compatibility: dict[str, object] = {
+            "status": "missing",
+            "sha256": None,
+        }
+        if (
+            not isinstance(predecessor, Mapping)
+            or not isinstance(predecessor.get("generation"), str)
+            or not isinstance(predecessor.get("manifest_digest"), str)
+            or predecessor.get("consumer_pin") is not True
+            or not isinstance(predecessor.get("consumer_sha256"), str)
+        ):
+            reason_codes.append("runtime_lifecycle_predecessor_missing")
+        if bound.compatibility_profile is None:
+            reason_codes.append("runtime_release_compatibility_profile_missing")
+        else:
+            try:
+                from the_hive.runtime_layout import (
+                    validate_runtime_release_compatibility_profile,
+                )
+
+                validated_profile = validate_runtime_release_compatibility_profile(
+                    bound.compatibility_profile
+                )
+            except (ValueError, RuntimeLifecycleError):
+                reason_codes.append("runtime_release_compatibility_profile_invalid")
+            else:
+                compatibility = {
+                    "status": (
+                        "qualified"
+                        if validated_profile.get("schema_version") == 2
+                        and validated_profile.get("status") == "structural_requirements"
+                        else "present_unvalidated"
+                    ),
+                    "sha256": hashlib.sha256(bound.compatibility_profile).hexdigest(),
+                }
+                if compatibility["status"] != "qualified":
+                    reason_codes.append(
+                        "runtime_release_compatibility_profile_unvalidated"
+                    )
+        qualification_root = _canary_runtime_root()
+        qualification_record = _read_canary_qualification_record(qualification_root)
+        qualification: dict[str, object]
+        if qualification_record is None:
+            qualification = {"status": "missing"}
+            reason_codes.append("runtime_lifecycle_qualification_record_missing")
+        else:
+            issued_at = qualification_record["issued_at_unix_ns"]
+            qualification = {
+                "status": qualification_record["status"],
+                "issued_at_unix_ns": issued_at,
+                "sha256": hashlib.sha256(
+                    _d320_canonical_json(dict(qualification_record))
+                ).hexdigest(),
+            }
+            qualification_plan = {
+                "source": {
+                    "commit": bound.source_commit,
+                    "tree_sha256": bound.source_tree_digest,
+                },
+                "compatibility": compatibility,
+                "predecessor": dict(predecessor)
+                if isinstance(predecessor, Mapping)
+                else None,
+                "target": target,
+                "manager_states": dict(bound.states),
+                "output_manifest_digest": "pending",
+                "qualification": qualification,
+            }
+            qualification_reason = _v2_qualification_record_reason(qualification_plan)
+            if qualification_reason is not None:
+                reason_codes.append(qualification_reason)
+        snapshots: list[dict[str, object]] = []
+        for path, content, _mode in bound.files:
+            if content is None:
+                fields: dict[str, object] = {"sha256": None, "mode": None}
+            else:
+                info = path.lstat()
+                fields = {
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "dev": info.st_dev,
+                    "ino": info.st_ino,
+                    "uid": info.st_uid,
+                    "gid": info.st_gid,
+                    "nlink": info.st_nlink,
+                }
+            snapshots.append(
+                {
+                    "name": path.name,
+                    "path": str(path),
+                    "present": content is not None,
+                    **fields,
+                }
+            )
+        payload = {
+            "schema": "D320RuntimeCutoverPlanV2",
+            "mode": "runtime_lifecycle",
+            "source": {
+                "commit": bound.source_commit,
+                "tree_sha256": bound.source_tree_digest,
+            },
+            "target": {
+                **target,
+            },
+            "owner_uid": os.geteuid(),
+            "predecessor": dict(predecessor)
+            if isinstance(predecessor, Mapping)
+            else None,
+            "compatibility": compatibility,
+            "qualification": qualification,
+            "files": snapshots,
+            "extra_effects": _v2_plan_effects(home, bound.source_commit),
+            "manager_states": {name: dict(value) for name, value in bound.states},
+            "actions": ["install", "activate", "observe", "commit"],
+            "inverse_actions": [
+                "restore_manager",
+                "restore_files",
+                "discard_generation",
+            ],
+            "output_manifest_digest": "pending",
+        }
+        encoded = _d320_canonical_json(payload)
+        _revalidate_cutover_inputs(bound)
+        if isinstance(predecessor, Mapping) and predecessor.get("consumer_pin") is True:
+            _revalidate_v2_predecessor(bound.release_root, predecessor)
+        return {
+            "status": (
+                "runtime_lifecycle_plan_blocked"
+                if reason_codes
+                else "runtime_lifecycle_plan_ready"
+            ),
+            "plan": payload,
+            "plan_sha256": hashlib.sha256(encoded).hexdigest(),
+            "reason_codes": reason_codes,
+            "raw_output": "not_returned",
+        }
+    except RuntimeLifecycleError as exc:
+        return {"status": str(exc), "raw_output": "not_returned"}
+
+
 def _bind_systemd_states(bound: _BoundCutover, systemctl: Systemctl) -> _BoundCutover:
     """Bind manager state before the installer changes either unit namespace."""
 
-    states = tuple(
-        (unit, _show(systemctl, unit))
-        for unit in (_NEW_SERVICE, _NEW_TIMER, _LEGACY_SERVICE, _LEGACY_TIMER)
-    )
+    states = tuple((unit, _show(systemctl, unit)) for unit in _V2_MANAGER_UNITS)
     bound_states = dict(states)
     if any(not _valid_bound_unit_state(state) for state in bound_states.values()):
         raise _error("runtime_lifecycle_systemd_state_invalid")
@@ -2783,10 +4862,30 @@ def _bind_systemd_states(bound: _BoundCutover, systemctl: Systemctl) -> _BoundCu
     return replace(bound, states=states)
 
 
-def _install_attested_runtime(home: Path) -> None:
+def _install_attested_runtime(
+    home: Path,
+    *,
+    stage_name: str | None = None,
+    record_setup: Callable[[Path], None] | None = None,
+    reserve_setup: Callable[[Path, Path, str], None] | None = None,
+    before_publish: Callable[[Path, object, dict[str, str]], None] | None = None,
+) -> Mapping[str, object]:
     """Cross the existing attested-installer boundary; never compose a wrapper."""
 
+    if record_setup is None or reserve_setup is None or before_publish is None:
+        raise _error("runtime_lifecycle_v2_journal_unavailable")
+
     repository = Path(__file__).resolve().parents[2]
+
+    def unavailable_before_publish(
+        _stage: Path, _layout: object, _output_digests: dict[str, str]
+    ) -> None:
+        raise _error("runtime_lifecycle_v2_journal_unavailable")
+
+    selected_stage = stage_name or f".the-hive-runtime.stage.{secrets.token_hex(16)}"
+    setup = record_setup
+    seal = before_publish or unavailable_before_publish
+
     try:
         _source_tree_binding(repository)
         with _bound_installer_entry(repository) as entry:
@@ -2794,37 +4893,1690 @@ def _install_attested_runtime(home: Path) -> None:
             install = installer.get("_install_attested_runtime")
             if not callable(install):
                 raise _error("runtime_lifecycle_installer_invalid")
-            result = install(home=home)
+            result = install(
+                home=home,
+                stage_name=selected_stage,
+                record_setup=setup,
+                reserve_setup=reserve_setup,
+                before_publish=seal,
+            )
     except RuntimeLifecycleError:
         raise
     except Exception as exc:
         raise _error("runtime_lifecycle_install_failed") from exc
     if not isinstance(result, Mapping) or result.get("status") != "installed":
         raise _error("runtime_lifecycle_install_failed")
+    return result
 
 
-def _provision_hook_session_pin_authority(home: Path) -> None:
-    """Create only an absent canonical hook authority; never repair one."""
+def _v2_bootstrap_store(home: Path) -> None:
+    """Create only the private coordinator path, durably and restartably."""
 
-    state_root = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
-    _bound_path_from_home(home, state_root)
+    target = home.lstat()
+    if (
+        stat.S_ISLNK(target.st_mode)
+        or not stat.S_ISDIR(target.st_mode)
+        or target.st_uid != os.geteuid()
+    ):
+        raise _error("runtime_lifecycle_home_invalid")
+    directories = (
+        home / ".local",
+        home / ".local" / "state",
+        home / ".local" / "state" / "codex-master-mcp",
+        _v2_journal_path(home).parent,
+    )
+    for directory in directories:
+        _bound_path_from_home(home, directory)
+        try:
+            directory.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            created = False
+        except OSError as exc:
+            raise _error("runtime_lifecycle_store_unavailable") from exc
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(descriptor)
+            named = directory.lstat()
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or stat.S_ISLNK(named.st_mode)
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                or opened.st_uid != os.geteuid()
+                or (not created and stat.S_IMODE(opened.st_mode) != 0o700)
+            ):
+                raise _error("runtime_lifecycle_store_untrusted")
+            if created:
+                os.fchmod(descriptor, 0o700)
+            os.fsync(descriptor)
+        except RuntimeLifecycleError:
+            raise
+        except OSError as exc:
+            raise _error("runtime_lifecycle_store_unavailable") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if created:
+            parent_fd = -1
+            try:
+                parent_fd = os.open(
+                    directory.parent,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                )
+                os.fsync(parent_fd)
+            except OSError as exc:
+                raise _error("runtime_lifecycle_store_unavailable") from exc
+            finally:
+                if parent_fd >= 0:
+                    os.close(parent_fd)
+
+    lock = home / ".local" / "state" / "codex-master-mcp" / "hive" / _LOCK_NAME
+    descriptor = -1
+    created = False
     try:
-        state_root.lstat()
-    except FileNotFoundError:
-        create = True
+        try:
+            descriptor = os.open(
+                lock,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(
+                lock,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+        info = os.fstat(descriptor)
+        named = lock.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or (not created and stat.S_IMODE(info.st_mode) != 0o600)
+        ):
+            raise _error("runtime_lifecycle_lock_invalid")
+        if created:
+            os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    except RuntimeLifecycleError:
+        raise
     except OSError as exc:
-        raise _error("runtime_lifecycle_hook_pin_authority_invalid") from exc
-    else:
-        create = False
+        raise _error("runtime_lifecycle_store_unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if created:
+        parent_fd = -1
+        try:
+            parent_fd = os.open(
+                lock.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise _error("runtime_lifecycle_store_unavailable") from exc
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+
+
+def _v2_require_existing_lifecycle_lock(home: Path) -> None:
+    for path in (
+        home / ".local",
+        home / ".local" / "state",
+        home / ".local" / "state" / "codex-master-mcp",
+        _v2_journal_path(home).parent,
+    ):
+        _private_directory(path)
+    lock = home / ".local" / "state" / "codex-master-mcp" / "hive" / _LOCK_NAME
     try:
-        store = (
-            HookSessionPinStoreV1.create_at(state_root)
-            if create
-            else HookSessionPinStoreV1.open_at(state_root)
+        info = lock.lstat()
+    except OSError as exc:
+        raise _error("runtime_lifecycle_lock_unavailable") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise _error("runtime_lifecycle_lock_invalid")
+
+
+def _v2_install_phase(
+    *, home: Path, plan_result: Mapping[str, object], systemctl: Systemctl
+) -> dict[str, object]:
+    plan_payload = plan_result.get("plan")
+    plan_sha256 = plan_result.get("plan_sha256")
+    if not isinstance(plan_payload, Mapping) or not isinstance(plan_sha256, str):
+        raise _error("runtime_lifecycle_plan_invalid")
+    _v2_bootstrap_store(home)
+    _v2_require_existing_lifecycle_lock(home)
+    with _lifecycle_lock(home) as lease:
+        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        _revalidate_cutover_inputs(bound)
+        fresh = plan(home=home, systemctl=systemctl)
+        if (
+            fresh.get("status") != "runtime_lifecycle_plan_ready"
+            or fresh.get("plan_sha256") != plan_sha256
+        ):
+            raise _error("runtime_lifecycle_plan_changed")
+        predecessor = plan_payload.get("predecessor")
+        if not isinstance(predecessor, Mapping):
+            raise _error("runtime_lifecycle_predecessor_missing")
+        _revalidate_v2_predecessor(bound.release_root, predecessor)
+        prior = _v2_load_journal(home)
+        if prior is not None and prior.payload["phase"] not in {
+            "COMMITTED",
+            "ROLLED_BACK",
+        }:
+            raise _error("runtime_lifecycle_transaction_active")
+        old_raw = _regular_bytes(
+            _v2_journal_path(home), maximum=_D320_MAX_ENVELOPE_BYTES, mode=0o600
         )
-        store.retained_bindings(now_unix_ns=time.time_ns())
-    except HookSessionPinStoreError as exc:
-        raise _error("runtime_lifecycle_hook_pin_authority_invalid") from exc
+        old_digest = (
+            hashlib.sha256(old_raw).hexdigest() if old_raw is not None else None
+        )
+        stage_name = f".the-hive-runtime.stage.{secrets.token_hex(16)}"
+        journal = _v2_initial_journal(
+            bound,
+            plan=plan_payload,
+            plan_sha256=plan_sha256,
+            stage_name=stage_name,
+            previous=prior,
+        )
+        _v2_store_journal(home, journal, expected_digest=old_digest, lease=lease)
+
+        def record_setup(stage: Path) -> None:
+            nonlocal journal
+            if stage != home / ".local" / "lib" / stage_name:
+                raise _error("runtime_lifecycle_stage_setup_invalid")
+            before = {item["path"]: item for item in journal.payload["extra_effects"]}
+            after = _v2_capture_effects(home, bound.source_commit, stage_name)
+            temp_to_target = {
+                str(_v2_setup_temp_path(journal.payload, Path(path))): path
+                for path in _v2_expected_effects(home, bound.source_commit, stage_name)
+            }
+            setup_records = {
+                temp_to_target[step["effect"]]: step["sha256"]
+                for step in journal.payload["steps"]
+                if step["action"] == "effect_created"
+            }
+            created = []
+            for effect in after:
+                path = effect["path"]
+                if path in {
+                    str(_v2_journal_path(home)),
+                    str(home / ".local/state/codex-master-mcp/hive" / _LOCK_NAME),
+                }:
+                    continue
+                old = before[path]
+                if _v2_effect_identity_digest(old) == _v2_effect_identity_digest(
+                    effect
+                ):
+                    continue
+                if old["present"] or not effect["present"]:
+                    raise _error(
+                        "runtime_lifecycle_installer_setup_changed_existing:"
+                        + str(path)
+                    )
+                reserved = setup_records.get(path)
+                if reserved != _v2_setup_reservation_digest(Path(path), Path(path)):
+                    raise _error("runtime_lifecycle_installer_setup_unreserved")
+                created.append(effect)
+            if not created:
+                raise _error("runtime_lifecycle_installer_setup_empty")
+            if str(stage) not in setup_records:
+                raise _error("runtime_lifecycle_installer_stage_unbound")
+
+        def reserve_setup(path: Path, temporary: Path, digest: str) -> None:
+            nonlocal journal
+            effects = {item["path"]: item for item in journal.payload["extra_effects"]}
+            effect = effects.get(str(path))
+            if (
+                not isinstance(effect, Mapping)
+                or effect["present"]
+                or temporary != _v2_setup_temp_path(journal.payload, path)
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise _error("runtime_lifecycle_installer_setup_unbound")
+            if any(
+                step["action"] == "effect_created" and step["effect"] == str(temporary)
+                for step in journal.payload["steps"]
+            ):
+                raise _error("runtime_lifecycle_installer_setup_duplicate")
+            journal = _v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="INTENT",
+                action="effect_created",
+                effect=str(temporary),
+                digest=digest,
+            )
+
+        def seal_before_publish(
+            stage: Path, layout: object, outputs: dict[str, str]
+        ) -> None:
+            nonlocal journal
+            if (
+                stage.name != stage_name
+                or stage.parent != home / ".local" / "lib"
+                or getattr(layout, "manifest_digest", None) is None
+                or not isinstance(outputs, dict)
+                or set(outputs)
+                != {
+                    "mcp_launcher",
+                    "hourly_service",
+                    "hourly_timer",
+                    "pricing_launcher",
+                    "pricing_service",
+                    "pricing_timer",
+                    "legacy_launcher",
+                }
+            ):
+                raise _error("runtime_lifecycle_stage_seal_invalid")
+            manifest_digest = getattr(layout, "manifest_digest")
+            if not isinstance(manifest_digest, str) or not manifest_digest.startswith(
+                "sha256:"
+            ):
+                raise _error("runtime_lifecycle_stage_seal_invalid")
+            _d320_sha256(manifest_digest[7:])
+            manifest_bound_plan = dict(journal.payload["plan"])
+            manifest_bound_plan["output_manifest_digest"] = manifest_digest
+            qualification_reason = _v2_qualification_record_reason(manifest_bound_plan)
+            if qualification_reason is not None:
+                raise _error(qualification_reason)
+            compatibility = journal.payload["plan"].get("compatibility")
+            if not isinstance(compatibility, Mapping):
+                raise _error("runtime_lifecycle_stage_seal_invalid")
+            profile_digest = compatibility.get("sha256")
+            if not isinstance(profile_digest, str):
+                raise _error("runtime_lifecycle_stage_seal_invalid")
+            _verify_candidate_compatibility_profile_stage(layout, profile_digest)
+            for digest in outputs.values():
+                _d320_sha256(digest)
+            stage_temporary = _v2_setup_temp_path(journal.payload, stage)
+            stage_reservation = next(
+                (
+                    step["sha256"]
+                    for step in journal.payload["steps"]
+                    if step["action"] == "effect_created"
+                    and step["effect"] == str(stage_temporary)
+                ),
+                None,
+            )
+            stage_identity = _v2_setup_reservation_digest(stage, stage)
+            generation_path = (
+                home / ".local/lib/the-hive-runtime/generations" / bound.source_commit
+            )
+            if (
+                stage_reservation != stage_identity
+                or not generation_path.parent.is_dir()
+            ):
+                raise _error("runtime_lifecycle_stage_seal_invalid")
+            generation_identity = _v2_setup_reservation_digest(
+                stage,
+                generation_path,
+                parent_path=generation_path.parent,
+            )
+            sealed = {
+                "generation": bound.source_commit,
+                "manifest_digest": manifest_digest,
+                "output_sha256": dict(outputs),
+                "stage_identity_sha256": stage_identity,
+                "generation_identity_sha256": generation_identity,
+            }
+            _revalidate_cutover_inputs(bound)
+            _revalidate_v2_predecessor(bound.release_root, predecessor)
+            journal = _v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="SEALED",
+                action="stage_sealed",
+                effect=str(stage),
+                digest=manifest_digest[7:],
+                updates={"sealed": sealed},
+            )
+
+        install_result = _install_attested_runtime(
+            home,
+            stage_name=stage_name,
+            record_setup=record_setup,
+            reserve_setup=reserve_setup,
+            before_publish=seal_before_publish,
+        )
+        sealed = journal.payload["sealed"]
+        if (
+            journal.payload["phase"] != "SEALED"
+            or not isinstance(sealed, Mapping)
+            or install_result.get("generation") != bound.source_commit
+            or install_result.get("manifest_digest") != sealed["manifest_digest"]
+        ):
+            raise _error("runtime_lifecycle_installer_result_invalid")
+        before_files = {item["path"]: item for item in journal.payload["files"]}
+        installed_readbacks: list[tuple[str, str, str]] = []
+        for path, _content, mode in bound.files:
+            snapshot = _v2_capture_managed_file(path, mode)
+            prior_snapshot = before_files[str(path)]
+            if snapshot != prior_snapshot:
+                installed_readbacks.append(
+                    (
+                        "effect_installed",
+                        str(path),
+                        hashlib.sha256(_d320_canonical_json(snapshot)).hexdigest(),
+                    )
+                )
+        journal = _v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="INSTALLED",
+            action="generation_published",
+            effect=str(
+                home
+                / ".local"
+                / "lib"
+                / "the-hive-runtime"
+                / "generations"
+                / bound.source_commit
+            ),
+            digest=sealed["manifest_digest"][7:],
+            additional_steps=installed_readbacks,
+        )
+    return {
+        "status": "runtime_lifecycle_install_complete",
+        "plan_sha256": plan_sha256,
+        "journal_phase": journal.payload["phase"],
+        "raw_output": "not_returned",
+    }
+
+
+def _v2_activate_phase(
+    *, home: Path, plan_sha256: str, systemctl: Systemctl
+) -> dict[str, object]:
+    _v2_require_existing_lifecycle_lock(home)
+    with _lifecycle_lock(home) as lease:
+        journal = _v2_load_journal(home)
+        if journal is None:
+            raise _error("runtime_lifecycle_journal_missing")
+        payload = journal.payload
+        if payload["phase"] != "INSTALLED" or payload["plan_sha256"] != plan_sha256:
+            raise _error("runtime_lifecycle_phase_changed")
+        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        if (
+            bound.source_commit != payload["source"]["commit"]
+            or bound.source_tree_digest != payload["source"]["tree_sha256"]
+            or dict(bound.states) != payload["manager_pre"]
+        ):
+            raise _error("runtime_lifecycle_input_changed")
+        sealed = payload["sealed"]
+        identity = _runtime_identity(bound.release_root)
+        if (
+            not isinstance(sealed, Mapping)
+            or not isinstance(identity, Mapping)
+            or identity.get("generation") != sealed["generation"]
+            or identity.get("manifest_digest") != sealed["manifest_digest"]
+        ):
+            raise _error("runtime_lifecycle_installed_runtime_changed")
+        _v2_verify_installed_outputs(home, sealed)
+        root_receipt_digest, root_lock_fd = _verify_root_hook_effect_receipt(
+            generation=str(sealed["generation"]),
+            manifest_digest=str(sealed["manifest_digest"]),
+            hold_lock=True,
+        )
+        try:
+            journal = _v2_record_owner_evidence(
+                home,
+                journal,
+                lease=lease,
+                phase="ACTIVATED",
+                effect=str(_ROOT_HOOK_ABI_PARENT / _ROOT_HOOK_EFFECT_RECEIPT),
+                digest=root_receipt_digest,
+            )
+        finally:
+            _release_root_hook_effect_lock(root_lock_fd)
+        migrations = _legacy_requires_migration(bound)
+        commands: list[tuple[tuple[str, ...], str, str]] = [
+            (
+                ("daemon-reload",),
+                "manager:" + _NEW_SERVICE,
+                "manager_reload_before_activation",
+            )
+        ]
+        if migrations:
+            commands.extend(
+                (
+                    (
+                        ("stop", _LEGACY_SERVICE),
+                        "manager:" + _LEGACY_SERVICE,
+                        "legacy_service_stop",
+                    ),
+                    (
+                        ("disable", "--now", _LEGACY_TIMER),
+                        "manager:" + _LEGACY_TIMER,
+                        "legacy_timer_disable",
+                    ),
+                )
+            )
+        commands.append(
+            (
+                ("enable", "--now", _NEW_TIMER),
+                "manager:" + _NEW_TIMER,
+                "new_timer_enable",
+            )
+        )
+        if migrations:
+            commands.append(
+                (
+                    ("daemon-reload",),
+                    "manager:" + _PRICING_UNITS[0],
+                    "manager_reload_after_legacy_removal",
+                )
+            )
+        for arguments, effect, label in commands:
+            _revalidate_cutover_inputs(bound)
+            _v2_verify_installed_outputs(home, sealed)
+            journal = _v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="ACTIVATED",
+                action="manager_mutation",
+                effect=effect,
+                digest=hashlib.sha256(
+                    _d320_canonical_json(
+                        {"operation": label, "arguments": list(arguments)}
+                    )
+                ).hexdigest(),
+            )
+            _cutover_systemctl_mutate(systemctl, arguments, phase=label)
+        if migrations:
+            for path, content, _mode in bound.files:
+                if (
+                    path.name in {_LEGACY_SERVICE, _LEGACY_TIMER}
+                    and content is not None
+                ):
+                    journal = _v2_transition(
+                        home,
+                        journal,
+                        lease=lease,
+                        phase="ACTIVATED",
+                        action="effect_installed",
+                        effect=str(path),
+                        digest=hashlib.sha256(content).hexdigest(),
+                    )
+            _remove_legacy_hourly_units(bound)
+        current = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        states = dict(current.states)
+        if (
+            states[_NEW_TIMER].get("UnitFileState") != "enabled"
+            or states[_NEW_TIMER].get("ActiveState") != "active"
+            or states[_LEGACY_TIMER].get("UnitFileState") != "disabled"
+            or states[_LEGACY_TIMER].get("ActiveState") != "inactive"
+            or states[_LEGACY_SERVICE].get("ActiveState") != "inactive"
+        ):
+            raise _error("runtime_lifecycle_manager_readback_failed")
+    return {
+        "status": "runtime_lifecycle_activation_complete",
+        "plan_sha256": plan_sha256,
+        "journal_phase": journal.payload["phase"],
+        "raw_output": "not_returned",
+    }
+
+
+def _v2_observe_phase(
+    *, home: Path, plan_sha256: str, systemctl: Systemctl
+) -> dict[str, object]:
+    _v2_require_existing_lifecycle_lock(home)
+    with _lifecycle_lock(home) as lease:
+        journal = _v2_load_journal(home)
+        if journal is None or journal.payload["phase"] != "ACTIVATED":
+            raise _error("runtime_lifecycle_phase_changed")
+        payload = journal.payload
+        if payload["plan_sha256"] != plan_sha256:
+            raise _error("runtime_lifecycle_plan_changed")
+        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        if (
+            bound.source_commit != payload["source"]["commit"]
+            or bound.source_tree_digest != payload["source"]["tree_sha256"]
+        ):
+            raise _error("runtime_lifecycle_source_changed")
+        sealed = payload["sealed"]
+        identity = _runtime_identity(bound.release_root)
+        states = dict(bound.states)
+        if (
+            not isinstance(sealed, Mapping)
+            or not isinstance(identity, Mapping)
+            or identity.get("generation") != sealed["generation"]
+            or identity.get("manifest_digest") != sealed["manifest_digest"]
+            or states[_NEW_TIMER].get("UnitFileState") != "enabled"
+            or states[_NEW_TIMER].get("ActiveState") != "active"
+            or states[_LEGACY_TIMER].get("UnitFileState") != "disabled"
+            or states[_LEGACY_TIMER].get("ActiveState") != "inactive"
+            or states[_LEGACY_SERVICE].get("ActiveState") != "inactive"
+        ):
+            raise _error("runtime_lifecycle_manager_state_changed")
+        _v2_verify_installed_outputs(home, sealed)
+        _observe_argumentless_installed_probe(home)
+        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        _v2_verify_installed_outputs(home, sealed)
+        post = _v2_capture_post(
+            home, payload["source"]["commit"], payload["stage_name"], bound
+        )
+        files = post["files"]
+        effects = post["extra_effects"]
+        managers = post["manager_states"]
+        readbacks = [
+            (
+                "effect_readback",
+                item["path"],
+                hashlib.sha256(_d320_canonical_json(item)).hexdigest(),
+            )
+            for item in (*files, *effects)
+        ] + [
+            (
+                "manager_readback",
+                "manager:" + unit,
+                hashlib.sha256(_d320_canonical_json(state)).hexdigest(),
+            )
+            for unit, state in managers.items()
+        ]
+        action, effect, digest = readbacks[0]
+        journal = _v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="OBSERVED",
+            action=action,
+            effect=effect,
+            digest=digest,
+            updates={"post": post},
+            additional_steps=readbacks[1:],
+        )
+    return {
+        "status": "runtime_lifecycle_observation_complete",
+        "plan_sha256": plan_sha256,
+        "journal_phase": journal.payload["phase"],
+        "raw_output": "not_returned",
+    }
+
+
+def _v2_commit_phase(
+    *, home: Path, plan_sha256: str, systemctl: Systemctl
+) -> dict[str, object]:
+    _v2_require_existing_lifecycle_lock(home)
+    with _lifecycle_lock(home) as lease:
+        journal = _v2_load_journal(home)
+        if journal is None or journal.payload["phase"] != "OBSERVED":
+            raise _error("runtime_lifecycle_phase_changed")
+        payload = journal.payload
+        if payload["plan_sha256"] != plan_sha256:
+            raise _error("runtime_lifecycle_plan_changed")
+        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        if (
+            bound.source_commit != payload["source"]["commit"]
+            or bound.source_tree_digest != payload["source"]["tree_sha256"]
+        ):
+            raise _error("runtime_lifecycle_source_changed")
+        observed = _v2_capture_post(
+            home, payload["source"]["commit"], payload["stage_name"], bound
+        )
+        if not _v2_post_matches(observed, payload["post"]):
+            raise _error("runtime_lifecycle_observation_changed")
+        sealed = payload["sealed"]
+        if not isinstance(sealed, Mapping):
+            raise _error("runtime_lifecycle_journal_invalid")
+        plugin_receipt_digest = _verify_plugin_release_effect_receipt(
+            home=home,
+            generation=str(sealed["generation"]),
+            manifest_digest=str(sealed["manifest_digest"]),
+        )
+        root_receipt_digest, root_lock_fd = _verify_root_hook_effect_receipt(
+            generation=str(sealed["generation"]),
+            manifest_digest=str(sealed["manifest_digest"]),
+            hold_lock=True,
+        )
+        try:
+            journal = _v2_record_owner_evidence(
+                home,
+                journal,
+                lease=lease,
+                phase="OBSERVED",
+                effect=str(_ROOT_HOOK_ABI_PARENT / _ROOT_HOOK_EFFECT_RECEIPT),
+                digest=root_receipt_digest,
+            )
+            journal = _v2_record_owner_evidence(
+                home,
+                journal,
+                lease=lease,
+                phase="OBSERVED",
+                effect=str(
+                    home / ".local/state/codex-master-mcp/hive" / _PLUGIN_EFFECT_RECEIPT
+                ),
+                digest=plugin_receipt_digest,
+            )
+            journal_path = str(_v2_journal_path(home))
+            journal = _v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="COMMITTED",
+                action="commit_verified",
+                effect=journal_path,
+                digest=hashlib.sha256(
+                    _d320_canonical_json(payload["post"])
+                ).hexdigest(),
+            )
+        finally:
+            _release_root_hook_effect_lock(root_lock_fd)
+    return {
+        "status": "runtime_lifecycle_commit_complete",
+        "plan_sha256": plan_sha256,
+        "journal_phase": journal.payload["phase"],
+        "raw_output": "not_returned",
+    }
+
+
+def _v2_recovery_manager_states_are_bound(
+    payload: Mapping[str, object],
+    current: Mapping[str, Mapping[str, str]],
+    previous: Mapping[str, Mapping[str, str]],
+) -> bool:
+    steps = payload["steps"]
+    intents = {
+        step["effect"].removeprefix("manager:")
+        for step in steps
+        if step["action"] == "manager_mutation"
+    }
+    expected = {unit: dict(state) for unit, state in previous.items()}
+    expected[_NEW_TIMER].update(UnitFileState="enabled", ActiveState="active")
+    expected[_LEGACY_TIMER].update(UnitFileState="disabled", ActiveState="inactive")
+    expected[_LEGACY_SERVICE]["ActiveState"] = "inactive"
+    for unit, state in current.items():
+        if state == previous[unit]:
+            continue
+        if unit not in intents or state != expected[unit]:
+            return False
+    return True
+
+
+def _v2_recovery_files_are_bound(
+    home: Path, payload: Mapping[str, object], phase: str
+) -> bool:
+    snapshots = {item["path"]: item for item in payload["files"]}
+    post = payload["post"]
+    post_files = (
+        {item["path"]: item for item in post["files"]}
+        if isinstance(post, Mapping)
+        else {}
+    )
+    effects = [
+        step for step in payload["steps"] if step["action"] == "effect_installed"
+    ]
+    inverse_reservations = {
+        step["effect"]: step["sha256"]
+        for step in payload["steps"]
+        if step["action"] == "inverse_reserved"
+    }
+    installed_snapshots = {
+        step["effect"]: step["sha256"]
+        for step in payload["steps"]
+        if step["action"] == "effect_installed" and step["phase"] == "INSTALLED"
+    }
+    legacy_removals = {
+        step["effect"]: step["sha256"]
+        for step in effects
+        if Path(step["effect"]).name in {_LEGACY_SERVICE, _LEGACY_TIMER}
+    }
+    try:
+        for path_string, old in snapshots.items():
+            path = Path(path_string)
+            mode = (
+                old["mode"]
+                if old["present"]
+                else (
+                    0o600
+                    if path.name == _OBSERVATION_NAME
+                    else (
+                        0o755
+                        if path.name
+                        in {
+                            "the-hive-mcp",
+                            _PRICING_LAUNCHER,
+                            "codex_master_hive_hourly_probe.py",
+                        }
+                        else 0o644
+                    )
+                )
+            )
+            current = _regular_bytes(
+                path,
+                maximum=(
+                    _MAX_HEALTH_BYTES
+                    if path.name == ".the-hive-release-pointers.json"
+                    else (
+                        _MAX_OBSERVATION_BYTES
+                        if path.name == _OBSERVATION_NAME
+                        else _MAX_UNIT_BYTES
+                    )
+                ),
+                mode=mode,
+            )
+            old_bytes = (
+                base64.b64decode(old["bytes_b64"], validate=True)
+                if old["present"]
+                else None
+            )
+            if current == old_bytes:
+                if not _v2_file_snapshot_identity_matches(path, old):
+                    expected_inverse = inverse_reservations.get(path_string)
+                    if (
+                        expected_inverse is None
+                        or _v2_file_identity_digest(path) != expected_inverse
+                    ):
+                        return False
+                continue
+            recorded_post = post_files.get(path_string)
+            if phase in {"OBSERVED", "RECOVERING"} and recorded_post is not None:
+                post_bytes = (
+                    base64.b64decode(recorded_post["bytes_b64"], validate=True)
+                    if recorded_post["present"]
+                    else None
+                )
+                if current == post_bytes:
+                    if not _v2_file_snapshot_identity_matches(path, recorded_post):
+                        return False
+                    continue
+            installed_digest = installed_snapshots.get(path_string)
+            if installed_digest is not None:
+                installed_snapshot = _v2_capture_managed_file(path, mode)
+                if (
+                    hashlib.sha256(_d320_canonical_json(installed_snapshot)).hexdigest()
+                    == installed_digest
+                ):
+                    continue
+            reserved_digest = inverse_reservations.get(path_string)
+            temporary = _v2_restore_temp_path(payload, path)
+            try:
+                temporary.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            else:
+                if (
+                    reserved_digest is None
+                    or _v2_file_identity_digest(temporary) != reserved_digest
+                    or _regular_bytes(temporary, maximum=_MAX_HEALTH_BYTES, mode=mode)
+                    != old_bytes
+                ):
+                    return False
+                continue
+            if path.name in {_LEGACY_SERVICE, _LEGACY_TIMER} and current is None:
+                if legacy_removals.get(path_string) == old["sha256"]:
+                    continue
+            return False
+    except (OSError, RuntimeLifecycleError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _v2_file_snapshot_identity_matches(
+    path: Path, snapshot: Mapping[str, object]
+) -> bool:
+    if not snapshot["present"]:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_dev == snapshot["dev"]
+        and info.st_ino == snapshot["ino"]
+        and info.st_uid == snapshot["uid"]
+        and info.st_gid == snapshot["gid"]
+        and stat.S_IMODE(info.st_mode) == snapshot["mode"]
+        and info.st_nlink == snapshot["nlink"]
+        and info.st_size == snapshot["size"]
+    )
+
+
+def _v2_file_identity_digest(path: Path) -> str:
+    try:
+        item = path.lstat()
+    except OSError as exc:
+        raise _error("runtime_lifecycle_recovery_hold") from exc
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISREG(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or item.st_nlink != 1
+    ):
+        raise _error("runtime_lifecycle_recovery_hold")
+    identity = {
+        "type": "file",
+        "dev": item.st_dev,
+        "ino": item.st_ino,
+        "uid": item.st_uid,
+        "gid": item.st_gid,
+        "mode": stat.S_IMODE(item.st_mode),
+        "nlink": item.st_nlink,
+        "size": item.st_size,
+    }
+    return hashlib.sha256(_d320_canonical_json(identity)).hexdigest()
+
+
+def _v2_setup_reservation_digest(
+    path: Path, target: Path, *, parent_path: Path | None = None
+) -> str:
+    try:
+        item = path.lstat()
+        parent = (parent_path or path.parent).lstat()
+    except OSError as exc:
+        raise _error("runtime_lifecycle_recovery_hold") from exc
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+    ):
+        raise _error("runtime_lifecycle_recovery_hold")
+    if stat.S_ISDIR(item.st_mode):
+        selected = {
+            "type": "directory",
+            "dev": item.st_dev,
+            "ino": item.st_ino,
+            "uid": item.st_uid,
+            "gid": item.st_gid,
+            "mode": stat.S_IMODE(item.st_mode),
+        }
+    elif stat.S_ISREG(item.st_mode) and item.st_nlink == 1:
+        selected = {
+            "type": "file",
+            "dev": item.st_dev,
+            "ino": item.st_ino,
+            "uid": item.st_uid,
+            "gid": item.st_gid,
+            "mode": stat.S_IMODE(item.st_mode),
+            "nlink": item.st_nlink,
+        }
+    else:
+        raise _error("runtime_lifecycle_recovery_hold")
+    selected["parent_dev"] = parent.st_dev
+    selected["parent_ino"] = parent.st_ino
+    selected["target"] = str(target)
+    selected["target"] = str(target)
+    return hashlib.sha256(_d320_canonical_json(selected)).hexdigest()
+
+
+def _v2_restore_temp_path(payload: Mapping[str, object], target: Path) -> Path:
+    suffix = hashlib.sha256(str(target).encode("utf-8")).hexdigest()[:16]
+    return target.parent / f".{target.name}.v2-restore-{payload['journal_id']}-{suffix}"
+
+
+def _v2_remove_owned_stage(
+    home: Path,
+    payload: Mapping[str, object],
+    *,
+    require_seal: bool,
+    remove: bool = True,
+) -> None:
+    stage = home / ".local" / "lib" / str(payload["stage_name"])
+    try:
+        before = stage.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise _error("runtime_lifecycle_recovery_hold") from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISDIR(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or stat.S_IMODE(before.st_mode) != 0o700
+    ):
+        raise _error("runtime_lifecycle_recovery_hold")
+    sealed = payload["sealed"]
+    if isinstance(sealed, Mapping):
+        expected_identity = sealed["stage_identity_sha256"]
+    else:
+        temporary = _v2_setup_temp_path(payload, stage)
+        expected_identity = next(
+            (
+                step["sha256"]
+                for step in payload["steps"]
+                if step["action"] == "effect_created"
+                and step["effect"] == str(temporary)
+            ),
+            None,
+        )
+    if (
+        not isinstance(expected_identity, str)
+        or _v2_setup_reservation_digest(stage, stage) != expected_identity
+    ):
+        raise _error("runtime_lifecycle_recovery_hold")
+    if require_seal:
+        try:
+            from the_hive.runtime_layout import RuntimeLayout
+
+            stage_layout = RuntimeLayout.from_runtime_root(stage)
+            install_script = (
+                Path(__file__).resolve().parents[2]
+                / "scripts"
+                / "the-hive-hive-hourly-probe-install"
+            )
+            installer = runpy.run_path(os.fspath(install_script))
+            installer["_validate_runtime_image_stage"](stage=stage, home=home)
+            hourly_service, hourly_timer = installer["_staged_hourly_probe_unit_bytes"](
+                layout=stage_layout, generation=payload["source"]["commit"]
+            )
+            pricing_service, pricing_timer = installer[
+                "_staged_pricing_inventory_unit_bytes"
+            ](layout=stage_layout)
+            outputs = {
+                "mcp_launcher": installer["_attested_stable_mcp_launcher_bytes"](
+                    stage_layout
+                ),
+                "hourly_service": hourly_service,
+                "hourly_timer": hourly_timer,
+                "pricing_launcher": installer[
+                    "_attested_pricing_inventory_launcher_bytes"
+                ](stage_layout),
+                "pricing_service": pricing_service,
+                "pricing_timer": pricing_timer,
+                "legacy_launcher": installer["_attested_legacy_probe_launcher_bytes"](
+                    stage_layout
+                ),
+            }
+        except Exception as exc:
+            raise _error("runtime_lifecycle_recovery_hold") from exc
+        sealed = payload["sealed"]
+        if (
+            not isinstance(sealed, Mapping)
+            or stage_layout.root != stage
+            or stage_layout.manifest_digest != sealed["manifest_digest"]
+            or {
+                name: hashlib.sha256(content).hexdigest()
+                for name, content in outputs.items()
+            }
+            != sealed["output_sha256"]
+        ):
+            raise _error("runtime_lifecycle_recovery_hold")
+    if not remove:
+        return
+    try:
+        if _v2_setup_reservation_digest(stage, stage) != expected_identity:
+            raise _error("runtime_lifecycle_recovery_hold")
+        _v2_remove_journaled_effect(
+            home,
+            payload,
+            path=stage,
+            kind="stage",
+            digest=expected_identity,
+        )
+    except (OSError, RuntimeLifecycleError) as exc:
+        raise _error("runtime_lifecycle_recovery_hold") from exc
+
+
+def _v2_setup_temp_path(payload: Mapping[str, object], target: Path) -> Path:
+    if (
+        target.name == ".hook-session-pins-v1.lock"
+        and target.parent.name == "hook-session-pins-v1"
+    ):
+        return _v2_setup_temp_path(payload, target.parent) / target.name
+    transaction = str(payload["stage_name"]).rsplit(".", 1)[-1]
+    selected = hashlib.sha256(os.fsencode(target)).hexdigest()[:16]
+    return target.parent / f".{target.name}.hive-v2-setup-{transaction}-{selected}"
+
+
+def _v2_remove_journaled_effect(
+    home: Path,
+    payload: Mapping[str, object],
+    *,
+    path: Path,
+    kind: str,
+    digest: str,
+) -> None:
+    """Remove one setup artifact only after a NOREPLACE identity handoff."""
+
+    _bound_path_from_home(home, path)
+    parent_fd = -1
+    name = path.name
+    quarantine = (
+        ".hive-lifecycle-recovery-"
+        + hashlib.sha256(
+            (str(payload["journal_id"]) + "\0" + str(path)).encode("utf-8")
+        ).hexdigest()[:32]
+    )
+
+    def current_identity(selected: str) -> Mapping[str, object] | None:
+        try:
+            info = os.stat(selected, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise _error("runtime_lifecycle_recovery_hold") from exc
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+            raise _error("runtime_lifecycle_recovery_hold")
+        if stat.S_ISDIR(info.st_mode):
+            effect_type = "directory"
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            effect_type = "file"
+        else:
+            raise _error("runtime_lifecycle_recovery_hold")
+        return {
+            "type": effect_type,
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "mode": stat.S_IMODE(info.st_mode),
+            "nlink": info.st_nlink,
+        }
+
+    def matches(identity: Mapping[str, object] | None) -> bool:
+        directory_kinds = {
+            "state_parent",
+            "install_state",
+            "local_bin",
+            "local_libexec",
+            "hook_pin_parent",
+            "hook_pin_authority",
+            "config",
+            "config_systemd",
+            "units",
+            "library",
+            "release_root",
+            "generations",
+            "stage",
+            "generation",
+        }
+        if identity is None or identity["type"] != (
+            "directory" if kind in directory_kinds else "file"
+        ):
+            return False
+        stable = {
+            key: identity[key] for key in ("type", "dev", "ino", "uid", "gid", "mode")
+        }
+        if identity["type"] == "file":
+            stable["nlink"] = identity["nlink"]
+        if kind != "managed_file":
+            parent = os.fstat(parent_fd)
+            stable["parent_dev"] = parent.st_dev
+            stable["parent_ino"] = parent.st_ino
+            stable["target"] = str(path)
+        return hashlib.sha256(_d320_canonical_json(stable)).hexdigest() == digest
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise _error("runtime_lifecycle_recovery_hold")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    try:
+        selected_parent = path.parent
+        selected_name = name
+        try:
+            path.parent.lstat()
+        except FileNotFoundError:
+            temporary_path = _v2_setup_temp_path(payload, path)
+            selected_parent = temporary_path.parent
+            selected_name = temporary_path.name
+        parent_fd = os.open(
+            selected_parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        source_name = selected_name
+        source_identity = current_identity(source_name)
+        if source_identity is None:
+            temporary_name = _v2_setup_temp_path(payload, path).name
+            temporary_identity = current_identity(temporary_name)
+            if temporary_identity is not None:
+                source_name = temporary_name
+                source_identity = temporary_identity
+        quarantine_identity = current_identity(quarantine)
+        if source_identity is None:
+            if quarantine_identity is None:
+                return
+            if not matches(quarantine_identity):
+                raise _error("runtime_lifecycle_recovery_hold")
+        else:
+            if quarantine_identity is not None or not matches(source_identity):
+                raise _error("runtime_lifecycle_recovery_hold")
+            result = renameat2(
+                parent_fd,
+                os.fsencode(source_name),
+                parent_fd,
+                os.fsencode(quarantine),
+                1,
+            )
+            if result != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(error_number, os.strerror(error_number))
+            quarantine_identity = current_identity(quarantine)
+            if not matches(quarantine_identity):
+                if current_identity(name) is None:
+                    renameat2(
+                        parent_fd,
+                        os.fsencode(quarantine),
+                        parent_fd,
+                        os.fsencode(name),
+                        1,
+                    )
+                raise _error("runtime_lifecycle_recovery_hold")
+        os.fsync(parent_fd)
+        if kind in {"stage", "generation"}:
+            shutil.rmtree(path.parent / quarantine)
+        elif quarantine_identity["type"] == "directory":
+            os.rmdir(quarantine, dir_fd=parent_fd)
+        else:
+            os.unlink(quarantine, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except (OSError, RuntimeLifecycleError) as exc:
+        if isinstance(exc, RuntimeLifecycleError):
+            raise
+        raise _error("runtime_lifecycle_recovery_hold") from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _v2_recover_phase(
+    *, home: Path, plan_sha256: str, systemctl: Systemctl
+) -> dict[str, object]:
+    _v2_require_existing_lifecycle_lock(home)
+    with _lifecycle_lock(home) as lease:
+        journal = _v2_load_journal(home)
+        if journal is None:
+            raise _error("runtime_lifecycle_journal_missing")
+        payload = journal.payload
+        phase = str(payload["phase"])
+        if payload["plan_sha256"] != plan_sha256:
+            raise _error("runtime_lifecycle_plan_changed")
+        if phase in {"COMMITTED", "ROLLED_BACK"}:
+            return {
+                "status": "runtime_lifecycle_recovery_not_needed",
+                "journal_phase": phase,
+                "raw_output": "not_returned",
+            }
+        if phase == "BLOCKED":
+            raise _error("runtime_lifecycle_recovery_hold")
+        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        target = payload["target"]
+        info = home.lstat()
+        if (
+            str(home.resolve(strict=True)) != target["realpath"]
+            or (info.st_dev, info.st_ino, info.st_uid, info.st_gid)
+            != (target["dev"], target["ino"], target["uid"], target["gid"])
+            or stat.S_IMODE(info.st_mode) != target["mode"]
+            or bound.source_commit != payload["source"]["commit"]
+            or bound.source_tree_digest != payload["source"]["tree_sha256"]
+        ):
+            raise _error("runtime_lifecycle_recovery_hold")
+
+        snapshots = {item["path"]: item for item in payload["files"]}
+        modes = {str(path): mode for path, _content, mode in bound.files}
+        original_files: list[tuple[Path, bytes | None, int]] = []
+        for path in (home / relative for relative in _V2_FILE_PATHS):
+            item = snapshots[str(path)]
+            mode = modes[str(path)]
+            content = (
+                base64.b64decode(item["bytes_b64"], validate=True)
+                if item["present"]
+                else None
+            )
+            original_files.append((path, content, mode))
+        original_states = tuple(
+            (unit, dict(state)) for unit, state in payload["manager_pre"].items()
+        )
+        initial_effects = {item["kind"]: item for item in payload["extra_effects"]}
+        generation_effect = initial_effects["generations"]
+        generations_before = frozenset(
+            generation_effect["identity"]["children"]
+            if generation_effect["present"]
+            else ()
+        )
+        legacy_present = any(
+            item["present"]
+            for item in payload["files"]
+            if item["name"] in {_LEGACY_SERVICE, _LEGACY_TIMER}
+        )
+        original = replace(
+            bound,
+            files=tuple(original_files),
+            generations_before=generations_before,
+            legacy_present=legacy_present,
+            states=original_states,
+        )
+
+        current_states = dict(bound.states)
+        pre_states = payload["manager_pre"]
+        if not _v2_recovery_manager_states_are_bound(
+            payload, current_states, pre_states
+        ):
+            raise _error("runtime_lifecycle_recovery_hold")
+        if not _v2_recovery_files_are_bound(home, payload, phase):
+            raise _error("runtime_lifecycle_recovery_hold")
+        stage_path = home / ".local" / "lib" / payload["stage_name"]
+        generation_path = (
+            home
+            / ".local/lib/the-hive-runtime/generations"
+            / payload["source"]["commit"]
+        )
+        sealed = payload["sealed"]
+        if phase != "INTENT":
+            if not isinstance(sealed, Mapping):
+                raise _error("runtime_lifecycle_recovery_hold")
+            try:
+                generation_path.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise _error("runtime_lifecycle_recovery_hold") from exc
+            else:
+                if (
+                    _v2_setup_reservation_digest(generation_path, generation_path)
+                    != sealed["generation_identity_sha256"]
+                ):
+                    raise _error("runtime_lifecycle_recovery_hold")
+        temp_to_target = {
+            str(_v2_setup_temp_path(payload, Path(path))): path
+            for path in _v2_expected_effects(
+                home, payload["source"]["commit"], payload["stage_name"]
+            )
+        }
+        setup_records = {
+            temp_to_target[step["effect"]]: step["sha256"]
+            for step in payload["steps"]
+            if step["action"] == "effect_created"
+        }
+        for effect_path in _v2_expected_effects(
+            home, payload["source"]["commit"], payload["stage_name"]
+        ):
+            temporary = _v2_setup_temp_path(payload, Path(effect_path))
+            try:
+                temporary.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise _error("runtime_lifecycle_recovery_hold") from exc
+            if (
+                effect_path not in setup_records
+                or _v2_setup_reservation_digest(temporary, Path(effect_path))
+                != setup_records[effect_path]
+            ):
+                raise _error("runtime_lifecycle_recovery_hold")
+        if phase in {"INTENT", "RECOVERING"}:
+            current_effects = _v2_capture_effects(
+                home, payload["source"]["commit"], payload["stage_name"]
+            )
+            baseline = {item["path"]: item for item in payload["extra_effects"]}
+            allowed_coordination = {
+                str(_v2_journal_path(home)),
+                str(
+                    home / ".local/state/codex-master-mcp/hive/.runtime-lifecycle.lock"
+                ),
+            }
+            for item in current_effects:
+                if item["path"] in allowed_coordination:
+                    continue
+                if item["path"] == str(generation_path) and not item["present"]:
+                    continue
+                prior = baseline[item["path"]]
+                if _v2_effect_identity_digest(item) == _v2_effect_identity_digest(
+                    prior
+                ):
+                    if item["kind"] == "generation" and item["present"]:
+                        raise _error("runtime_lifecycle_recovery_hold")
+                    if (
+                        item["path"] == str(stage_path)
+                        and item["present"]
+                        and item["path"] not in setup_records
+                    ):
+                        raise _error("runtime_lifecycle_recovery_hold")
+                    continue
+                if not item["present"] and prior["present"]:
+                    raise _error("runtime_lifecycle_recovery_hold")
+                if not item["present"] or setup_records.get(item["path"]) != (
+                    _v2_setup_reservation_digest(Path(item["path"]), Path(item["path"]))
+                ):
+                    raise _error("runtime_lifecycle_recovery_hold")
+        elif phase == "SEALED":
+            stage_info = None
+            try:
+                stage_info = stage_path.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise _error("runtime_lifecycle_recovery_hold") from exc
+            if stage_info is not None:
+                _v2_remove_owned_stage(home, payload, require_seal=True, remove=False)
+            try:
+                generation_info = generation_path.lstat()
+            except FileNotFoundError:
+                generation_info = None
+            except OSError as exc:
+                raise _error("runtime_lifecycle_recovery_hold") from exc
+            if generation_info is not None:
+                if (
+                    _v2_setup_reservation_digest(generation_path, generation_path)
+                    != sealed["generation_identity_sha256"]
+                ):
+                    raise _error("runtime_lifecycle_recovery_hold")
+                try:
+                    from the_hive.runtime_layout import RuntimeLayout
+
+                    candidate = RuntimeLayout.from_runtime_root(generation_path)
+                except Exception as exc:
+                    raise _error("runtime_lifecycle_recovery_hold") from exc
+                if candidate.manifest_digest != payload["sealed"]["manifest_digest"]:
+                    raise _error("runtime_lifecycle_recovery_hold")
+        elif phase in {"INSTALLED", "ACTIVATED", "OBSERVED"}:
+            sealed = payload["sealed"]
+            if not isinstance(sealed, Mapping):
+                raise _error("runtime_lifecycle_recovery_hold")
+            identity = _runtime_identity(bound.release_root)
+            if (
+                not isinstance(identity, Mapping)
+                or identity.get("generation") != sealed["generation"]
+                or identity.get("manifest_digest") != sealed["manifest_digest"]
+            ):
+                raise _error("runtime_lifecycle_recovery_hold")
+            if phase == "INSTALLED" and current_states != pre_states:
+                raise _error("runtime_lifecycle_recovery_hold")
+        elif phase == "RECOVERING":
+            # Resume is allowed only while each managed byte and manager state
+            # remains either at its recorded pre-state or at a transaction
+            # state already covered by the durable intent/readback log.
+            pass
+        else:
+            raise _error("runtime_lifecycle_recovery_hold")
+
+        if phase != "RECOVERING":
+            journal = _v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="RECOVERING",
+                action="recovery_started",
+                effect=str(_v2_journal_path(home)),
+                digest=hashlib.sha256(journal.to_bytes()).hexdigest(),
+                updates={"recovery_count": int(payload["recovery_count"]) + 1},
+            )
+        _v2_remove_owned_stage(
+            home,
+            payload,
+            require_seal=bool(payload["sealed"]),
+        )
+
+        def restore_v2_file(path: Path, content: bytes, mode: int) -> None:
+            nonlocal journal
+            temp_path = _v2_restore_temp_path(payload, path)
+
+            def reserve(target: Path, digest: str, created: bool) -> None:
+                nonlocal journal
+                current_steps = journal.payload["steps"]
+                existing = next(
+                    (
+                        step
+                        for step in current_steps
+                        if step["phase"] == "RECOVERING"
+                        and step["action"] == "inverse_reserved"
+                        and step["effect"] == str(target)
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["sha256"] != digest:
+                        raise _error("runtime_lifecycle_recovery_hold")
+                    return
+                if not created:
+                    raise _error("runtime_lifecycle_recovery_hold")
+                journal = _v2_transition(
+                    home,
+                    journal,
+                    lease=lease,
+                    phase="RECOVERING",
+                    action="inverse_reserved",
+                    effect=str(target),
+                    digest=digest,
+                )
+
+            def applied(target: Path, digest: str) -> None:
+                nonlocal journal
+                existing = next(
+                    (
+                        step
+                        for step in journal.payload["steps"]
+                        if step["phase"] == "RECOVERING"
+                        and step["action"] == "inverse_applied"
+                        and step["effect"] == str(target)
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["sha256"] != digest:
+                        raise _error("runtime_lifecycle_recovery_hold")
+                    return
+                journal = _v2_transition(
+                    home,
+                    journal,
+                    lease=lease,
+                    phase="RECOVERING",
+                    action="inverse_applied",
+                    effect=str(target),
+                    digest=digest,
+                )
+
+            _atomic_restore(
+                path,
+                content,
+                mode,
+                temporary_path=temp_path,
+                before_replace=reserve,
+                after_replace=applied,
+            )
+
+        def remove_v2_file(path: Path) -> None:
+            nonlocal journal
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+            ):
+                raise _error("runtime_lifecycle_recovery_hold")
+            identity = {
+                "identity": {
+                    "type": "file",
+                    "dev": info.st_dev,
+                    "ino": info.st_ino,
+                    "uid": info.st_uid,
+                    "gid": info.st_gid,
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "nlink": info.st_nlink,
+                }
+            }
+            digest = _v2_effect_identity_digest(identity)
+            existing = next(
+                (
+                    step
+                    for step in journal.payload["steps"]
+                    if step["phase"] == "RECOVERING"
+                    and step["action"] == "inverse_reserved"
+                    and step["effect"] == str(path)
+                ),
+                None,
+            )
+            if existing is None:
+                journal = _v2_transition(
+                    home,
+                    journal,
+                    lease=lease,
+                    phase="RECOVERING",
+                    action="inverse_reserved",
+                    effect=str(path),
+                    digest=digest,
+                )
+            elif existing["sha256"] != digest:
+                raise _error("runtime_lifecycle_recovery_hold")
+            _v2_remove_journaled_effect(
+                home,
+                journal.payload,
+                path=path,
+                kind="managed_file",
+                digest=digest,
+            )
+            applied = next(
+                (
+                    step
+                    for step in journal.payload["steps"]
+                    if step["phase"] == "RECOVERING"
+                    and step["action"] == "inverse_applied"
+                    and step["effect"] == str(path)
+                ),
+                None,
+            )
+            if applied is None:
+                journal = _v2_transition(
+                    home,
+                    journal,
+                    lease=lease,
+                    phase="RECOVERING",
+                    action="inverse_applied",
+                    effect=str(path),
+                    digest=digest,
+                )
+
+        rollback = _restore_bound_state_result(
+            original,
+            systemctl,
+            restore_file=restore_v2_file,
+            remove_file=remove_v2_file,
+            discard_generation=lambda selected: _discard_new_generation(
+                selected,
+                home=home,
+                payload=journal.payload,
+                expected_identity=(
+                    journal.payload["sealed"]["generation_identity_sha256"]
+                    if isinstance(journal.payload["sealed"], Mapping)
+                    else None
+                ),
+            ),
+        )
+        if not rollback.restored:
+            journal = _v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="BLOCKED",
+                action="blocked",
+                effect=str(_v2_journal_path(home)),
+                digest=hashlib.sha256(
+                    _d320_canonical_json(
+                        {"phase": rollback.phase, "error": rollback.error_code}
+                    )
+                ).hexdigest(),
+            )
+            return {
+                "status": "runtime_lifecycle_recovery_blocked",
+                "journal_phase": journal.payload["phase"],
+                "raw_output": "not_returned",
+            }
+        created = sorted(
+            setup_records.items(),
+            key=lambda item: (item[0].count(os.sep), item[0]),
+            reverse=True,
+        )
+        kinds = {item["path"]: item["kind"] for item in payload["extra_effects"]}
+        for effect_path, digest in created:
+            _v2_remove_journaled_effect(
+                home,
+                journal.payload,
+                path=Path(effect_path),
+                kind=kinds[effect_path],
+                digest=digest,
+            )
+        for path, content, mode in original.files:
+            if _regular_bytes(path, maximum=_MAX_UNIT_BYTES, mode=mode) != content:
+                raise _error("runtime_lifecycle_recovery_hold")
+        reservations = [
+            step
+            for step in journal.payload["steps"]
+            if step["phase"] == "RECOVERING" and step["action"] == "inverse_reserved"
+        ]
+        applied_effects = {
+            step["effect"]
+            for step in journal.payload["steps"]
+            if step["phase"] == "RECOVERING" and step["action"] == "inverse_applied"
+        }
+        for reservation in reservations:
+            target = Path(reservation["effect"])
+            if reservation["effect"] in applied_effects:
+                continue
+            if _v2_file_identity_digest(target) != reservation["sha256"]:
+                continue
+            journal = _v2_transition(
+                home,
+                journal,
+                lease=lease,
+                phase="RECOVERING",
+                action="inverse_applied",
+                effect=reservation["effect"],
+                digest=reservation["sha256"],
+            )
+        journal = _v2_transition(
+            home,
+            journal,
+            lease=lease,
+            phase="ROLLED_BACK",
+            action="rollback_verified",
+            effect=str(_v2_journal_path(home)),
+            digest=hashlib.sha256(
+                _d320_canonical_json(
+                    {"source_commit": original.source_commit, "restored": True}
+                )
+            ).hexdigest(),
+        )
+    return {
+        "status": "runtime_lifecycle_recovery_complete",
+        "journal_phase": journal.payload["phase"],
+        "raw_output": "not_returned",
+    }
 
 
 def _bind_post_install(home: Path) -> _PostInstallBinding:
@@ -2961,20 +6713,71 @@ def _cutover_systemctl_mutate(
         raise _CutoverMutationError(phase=phase, error=exc) from exc
 
 
-def _atomic_restore(path: Path, content: bytes, mode: int) -> None:
+def _atomic_restore(
+    path: Path,
+    content: bytes,
+    mode: int,
+    *,
+    temporary_path: Path | None = None,
+    before_replace: Callable[[Path, str, bool], None] | None = None,
+    after_replace: Callable[[Path, str], None] | None = None,
+) -> None:
     descriptor = -1
     temporary = Path()
+    retain_temporary = False
+    digest: str | None = None
     try:
-        descriptor, name = tempfile.mkstemp(
-            prefix=f".{path.name}.rollback.", dir=path.parent
-        )
-        temporary = Path(name)
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
+        if temporary_path is None:
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{path.name}.rollback.", dir=path.parent
+            )
+            temporary = Path(name)
+        else:
+            temporary = temporary_path
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    mode,
+                )
+            except FileExistsError:
+                descriptor = os.open(
+                    temporary,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                item = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(item.st_mode)
+                    or item.st_uid != os.geteuid()
+                    or item.st_nlink != 1
+                    or stat.S_IMODE(item.st_mode) != mode
+                ):
+                    raise _error("runtime_lifecycle_recovery_hold")
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if b"".join(chunks) != content:
+                    raise _error("runtime_lifecycle_recovery_hold")
+                digest = _v2_file_identity_digest(temporary)
+                os.close(descriptor)
+                descriptor = -1
+                if before_replace is not None:
+                    retain_temporary = True
+                    before_replace(path, digest, False)
+        if digest is None:
+            os.fchmod(descriptor, mode)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            digest = _v2_file_identity_digest(temporary)
+            if before_replace is not None:
+                retain_temporary = True
+                before_replace(path, digest, True)
         os.replace(temporary, path)
         directory = os.open(
             path.parent,
@@ -2985,12 +6788,14 @@ def _atomic_restore(path: Path, content: bytes, mode: int) -> None:
         finally:
             os.close(directory)
         temporary = Path()
+        if after_replace is not None and digest is not None:
+            after_replace(path, digest)
     except OSError as exc:
         raise _error("runtime_lifecycle_rollback_failed") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary != Path():
+        if temporary != Path() and not retain_temporary:
             try:
                 temporary.unlink()
             except OSError:
@@ -3032,7 +6837,13 @@ def _revalidate_legacy_units(bound: _BoundCutover) -> None:
             raise _error("runtime_lifecycle_legacy_changed")
 
 
-def _discard_new_generation(bound: _BoundCutover) -> None:
+def _discard_new_generation(
+    bound: _BoundCutover,
+    *,
+    home: Path | None = None,
+    payload: Mapping[str, object] | None = None,
+    expected_identity: str | None = None,
+) -> None:
     """Discard only this transaction's newly attested, unreferenced generation."""
 
     if bound.source_commit in bound.generations_before:
@@ -3041,12 +6852,28 @@ def _discard_new_generation(bound: _BoundCutover) -> None:
     try:
         candidate.lstat()
     except FileNotFoundError:
+        if expected_identity is not None and candidate.parent.exists():
+            if not isinstance(home, Path) or not isinstance(payload, Mapping):
+                raise _error("runtime_lifecycle_recovery_hold")
+            _v2_remove_journaled_effect(
+                home,
+                payload,
+                path=candidate,
+                kind="generation",
+                digest=expected_identity,
+            )
         return
     except OSError as exc:
         raise _error("runtime_lifecycle_rollback_failed") from exc
     try:
         from the_hive.runtime_layout import RuntimeLayout
 
+        if expected_identity is not None and (
+            not isinstance(home, Path)
+            or not isinstance(payload, Mapping)
+            or _v2_setup_reservation_digest(candidate, candidate) != expected_identity
+        ):
+            raise _error("runtime_lifecycle_recovery_hold")
         layout = RuntimeLayout.from_runtime_root(candidate)
         raw = _regular_bytes(
             candidate / ".the-hive-runtime-manifest.json",
@@ -3061,7 +6888,16 @@ def _discard_new_generation(bound: _BoundCutover) -> None:
             or manifest.get("commit") != bound.source_commit
         ):
             raise _error("runtime_lifecycle_rollback_failed")
-        shutil.rmtree(candidate)
+        if expected_identity is not None:
+            _v2_remove_journaled_effect(
+                home,
+                payload,
+                path=candidate,
+                kind="generation",
+                digest=expected_identity,
+            )
+        else:
+            shutil.rmtree(candidate)
     except RuntimeLifecycleError:
         raise
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -3075,7 +6911,12 @@ def _discard_new_generation(bound: _BoundCutover) -> None:
 
 
 def _restore_bound_state_result(
-    bound: _BoundCutover, systemctl: Systemctl
+    bound: _BoundCutover,
+    systemctl: Systemctl,
+    *,
+    restore_file: Callable[[Path, bytes, int], None] | None = None,
+    remove_file: Callable[[Path], None] | None = None,
+    discard_generation: Callable[[_BoundCutover], None] | None = None,
 ) -> _RollbackResult:
     """Restore the bound transaction state with fixed, public-safe diagnostics."""
 
@@ -3093,9 +6934,15 @@ def _restore_bound_state_result(
             current = _regular_bytes(path, maximum=maximum, mode=mode)
             if content is None:
                 if current is not None:
-                    path.unlink()
+                    if remove_file is None:
+                        path.unlink()
+                    else:
+                        remove_file(path)
             elif current != content:
-                _atomic_restore(path, content, mode)
+                if restore_file is None:
+                    _atomic_restore(path, content, mode)
+                else:
+                    restore_file(path, content, mode)
             if _regular_bytes(path, maximum=maximum, mode=mode) != content:
                 raise _error("runtime_lifecycle_rollback_failed")
     except (RuntimeLifecycleError, OSError):
@@ -3104,7 +6951,10 @@ def _restore_bound_state_result(
         )
 
     try:
-        _discard_new_generation(bound)
+        if discard_generation is None:
+            _discard_new_generation(bound)
+        else:
+            discard_generation(bound)
     except RuntimeLifecycleError:
         return _RollbackResult(
             False, _ROLLBACK_PHASE_GENERATION_DISCARD, "generation_discard_failed"
@@ -3188,10 +7038,7 @@ def _cutover_mutation_failure_result(
 ) -> dict[str, object]:
     """Publish only the fixed phase/error pair after a complete rollback."""
 
-    if (
-        failure.phase not in _CUTOVER_MUTATION_PHASES
-        or not failure.status_whitelisted
-    ):
+    if failure.phase not in _CUTOVER_MUTATION_PHASES or not failure.status_whitelisted:
         phase = _CUTOVER_TELEMETRY_INVALID
         error = _CUTOVER_TELEMETRY_INVALID
     else:
@@ -3269,9 +7116,7 @@ def _systemd_run_failure_code(
         or len(stderr) > 512
     ):
         return "runtime_canary_manager_failed"
-    return _CANARY_SYSTEMD_RUN_FAILURES.get(
-        stderr, "runtime_canary_manager_failed"
-    )
+    return _CANARY_SYSTEMD_RUN_FAILURES.get(stderr, "runtime_canary_manager_failed")
 
 
 def _systemd_run_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
@@ -3402,9 +7247,7 @@ def _canary_show(systemctl: Systemctl, unit: str) -> Mapping[str, str]:
         not isinstance(result, Mapping)
         or set(result) != required
         or any(
-            not isinstance(key, str)
-            or not isinstance(value, str)
-            or len(value) > 256
+            not isinstance(key, str) or not isinstance(value, str) or len(value) > 256
             for key, value in result.items()
         )
     ):
@@ -3412,9 +7255,7 @@ def _canary_show(systemctl: Systemctl, unit: str) -> Mapping[str, str]:
     return dict(result)
 
 
-def _canary_unit_owned(
-    state: Mapping[str, str], binding: _CanaryUnitBinding
-) -> bool:
+def _canary_unit_owned(state: Mapping[str, str], binding: _CanaryUnitBinding) -> bool:
     return (
         state.get("LoadState") == "loaded"
         and state.get("Transient") == "yes"
@@ -3422,9 +7263,7 @@ def _canary_unit_owned(
     )
 
 
-def _start_canary_unit(
-    systemd_run: SystemdRun, binding: _CanaryUnitBinding
-) -> None:
+def _start_canary_unit(systemd_run: SystemdRun, binding: _CanaryUnitBinding) -> None:
     try:
         result = systemd_run(binding.run_arguments)
     except RuntimeLifecycleError:
@@ -3523,9 +7362,11 @@ def _canary_diagnostic_value(value: object, *, command_ready: bool) -> str:
             "redaction_applied": False,
         },
     }
-    if value != expected or (
-        command_ready and code != "ok"
-    ) or (not command_ready and code not in _CANARY_STAGE_CODES):
+    if (
+        value != expected
+        or (command_ready and code != "ok")
+        or (not command_ready and code not in _CANARY_STAGE_CODES)
+    ):
         raise _error("runtime_canary_evidence_invalid")
     return code
 
@@ -3621,6 +7462,859 @@ def _canary_evidence_result(
     raise _error("runtime_canary_evidence_invalid")
 
 
+def _canary_runtime_qualification_status(
+    *, image: _CanaryImage, manager_state: Mapping[str, str]
+) -> str:
+    """Separate a successful pilot-blocked diagnosis from runtime qualification."""
+
+    try:
+        status, _error_code = _canary_evidence_result(
+            image=image, manager_state=manager_state
+        )
+        raw = _regular_bytes(
+            image.state_root / "hive-hourly-health.json",
+            maximum=_CANARY_HEALTH_BYTES,
+            mode=0o600,
+        )
+        payload = _d320_parse_json(raw) if raw is not None else None
+    except (RuntimeLifecycleError, D320CutoverJournalError):
+        return "fail"
+    if status != "runtime_canary_green" or not isinstance(payload, Mapping):
+        return "fail"
+    checks = payload.get("checks")
+    commands = payload.get("commands")
+    if (
+        not isinstance(checks, Mapping)
+        or not isinstance(commands, Mapping)
+        or not all(value is True for value in checks.values())
+        or not all(value is True for value in commands.values())
+        or manager_state.get("ActiveState") != "active"
+        or manager_state.get("Result") != "success"
+        or manager_state.get("ExecMainStatus") != "0"
+    ):
+        return "unknown"
+    return "pass"
+
+
+def _probe_codex_client_metadata(
+    *, executable: Path, home: Path, codex_home: Path
+) -> dict[str, object]:
+    """Observe CLI metadata and config readback through one pinned executable FD.
+
+    The differential config probe checks only the structural `--no-daemon`
+    consumer contract. It does not establish runtime behavior or G5 support.
+    """
+
+    source_fd = snapshot_fd = codex_fd = config_fd = -1
+    try:
+        for directory in (home, codex_home):
+            info = directory.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise _error("runtime_canary_client_probe_invalid")
+        if codex_home.parent != home or codex_home.name != ".codex":
+            raise _error("runtime_canary_client_probe_invalid")
+        path_info = executable.lstat()
+        if (
+            stat.S_ISLNK(path_info.st_mode)
+            or not stat.S_ISREG(path_info.st_mode)
+            or path_info.st_uid not in {0, os.geteuid()}
+            or path_info.st_nlink != 1
+            or path_info.st_mode & 0o022
+            or not os.access(executable, os.X_OK)
+        ):
+            raise _error("runtime_canary_client_probe_invalid")
+        source_fd = os.open(
+            executable,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        pinned = os.fstat(source_fd)
+        current = executable.lstat()
+        if (
+            not stat.S_ISREG(pinned.st_mode)
+            or pinned.st_nlink != 1
+            or pinned.st_uid not in {0, os.geteuid()}
+            or pinned.st_mode & 0o022
+            or (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino)
+            or pinned.st_size <= 0
+            or pinned.st_size > 512 * 1024 * 1024
+        ):
+            raise _error("runtime_canary_client_probe_invalid")
+        snapshot_fd = os.memfd_create(
+            "the-hive-codex-probe",
+            getattr(os, "MFD_CLOEXEC", 0) | getattr(os, "MFD_ALLOW_SEALING", 0),
+        )
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < pinned.st_size:
+            chunk = os.pread(
+                source_fd, min(1024 * 1024, pinned.st_size - offset), offset
+            )
+            if not chunk:
+                raise _error("runtime_canary_client_probe_invalid")
+            digest.update(chunk)
+            written = 0
+            while written < len(chunk):
+                written += os.write(snapshot_fd, chunk[written:])
+            offset += len(chunk)
+        if os.fstat(source_fd).st_size != pinned.st_size:
+            raise _error("runtime_canary_client_probe_invalid")
+        os.fchmod(snapshot_fd, 0o500)
+        seals = (
+            getattr(fcntl, "F_SEAL_SEAL", 0)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0)
+            | getattr(fcntl, "F_SEAL_GROW", 0)
+            | getattr(fcntl, "F_SEAL_WRITE", 0)
+        )
+        if not seals:
+            raise _error("runtime_canary_client_probe_invalid")
+        fcntl.fcntl(snapshot_fd, fcntl.F_ADD_SEALS, seals)
+        os.close(source_fd)
+        source_fd = -1
+        environment = {
+            "CODEX_HOME": os.fspath(codex_home),
+            "HOME": os.fspath(home),
+            "LANG": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        codex_info = codex_home.lstat()
+        codex_fd = os.open(
+            codex_home,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_codex = os.fstat(codex_fd)
+        if (
+            (opened_codex.st_dev, opened_codex.st_ino)
+            != (codex_info.st_dev, codex_info.st_ino)
+            or opened_codex.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_codex.st_mode) != 0o700
+        ):
+            raise _error("runtime_canary_client_probe_invalid")
+        config_fd = os.open(
+            "config.toml",
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=codex_fd,
+        )
+        os.fchmod(config_fd, 0o600)
+        config_identity = os.fstat(config_fd)
+        if (
+            not stat.S_ISREG(config_identity.st_mode)
+            or config_identity.st_uid != os.geteuid()
+            or config_identity.st_nlink != 1
+            or stat.S_IMODE(config_identity.st_mode) != 0o600
+        ):
+            raise _error("runtime_canary_client_probe_invalid")
+
+        def read_back_config(expected: bytes) -> str:
+            current_parent = os.stat(".", dir_fd=codex_fd, follow_symlinks=False)
+            parent_path = codex_home.lstat()
+            named = os.stat("config.toml", dir_fd=codex_fd, follow_symlinks=False)
+            opened = os.fstat(config_fd)
+            if (
+                (current_parent.st_dev, current_parent.st_ino)
+                != (opened_codex.st_dev, opened_codex.st_ino)
+                or (parent_path.st_dev, parent_path.st_ino)
+                != (opened_codex.st_dev, opened_codex.st_ino)
+                or (named.st_dev, named.st_ino)
+                != (config_identity.st_dev, config_identity.st_ino)
+                or (opened.st_dev, opened.st_ino, opened.st_size)
+                != (config_identity.st_dev, config_identity.st_ino, len(expected))
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or os.pread(config_fd, len(expected) + 1, 0) != expected
+            ):
+                raise _error("runtime_canary_client_probe_invalid")
+            return hashlib.sha256(expected).hexdigest()
+
+        def observe_feature_value(value: bool) -> tuple[bool, str, str, str] | None:
+            config = (
+                b"[features]\ndaemon_auto_start = true\n"
+                if value
+                else b"[features]\ndaemon_auto_start = false\n"
+            )
+            os.ftruncate(config_fd, 0)
+            offset = 0
+            while offset < len(config):
+                offset += os.pwrite(config_fd, config[offset:], offset)
+            os.fsync(config_fd)
+            config_sha256 = read_back_config(config)
+            response = _run_pinned_client_command(
+                snapshot_fd,
+                ("--no-daemon", "features", "list"),
+                cwd=home,
+                environment=environment,
+            )
+            if response is None:
+                return None
+            read_back_config(config)
+            matches = [
+                line.strip()
+                for line in response.splitlines()
+                if line.split()[:1] == ["daemon_auto_start"]
+            ]
+            if len(matches) != 1:
+                return None
+            fields = matches[0].split()
+            if len(fields) != 3 or fields[1] != "stable":
+                return None
+            parsed = fields[2] == "true" if fields[2] in {"true", "false"} else None
+            if parsed is None or parsed is not value:
+                return None
+            if (
+                os.fstat(config_fd).st_size != len(config)
+                or os.pread(config_fd, len(config) + 1, 0) != config
+            ):
+                return None
+            return (
+                parsed,
+                config_sha256,
+                hashlib.sha256(matches[0].encode("utf-8")).hexdigest(),
+                hashlib.sha256(response.encode("utf-8")).hexdigest(),
+            )
+
+        version = _run_pinned_client_command(
+            snapshot_fd, ("--version",), cwd=home, environment=environment
+        )
+        false_probe = observe_feature_value(False)
+        true_probe = observe_feature_value(True)
+        parent_after = codex_home.lstat()
+        if (parent_after.st_dev, parent_after.st_ino) != (
+            opened_codex.st_dev,
+            opened_codex.st_ino,
+        ):
+            raise _error("runtime_canary_client_probe_invalid")
+        compatibility_probe = None
+        if false_probe is not None and true_probe is not None:
+            compatibility_probe = {
+                "argv": ["--no-daemon", "features", "list"],
+                "config_sha256": {
+                    "false": false_probe[1],
+                    "true": true_probe[1],
+                },
+                "exit_codes": {"false": 0, "true": 0},
+                "expected": {"false": False, "true": True},
+                "observed": {
+                    "false": false_probe[0],
+                    "true": true_probe[0],
+                },
+                "readback_line_sha256": {
+                    "false": false_probe[2],
+                    "true": true_probe[2],
+                },
+                "response_sha256": {
+                    "false": false_probe[3],
+                    "true": true_probe[3],
+                },
+                "schema_revision": 1,
+            }
+        return {
+            "artifact_sha256": digest.hexdigest(),
+            "compatibility_probe": compatibility_probe,
+            "features_sha256": (
+                hashlib.sha256(
+                    _d320_canonical_json(
+                        {
+                            "false": false_probe[3],
+                            "true": true_probe[3],
+                        }
+                    )
+                ).hexdigest()
+                if false_probe is not None and true_probe is not None
+                else None
+            ),
+            "features_status": (
+                "observed"
+                if false_probe is not None and true_probe is not None
+                else "unknown"
+            ),
+            "version": version,
+            "version_status": "observed" if version is not None else "unknown",
+            "no_daemon_status": (
+                "pass" if compatibility_probe is not None else "unknown"
+            ),
+            "config_readback_status": (
+                "pass" if compatibility_probe is not None else "unknown"
+            ),
+        }
+    except (OSError, RuntimeLifecycleError):
+        return {
+            "artifact_sha256": None,
+            "features": None,
+            "features_status": "unknown",
+            "compatibility_probe": None,
+            "version": None,
+            "version_status": "unknown",
+            "no_daemon_status": "unknown",
+            "config_readback_status": "unknown",
+        }
+    finally:
+        for descriptor in (source_fd, snapshot_fd, config_fd, codex_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _canonical_codex_client_path() -> Path | None:
+    """Resolve only the fixed, root-owned Codex installation used by Hive."""
+
+    try:
+        wrapper_link = _CANONICAL_CODEX_WRAPPER
+        link_info = wrapper_link.lstat()
+        wrapper = wrapper_link.resolve(strict=True)
+        wrapper_info = wrapper.lstat()
+        if (
+            not stat.S_ISLNK(link_info.st_mode)
+            or link_info.st_uid != 0
+            or not stat.S_ISREG(wrapper_info.st_mode)
+            or wrapper_info.st_uid != 0
+            or wrapper_info.st_nlink != 1
+            or wrapper_info.st_mode & 0o022
+            or wrapper.name != "codex.js"
+            or wrapper.parent.name != "bin"
+            or wrapper.parents[1].name != "codex"
+            or wrapper.parents[2].name != "@openai"
+            or wrapper.parents[3].name != "node_modules"
+        ):
+            return None
+        current = wrapper_link.parent
+        while current != Path("/"):
+            info = current.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != 0
+                or info.st_mode & 0o022
+            ):
+                return None
+            current = current.parent
+        platform_key = (os.uname().sysname, os.uname().machine)
+        package, target = {
+            ("Linux", "x86_64"): ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+            ("Linux", "aarch64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+        }[platform_key]
+        executable = (
+            wrapper.parents[1]
+            / "node_modules"
+            / "@openai"
+            / package
+            / "vendor"
+            / target
+            / "bin"
+            / "codex"
+        )
+        current = executable
+        while current != Path("/"):
+            info = current.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or info.st_uid != 0
+                or info.st_mode & 0o022
+                or (current != executable and not stat.S_ISDIR(info.st_mode))
+            ):
+                return None
+            current = current.parent
+        info = executable.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or not info.st_mode & 0o111
+        ):
+            return None
+        latest_link = wrapper_link.lstat()
+        if (latest_link.st_dev, latest_link.st_ino) != (
+            link_info.st_dev,
+            link_info.st_ino,
+        ) or wrapper_link.resolve(strict=True) != wrapper:
+            return None
+        return executable
+    except (OSError, KeyError, IndexError, AttributeError):
+        return None
+
+
+def _canonical_codex_client_digest() -> str | None:
+    executable = _canonical_codex_client_path()
+    if executable is None:
+        return None
+    descriptor = -1
+    try:
+        before = executable.lstat()
+        descriptor = os.open(
+            executable,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or opened.st_nlink != 1
+            or opened.st_mode & 0o022
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size <= 0
+            or opened.st_size > 512 * 1024 * 1024
+        ):
+            return None
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < opened.st_size:
+            chunk = os.pread(
+                descriptor, min(1024 * 1024, opened.st_size - offset), offset
+            )
+            if not chunk:
+                return None
+            digest.update(chunk)
+            offset += len(chunk)
+        after = os.fstat(descriptor)
+        latest = executable.lstat()
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+        ) or (latest.st_dev, latest.st_ino) != (opened.st_dev, opened.st_ino):
+            return None
+        return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _canary_client_metadata(invocation: Path) -> Mapping[str, object] | None:
+    executable = _canonical_codex_client_path()
+    if executable is None:
+        return None
+    home = invocation / "client-home"
+    codex_home = home / ".codex"
+    try:
+        home.mkdir(mode=0o700)
+        codex_home.mkdir(mode=0o700)
+        _private_directory(home)
+        _private_directory(codex_home)
+        observation = _probe_codex_client_metadata(
+            executable=executable, home=home, codex_home=codex_home
+        )
+        if (
+            observation["version_status"] != "observed"
+            or observation["features_status"] != "observed"
+            or not isinstance(observation["artifact_sha256"], str)
+            or not isinstance(observation["features_sha256"], str)
+            or not _valid_client_compatibility_probe(
+                observation.get("compatibility_probe")
+            )
+        ):
+            return None
+        return {
+            "artifact_sha256": observation["artifact_sha256"],
+            "compatibility_probe": observation["compatibility_probe"],
+            "features_sha256": observation["features_sha256"],
+            "version": observation["version"],
+        }
+    except (OSError, RuntimeLifecycleError):
+        return None
+
+
+def _valid_client_compatibility_probe(value: object) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "argv",
+        "config_sha256",
+        "exit_codes",
+        "expected",
+        "observed",
+        "readback_line_sha256",
+        "response_sha256",
+        "schema_revision",
+    }:
+        return False
+    config_sha256 = value.get("config_sha256")
+    readback = value.get("readback_line_sha256")
+    responses = value.get("response_sha256")
+    return (
+        value.get("schema_revision") == 1
+        and value.get("argv") == ["--no-daemon", "features", "list"]
+        and value.get("exit_codes") == {"false": 0, "true": 0}
+        and value.get("expected") == {"false": False, "true": True}
+        and value.get("observed") == {"false": False, "true": True}
+        and isinstance(config_sha256, Mapping)
+        and set(config_sha256) == {"false", "true"}
+        and all(
+            isinstance(config_sha256.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", config_sha256[key])
+            for key in ("false", "true")
+        )
+        and isinstance(readback, Mapping)
+        and set(readback) == {"false", "true"}
+        and all(
+            isinstance(readback.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", readback[key])
+            for key in ("false", "true")
+        )
+        and isinstance(responses, Mapping)
+        and set(responses) == {"false", "true"}
+        and all(
+            isinstance(responses.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", responses[key])
+            for key in ("false", "true")
+        )
+    )
+
+
+def _canary_manager_state_snapshot(
+    systemctl: Systemctl,
+) -> dict[str, dict[str, str]] | None:
+    """Read the six cutover units without attributing behavior to their manager."""
+
+    try:
+        return {unit: dict(_show(systemctl, unit)) for unit in _V2_MANAGER_UNITS}
+    except RuntimeLifecycleError:
+        return None
+    except Exception:
+        return None
+
+
+def _manager_api_contract_snapshot() -> dict[str, object] | None:
+    """Observe the real user manager API through its pinned bus socket.
+
+    This records interface availability only. It does not claim permission or
+    successful execution of manager actions.
+    """
+
+    runtime_directory = _user_runtime_directory()
+    bus_path = runtime_directory / "bus"
+    runtime_fd = bus_fd = -1
+    try:
+        _private_directory(runtime_directory)
+        runtime_before = runtime_directory.lstat()
+        runtime_fd = os.open(
+            runtime_directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        runtime_info = os.fstat(runtime_fd)
+        if (runtime_info.st_dev, runtime_info.st_ino) != (
+            runtime_before.st_dev,
+            runtime_before.st_ino,
+        ):
+            return None
+        bus_before = os.stat("bus", dir_fd=runtime_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISSOCK(bus_before.st_mode)
+            or bus_before.st_uid != os.geteuid()
+            or bus_before.st_nlink != 1
+        ):
+            return None
+        bus_fd = os.open(
+            "bus",
+            getattr(os, "O_PATH", os.O_RDONLY)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=runtime_fd,
+        )
+        bus_info = os.fstat(bus_fd)
+        if (bus_info.st_dev, bus_info.st_ino) != (
+            bus_before.st_dev,
+            bus_before.st_ino,
+        ):
+            return None
+        address = f"unix:path=/proc/self/fd/{bus_fd}"
+        environment = {
+            "DBUS_SESSION_BUS_ADDRESS": address,
+            "LANG": "C",
+            "PATH": "/usr/bin:/bin",
+            "XDG_RUNTIME_DIR": os.fspath(runtime_directory),
+        }
+
+        def run(arguments: list[str], maximum: int) -> str | None:
+            try:
+                completed = subprocess.run(
+                    arguments,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=8,
+                    env=environment,
+                    pass_fds=(bus_fd,),
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if completed.returncode != 0 or len(completed.stdout) > maximum:
+                return None
+            try:
+                return completed.stdout.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return None
+
+        manager_text = run(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "--no-pager",
+                "show",
+                "--property=Version,Features,UnitPath",
+            ],
+            16 * 1024,
+        )
+        if manager_text is None:
+            return None
+        manager = dict(
+            line.split("=", 1) for line in manager_text.splitlines() if "=" in line
+        )
+        unit_paths = manager.get("UnitPath", "").split()
+        if (
+            not manager.get("Version")
+            or not manager.get("Features")
+            or not unit_paths
+            or any(not os.path.isabs(path) for path in unit_paths)
+        ):
+            return None
+        unit_path_rows: list[dict[str, object]] = []
+        for path in unit_paths:
+            try:
+                path_info = os.lstat(path)
+            except FileNotFoundError:
+                unit_path_rows.append(
+                    {"dev": None, "ino": None, "mode": None, "path": path, "uid": None}
+                )
+            except OSError:
+                return None
+            else:
+                if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(
+                    path_info.st_mode
+                ):
+                    return None
+                unit_path_rows.append(
+                    {
+                        "dev": path_info.st_dev,
+                        "ino": path_info.st_ino,
+                        "mode": stat.S_IMODE(path_info.st_mode),
+                        "path": path,
+                        "uid": path_info.st_uid,
+                    }
+                )
+        owner_text = run(
+            ["/usr/bin/busctl", "--user", "status", "org.freedesktop.systemd1"],
+            8 * 1024,
+        )
+        introspection = run(
+            [
+                "/usr/bin/busctl",
+                "--user",
+                "introspect",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+            ],
+            64 * 1024,
+        )
+        if owner_text is None or introspection is None:
+            return None
+        owner = dict(
+            line.split("=", 1) for line in owner_text.splitlines() if "=" in line
+        )
+        if (
+            owner.get("UID") != str(os.geteuid())
+            or owner.get("OwnerUID") != str(os.geteuid())
+            or not owner.get("UniqueName", "").startswith(":")
+            or not owner.get("PID", "").isdigit()
+            or not owner.get("Unit")
+            or not owner.get("CGroup")
+        ):
+            return None
+        required_signatures = {
+            "Reload": ("-", "-"),
+            "StartUnit": ("ss", "o"),
+            "StopUnit": ("ss", "o"),
+            "EnableUnitFiles": ("asbb", "ba(sss)"),
+            "DisableUnitFiles": ("asb", "a(sss)"),
+            "GetUnitFileState": ("s", "s"),
+        }
+        found: dict[str, tuple[str, str]] = {}
+        for line in introspection.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) >= 4 and fields[1] == "method":
+                found[fields[0].lstrip(".")] = (fields[2], fields[3])
+        if any(
+            found.get(name) != signature
+            for name, signature in required_signatures.items()
+        ):
+            return None
+        current_runtime = runtime_directory.lstat()
+        current_runtime_fd = os.fstat(runtime_fd)
+        current_bus = os.stat("bus", dir_fd=runtime_fd, follow_symlinks=False)
+        current_bus_path = bus_path.lstat()
+        current_fd = os.fstat(bus_fd)
+        if (
+            (current_runtime.st_dev, current_runtime.st_ino)
+            != (
+                runtime_info.st_dev,
+                runtime_info.st_ino,
+            )
+            or (current_runtime_fd.st_dev, current_runtime_fd.st_ino)
+            != (
+                runtime_info.st_dev,
+                runtime_info.st_ino,
+            )
+            or (current_bus.st_dev, current_bus.st_ino)
+            != (
+                bus_info.st_dev,
+                bus_info.st_ino,
+            )
+            or (current_bus_path.st_dev, current_bus_path.st_ino)
+            != (
+                bus_info.st_dev,
+                bus_info.st_ino,
+            )
+            or (current_fd.st_dev, current_fd.st_ino)
+            != (
+                bus_info.st_dev,
+                bus_info.st_ino,
+            )
+        ):
+            return None
+        current_unit_path_rows: list[dict[str, object]] = []
+        for path in unit_paths:
+            try:
+                path_info = os.lstat(path)
+            except FileNotFoundError:
+                current_unit_path_rows.append(
+                    {"dev": None, "ino": None, "mode": None, "path": path, "uid": None}
+                )
+            except OSError:
+                return None
+            else:
+                if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(
+                    path_info.st_mode
+                ):
+                    return None
+                current_unit_path_rows.append(
+                    {
+                        "dev": path_info.st_dev,
+                        "ino": path_info.st_ino,
+                        "mode": stat.S_IMODE(path_info.st_mode),
+                        "path": path,
+                        "uid": path_info.st_uid,
+                    }
+                )
+        if current_unit_path_rows != unit_path_rows:
+            return None
+        return {
+            "bus": {
+                "dev": bus_info.st_dev,
+                "ino": bus_info.st_ino,
+                "mode": stat.S_IMODE(bus_info.st_mode),
+                "uid": bus_info.st_uid,
+            },
+            "owner": {
+                key: owner[key]
+                for key in ("CGroup", "OwnerUID", "PID", "Unit", "UID", "UniqueName")
+            },
+            "manager": {
+                "features_sha256": hashlib.sha256(
+                    manager["Features"].encode("utf-8")
+                ).hexdigest(),
+                "version": manager["Version"],
+            },
+            "unit_paths": unit_path_rows,
+            "unit_path_sha256": hashlib.sha256(
+                _d320_canonical_json(unit_path_rows)
+            ).hexdigest(),
+            "api_sha256": hashlib.sha256(
+                _d320_canonical_json(
+                    {
+                        name: list(required_signatures[name])
+                        for name in sorted(required_signatures)
+                    }
+                )
+            ).hexdigest(),
+        }
+    except (OSError, D320CutoverJournalError, ValueError):
+        return None
+    finally:
+        if bus_fd >= 0:
+            os.close(bus_fd)
+        if runtime_fd >= 0:
+            os.close(runtime_fd)
+
+
+def _run_pinned_client_command(
+    executable_fd: int,
+    arguments: tuple[str, ...],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+) -> str | None:
+    """Run one metadata command through the exact inherited executable FD."""
+
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    output = bytearray()
+    try:
+        process = subprocess.Popen(
+            [f"/proc/self/fd/{executable_fd}", *arguments],
+            cwd=cwd,
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(executable_fd,),
+            start_new_session=True,
+        )
+        assert process.stdout is not None and process.stderr is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        deadline = time.monotonic() + _CANARY_CLIENT_COMMAND_SECONDS
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            for key, _mask in selector.select(min(remaining, 0.2)):
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                if key.fileobj is process.stdout:
+                    if len(output) + len(chunk) > _CANARY_CLIENT_OUTPUT_BYTES:
+                        raise ValueError("client probe output exceeded limit")
+                    output.extend(chunk)
+        if process.wait(timeout=max(0.0, deadline - time.monotonic())) != 0:
+            return None
+        text = output.decode("utf-8", errors="strict").strip()
+        return text if text and len(text) <= _CANARY_CLIENT_OUTPUT_BYTES else None
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        TimeoutError,
+        UnicodeError,
+        ValueError,
+    ):
+        return None
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.SubprocessError):
+                process.wait(timeout=1)
+
+
 def _valid_bound_unit_state(state: Mapping[str, str]) -> bool:
     """Accept only states for which rollback has a defined, safe operation."""
 
@@ -3667,9 +8361,7 @@ def _restore_operations(
     return (("start", unit),) if _state_is_active(state) else (("stop", unit),)
 
 
-def _restored_state_target(
-    unit: str, state: Mapping[str, str]
-) -> Mapping[str, str]:
+def _restored_state_target(unit: str, state: Mapping[str, str]) -> Mapping[str, str]:
     """Name the exact manager state a safe inverse operation can recreate.
 
     systemd has no non-executing operation that recreates a historical
@@ -3757,6 +8449,7 @@ def _runtime_identity(release_root: Path) -> dict[str, object] | None:
             "generation": generation,
             "manifest_digest": digest,
             "consumer_pin": pin,
+            "consumer_sha256": hashlib.sha256(consumer).hexdigest(),
         }
     except (
         RuntimeLifecycleError,
@@ -3801,6 +8494,23 @@ def _consumer_producer_contract(raw: bytes) -> bool:
         for node in ast.walk(module)
     )
     return values == _PRODUCER_CONSUMER_CONTRACT and python_directory_contract
+
+
+def _revalidate_v2_predecessor(
+    release_root: Path, expected: Mapping[str, object]
+) -> None:
+    """Re-read the attested runtime consumer before using journaled predecessor data."""
+
+    actual = _runtime_identity(release_root)
+    if (
+        not isinstance(actual, Mapping)
+        or actual.get("consumer_pin") is not True
+        or any(
+            actual.get(name) != expected.get(name)
+            for name in ("generation", "manifest_digest", "consumer_sha256")
+        )
+    ):
+        raise _error("runtime_lifecycle_predecessor_changed")
 
 
 def _probe_observation_binding(
@@ -3969,9 +8679,7 @@ def _observe_argumentless_installed_probe(home: Path) -> None:
             mode=0o600,
         )
         health = (
-            json.loads(health_raw.decode("utf-8"))
-            if health_raw is not None
-            else None
+            json.loads(health_raw.decode("utf-8")) if health_raw is not None else None
         )
         checked_at_raw = (
             health.get("checked_at") if isinstance(health, Mapping) else None
@@ -4029,11 +8737,9 @@ def _d296_and_v2_accepted() -> bool:
         "RH_Privat",
     )
     authorities = getattr(evidence, "pool_authorities", ())
-    if (
-        getattr(evidence, "status", None)
-        not in {"complete", "partial", "stale"}
-        or len(authorities) != len(expected)
-    ):
+    if getattr(evidence, "status", None) not in {"complete", "partial", "stale"} or len(
+        authorities
+    ) != len(expected):
         return False
     observed = [
         (
@@ -4066,8 +8772,7 @@ def _d296_and_v2_accepted() -> bool:
         persistent = getattr(item, "persistent_leadership_eligible", None)
         long_running = getattr(item, "long_running_leadership_eligible", None)
         if any(
-            type(value) is not bool
-            for value in (available, persistent, long_running)
+            type(value) is not bool for value in (available, persistent, long_running)
         ):
             return False
         if (persistent or long_running) and not available:
@@ -4271,8 +8976,611 @@ def _validate_canary_home(home: Path) -> None:
     _canary_path_text(home)
 
 
+def _target_binding(home: Path) -> dict[str, object]:
+    info = home.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+    ):
+        raise _error("runtime_lifecycle_target_invalid")
+    return {
+        "realpath": str(home.resolve(strict=True)),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+
+
+def _manager_states_digest(states: object) -> str | None:
+    if not isinstance(states, Mapping):
+        return None
+    try:
+        return hashlib.sha256(_d320_canonical_json(dict(states))).hexdigest()
+    except D320CutoverJournalError:
+        return None
+
+
+def _valid_manager_api_contract(value: object) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "api_sha256",
+        "bus",
+        "manager",
+        "owner",
+        "unit_paths",
+        "unit_path_sha256",
+    }:
+        return False
+    bus = value.get("bus")
+    manager = value.get("manager")
+    owner = value.get("owner")
+    return bool(
+        isinstance(bus, Mapping)
+        and set(bus) == {"dev", "ino", "mode", "uid"}
+        and all(type(bus.get(key)) is int for key in ("dev", "ino", "mode", "uid"))
+        and isinstance(manager, Mapping)
+        and set(manager) == {"features_sha256", "version"}
+        and isinstance(manager.get("features_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", manager["features_sha256"])
+        and isinstance(manager.get("version"), str)
+        and bool(manager["version"])
+        and isinstance(owner, Mapping)
+        and set(owner) == {"CGroup", "OwnerUID", "PID", "Unit", "UID", "UniqueName"}
+        and all(isinstance(owner.get(key), str) and owner[key] for key in owner)
+        and owner["PID"].isdigit()
+        and owner["UID"].isdigit()
+        and owner["OwnerUID"].isdigit()
+        and owner["OwnerUID"] == owner["UID"]
+        and owner["UniqueName"].startswith(":")
+        and isinstance(value.get("unit_paths"), list)
+        and bool(value["unit_paths"])
+        and all(
+            isinstance(item, Mapping)
+            and set(item) == {"dev", "ino", "mode", "path", "uid"}
+            and isinstance(item.get("path"), str)
+            and os.path.isabs(item["path"])
+            and all(
+                item.get(key) is None or type(item.get(key)) is int
+                for key in ("dev", "ino", "mode", "uid")
+            )
+            and (
+                all(item.get(key) is None for key in ("dev", "ino", "mode", "uid"))
+                or all(
+                    type(item.get(key)) is int for key in ("dev", "ino", "mode", "uid")
+                )
+            )
+            for item in value["unit_paths"]
+        )
+        and isinstance(value.get("unit_path_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["unit_path_sha256"])
+        and value["unit_path_sha256"]
+        == hashlib.sha256(_d320_canonical_json(value["unit_paths"])).hexdigest()
+        and isinstance(value.get("api_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["api_sha256"])
+    )
+
+
 def _canary_runtime_root() -> Path:
     return _user_runtime_directory() / _CANARY_RUNTIME_ROOT_NAME
+
+
+def _read_canary_qualification_record(root: Path) -> Mapping[str, object] | None:
+    """Read one existing qualification record under the Canary owner's SH lock."""
+
+    root_fd = lock_fd = record_fd = -1
+    try:
+        try:
+            root_info = root.lstat()
+        except FileNotFoundError:
+            return None
+        _private_directory(root)
+        root_fd = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_root = os.fstat(root_fd)
+        if (opened_root.st_dev, opened_root.st_ino) != (
+            root_info.st_dev,
+            root_info.st_ino,
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        try:
+            lock_fd = os.open(
+                _CANARY_LOCK_NAME,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return None
+        lock_info = os.fstat(lock_fd)
+        lock_name_info = os.stat(
+            _CANARY_LOCK_NAME, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or lock_info.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+            or (lock_info.st_dev, lock_info.st_ino)
+            != (lock_name_info.st_dev, lock_name_info.st_ino)
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise _error("runtime_lifecycle_qualification_record_busy") from exc
+        current_root = root.lstat()
+        current_lock = os.stat(_CANARY_LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+        if (current_root.st_dev, current_root.st_ino) != (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ) or (current_lock.st_dev, current_lock.st_ino) != (
+            lock_info.st_dev,
+            lock_info.st_ino,
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        try:
+            record_fd = os.open(
+                _CANARY_QUALIFICATION_NAME,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return None
+        before = os.fstat(record_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size <= 0
+            or before.st_size > _MAX_CANARY_QUALIFICATION_BYTES
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(record_fd, min(remaining, 8192))
+            if not chunk:
+                raise _error("runtime_lifecycle_qualification_record_invalid")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(record_fd)
+        current_name = os.stat(
+            _CANARY_QUALIFICATION_NAME, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ) or (current_name.st_dev, current_name.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        raw = b"".join(chunks)
+        value = _d320_parse_json(raw)
+        if not isinstance(value, Mapping) or set(value) != {
+            "bindings",
+            "criteria",
+            "issued_at_unix_ns",
+            "owner_uid",
+            "schema_version",
+            "status",
+        }:
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        criteria = value.get("criteria")
+        bindings = value.get("bindings")
+        predecessor = (
+            bindings.get("predecessor") if isinstance(bindings, Mapping) else None
+        )
+        profile_sha256 = (
+            bindings.get("profile_sha256") if isinstance(bindings, Mapping) else None
+        )
+        if (
+            _d320_canonical_json(dict(value)) != raw
+            or value.get("schema_version") != 1
+            or value.get("owner_uid") != os.geteuid()
+            or type(value.get("issued_at_unix_ns")) is not int
+            or value["issued_at_unix_ns"] <= 0
+            or value.get("status") not in {"qualified", "unqualified"}
+            or not isinstance(criteria, Mapping)
+            or set(criteria) != _CANARY_QUALIFICATION_CRITERIA
+            or any(
+                item not in {"pass", "fail", "unknown"} for item in criteria.values()
+            )
+            or not isinstance(bindings, Mapping)
+            or set(bindings)
+            != {
+                "candidate_generation",
+                "candidate_manifest_digest",
+                "client",
+                "manager_states_sha256",
+                "manager_api_contract",
+                "predecessor",
+                "profile_sha256",
+                "source_commit",
+                "source_tree_sha256",
+                "target",
+            }
+            or not isinstance(bindings.get("source_commit"), str)
+            or not isinstance(bindings.get("source_tree_sha256"), str)
+            or not isinstance(bindings.get("candidate_generation"), str)
+            or not isinstance(bindings.get("candidate_manifest_digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", bindings["source_commit"])
+            or not re.fullmatch(r"[0-9a-f]{64}", bindings["source_tree_sha256"])
+            or not re.fullmatch(r"[0-9a-f]{40}", bindings["candidate_generation"])
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", bindings["candidate_manifest_digest"]
+            )
+            or (
+                bindings.get("manager_states_sha256") is not None
+                and (
+                    not isinstance(bindings.get("manager_states_sha256"), str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}", bindings["manager_states_sha256"]
+                    )
+                )
+            )
+            or (
+                bindings.get("manager_api_contract") is not None
+                and not _valid_manager_api_contract(
+                    bindings.get("manager_api_contract")
+                )
+            )
+            or not isinstance(bindings.get("target"), Mapping)
+            or set(bindings["target"])
+            != {"dev", "gid", "ino", "mode", "realpath", "uid"}
+            or not isinstance(bindings["target"].get("realpath"), str)
+            or any(
+                type(bindings["target"].get(key)) is not int
+                for key in ("dev", "gid", "ino", "mode", "uid")
+            )
+            or (
+                bindings.get("client") is not None
+                and (
+                    not isinstance(bindings.get("client"), Mapping)
+                    or set(bindings["client"])
+                    != {
+                        "artifact_sha256",
+                        "compatibility_probe",
+                        "features_sha256",
+                        "version",
+                    }
+                    or not isinstance(bindings["client"].get("artifact_sha256"), str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}", bindings["client"]["artifact_sha256"]
+                    )
+                    or not _valid_client_compatibility_probe(
+                        bindings["client"].get("compatibility_probe")
+                    )
+                    or not isinstance(bindings["client"].get("features_sha256"), str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}", bindings["client"]["features_sha256"]
+                    )
+                    or not isinstance(bindings["client"].get("version"), str)
+                    or not bindings["client"]["version"]
+                    or len(bindings["client"]["version"]) > 128
+                )
+            )
+            or (
+                value.get("status") == "qualified"
+                and (
+                    not _valid_manager_api_contract(
+                        bindings.get("manager_api_contract")
+                    )
+                    or bindings.get("manager_states_sha256") is None
+                    or profile_sha256 is None
+                    or predecessor is None
+                    or bindings.get("client") is None
+                )
+            )
+            or (
+                profile_sha256 is not None
+                and (
+                    not isinstance(profile_sha256, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", profile_sha256)
+                )
+            )
+            or (
+                predecessor is not None
+                and (
+                    not isinstance(predecessor, Mapping)
+                    or set(predecessor)
+                    != {"consumer_sha256", "generation", "manifest_digest"}
+                    or not isinstance(predecessor.get("consumer_sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", predecessor["consumer_sha256"])
+                    or not isinstance(predecessor.get("generation"), str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", predecessor["generation"])
+                    or not isinstance(predecessor.get("manifest_digest"), str)
+                    or not re.fullmatch(
+                        r"sha256:[0-9a-f]{64}", predecessor["manifest_digest"]
+                    )
+                )
+            )
+            or (
+                criteria.get("client_probe") == "pass"
+                and bindings.get("client") is None
+            )
+            or (
+                criteria.get("client_compatibility") == "pass"
+                and (
+                    not isinstance(bindings.get("client"), Mapping)
+                    or not _valid_client_compatibility_probe(
+                        bindings["client"].get("compatibility_probe")
+                    )
+                )
+            )
+            or (
+                value.get("status") == "qualified"
+                and (
+                    any(
+                        criteria[name] != "pass"
+                        for name in _CANARY_QUALIFICATION_CRITERIA
+                        if name not in {"client_behavior", "manager_actions"}
+                    )
+                    or criteria["manager_actions"] != "unknown"
+                    or criteria["client_behavior"] != "unknown"
+                )
+            )
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        return value
+    except RuntimeLifecycleError:
+        raise
+    except (OSError, D320CutoverJournalError, ValueError, TypeError) as exc:
+        raise _error("runtime_lifecycle_qualification_record_invalid") from exc
+    finally:
+        if record_fd >= 0:
+            os.close(record_fd)
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _canary_qualification_record(
+    *,
+    repository: Path,
+    home: Path,
+    source_commit: str,
+    source_tree_digest: str,
+    image: _CanaryImage,
+    runtime_status: str,
+    client_metadata: Mapping[str, object] | None,
+    manager_states: Mapping[str, Mapping[str, str]] | None,
+    manager_api_contract: Mapping[str, object] | None,
+) -> dict[str, object]:
+    profile = _regular_bytes(
+        repository
+        / "src"
+        / "the_hive"
+        / "markdown"
+        / "runtime-release-compatibility-v1.json",
+        maximum=64 * 1024,
+        mode=0o644,
+    )
+    profile_qualified = False
+    if profile is not None:
+        try:
+            from the_hive.runtime_layout import (
+                validate_runtime_release_compatibility_profile,
+            )
+
+            parsed_profile = validate_runtime_release_compatibility_profile(profile)
+            profile_qualified = (
+                parsed_profile.get("schema_version") == 2
+                and parsed_profile.get("status") == "structural_requirements"
+            )
+        except (ValueError, RuntimeLifecycleError):
+            profile_qualified = False
+    predecessor = _runtime_identity(home / ".local" / "lib" / "the-hive-runtime")
+    client_probe_valid = (
+        isinstance(client_metadata, Mapping)
+        and isinstance(client_metadata.get("artifact_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", client_metadata["artifact_sha256"])
+        and isinstance(client_metadata.get("features_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", client_metadata["features_sha256"])
+        and isinstance(client_metadata.get("version"), str)
+        and bool(client_metadata["version"])
+        and _valid_client_compatibility_probe(
+            client_metadata.get("compatibility_probe")
+        )
+    )
+    criteria = {
+        "client_compatibility": (
+            "pass" if client_probe_valid and profile_qualified else "unknown"
+        ),
+        "client_behavior": "unknown",
+        "client_probe": ("pass" if client_probe_valid else "unknown"),
+        "manager_api_contract": (
+            "pass" if _valid_manager_api_contract(manager_api_contract) else "unknown"
+        ),
+        "manager_actions": "unknown",
+        "runtime_canary": runtime_status,
+        "runtime_features": runtime_status,
+    }
+    required_bindings_present = (
+        isinstance(predecessor, Mapping)
+        and all(
+            isinstance(predecessor.get(key), str)
+            for key in ("consumer_sha256", "generation", "manifest_digest")
+        )
+        and profile is not None
+        and profile_qualified
+        and _manager_states_digest(manager_states) is not None
+        and _valid_manager_api_contract(manager_api_contract)
+        and client_probe_valid
+    )
+    return {
+        "bindings": {
+            "candidate_generation": image.generation,
+            "candidate_manifest_digest": image.manifest_digest,
+            "client": dict(client_metadata) if client_metadata is not None else None,
+            "manager_states_sha256": _manager_states_digest(manager_states),
+            "manager_api_contract": (
+                dict(manager_api_contract) if manager_api_contract is not None else None
+            ),
+            "predecessor": (
+                {
+                    "consumer_sha256": predecessor["consumer_sha256"],
+                    "generation": predecessor["generation"],
+                    "manifest_digest": predecessor["manifest_digest"],
+                }
+                if isinstance(predecessor, Mapping)
+                and all(
+                    isinstance(predecessor.get(key), str)
+                    for key in ("consumer_sha256", "generation", "manifest_digest")
+                )
+                else None
+            ),
+            "profile_sha256": (
+                hashlib.sha256(profile).hexdigest() if profile is not None else None
+            ),
+            "source_commit": source_commit,
+            "source_tree_sha256": source_tree_digest,
+            "target": _target_binding(home),
+        },
+        "criteria": criteria,
+        "issued_at_unix_ns": time.time_ns(),
+        "owner_uid": os.geteuid(),
+        "schema_version": 1,
+        "status": (
+            "qualified"
+            if required_bindings_present
+            and all(
+                value == "pass"
+                for name, value in criteria.items()
+                if name not in {"client_behavior", "manager_actions"}
+            )
+            and criteria["manager_actions"] == "unknown"
+            and criteria["client_behavior"] == "unknown"
+            else "unqualified"
+        ),
+    }
+
+
+def _publish_canary_qualification_record(
+    *, root: Path, lock_fd: int, value: Mapping[str, object]
+) -> None:
+    """Atomically publish one owner-produced record while holding Canary EX lock."""
+
+    root_fd = temporary_fd = -1
+    temporary_name = f".{_CANARY_QUALIFICATION_NAME}.{secrets.token_hex(12)}.tmp"
+    try:
+        lock_info = os.fstat(lock_fd)
+        root_info = root.lstat()
+        root_fd = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_root = os.fstat(root_fd)
+        current_lock = os.stat(_CANARY_LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            (opened_root.st_dev, opened_root.st_ino)
+            != (root_info.st_dev, root_info.st_ino)
+            or (current_lock.st_dev, current_lock.st_ino)
+            != (lock_info.st_dev, lock_info.st_ino)
+            or not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != os.geteuid()
+            or lock_info.st_nlink != 1
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        raw = _d320_canonical_json(dict(value))
+        if len(raw) > _MAX_CANARY_QUALIFICATION_BYTES:
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=root_fd,
+        )
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(temporary_fd, raw[offset:])
+        os.fsync(temporary_fd)
+        temporary_info = os.fstat(temporary_fd)
+        try:
+            existing = os.stat(
+                _CANARY_QUALIFICATION_NAME,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISREG(existing.st_mode)
+            or existing.st_uid != os.geteuid()
+            or existing.st_nlink != 1
+            or stat.S_IMODE(existing.st_mode) != 0o600
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        latest_root = root.lstat()
+        latest_lock = os.stat(_CANARY_LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+        if (latest_root.st_dev, latest_root.st_ino) != (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ) or (latest_lock.st_dev, latest_lock.st_ino) != (
+            lock_info.st_dev,
+            lock_info.st_ino,
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        os.replace(
+            temporary_name,
+            _CANARY_QUALIFICATION_NAME,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+        published = os.stat(
+            _CANARY_QUALIFICATION_NAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if (published.st_dev, published.st_ino) != (
+            temporary_info.st_dev,
+            temporary_info.st_ino,
+        ):
+            raise _error("runtime_lifecycle_qualification_record_invalid")
+        os.fsync(root_fd)
+    except RuntimeLifecycleError:
+        raise
+    except (OSError, D320CutoverJournalError) as exc:
+        raise _error("runtime_lifecycle_qualification_record_invalid") from exc
+    finally:
+        if root_fd >= 0:
+            if temporary_fd >= 0:
+                try:
+                    info = os.stat(
+                        temporary_name, dir_fd=root_fd, follow_symlinks=False
+                    )
+                    owned = os.fstat(temporary_fd)
+                    if (info.st_dev, info.st_ino) == (owned.st_dev, owned.st_ino):
+                        os.unlink(temporary_name, dir_fd=root_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(root_fd)
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
 
 
 @contextmanager
@@ -4309,7 +9617,7 @@ def _canary_lock(root: Path):
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise _error("runtime_canary_busy") from exc
-        yield
+        yield descriptor
     except RuntimeLifecycleError:
         raise
     except OSError as exc:
@@ -4419,12 +9727,17 @@ def canary(
     binding: _CanaryUnitBinding | None = None
     launch_attempted = False
     ownership_attested = False
+    manager_states: dict[str, dict[str, str]] | None = None
+    qualification_input: (
+        tuple[_CanaryImage, str, Mapping[str, object] | None] | None
+    ) = None
     root = _canary_runtime_root()
     try:
         _validate_canary_home(home)
         repository = Path(__file__).resolve().parents[2]
         source_commit, source_tree_digest = _source_tree_binding(repository)
-        with _canary_lock(root):
+        with _canary_lock(root) as lock_fd:
+            qualification_record: dict[str, object] | None = None
             try:
                 if _source_tree_binding(repository) != (
                     source_commit,
@@ -4467,6 +9780,14 @@ def canary(
                 status_code, error_code = _canary_evidence_result(
                     image=image, manager_state=manager_state
                 )
+                if status_code == "runtime_canary_green":
+                    qualification_input = (
+                        image,
+                        _canary_runtime_qualification_status(
+                            image=image, manager_state=manager_state
+                        ),
+                        _canary_client_metadata(invocation),
+                    )
                 result = _canary_result(
                     status_code=status_code,
                     error_code=error_code,
@@ -4488,6 +9809,45 @@ def canary(
                     )
                 if not cleanup_ok:
                     raise _error("runtime_canary_cleanup_unverified")
+            if qualification_input is not None:
+                image, runtime_status, client_metadata = qualification_input
+                manager_states = _canary_manager_state_snapshot(systemctl)
+                manager_api_contract = _manager_api_contract_snapshot()
+                qualification_record = _canary_qualification_record(
+                    repository=repository,
+                    home=home,
+                    source_commit=source_commit,
+                    source_tree_digest=source_tree_digest,
+                    image=image,
+                    runtime_status=runtime_status,
+                    client_metadata=client_metadata,
+                    manager_states=manager_states,
+                    manager_api_contract=manager_api_contract,
+                )
+            if qualification_record is not None:
+                if _source_tree_binding(repository) != (
+                    source_commit,
+                    source_tree_digest,
+                ):
+                    raise _error("runtime_canary_source_changed")
+                expected_bindings = qualification_record["bindings"]
+                if (
+                    _manager_api_contract_snapshot()
+                    == expected_bindings.get("manager_api_contract")
+                    and _manager_states_digest(
+                        _canary_manager_state_snapshot(systemctl)
+                    )
+                    == expected_bindings.get("manager_states_sha256")
+                    and _target_binding(home) == expected_bindings.get("target")
+                    and (
+                        expected_bindings.get("client") is None
+                        or _canonical_codex_client_digest()
+                        == expected_bindings["client"].get("artifact_sha256")
+                    )
+                ):
+                    _publish_canary_qualification_record(
+                        root=root, lock_fd=lock_fd, value=qualification_record
+                    )
     except RuntimeLifecycleError as exc:
         code = str(exc)
         result = _canary_result(
@@ -4557,12 +9917,21 @@ def _lifecycle_lock(home: Path):
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise _error("runtime_lifecycle_busy") from exc
-        yield
+        lease = _LifecycleLockLease(
+            home=home.resolve(strict=True),
+            lock_path=lock,
+            descriptor=descriptor,
+            identity=(info.st_dev, info.st_ino),
+            owner_pid=os.getpid(),
+        )
+        yield lease
     except RuntimeLifecycleError:
         raise
     except OSError as exc:
         raise _error("runtime_lifecycle_lock_invalid") from exc
     finally:
+        if "lease" in locals():
+            lease.active = False
         if descriptor >= 0:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -4570,116 +9939,171 @@ def _lifecycle_lock(home: Path):
                 os.close(descriptor)
 
 
-def cutover(
+def _execute_cutover(
     *, home: Path, systemctl: Systemctl = _systemctl_default
 ) -> dict[str, object]:
-    """Run the sole D298 mutating runtime/user-manager transaction."""
+    """Reject the retired transaction body before any pin or manager effect."""
 
+    _ = home, systemctl
+    return {
+        "status": "runtime_lifecycle_v2_journal_unavailable",
+        "raw_output": "not_returned",
+    }
+
+
+def cutover(
+    *,
+    home: Path,
+    plan_sha256: str | None = None,
+    phase: str | None = None,
+    systemctl: Systemctl | None = None,
+) -> dict[str, object]:
+    """Consume only a fresh public plan before entering any transaction body."""
+
+    if plan_sha256 is None:
+        return {
+            "status": "runtime_lifecycle_plan_required",
+            "raw_output": "not_returned",
+        }
+    if re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
+        return {
+            "status": "runtime_lifecycle_plan_digest_invalid",
+            "raw_output": "not_returned",
+        }
+    selected_systemctl = systemctl or _systemctl_default
+    if phase == "recover":
+        try:
+            journal = _v2_load_journal(home)
+            if journal is None:
+                return {
+                    "status": "runtime_lifecycle_journal_missing",
+                    "raw_output": "not_returned",
+                }
+            if journal.payload["plan_sha256"] != plan_sha256:
+                return {
+                    "status": "runtime_lifecycle_plan_changed",
+                    "raw_output": "not_returned",
+                }
+            return _v2_recover_phase(
+                home=home, plan_sha256=plan_sha256, systemctl=selected_systemctl
+            )
+        except RuntimeLifecycleError as exc:
+            return {"status": str(exc), "raw_output": "not_returned"}
+    current = plan(home=home, systemctl=selected_systemctl)
+    if current.get("plan_sha256") != plan_sha256:
+        return {
+            "status": "runtime_lifecycle_plan_changed",
+            "raw_output": "not_returned",
+        }
+    if phase not in {"install", "activate", "observe", "commit", "recover"}:
+        return {
+            "status": "runtime_lifecycle_phase_required",
+            "raw_output": "not_returned",
+        }
+    if current.get("status") != "runtime_lifecycle_plan_ready":
+        return {
+            "status": "runtime_lifecycle_plan_blocked",
+            "reason_codes": current.get("reason_codes", []),
+            "raw_output": "not_returned",
+        }
     try:
-        with _lifecycle_lock(home):
-            bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
-            # A completely verified target is a no-op; it must not re-install
-            # an image or perturb the user manager merely to prove idempotence.
-            already_green = verify(home=home, systemctl=systemctl)
-            runtime_identity = already_green.get("runtime_identity")
-            if (
-                already_green.get("status") == "runtime_lifecycle_green"
-                and isinstance(runtime_identity, Mapping)
-                and runtime_identity.get("generation") == bound.source_commit
-            ):
-                return already_green
-            # Provision the independent launcher authority before the final
-            # source rebind.  Invalid existing authority is never repaired and
-            # cannot cause a compensating manager reload.
-            _provision_hook_session_pin_authority(home)
-            # This final rebind check deliberately remains outside the runtime
-            # mutation handler: a hostile replacement before installer entry
-            # must not cause a compensating manager reload.
-            _revalidate_cutover_inputs(bound)
-            try:
-                # The preceding statement is immediately before crossing the
-                # existing installer mutation boundary.
-                _install_attested_runtime(home)
-                post_install = _bind_post_install(home)
-                if _legacy_requires_migration(bound):
-                    _revalidate_legacy_units(bound)
-                _revalidate_post_install(post_install, home)
-                _cutover_systemctl_mutate(
-                    systemctl,
-                    ("daemon-reload",),
-                    phase="before_activation_reload",
-                )
-                if _legacy_requires_migration(bound):
-                    _revalidate_legacy_units(bound)
-                    _revalidate_post_install(post_install, home)
-                    _cutover_systemctl_mutate(
-                        systemctl,
-                        ("stop", _LEGACY_SERVICE),
-                        phase="legacy_service_stop",
-                    )
-                    _revalidate_legacy_units(bound)
-                    _revalidate_post_install(post_install, home)
-                    _cutover_systemctl_mutate(
-                        systemctl,
-                        ("disable", "--now", _LEGACY_TIMER),
-                        phase="legacy_timer_disable",
-                    )
-                _revalidate_post_install(post_install, home)
-                _observe_argumentless_installed_probe(home)
-                _revalidate_post_install(post_install, home)
-                _cutover_systemctl_mutate(
-                    systemctl,
-                    ("enable", "--now", _NEW_TIMER),
-                    phase="new_timer_enable",
-                )
-                _remove_legacy_hourly_units(bound)
-                _revalidate_post_install(post_install, home)
-                _cutover_systemctl_mutate(
-                    systemctl,
-                    ("daemon-reload",),
-                    phase="after_unit_removal_reload",
-                )
-                result = verify(home=home, systemctl=systemctl)
-                if result.get("status") != "runtime_lifecycle_green":
-                    raise _error("runtime_lifecycle_postconditions_failed")
-                return result
-            except RuntimeLifecycleError as exc:
-                rollback = _restore_bound_state_result(bound, systemctl)
-                if not rollback.restored:
-                    if not _publish_rollback_failure(bound):
-                        return _rollback_failure_result(
-                            status="runtime_lifecycle_rollback_alarm_failed",
-                            rollback=rollback,
-                        )
-                    return _rollback_failure_result(
-                        status="runtime_lifecycle_rollback_failed", rollback=rollback
-                    )
-                if isinstance(exc, _CutoverMutationError):
-                    return _cutover_mutation_failure_result(exc)
-                raise
+        if phase == "install":
+            return _v2_install_phase(
+                home=home,
+                plan_result=current,
+                systemctl=selected_systemctl,
+            )
+        if phase == "activate":
+            return _v2_activate_phase(
+                home=home,
+                plan_sha256=plan_sha256,
+                systemctl=selected_systemctl,
+            )
+        if phase == "observe":
+            return _v2_observe_phase(
+                home=home,
+                plan_sha256=plan_sha256,
+                systemctl=selected_systemctl,
+            )
+        if phase == "commit":
+            return _v2_commit_phase(
+                home=home,
+                plan_sha256=plan_sha256,
+                systemctl=selected_systemctl,
+            )
+        return {
+            "status": "runtime_lifecycle_phase_unavailable",
+            "raw_output": "not_returned",
+        }
     except RuntimeLifecycleError as exc:
         return {"status": str(exc), "raw_output": "not_returned"}
+
+
+def _verify_candidate_compatibility_profile_stage(
+    layout: object, expected_sha256: str
+) -> None:
+    """Require the sealed candidate member to match the immutable plan bytes."""
+
+    try:
+        _d320_sha256(expected_sha256)
+        raw = layout.read_attested_file(
+            "src/the_hive/markdown/runtime-release-compatibility-v1.json"
+        )
+    except (AttributeError, OSError, ValueError, RuntimeLifecycleError) as exc:
+        raise _error("runtime_lifecycle_compatibility_profile_changed") from exc
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise _error("runtime_lifecycle_compatibility_profile_changed")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="the-hive-runtime-service")
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("canary", "cutover", "status", "verify"):
+    for command in ("canary", "cutover", "plan", "status", "verify"):
         child = commands.add_parser(command)
         child.add_argument("--home", type=Path, required=True)
+        if command == "cutover":
+            child.add_argument("--plan-sha256")
+            child.add_argument(
+                "--phase",
+                choices=("install", "activate", "observe", "commit", "recover"),
+            )
     arguments = parser.parse_args()
-    operation = {
-        "canary": canary,
-        "cutover": cutover,
-        "status": status,
-        "verify": verify,
-    }[arguments.command]
-    result = operation(home=arguments.home)
+    if arguments.command == "cutover":
+        result = cutover(
+            home=arguments.home,
+            plan_sha256=arguments.plan_sha256,
+            phase=arguments.phase,
+        )
+    else:
+        operation = {
+            "canary": canary,
+            "plan": plan,
+            "status": status,
+            "verify": verify,
+        }[arguments.command]
+        result = operation(home=arguments.home)
     print(json.dumps(result, sort_keys=True))
+    status_value = result.get("status")
+    if arguments.command == "plan":
+        return (
+            0
+            if status_value
+            in {"runtime_lifecycle_plan_blocked", "runtime_lifecycle_plan_ready"}
+            else 1
+        )
     return (
         0
-        if result.get("status")
-        in {"runtime_canary_green", "runtime_lifecycle_green"}
+        if status_value
+        in {
+            "runtime_canary_green",
+            "runtime_lifecycle_green",
+            "runtime_lifecycle_install_complete",
+            "runtime_lifecycle_activation_complete",
+            "runtime_lifecycle_observation_complete",
+            "runtime_lifecycle_commit_complete",
+            "runtime_lifecycle_recovery_complete",
+            "runtime_lifecycle_recovery_not_needed",
+        }
         else 1
     )
 

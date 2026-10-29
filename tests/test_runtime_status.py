@@ -46,9 +46,12 @@ def _named_release_layout(tmp_path: Path, runtime_image) -> object:
     assert isinstance(generation, str)
     target = generations / generation
     os.replace(stage, target)
-    digest = "sha256:" + hashlib.sha256(
-        (target / ".the-hive-runtime-manifest.json").read_bytes()
-    ).hexdigest()
+    digest = (
+        "sha256:"
+        + hashlib.sha256(
+            (target / ".the-hive-runtime-manifest.json").read_bytes()
+        ).hexdigest()
+    )
     pointers = {
         "schema_version": 1,
         "current": {"generation": generation, "manifest_digest": digest},
@@ -153,7 +156,9 @@ def test_runtime_status_checks_validated_metadata_and_direct_mcp_surface(
     assert modules is not None
     layout_module, status_module = modules
     layout = _named_release_layout(tmp_path, runtime_image)
-    monkeypatch.setattr(status_module, "run_bounded", lambda *_args, **_kwargs: _healthy_mcp_result())
+    monkeypatch.setattr(
+        status_module, "run_bounded", lambda *_args, **_kwargs: _healthy_mcp_result()
+    )
 
     result = status_module.runtime_status(layout=layout)
 
@@ -192,7 +197,8 @@ def test_runtime_status_sanitizes_client_layout_environment(
 
 
 def test_runtime_status_rejects_invalid_metadata_without_starting_mcp(
-    runtime_image, tmp_path: Path,
+    runtime_image,
+    tmp_path: Path,
 ) -> None:
     modules = _runtime_modules()
     assert modules is not None
@@ -235,7 +241,11 @@ def test_runtime_status_rejects_mcp_start_and_incomplete_tools_surface(
                         "id": 1,
                         "result": {
                             "protocolVersion": "2024-11-05",
-                            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                            "capabilities": {
+                                "tools": {},
+                                "resources": {},
+                                "prompts": {},
+                            },
                             "serverInfo": {"name": "the-hive-mcp", "version": "1"},
                         },
                     }
@@ -295,7 +305,9 @@ def test_runtime_status_rejects_an_empty_direct_tool_list(
     output = [json.loads(line) for line in empty_tools.stdout.splitlines()]
     output[1]["result"] = {"tools": []}
     empty_tools.stdout = "\n".join(json.dumps(value) for value in output)
-    monkeypatch.setattr(status_module, "run_bounded", lambda *_args, **_kwargs: empty_tools)
+    monkeypatch.setattr(
+        status_module, "run_bounded", lambda *_args, **_kwargs: empty_tools
+    )
 
     result = status_module.runtime_status(layout=layout)
 
@@ -354,9 +366,10 @@ def test_runtime_status_uses_the_fixed_protected_home_runtime_only_when_requeste
     monkeypatch.setattr(status_module, "run_bounded", observe)
 
     assert status_module.runtime_status(layout=layout)["ok"] is True
-    assert status_module.runtime_status(
-        layout=layout, protected_home_runtime=True
-    )["ok"] is True
+    assert (
+        status_module.runtime_status(layout=layout, protected_home_runtime=True)["ok"]
+        is True
+    )
     assert received == [None, status_module._PROTECTED_HOME_RUNTIME_DIRECTORY]
 
 

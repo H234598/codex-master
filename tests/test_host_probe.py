@@ -44,7 +44,9 @@ from the_hive.host_probe import (
 
 
 class Kernel:
-    def __init__(self, *, cpu_count: object = 8, memory_bytes: object = 16 * 1024**3) -> None:
+    def __init__(
+        self, *, cpu_count: object = 8, memory_bytes: object = 16 * 1024**3
+    ) -> None:
         self.cpu_count = cpu_count
         self.memory_bytes = memory_bytes
 
@@ -71,7 +73,9 @@ NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 CAPABILITIES_DIGEST = "sha256:" + "c" * 64
 
 
-def _registry_evidence(*, observed_at: str = "2026-08-30T11:00:00Z") -> dict[str, object]:
+def _registry_evidence(
+    *, observed_at: str = "2026-08-30T11:00:00Z"
+) -> dict[str, object]:
     return {
         "label": "Worker One",
         "role": "execution",
@@ -203,12 +207,23 @@ class _Collector:
 
 
 def test_local_probe_collects_only_bounded_normalized_evidence() -> None:
-    evidence = LocalHostProbeCollector(lambda: datetime(2026, 8, 30, tzinfo=UTC)).collect(Kernel())
+    evidence = LocalHostProbeCollector(
+        lambda: datetime(2026, 8, 30, tzinfo=UTC)
+    ).collect(Kernel())
 
     assert set(evidence.public()) == {
-        "kernel_class", "architecture_class", "cpu_count", "memory_class",
-        "cgroup_v2", "systemd", "load_class", "pressure_class",
-        "ollama_capability", "observed_at", "agent_generation", "evidence_digest",
+        "kernel_class",
+        "architecture_class",
+        "cpu_count",
+        "memory_class",
+        "cgroup_v2",
+        "systemd",
+        "load_class",
+        "pressure_class",
+        "ollama_capability",
+        "observed_at",
+        "agent_generation",
+        "evidence_digest",
     }
     assert "/" not in json.dumps(evidence.public())
     assert evidence.public()["cpu_count"] == 8
@@ -233,7 +248,9 @@ def test_local_probe_maps_collector_failure_to_stable_code() -> None:
 
 
 def test_remote_evidence_uses_the_exact_same_public_dto_validation() -> None:
-    local = LocalHostProbeCollector(lambda: datetime(2026, 8, 30, tzinfo=UTC)).collect(Kernel())
+    local = LocalHostProbeCollector(lambda: datetime(2026, 8, 30, tzinfo=UTC)).collect(
+        Kernel()
+    )
 
     assert HostProbeEvidenceV1.from_public(local.public()).public() == local.public()
     tampered = local.public()
@@ -243,7 +260,9 @@ def test_remote_evidence_uses_the_exact_same_public_dto_validation() -> None:
 
 
 def test_host_bound_internal_idempotency_never_aliases_hosts() -> None:
-    assert _operation_key("worker-one", "client-key") != _operation_key("worker-two", "client-key")
+    assert _operation_key("worker-one", "client-key") != _operation_key(
+        "worker-two", "client-key"
+    )
 
 
 def test_probe_evidence_digest_is_stable_for_completion_retry() -> None:
@@ -251,7 +270,9 @@ def test_probe_evidence_digest_is_stable_for_completion_retry() -> None:
         lambda: datetime(2026, 8, 30, tzinfo=UTC)
     ).collect(Kernel())
 
-    assert HostProbeEvidenceV1.from_public(evidence.public()).public() == evidence.public()
+    assert (
+        HostProbeEvidenceV1.from_public(evidence.public()).public() == evidence.public()
+    )
 
 
 @pytest.mark.parametrize(
@@ -261,8 +282,16 @@ def test_probe_evidence_digest_is_stable_for_completion_retry() -> None:
 def test_probe_evidence_rejects_noncanonical_observed_at(observed_at: str) -> None:
     with pytest.raises(HostProbeError, match="host.probe_failed"):
         HostProbeEvidenceV1(
-            "linux", "x86_64", 8, "8-31-gib", True, True, "idle", "none",
-            False, observed_at,
+            "linux",
+            "x86_64",
+            8,
+            "8-31-gib",
+            True,
+            True,
+            "idle",
+            "none",
+            False,
+            observed_at,
         )
 
 
@@ -341,9 +370,7 @@ def test_remote_adapter_queues_exact_target_bound_collect_operation(
         "worker-one", expected_generation=4, idempotency_key="remote-one"
     )
     principal = OperationPrincipalV1("worker-one", 4)
-    lease = agent_operations.poll(
-        principal, AgentPollV1(4, 1, CAPABILITIES_DIGEST, 0)
-    )
+    lease = agent_operations.poll(principal, AgentPollV1(4, 1, CAPABILITIES_DIGEST, 0))
 
     assert planned.state == "planned"
     assert isinstance(lease, AgentLeaseV1)
@@ -407,9 +434,7 @@ def test_router_uses_real_local_and_remote_adapters_without_crossing_paths(
     assert local.state == "succeeded"
     assert remote.state == "planned"
     operation_document = json.loads(
-        (tmp_path / "agent-operations" / "operations.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "agent-operations" / "operations.json").read_text(encoding="utf-8")
     )
     assert len(operation_document["operations"]) == 1
     assert operation_document["operations"][0]["target_host_ref"] == "worker-one"
@@ -667,9 +692,7 @@ def test_generation_exhaustion_terminalizes_without_registry_mutation(
         agent_operations=agent_operations,
         host_registry=registry,
         clock=lambda: NOW,
-    ).probe(
-        "worker-one", expected_generation=maximum, idempotency_key="generation-max"
-    )
+    ).probe("worker-one", expected_generation=maximum, idempotency_key="generation-max")
     lease = agent_operations.poll(
         OperationPrincipalV1("worker-one", maximum),
         AgentPollV1(maximum, 1, CAPABILITIES_DIGEST, 0),
@@ -747,7 +770,9 @@ def test_agent_terminal_ack_failure_retries_after_owner_reconstruction(
         fail_ack_once,
     )
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         owner.complete(principal, receipt)
 
     assert operations.get(operation_id).state in {"succeeded", "failed"}
@@ -763,9 +788,9 @@ def test_agent_terminal_ack_failure_retries_after_owner_reconstruction(
 
     assert completed.state == receipt_state
     lifecycle = json.loads(
-        (
-            tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-        ).read_text(encoding="utf-8")
+        (tmp_path / "admin-operations" / "host-probe-lifecycle.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert lifecycle["owners"][0]["acknowledged"] is True
 
@@ -1039,9 +1064,7 @@ def test_legacy_terminal_pair_migrates_to_acknowledged_replay_tombstone(
     terminal_admin = operations.get(operation_id)
     registry_path = _registry_document(tmp_path)
     registry_after_completion = registry_path.read_bytes()
-    lifecycle_path = (
-        tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-    )
+    lifecycle_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
     lifecycle_path.unlink()
     now[0] += timedelta(minutes=16)
 
@@ -1109,9 +1132,7 @@ def test_legacy_terminal_admin_with_leased_agent_is_protected_then_converges(
     assert agent_operations.get(lease.operation_id).state == "leased"
     registry_path = _registry_document(tmp_path)
     registry_after_admin = registry_path.read_bytes()
-    lifecycle_path = (
-        tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-    )
+    lifecycle_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
     lifecycle_path.unlink()
     now[0] += timedelta(minutes=16)
 
@@ -1148,10 +1169,13 @@ def test_legacy_terminal_admin_with_leased_agent_is_protected_then_converges(
     )
     with pytest.raises(AdminOperationError, match="control.operation_not_found"):
         operations.get(operation_id)
-    assert AgentOperationStore.for_test(
-        tmp_path,
-        clock=clock,
-    ).get(lease.operation_id) == terminal_agent
+    assert (
+        AgentOperationStore.for_test(
+            tmp_path,
+            clock=clock,
+        ).get(lease.operation_id)
+        == terminal_agent
+    )
 
 
 def test_legacy_bool_schema_migration_fails_before_any_durable_mutation(
@@ -1162,12 +1186,16 @@ def test_legacy_bool_schema_migration_fails_before_any_durable_mutation(
     def clock() -> datetime:
         return now[0]
 
-    _owner, operations, _agent_operations, _registry, _principal, _lease, _operation_id = (
-        _remote_scenario(tmp_path, clock=clock)
-    )
-    lifecycle_path = (
-        tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-    )
+    (
+        _owner,
+        operations,
+        _agent_operations,
+        _registry,
+        _principal,
+        _lease,
+        _operation_id,
+    ) = _remote_scenario(tmp_path, clock=clock)
+    lifecycle_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
     lifecycle_path.unlink()
     agent_path = tmp_path / "agent-operations" / "operations.json"
     agent_document = json.loads(agent_path.read_text(encoding="utf-8"))
@@ -1195,7 +1223,9 @@ def test_legacy_bool_schema_migration_fails_before_any_durable_mutation(
     before_admin = admin_path.read_bytes()
     before_agent = agent_path.read_bytes()
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         operations.plan(
             kind="google.provision",
             generation=4,
@@ -1213,9 +1243,15 @@ def test_lifecycle_boundaries_reject_bool_schema_before_mutation(
     tmp_path: Path,
     boundary: str,
 ) -> None:
-    owner, _operations, agent_operations, _registry, _principal, lease, _operation_id = (
-        _remote_scenario(tmp_path)
-    )
+    (
+        owner,
+        _operations,
+        agent_operations,
+        _registry,
+        _principal,
+        lease,
+        _operation_id,
+    ) = _remote_scenario(tmp_path)
     invalid_arguments = {
         "admin_operation_id": lease.arguments["admin_operation_id"],
         "probe_schema": True,
@@ -1327,20 +1363,29 @@ def test_lifecycle_ack_rejects_bool_schema_before_sidecar_mutation(
 def test_completion_rejects_persisted_bool_schema_before_mutation(
     tmp_path: Path,
 ) -> None:
-    owner, _operations, _agent_operations, _registry, principal, lease, _operation_id = (
-        _remote_scenario(tmp_path)
-    )
+    (
+        owner,
+        _operations,
+        _agent_operations,
+        _registry,
+        principal,
+        lease,
+        _operation_id,
+    ) = _remote_scenario(tmp_path)
     invalid_arguments = dict(lease.arguments)
     invalid_arguments["probe_schema"] = True
-    invalid_digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            invalid_arguments,
-            ensure_ascii=True,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    invalid_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                invalid_arguments,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     agent_path = tmp_path / "agent-operations" / "operations.json"
     document = json.loads(agent_path.read_text(encoding="utf-8"))
     document["operations"][0]["arguments"] = invalid_arguments
@@ -1420,7 +1465,9 @@ def test_migration_rejects_duplicate_sidecar_agent_owner_without_partial_write(
     )
     before = tuple(path.read_bytes() for path in paths)
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         operations.plan(
             kind="google.provision",
             generation=4,
@@ -1448,9 +1495,7 @@ def test_legacy_terminal_migration_rejects_inexact_pair_without_mutation(
         _remote_scenario(tmp_path, clock=clock)
     )
     owner.complete(principal, _receipt(lease))
-    lifecycle_path = (
-        tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-    )
+    lifecycle_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
     lifecycle_path.unlink()
     agent_path = tmp_path / "agent-operations" / "operations.json"
     document = json.loads(agent_path.read_text(encoding="utf-8"))
@@ -1472,7 +1517,9 @@ def test_legacy_terminal_migration_rejects_inexact_pair_without_mutation(
     before_admin = admin_path.read_bytes()
     before_agent = agent_path.read_bytes()
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         operations.plan(
             kind="google.provision",
             generation=4,
@@ -1496,9 +1543,7 @@ def test_legacy_receipt_terminal_cannot_authorize_nonterminal_admin_pair(
     _owner, operations, agent_operations, _registry, principal, lease, _operation_id = (
         _remote_scenario(tmp_path, clock=clock)
     )
-    lifecycle_path = (
-        tmp_path / "admin-operations" / "host-probe-lifecycle.json"
-    )
+    lifecycle_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
     lifecycle_path.unlink()
     agent_operations.complete(
         OperationPrincipalV1(principal.host_ref, principal.registry_generation),
@@ -1509,7 +1554,9 @@ def test_legacy_receipt_terminal_cannot_authorize_nonterminal_admin_pair(
     agent_path = tmp_path / "agent-operations" / "operations.json"
     before = (admin_path.read_bytes(), agent_path.read_bytes())
 
-    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+    with pytest.raises(
+        AdminOperationError, match="control.operation_store_unavailable"
+    ):
         operations.plan(
             kind="google.provision",
             generation=4,

@@ -157,8 +157,10 @@ class HeadlessWriteScopeStore:
             self.state_root = Path.cwd() / self.state_root
         self.state_root = Path(os.path.abspath(self.state_root))
         self.git_runner = git_runner or _default_git_runner
-        self._journal_state_fd: contextvars.ContextVar[int | None] = contextvars.ContextVar(
-            "headless_write_scope_journal_state_fd", default=None
+        self._journal_state_fd: contextvars.ContextVar[int | None] = (
+            contextvars.ContextVar(
+                "headless_write_scope_journal_state_fd", default=None
+            )
         )
 
     def create(
@@ -200,9 +202,11 @@ class HeadlessWriteScopeStore:
             )
         if base_ref is not None:
             base_ref = self._require_text(base_ref, "base_ref", 200)
-            if base_ref.startswith("-") or any(
-                char.isspace() for char in base_ref
-            ) or "\x00" in base_ref:
+            if (
+                base_ref.startswith("-")
+                or any(char.isspace() for char in base_ref)
+                or "\x00" in base_ref
+            ):
                 raise self._failure(
                     "headless_attestation_invalid",
                     "requested baseline ref is unsafe",
@@ -276,8 +280,7 @@ class HeadlessWriteScopeStore:
         available = [
             attestation
             for _path, attestation in records
-            if attestation.agent_id == agent_id
-            and attestation.lifecycle == "available"
+            if attestation.agent_id == agent_id and attestation.lifecycle == "available"
         ]
         if len(available) > 1:
             raise self._failure(
@@ -329,7 +332,9 @@ class HeadlessWriteScopeStore:
             attestation = available[0]
             self._verify_attestation(attestation, agent_id, repository)
             self._verify_clean_worktree(attestation)
-            declarations = self._verify_declared_paths(attestation.worktree_path, declarations)
+            declarations = self._verify_declared_paths(
+                attestation.worktree_path, declarations
+            )
             updated = self._replace(
                 attestation,
                 lifecycle="bound",
@@ -382,7 +387,10 @@ class HeadlessWriteScopeStore:
             )
         with self._locked():
             attestation = self._read_unlocked(binding.attestation_id)
-            if attestation.lifecycle != "bound" or attestation.assignment_id != binding.assignment_id:
+            if (
+                attestation.lifecycle != "bound"
+                or attestation.assignment_id != binding.assignment_id
+            ):
                 raise self._failure(
                     "headless_attestation_invalid",
                     "attestation is stale, consumed, or bound to another assignment",
@@ -465,7 +473,11 @@ class HeadlessWriteScopeStore:
             except HeadlessWriteScopeFailure as exc:
                 result = ScopeResult(False, exc.code, 0, 0, 0)
             finally:
-                terminal_code = result.code if result is not None else "headless_write_attribution_unverified"
+                terminal_code = (
+                    result.code
+                    if result is not None
+                    else "headless_write_attribution_unverified"
+                )
                 consumed = self._replace(
                     attestation,
                     lifecycle="consumed",
@@ -492,18 +504,14 @@ class HeadlessWriteScopeStore:
     def _locked(self) -> Iterator[None]:
         self._ensure_state_dir()
         directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
             directory_fd = self._open_state_directory_fd(directory_flags)
             self._verify_journal_directory_fd(directory_fd)
             fd = os.open(
                 "store.lock",
-                os.O_RDWR
-                | os.O_CREAT
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
                 dir_fd=directory_fd,
             )
@@ -664,7 +672,9 @@ class HeadlessWriteScopeStore:
         self, records: list[tuple[Path, ScopeAttestation]]
     ) -> None:
         for index, (path, attestation) in enumerate(records):
-            if attestation.lifecycle != "available" or not self._is_expired(attestation):
+            if attestation.lifecycle != "available" or not self._is_expired(
+                attestation
+            ):
                 continue
             consumed = self._replace(attestation, lifecycle="consumed")
             record = self._record(consumed)
@@ -761,19 +771,26 @@ class HeadlessWriteScopeStore:
                 ) from exc
 
     def _read_unlocked(self, attestation_id: str) -> ScopeAttestation:
-        if not isinstance(attestation_id, str) or _ATTESTATION_ID_RE.fullmatch(attestation_id) is None:
+        if (
+            not isinstance(attestation_id, str)
+            or _ATTESTATION_ID_RE.fullmatch(attestation_id) is None
+        ):
             raise self._failure(
                 "headless_attestation_invalid",
                 "attestation identifier is malformed",
                 "create a fresh Masterjet worktree attestation",
             )
-        return self._from_record(self._read_record_path(self._record_path(attestation_id)))
+        return self._from_record(
+            self._read_record_path(self._record_path(attestation_id))
+        )
 
     def _write_unlocked(self, attestation: ScopeAttestation) -> None:
         self._write_record_unlocked(self._record(attestation))
 
     def _write_record_unlocked(self, record: Mapping[str, Any]) -> None:
-        raw = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        raw = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
         if len(raw) > MAX_RECORD_BYTES:
             raise self._failure(
                 "headless_attestation_invalid",
@@ -781,7 +798,10 @@ class HeadlessWriteScopeStore:
                 "create a fresh Masterjet worktree attestation",
             )
         attestation_id = record.get("attestation_id")
-        if not isinstance(attestation_id, str) or _ATTESTATION_ID_RE.fullmatch(attestation_id) is None:
+        if (
+            not isinstance(attestation_id, str)
+            or _ATTESTATION_ID_RE.fullmatch(attestation_id) is None
+        ):
             raise self._failure(
                 "headless_attestation_invalid",
                 "attestation record identifier is malformed",
@@ -793,7 +813,7 @@ class HeadlessWriteScopeStore:
                 "headless_attestation_invalid",
                 "attestation journal directory is not pinned",
                 "repair the Masterjet attestation store before retrying",
-        )
+            )
         temporary_name = f".attestation-{secrets.token_hex(16)}.tmp"
         fd = -1
         try:
@@ -944,7 +964,9 @@ class HeadlessWriteScopeStore:
             "lifecycle": attestation.lifecycle,
             "assignment_id": attestation.assignment_id,
             "provider_generation": attestation.provider_generation,
-            "declared_write_paths": [list(item) for item in attestation.declared_write_paths],
+            "declared_write_paths": [
+                list(item) for item in attestation.declared_write_paths
+            ],
         }
 
     def _from_record(self, record: Mapping[str, Any]) -> ScopeAttestation:
@@ -952,7 +974,10 @@ class HeadlessWriteScopeStore:
             if record.get("schema_version") != ATTESTATION_SCHEMA_VERSION:
                 raise ValueError
             attestation_id = record["attestation_id"]
-            if not isinstance(attestation_id, str) or _ATTESTATION_ID_RE.fullmatch(attestation_id) is None:
+            if (
+                not isinstance(attestation_id, str)
+                or _ATTESTATION_ID_RE.fullmatch(attestation_id) is None
+            ):
                 raise ValueError
             agent_id = self._require_text(record["agent_id"], "agent_id", 200)
             lifecycle = record["lifecycle"]
@@ -983,7 +1008,11 @@ class HeadlessWriteScopeStore:
             repository_root = Path(record["repository_root"])
             worktree_path = Path(record["worktree_path"])
             common_git_dir = Path(record["common_git_dir"])
-            if not repository_root.is_absolute() or not worktree_path.is_absolute() or not common_git_dir.is_absolute():
+            if (
+                not repository_root.is_absolute()
+                or not worktree_path.is_absolute()
+                or not common_git_dir.is_absolute()
+            ):
                 raise ValueError
             repository_device = self._require_device(record["repository_device"])
             repository_inode = self._require_inode(record["repository_inode"])
@@ -1003,14 +1032,18 @@ class HeadlessWriteScopeStore:
                 raise ValueError
             branch = record["branch"]
             if branch is not None and (
-                not isinstance(branch, str) or not branch or any(char.isspace() for char in branch)
+                not isinstance(branch, str)
+                or not branch
+                or any(char.isspace() for char in branch)
             ):
                 raise ValueError
             if detached != (branch is None):
                 raise ValueError
             assignment_id = record["assignment_id"]
             if assignment_id is not None:
-                self._require_text(assignment_id, "assignment_id", MAX_ASSIGNMENT_ID_CHARS)
+                self._require_text(
+                    assignment_id, "assignment_id", MAX_ASSIGNMENT_ID_CHARS
+                )
             provider_generation = record.get("provider_generation")
             if provider_generation is not None:
                 self._require_generation(provider_generation)
@@ -1019,9 +1052,11 @@ class HeadlessWriteScopeStore:
                 requested_base_ref = self._require_text(
                     requested_base_ref, "requested_base_ref", 200
                 )
-                if requested_base_ref.startswith("-") or any(
-                    char.isspace() for char in requested_base_ref
-                ) or "\x00" in requested_base_ref:
+                if (
+                    requested_base_ref.startswith("-")
+                    or any(char.isspace() for char in requested_base_ref)
+                    or "\x00" in requested_base_ref
+                ):
                     raise ValueError
             history_reflog_count = record["history_reflog_count"]
             if (
@@ -1090,10 +1125,16 @@ class HeadlessWriteScopeStore:
                 common_git_inode=common_git_inode,
                 branch=branch,
                 detached=detached,
-                baseline_commit=self._require_text(record["baseline_commit"], "baseline_commit", 200),
+                baseline_commit=self._require_text(
+                    record["baseline_commit"], "baseline_commit", 200
+                ),
                 requested_base_ref=requested_base_ref,
-                creation_generation=self._require_text(record["creation_generation"], "creation_generation", 100),
-                created_at_utc=self._require_text(record["created_at_utc"], "created_at_utc", 100),
+                creation_generation=self._require_text(
+                    record["creation_generation"], "creation_generation", 100
+                ),
+                created_at_utc=self._require_text(
+                    record["created_at_utc"], "created_at_utc", 100
+                ),
                 history_reflog_count=history_reflog_count,
                 history_reflog_digest=history_reflog_digest,
                 history_reflog_anchor=history_reflog_anchor,
@@ -1112,7 +1153,9 @@ class HeadlessWriteScopeStore:
             )
 
     def _git_identity(self, cwd: Path) -> dict[str, Any]:
-        top = self._real_directory(Path(self._git_output(cwd, ["rev-parse", "--show-toplevel"])))
+        top = self._real_directory(
+            Path(self._git_output(cwd, ["rev-parse", "--show-toplevel"]))
+        )
         common_raw = self._git_output(cwd, ["rev-parse", "--git-common-dir"])
         common_path = Path(common_raw)
         if not common_path.is_absolute():
@@ -1283,7 +1326,10 @@ class HeadlessWriteScopeStore:
     def _verify_attestation(
         self, attestation: ScopeAttestation, agent_id: str, repository: Path
     ) -> None:
-        if attestation.agent_id != agent_id or attestation.repository_root != repository:
+        if (
+            attestation.agent_id != agent_id
+            or attestation.repository_root != repository
+        ):
             raise self._failure(
                 "headless_attestation_invalid",
                 "agent or repository identity does not match the attestation",
@@ -1515,8 +1561,7 @@ class HeadlessWriteScopeStore:
                 "restore the bound Git index flags and retry",
             )
         if any(
-            path in current and current[path] != flag
-            for path, flag in expected.items()
+            path in current and current[path] != flag for path, flag in expected.items()
         ):
             raise self._failure(
                 "headless_attestation_invalid",
@@ -1635,9 +1680,7 @@ class HeadlessWriteScopeStore:
             )
 
     def _configured_external_excludes_file(self, cwd: Path) -> Path | None:
-        result = self._git(
-            ["config", "--local", "--get", "core.excludesFile"], cwd
-        )
+        result = self._git(["config", "--local", "--get", "core.excludesFile"], cwd)
         if result.returncode == 1:
             return None
         if result.returncode != 0:
@@ -1766,8 +1809,7 @@ class HeadlessWriteScopeStore:
         if (
             type(attestation.history_reflog_count) is not int
             or not 1 <= attestation.history_reflog_count <= MAX_HISTORY_REFLOG_ENTRIES
-            or re.fullmatch(r"[0-9a-f]{64}", attestation.history_reflog_digest)
-            is None
+            or re.fullmatch(r"[0-9a-f]{64}", attestation.history_reflog_digest) is None
             or not isinstance(attestation.history_reflog_anchor, str)
         ):
             raise self._failure(
@@ -1814,9 +1856,7 @@ class HeadlessWriteScopeStore:
                     "restore append-only Git history from the attested baseline and retry",
                 )
 
-    def _git_reflog_entries(
-        self, cwd: Path
-    ) -> tuple[tuple[str, str], ...]:
+    def _git_reflog_entries(self, cwd: Path) -> tuple[tuple[str, str], ...]:
         output = self._git_output(
             cwd,
             [
@@ -1847,10 +1887,7 @@ class HeadlessWriteScopeStore:
                     "repair the worktree Git reflog and retry",
                 )
             oid, subject = fields
-            if (
-                _GIT_OBJECT_ID_RE.fullmatch(oid) is None
-                or "\x00" in subject
-            ):
+            if _GIT_OBJECT_ID_RE.fullmatch(oid) is None or "\x00" in subject:
                 raise self._failure(
                     "headless_attestation_invalid",
                     "Git HEAD reflog evidence is malformed",
@@ -1885,9 +1922,7 @@ class HeadlessWriteScopeStore:
                 "remove refs/replace entries before retrying",
             )
         git_dir = Path(self._git_output(cwd, ["rev-parse", "--git-dir"]))
-        common_dir = Path(
-            self._git_output(cwd, ["rev-parse", "--git-common-dir"])
-        )
+        common_dir = Path(self._git_output(cwd, ["rev-parse", "--git-common-dir"]))
         if not git_dir.is_absolute():
             git_dir = cwd / git_dir
         if not common_dir.is_absolute():
@@ -1929,17 +1964,11 @@ class HeadlessWriteScopeStore:
         return "\x00".join(entry)
 
     def _is_ancestor(self, cwd: Path, old_head: str, new_head: str) -> bool:
-        result = self._git(
-            ["merge-base", "--is-ancestor", old_head, new_head], cwd
-        )
+        result = self._git(["merge-base", "--is-ancestor", old_head, new_head], cwd)
         return result.returncode == 0
 
-    def _verify_baseline_ancestor(
-        self, cwd: Path, baseline: str, head: str
-    ) -> None:
-        result = self._git(
-            ["merge-base", "--is-ancestor", baseline, head], cwd
-        )
+    def _verify_baseline_ancestor(self, cwd: Path, baseline: str, head: str) -> None:
+        result = self._git(["merge-base", "--is-ancestor", baseline, head], cwd)
         if result.returncode != 0:
             raise self._failure(
                 "headless_attestation_invalid",
@@ -2028,7 +2057,11 @@ class HeadlessWriteScopeStore:
     def _normalize_declared_paths(
         self, write_paths: list[str] | tuple[str, ...]
     ) -> tuple[tuple[str, bool], ...]:
-        if not isinstance(write_paths, (list, tuple)) or not write_paths or len(write_paths) > MAX_DECLARED_PATHS:
+        if (
+            not isinstance(write_paths, (list, tuple))
+            or not write_paths
+            or len(write_paths) > MAX_DECLARED_PATHS
+        ):
             raise self._failure(
                 "headless_write_path_invalid",
                 "headless write paths must be a bounded non-empty list",
@@ -2038,7 +2071,12 @@ class HeadlessWriteScopeStore:
         seen: set[str] = set()
         serialized_size = 0
         for raw in write_paths:
-            if not isinstance(raw, str) or not raw or len(raw) > MAX_PATH_CHARS or "\x00" in raw:
+            if (
+                not isinstance(raw, str)
+                or not raw
+                or len(raw) > MAX_PATH_CHARS
+                or "\x00" in raw
+            ):
                 raise self._failure(
                     "headless_write_path_invalid",
                     "headless write path is malformed",
@@ -2051,7 +2089,9 @@ class HeadlessWriteScopeStore:
                     "declare explicit repository-relative write paths",
                 )
             components = raw.split("/")
-            if any(not component or component in {".", ".."} for component in components):
+            if any(
+                not component or component in {".", ".."} for component in components
+            ):
                 raise self._failure(
                     "headless_write_path_invalid",
                     "headless write path contains traversal or ambiguous components",
@@ -2136,7 +2176,9 @@ class HeadlessWriteScopeStore:
     def _path_is_declared(
         self, path: str, declarations: tuple[tuple[str, bool], ...]
     ) -> bool:
-        if path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/")):
+        if path.startswith("/") or any(
+            part in {"", ".", ".."} for part in path.split("/")
+        ):
             raise self._failure(
                 "headless_write_attribution_unverified",
                 "Git reported an ambiguous path",
@@ -2212,7 +2254,10 @@ class HeadlessWriteScopeStore:
 
     @staticmethod
     def _bounded_output(value: Any, field: str, *, max_bytes: int = 4096) -> str:
-        if not isinstance(value, str) or len(value.encode("utf-8", "replace")) > max_bytes:
+        if (
+            not isinstance(value, str)
+            or len(value.encode("utf-8", "replace")) > max_bytes
+        ):
             raise HeadlessWriteScopeFailure(
                 "headless_write_attribution_unverified",
                 f"{field} is malformed or exceeds its bound",

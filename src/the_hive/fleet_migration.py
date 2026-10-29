@@ -78,7 +78,9 @@ def _binding_for_account(
     return binding
 
 
-def _sorted_candidate_key(candidate: tuple[str, str, int, str, str]) -> tuple[str, str, str]:
+def _sorted_candidate_key(
+    candidate: tuple[str, str, int, str, str],
+) -> tuple[str, str, str]:
     migration_identity, _source_prefix, _source_ordinal, account_id, label = candidate
     return label.casefold(), account_id, migration_identity
 
@@ -87,7 +89,9 @@ def _g_relocation_target(
     snapshot: FleetMigrationSnapshot,
 ) -> str | None:
     prefixes = {series.prefix for series in snapshot.series}
-    g_series = next((series for series in snapshot.series if series.prefix == "g"), None)
+    g_series = next(
+        (series for series in snapshot.series if series.prefix == "g"), None
+    )
     if g_series is None or g_series.provider is Provider.GEMINI_API:
         return None
     gemini_prefixes = sorted(
@@ -130,7 +134,9 @@ def plan_g_series_migration(
 
     grouped: dict[str, list[tuple[str, str, int, str, str]]] = {}
     for candidate in candidates:
-        _migration_identity, _source_prefix, _source_ordinal, account_id, _label = candidate
+        _migration_identity, _source_prefix, _source_ordinal, account_id, _label = (
+            candidate
+        )
         binding = _binding_for_account(credential_bindings, account_id)
         grouped.setdefault(binding, []).append(candidate)
 
@@ -157,7 +163,9 @@ def plan_g_series_migration(
         active_group = [candidate for candidate in group if candidate[0] in active]
         if len(active_group) > 1:
             raise GMigrationPlanError("multiple_active_credential_bindings")
-        winner = active_group[0] if active_group else min(group, key=_sorted_candidate_key)
+        winner = (
+            active_group[0] if active_group else min(group, key=_sorted_candidate_key)
+        )
         winners.append(winner)
         for candidate in group:
             if candidate != winner:
@@ -190,12 +198,22 @@ def plan_g_series_migration(
             used_ordinals.add(winner[2])
             selected.append(
                 GMigrationMember(
-                    winner[0], winner[1], winner[2], winner[3], winner[2], "g_member", "selected"
+                    winner[0],
+                    winner[1],
+                    winner[2],
+                    winner[3],
+                    winner[2],
+                    "g_member",
+                    "selected",
                 )
             )
 
     for winner in sorted(
-        (candidate for candidate in winners if candidate[0] not in {item.migration_identity for item in selected}),
+        (
+            candidate
+            for candidate in winners
+            if candidate[0] not in {item.migration_identity for item in selected}
+        ),
         key=_sorted_candidate_key,
     ):
         target_ordinal = 1
@@ -204,7 +222,13 @@ def plan_g_series_migration(
         used_ordinals.add(target_ordinal)
         selected.append(
             GMigrationMember(
-                winner[0], winner[1], winner[2], winner[3], target_ordinal, "g_member", "selected"
+                winner[0],
+                winner[1],
+                winner[2],
+                winner[3],
+                target_ordinal,
+                "g_member",
+                "selected",
             )
         )
 

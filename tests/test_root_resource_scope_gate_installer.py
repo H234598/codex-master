@@ -37,7 +37,15 @@ def _fixture(tmp_path: Path) -> dict[str, object]:
     generation = "a" * 40
     generation_root = release_root / "generations" / generation
     bin_root = generation_root / "bin"
-    for directory in (home, home / ".local", home / ".local" / "lib", release_root, release_root / "generations", generation_root, bin_root):
+    for directory in (
+        home,
+        home / ".local",
+        home / ".local" / "lib",
+        release_root,
+        release_root / "generations",
+        generation_root,
+        bin_root,
+    ):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.chmod(0o700)
 
@@ -67,7 +75,11 @@ def _fixture(tmp_path: Path) -> dict[str, object]:
         },
         "previous": None,
     }
-    _write(release_root / ".the-hive-release-pointers.json", consumer["_canonical_json"](pointer), 0o644)
+    _write(
+        release_root / ".the-hive-release-pointers.json",
+        consumer["_canonical_json"](pointer),
+        0o644,
+    )
     _write(release_root / ".the-hive-release-publish.lock", b"", 0o600)
     _write(generation_root / ".the-hive-runtime-manifest.json", manifest_raw, 0o644)
     _write(bin_root / "the-hive-resource-scope-gate", gate, 0o755)
@@ -86,9 +98,7 @@ def _fixture(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def _read_fixture_gate(
-    fixture: dict[str, object], **overrides: object
-) -> bytes:
+def _read_fixture_gate(fixture: dict[str, object], **overrides: object) -> bytes:
     consumer = fixture["consumer"]
     release_root = fixture["release_root"]
     release_fd, release_info, lock_fd = consumer["_open_release_read_lease"](
@@ -136,9 +146,8 @@ def _prepare_private_root_install(
         ),
     )
     published: list[bytes] = []
-    def publish(
-        _fd: int, raw: bytes, _digest: str, *, verify_source=None
-    ) -> str:
+
+    def publish(_fd: int, raw: bytes, _digest: str, *, verify_source=None) -> str:
         if verify_source is not None:
             verify_source()
         published.append(raw)
@@ -148,7 +157,9 @@ def _prepare_private_root_install(
     return published
 
 
-def _install_private_fixture(consumer: dict[str, object], fixture: dict[str, object]) -> str:
+def _install_private_fixture(
+    consumer: dict[str, object], fixture: dict[str, object]
+) -> str:
     return consumer["_install_for_uid"](
         fixture["uid"], fixture["generation"], fixture["manifest_digest"]
     )
@@ -193,7 +204,9 @@ def test_root_consumer_rejects_release_lock_rebind_after_lock_before_read(
         return lease
 
     monkeypatch.setitem(consumer, "_open_release_read_lease", lock_then_replace_name)
-    with pytest.raises(consumer["GateInstallError"], match="release_publish_lock_changed"):
+    with pytest.raises(
+        consumer["GateInstallError"], match="release_publish_lock_changed"
+    ):
         _install_private_fixture(consumer, fixture)
     assert published == []
 
@@ -223,7 +236,9 @@ def test_root_publisher_revalidates_release_lease_before_target_mutation(
         )
         lock_path.unlink()
         _write(lock_path, b"", 0o600)
-        with pytest.raises(consumer["GateInstallError"], match="release_publish_lock_changed"):
+        with pytest.raises(
+            consumer["GateInstallError"], match="release_publish_lock_changed"
+        ):
             consumer["_publish_gate"](
                 target_fd,
                 raw,
@@ -256,7 +271,13 @@ def test_root_consumer_rejects_wrong_operator_pin(tmp_path: Path, pin: str) -> N
         "generation": fixture["generation"],
         "manifest_sha256": fixture["manifest_digest"],
     }
-    arguments[{"uid": "uid", "generation": "generation", "manifest_digest": "manifest_sha256"}[pin]] = {
+    arguments[
+        {
+            "uid": "uid",
+            "generation": "generation",
+            "manifest_digest": "manifest_sha256",
+        }[pin]
+    ] = {
         "uid": fixture["uid"] + 1,
         "generation": "b" * 40,
         "manifest_digest": "0" * 64,
@@ -276,10 +297,14 @@ def test_root_consumer_rejects_wrong_current_pointer_without_touching_gate(
 
     with pytest.raises(fixture["consumer"]["GateInstallError"]):
         _read_fixture_gate(fixture)
-    assert (fixture["bin_root"] / "the-hive-resource-scope-gate").read_bytes() == fixture["gate"]
+    assert (
+        fixture["bin_root"] / "the-hive-resource-scope-gate"
+    ).read_bytes() == fixture["gate"]
 
 
-def test_root_consumer_rejects_changed_gate_bytes_and_wrong_mode(tmp_path: Path) -> None:
+def test_root_consumer_rejects_changed_gate_bytes_and_wrong_mode(
+    tmp_path: Path,
+) -> None:
     fixture = _fixture(tmp_path)
     gate_path = fixture["bin_root"] / "the-hive-resource-scope-gate"
     _write(gate_path, fixture["gate"] + b"changed", 0o755)
@@ -383,12 +408,16 @@ def test_root_consumer_rejects_gate_path_rebind_after_read(
 def _publish(consumer: dict[str, object], directory: Path, gate: bytes) -> str:
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        return consumer["_publish_gate"](descriptor, gate, hashlib.sha256(gate).hexdigest())
+        return consumer["_publish_gate"](
+            descriptor, gate, hashlib.sha256(gate).hexdigest()
+        )
     finally:
         os.close(descriptor)
 
 
-def test_root_publisher_is_atomic_and_idempotent_on_private_fixture(tmp_path: Path) -> None:
+def test_root_publisher_is_atomic_and_idempotent_on_private_fixture(
+    tmp_path: Path,
+) -> None:
     consumer = _consumer()
     target_dir = tmp_path / "usr" / "libexec"
     target_dir.mkdir(parents=True, mode=0o755)
@@ -402,7 +431,9 @@ def test_root_publisher_is_atomic_and_idempotent_on_private_fixture(tmp_path: Pa
     assert _publish(consumer, target_dir, gate) == "already_installed"
 
 
-def test_root_publisher_preserves_racing_foreign_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_root_publisher_preserves_racing_foreign_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     consumer = _consumer()
     target_dir = tmp_path / "usr" / "libexec"
     target_dir.mkdir(parents=True, mode=0o755)
@@ -412,7 +443,12 @@ def test_root_publisher_preserves_racing_foreign_target(tmp_path: Path, monkeypa
     target = target_dir / "the-hive-resource-scope-gate"
 
     def race(directory_fd: int, source: str, destination: str) -> None:
-        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755, dir_fd=directory_fd)
+        fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o755,
+            dir_fd=directory_fd,
+        )
         try:
             os.write(fd, foreign)
             os.fchmod(fd, 0o755)
@@ -467,7 +503,9 @@ def test_root_publisher_resumes_a_complete_stage_after_publish_failure(
         raise consumer["GateInstallError"]("atomic_noreplace_unavailable")
 
     monkeypatch.setitem(consumer, "_rename_noreplace", fail_publish)
-    with pytest.raises(consumer["GateInstallError"], match="atomic_noreplace_unavailable"):
+    with pytest.raises(
+        consumer["GateInstallError"], match="atomic_noreplace_unavailable"
+    ):
         _publish(consumer, target_dir, gate)
     assert list(target_dir.glob(".the-hive-resource-scope-gate.*.stage"))
 

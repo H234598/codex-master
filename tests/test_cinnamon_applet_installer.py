@@ -179,7 +179,9 @@ else:
         self.assertFalse(self.target.parent.exists())
         self.assertFalse(self.log.exists())
 
-    def test_install_stages_exact_tree_keeps_one_backup_and_uses_fixed_dbus(self) -> None:
+    def test_install_stages_exact_tree_keeps_one_backup_and_uses_fixed_dbus(
+        self,
+    ) -> None:
         self._write_tree(self.target, "old")
         self._write_tree(self.backup, "older")
 
@@ -191,7 +193,10 @@ else:
         backups = list(self.target.parent.glob(f"{UUID}.rollback*"))
         self.assertEqual(backups, [self.backup])
         self.assertEqual(list(self.target.parent.glob(f".{UUID}.retired*")), [])
-        calls = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+        calls = [
+            json.loads(line)
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+        ]
         joined = "\n".join(" ".join(call) for call in calls)
         self.assertEqual(calls[0][0], "monitor")
         self.assertIn(f"org.Cinnamon.ReloadXlet {UUID} APPLET", joined)
@@ -208,12 +213,16 @@ else:
         self.assertTrue(json.loads(result.stdout)["rollback"])
         self.assertEqual(self._manifest(self.target), self._manifest(self.source))
         self.assertTrue(self.backup.exists())
-        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "known-good", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
         self.assertEqual(list(self.target.parent.glob(f".{UUID}.retired*")), [])
 
         rollback = self._run("rollback", "--no-reload")
         self.assertEqual(rollback.returncode, 0, rollback.stderr)
-        self.assertIn("known-good", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "known-good", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
 
     def test_failed_backup_rotation_preserves_existing_rollback(self) -> None:
         self._write_tree(self.target, "current")
@@ -231,8 +240,12 @@ else:
                 with self.assertRaises(OSError):
                     module.install(dry_run=False, no_reload=True)
 
-        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
-        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "current", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "known-good", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
         self.assertEqual(list(self.target.parent.glob(f".{UUID}.*")), [])
 
     def test_cleanup_failure_does_not_mask_install_error(self) -> None:
@@ -252,12 +265,18 @@ else:
             return real_replace(source, destination)
 
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
-            with mock.patch.object(module.os, "replace", side_effect=fail_rotation_and_restore):
-                with self.assertRaisesRegex(OSError, "primary rotation failure") as caught:
+            with mock.patch.object(
+                module.os, "replace", side_effect=fail_rotation_and_restore
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "primary rotation failure"
+                ) as caught:
                     module.install(dry_run=False, no_reload=True)
 
         self.assertIn("cleanup restore failure", "\n".join(caught.exception.__notes__))
-        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "current", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
         self.assertIn("known-good", (retired / "applet.js").read_text(encoding="utf-8"))
         self.assertFalse(self.backup.exists())
 
@@ -269,7 +288,9 @@ else:
 
         def fail_promotion(source, destination):
             source = Path(source)
-            if Path(destination) == self.target and source.name.startswith(f".{UUID}.staging-"):
+            if Path(destination) == self.target and source.name.startswith(
+                f".{UUID}.staging-"
+            ):
                 raise OSError("injected promotion failure")
             return real_replace(source, destination)
 
@@ -278,8 +299,12 @@ else:
                 with self.assertRaises(OSError):
                     module.install(dry_run=False, no_reload=True)
 
-        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
-        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "current", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "known-good", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
         self.assertEqual(list(self.target.parent.glob(f".{UUID}.*")), [])
 
     def test_failed_deployment_preserves_existing_rollback(self) -> None:
@@ -289,8 +314,12 @@ else:
         result = self._run("install", mode="reload-fail")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
-        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "current", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "known-good", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
         self.assertEqual(list(self.target.parent.glob(f".{UUID}.retired*")), [])
 
     def test_restore_failure_preserves_retired_rollback_for_recovery(self) -> None:
@@ -305,13 +334,21 @@ else:
             return real_remove(path, label)
 
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
-            with mock.patch.object(module, "verify_files", side_effect=module.InstallerError("injected")):
-                with mock.patch.object(module, "remove_validated_tree", side_effect=fail_failed_target_removal):
+            with mock.patch.object(
+                module, "verify_files", side_effect=module.InstallerError("injected")
+            ):
+                with mock.patch.object(
+                    module,
+                    "remove_validated_tree",
+                    side_effect=fail_failed_target_removal,
+                ):
                     with self.assertRaises(module.InstallerError):
                         module.install(dry_run=False, no_reload=True)
 
         self.assertIn("new", (self.target / "applet.js").read_text(encoding="utf-8"))
-        self.assertIn("current", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "current", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
         retired = self.target.parent / f".{UUID}.retired"
         self.assertIn("known-good", (retired / "applet.js").read_text(encoding="utf-8"))
 
@@ -352,7 +389,9 @@ else:
         self.assertIn("old", (self.target / "applet.js").read_text(encoding="utf-8"))
         self.assertFalse(self.backup.exists())
 
-    def test_reload_or_running_verification_failure_restores_previous_tree(self) -> None:
+    def test_reload_or_running_verification_failure_restores_previous_tree(
+        self,
+    ) -> None:
         for mode in ("reload-fail", "missing", "spoofed"):
             with self.subTest(mode=mode):
                 self.log.unlink(missing_ok=True)
@@ -365,10 +404,17 @@ else:
                 result = self._run("install", mode=mode)
 
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn(f"old-{mode}", (self.target / "applet.js").read_text(encoding="utf-8"))
+                self.assertIn(
+                    f"old-{mode}",
+                    (self.target / "applet.js").read_text(encoding="utf-8"),
+                )
                 self.assertFalse(self.backup.exists())
-                calls = self.log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
-                self.assertEqual(calls, 2, "restored applet must be reloaded after failed deployment")
+                calls = self.log.read_text(encoding="utf-8").count(
+                    "org.Cinnamon.ReloadXlet"
+                )
+                self.assertEqual(
+                    calls, 2, "restored applet must be reloaded after failed deployment"
+                )
 
     def test_verify_rejects_byte_difference_and_unbounded_dbus_output(self) -> None:
         shutil.copytree(self.source, self.target)
@@ -413,7 +459,9 @@ else:
             with self.assertRaises(module.InstallerError):
                 module.validate_source(self.source)
 
-    def test_source_swap_during_staging_fails_without_touching_installed_tree(self) -> None:
+    def test_source_swap_during_staging_fails_without_touching_installed_tree(
+        self,
+    ) -> None:
         self._write_tree(self.target, "old")
         module = self._load_tool_module()
         original = module.copy_file_checked
@@ -427,7 +475,9 @@ else:
             return original(source, destination, expected_hash, mode)
 
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
-            with mock.patch.object(module, "copy_file_checked", side_effect=swap_before_copy):
+            with mock.patch.object(
+                module, "copy_file_checked", side_effect=swap_before_copy
+            ):
                 with self.assertRaises(module.InstallerError):
                     module.install(dry_run=False, no_reload=True)
 
@@ -445,11 +495,17 @@ else:
             nonlocal changed
             if Path(root) == self.target and not changed:
                 changed = True
-                (self.source / "applet.js").write_text("changed during verify\n", encoding="utf-8")
+                (self.source / "applet.js").write_text(
+                    "changed during verify\n", encoding="utf-8"
+                )
             return real_scan(root, label)
 
-        with mock.patch.object(module, "scan_tree", side_effect=change_source_before_target_scan):
-            with self.assertRaisesRegex(module.InstallerError, "source applet changed during verification"):
+        with mock.patch.object(
+            module, "scan_tree", side_effect=change_source_before_target_scan
+        ):
+            with self.assertRaisesRegex(
+                module.InstallerError, "source applet changed during verification"
+            ):
                 module.verify_files(self.source, self.target)
 
     def test_source_mode_change_between_stat_and_open_is_rejected(self) -> None:
@@ -464,7 +520,9 @@ else:
             return real_open(path, flags, *args)
 
         try:
-            with mock.patch.object(module.os, "open", side_effect=change_mode_then_open):
+            with mock.patch.object(
+                module.os, "open", side_effect=change_mode_then_open
+            ):
                 with self.assertRaises(module.InstallerError):
                     module.hash_regular_file(source_file, expected)
         finally:
@@ -505,15 +563,21 @@ else:
         target_result = self._run("install")
         self.assertNotEqual(target_result.returncode, 0)
 
-    def test_rollback_swaps_exact_tree_and_rejects_missing_or_symlink_backup(self) -> None:
+    def test_rollback_swaps_exact_tree_and_rejects_missing_or_symlink_backup(
+        self,
+    ) -> None:
         self._write_tree(self.target, "current")
         self._write_tree(self.backup, "previous")
 
         result = self._run("rollback", "--no-reload")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("previous", (self.target / "applet.js").read_text(encoding="utf-8"))
-        self.assertIn("current", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "previous", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "current", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
 
         shutil.rmtree(self.backup)
         missing = self._run("rollback", "--no-reload")
@@ -529,10 +593,16 @@ else:
         result = self._run("rollback", mode="reload-fail")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
-        self.assertIn("previous", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "current", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "previous", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
         calls = self.log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
-        self.assertEqual(calls, 2, "restored current applet must be reloaded after failed rollback")
+        self.assertEqual(
+            calls, 2, "restored current applet must be reloaded after failed rollback"
+        )
 
     def test_swap_recovery_failure_does_not_mask_primary_error(self) -> None:
         self._write_tree(self.target, "current")
@@ -549,16 +619,22 @@ else:
                 raise OSError("swap recovery failure")
             return real_replace(source, destination)
 
-        with mock.patch.object(module.os, "replace", side_effect=fail_swap_and_recovery):
+        with mock.patch.object(
+            module.os, "replace", side_effect=fail_swap_and_recovery
+        ):
             with self.assertRaisesRegex(OSError, "primary swap failure") as caught:
                 module.swap_directories(self.target, self.backup)
 
         self.assertIn("swap recovery failure", "\n".join(caught.exception.__notes__))
-        self.assertIn("previous", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "previous", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
         self.assertFalse(self.backup.exists())
         unfinished = list(self.target.parent.glob(f".{UUID}.swap-*"))
         self.assertEqual(len(unfinished), 1)
-        self.assertIn("current", (unfinished[0] / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "current", (unfinished[0] / "applet.js").read_text(encoding="utf-8")
+        )
 
     def test_rollback_refuses_unfinished_rotation_without_mutation(self) -> None:
         retired = self.target.parent / f".{UUID}.retired"
@@ -611,8 +687,12 @@ else:
         result = self._run("rollback", "--no-reload")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("previous", (self.target / "applet.js").read_text(encoding="utf-8"))
-        self.assertIn("current", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "previous", (self.target / "applet.js").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "current", (self.backup / "applet.js").read_text(encoding="utf-8")
+        )
 
     def test_mutating_commands_are_serialized_by_uuid_lock(self) -> None:
         module = self._load_tool_module()
@@ -645,7 +725,11 @@ else:
                         self.assertTrue(first_entered.wait(timeout=2))
                         second.start()
                         time.sleep(0.2)
-                        self.assertEqual(entered, 1, "second mutator entered before first released lock")
+                        self.assertEqual(
+                            entered,
+                            1,
+                            "second mutator entered before first released lock",
+                        )
                     finally:
                         release_first.set()
                         first.join(timeout=5)
@@ -705,8 +789,12 @@ else:
         process = Process()
         selector = BrokenSelector()
         with mock.patch.object(module.subprocess, "Popen", return_value=process):
-            with mock.patch.object(module.selectors, "DefaultSelector", return_value=selector):
-                with self.assertRaisesRegex(OSError, "injected selector setup failure") as caught:
+            with mock.patch.object(
+                module.selectors, "DefaultSelector", return_value=selector
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "injected selector setup failure"
+                ) as caught:
                     invoke(module)
 
         self.assertEqual(process.kill_count, 1)
@@ -719,10 +807,14 @@ else:
         self.assertIn("injected stderr cleanup failure", notes)
 
     def test_run_bounded_cleans_up_selector_setup_failure(self) -> None:
-        self._assert_selector_setup_failure_is_cleaned(lambda module: module.run_bounded(["gdbus"]))
+        self._assert_selector_setup_failure_is_cleaned(
+            lambda module: module.run_bounded(["gdbus"])
+        )
 
     def test_reload_cleans_up_selector_setup_failure(self) -> None:
-        self._assert_selector_setup_failure_is_cleaned(lambda module: module.reload_xlet())
+        self._assert_selector_setup_failure_is_cleaned(
+            lambda module: module.reload_xlet()
+        )
 
     def test_kill_and_wait_remains_bounded_when_process_cannot_be_reaped(self) -> None:
         module = self._load_tool_module()
@@ -746,7 +838,9 @@ else:
 
         process = StubbornProcess()
 
-        with self.assertRaisesRegex(module.InstallerError, "gdbus process could not be reaped"):
+        with self.assertRaisesRegex(
+            module.InstallerError, "gdbus process could not be reaped"
+        ):
             module.kill_and_wait(process)
 
         self.assertEqual(process.kill_count, 2)

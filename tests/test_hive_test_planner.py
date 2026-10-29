@@ -25,7 +25,11 @@ def test_planner_selects_only_tests_covering_changed_functions() -> None:
     result = TestPlanner().plan(request, index, now_monotonic_ns=1)
 
     assert [(item.test_id, item.action, item.reason_code) for item in result.tests] == [
-        ("pytest:tests/test_example.py:test_example_run", "run", "test.evidence_unavailable")
+        (
+            "pytest:tests/test_example.py:test_example_run",
+            "run",
+            "test.evidence_unavailable",
+        )
     ]
 
 

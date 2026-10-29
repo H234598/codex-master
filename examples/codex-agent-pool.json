@@ -8,17 +8,13 @@
       "prefix": "a",
       "count": 2,
       "template": "a1",
-      "authenticated": [
-        "a1"
-      ]
+      "authenticated": ["a1"]
     },
     {
       "prefix": "b",
       "count": 2,
       "template": "b1",
-      "authenticated": [
-        "b1"
-      ]
+      "authenticated": ["b1"]
     },
     {
       "prefix": "c",
@@ -30,20 +26,10 @@
   "aliases": {
     "a": "a1",
     "b": "b1",
-    "both": [
-      "a1",
-      "b1"
-    ]
+    "both": ["a1", "b1"]
   },
-  "shared_assets": [
-    "skills",
-    "plugins"
-  ],
-  "runtime_dirs": [
-    "sessions",
-    "logs",
-    "tmp"
-  ],
+  "shared_assets": ["skills", "plugins"],
+  "runtime_dirs": ["sessions", "logs", "tmp"],
   "auth": {
     "policy": "preserve_existing_only",
     "copy": []

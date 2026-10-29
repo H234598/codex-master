@@ -58,9 +58,7 @@ _NOREPLACE = 1
 _RECEIPT_NAME = re.compile(
     r"^(?P<reference>receipt-v1-[0-9a-f]{64})-(?P<state>issued|claimed|consumed|indeterminate)\.json$"
 )
-_TEMP_RECEIPT_NAME = re.compile(
-    r"^\.receipt-v1-[0-9a-f]{64}\.[0-9a-f]{32}\.tmp$"
-)
+_TEMP_RECEIPT_NAME = re.compile(r"^\.receipt-v1-[0-9a-f]{64}\.[0-9a-f]{32}\.tmp$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _BOOT_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,128}$")
 _OPAQUE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
@@ -389,9 +387,7 @@ class _PrincipalLeaseScopePort(Protocol):
 
 
 class _TargetsetPort(Protocol):
-    def read(
-        self, action: str, target_class: str
-    ) -> TargetSetRecord | None:
+    def read(self, action: str, target_class: str) -> TargetSetRecord | None:
         """Read one complete, closed targetset record."""
 
 
@@ -476,6 +472,7 @@ class QuiescenceReceipt:
             raise AuthorityUnavailable("record_not_canonical")
         return _receipt_from_payload(payload)
 
+
 def _coerce_plan(value: object) -> PlanBindingRecord:
     if not isinstance(value, PlanBindingRecord):
         raise AuthorityUnavailable("plan_binding_unavailable")
@@ -494,9 +491,7 @@ def _coerce_targetset(value: object) -> TargetSetRecord:
     return value
 
 
-def _validate_plan(
-    record: PlanBindingRecord, *, now_utc_ns: int | None
-) -> int:
+def _validate_plan(record: PlanBindingRecord, *, now_utc_ns: int | None) -> int:
     _opaque_reference(record.plan_reference)
     for field_name in (
         "plan_digest",
@@ -633,7 +628,10 @@ def _receipt_digest_payload(receipt: QuiescenceReceipt) -> dict[str, object]:
 
 
 def _validate_receipt(receipt: QuiescenceReceipt) -> None:
-    if type(receipt.schema_version) is not int or receipt.schema_version != _SCHEMA_VERSION:
+    if (
+        type(receipt.schema_version) is not int
+        or receipt.schema_version != _SCHEMA_VERSION
+    ):
         raise AuthorityUnavailable("schema_mismatch")
     if _RECEIPT_NAME.fullmatch(receipt.receipt_reference + "-issued.json") is None:
         raise AuthorityUnavailable("invalid_receipt_reference")
@@ -652,7 +650,10 @@ def _validate_receipt(receipt: QuiescenceReceipt) -> None:
         "target_set_digest",
     ):
         _digest_value(getattr(receipt, field_name), name=field_name)
-    if receipt.action not in _ACTIONS or _ACTIONS[receipt.action] != receipt.target_class:
+    if (
+        receipt.action not in _ACTIONS
+        or _ACTIONS[receipt.action] != receipt.target_class
+    ):
         raise AuthorityUnavailable("invalid_receipt_action")
     for field_name in (
         "inventory_authority_generation",
@@ -706,9 +707,17 @@ def _with_state(receipt: QuiescenceReceipt, state: str) -> QuiescenceReceipt:
 
 
 class _ClaimContinuity:
-    __slots__ = ("authority", "receipt_reference", "binding_digest", "nonce", "__weakref__")
+    __slots__ = (
+        "authority",
+        "receipt_reference",
+        "binding_digest",
+        "nonce",
+        "__weakref__",
+    )
 
-    def __init__(self, authority: object, receipt_reference: str, binding_digest: str) -> None:
+    def __init__(
+        self, authority: object, receipt_reference: str, binding_digest: str
+    ) -> None:
         self.authority = authority
         self.receipt_reference = receipt_reference
         self.binding_digest = binding_digest
@@ -879,9 +888,7 @@ def _scan_store(dirfd: int) -> dict[str, QuiescenceReceipt]:
         if receipt.receipt_reference != reference or receipt.state != state:
             raise AuthorityUnavailable("record_name_state_mismatch")
         if reference in records:
-            raise AuthorityIndeterminate(
-                "ambiguous_record_transition", receipt=receipt
-            )
+            raise AuthorityIndeterminate("ambiguous_record_transition", receipt=receipt)
         records[reference] = receipt
         states[reference] = state
     if record_count > _MAX_RECORDS:
@@ -1165,9 +1172,7 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
         if value is None:
             raise AuthorityUnavailable("principal_unavailable")
         record = _coerce_principal(value)
-        _validate_principal(
-            record, now_boottime_ns=now_boottime_ns, boot_id=boot_id
-        )
+        _validate_principal(record, now_boottime_ns=now_boottime_ns, boot_id=boot_id)
         return record
 
     def _read_targetset(
@@ -1287,9 +1292,7 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
     ) -> QuiescenceReceipt:
         next_receipt = _with_state(current, next_state)
         _validate_receipt(next_receipt)
-        _persist_new_record(
-            dirfd, next_receipt, checkpoint_guard=checkpoint_guard
-        )
+        _persist_new_record(dirfd, next_receipt, checkpoint_guard=checkpoint_guard)
         old_name = f"{current.receipt_reference}-{current.state.casefold()}.json"
         _remove_record(
             dirfd,
@@ -1335,12 +1338,8 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
         terminal = _with_state(receipt, "INDETERMINATE")
         _validate_receipt(terminal)
         _persist_new_record(dirfd, terminal)
-        terminal_name = (
-            f"{receipt.receipt_reference}-indeterminate.json"
-        )
-        for name in self._transition_record_names(
-            dirfd, receipt.receipt_reference
-        ):
+        terminal_name = f"{receipt.receipt_reference}-indeterminate.json"
+        for name in self._transition_record_names(dirfd, receipt.receipt_reference):
             if name == terminal_name:
                 continue
             try:
@@ -1431,9 +1430,7 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
             boot, utc, boot_id = self._clock_values()
             binding = self._read_binding(plan_reference)
             plan_expires_utc = _validate_plan(binding, now_utc_ns=utc)
-            principal = self._read_principal(
-                now_boottime_ns=boot, boot_id=boot_id
-            )
+            principal = self._read_principal(now_boottime_ns=boot, boot_id=boot_id)
             targetset = self._read_targetset(
                 binding=binding, principal=principal, boot_id=boot_id
             )
@@ -1477,7 +1474,8 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
             for known, digest in list(self._claimed_continuities.items())
         ):
             raise AuthorityIndeterminate(
-                "claim_continuity_missing", receipt=_with_state(receipt, "INDETERMINATE")
+                "claim_continuity_missing",
+                receipt=_with_state(receipt, "INDETERMINATE"),
             )
         boot, utc, boot_id = self._clock_values()
         self._attest_receipt(
@@ -1499,7 +1497,9 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
                 raise AuthorityUnavailable("receipt_not_found")
             if receipt.state != "ISSUED":
                 if receipt.state == "CLAIMED":
-                    raise AuthorityIndeterminate("receipt_already_claimed", receipt=receipt)
+                    raise AuthorityIndeterminate(
+                        "receipt_already_claimed", receipt=receipt
+                    )
                 if receipt.state == "CONSUMED":
                     raise AuthorityUnavailable("receipt_consumed")
                 raise AuthorityIndeterminate("receipt_indeterminate", receipt=receipt)
@@ -1527,7 +1527,9 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
                 raise AuthorityIndeterminate(
                     "claim_transition_expired", receipt=indeterminate
                 ) from exc
-        continuity = _ClaimContinuity(self, claimed.receipt_reference, claimed.binding_digest)
+        continuity = _ClaimContinuity(
+            self, claimed.receipt_reference, claimed.binding_digest
+        )
         self._claimed_continuities[continuity] = claimed.binding_digest
         return continuity
 
@@ -1562,7 +1564,9 @@ class GoogleInventoryDeploymentQuiescenceAuthorityV1:
                 raise AuthorityUnavailable("receipt_not_found")
             if receipt.state != "CLAIMED":
                 if receipt.state in {"CONSUMED", "INDETERMINATE"}:
-                    raise AuthorityIndeterminate("receipt_not_consumable", receipt=receipt)
+                    raise AuthorityIndeterminate(
+                        "receipt_not_consumable", receipt=receipt
+                    )
                 raise AuthorityIndeterminate("claim_required", receipt=receipt)
             if not self._continuity_matches(evidence, receipt):
                 indeterminate = self._transition(dirfd, receipt, "INDETERMINATE")

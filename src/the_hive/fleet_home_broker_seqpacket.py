@@ -188,18 +188,15 @@ def _peer_security_context(
 
 
 def _agent_start_security_context(value: object, expected_mcs_pair: str) -> str:
-    label = _peer_security_context(
-        value, "the_hive_agent_t", expected_mcs_pair
-    )
-    if (
-        label
-        != f"system_u:system_r:the_hive_agent_t:s0:{expected_mcs_pair}"
-    ):
+    label = _peer_security_context(value, "the_hive_agent_t", expected_mcs_pair)
+    if label != f"system_u:system_r:the_hive_agent_t:s0:{expected_mcs_pair}":
         raise ValueError
     return label
 
 
-def _snapshot_matches(value: object, pid: int, expected: PrincipalBinding) -> PeerSnapshot:
+def _snapshot_matches(
+    value: object, pid: int, expected: PrincipalBinding
+) -> PeerSnapshot:
     if type(value) is not PeerSnapshot:
         raise ValueError
     if (
@@ -231,9 +228,7 @@ def _reattest_seqpacket_peer_from_active_wal_binding(
         if type(kind) is not socket.SocketKind or kind is not socket.SOCK_SEQPACKET:
             raise ValueError
         pid, uid, gid = _credentials(operations.peer_credentials())
-        snapshot, identity = _observe_peer_snapshot_with_identity(
-            linux_operations, pid
-        )
+        snapshot, identity = _observe_peer_snapshot_with_identity(linux_operations, pid)
         expected = _lookup_active_principal_binding(
             wal_operations,
             snapshot.cgroup_dev,
@@ -327,9 +322,7 @@ def receive_admitted_seqpacket_request(
         QueryTransactionRequest,
         GetTerminalResultRequest,
     ):
-        raise SeqpacketRouteError(
-            SeqpacketRouteCode.FORBIDDEN_REQUEST_KIND
-        ) from None
+        raise SeqpacketRouteError(SeqpacketRouteCode.FORBIDDEN_REQUEST_KIND) from None
     return evidence, BrokerDispatchCommand(
         principal,
         message,

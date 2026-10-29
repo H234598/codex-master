@@ -54,7 +54,9 @@ class RuntimeGateDecision:
         if (
             not isinstance(self.reason_code, str)
             or not 1 <= len(self.reason_code) <= MAX_REASON_LENGTH
-            or any(not (char.isalnum() or char in {"_", "-"}) for char in self.reason_code)
+            or any(
+                not (char.isalnum() or char in {"_", "-"}) for char in self.reason_code
+            )
         ):
             raise AdmissionRuntimeError("invalid_runtime_gate_decision")
 
@@ -68,7 +70,9 @@ class AdmissionGate(Protocol):
 
 
 class AdmissionExecutor(Protocol):
-    def __call__(self, admission: AdmissionRecord, operation: str) -> Mapping[str, object]:
+    def __call__(
+        self, admission: AdmissionRecord, operation: str
+    ) -> Mapping[str, object]:
         """Invoke an existing low-level operation after all gates pass."""
 
 
@@ -135,7 +139,11 @@ class ServerAdmissionRuntime:
             return self._deny("invalid_admission_state")
         try:
             now = self._now()
-            if not isinstance(now, datetime) or now.tzinfo is None or admission.is_expired(now):
+            if (
+                not isinstance(now, datetime)
+                or now.tzinfo is None
+                or admission.is_expired(now)
+            ):
                 return self._deny("admission_expired")
         except (TypeError, ValueError, OverflowError):
             return self._deny("runtime_clock_unavailable")
@@ -168,7 +176,9 @@ class ServerAdmissionRuntime:
             return self._deny("invalid_admission_state")
         return self._revalidate_pool_authority(admission)
 
-    def execute(self, admission: AdmissionRecord, operation: str) -> Mapping[str, object]:
+    def execute(
+        self, admission: AdmissionRecord, operation: str
+    ) -> Mapping[str, object]:
         """Consume a successful revalidation and call the injected executor once."""
 
         if not isinstance(admission, AdmissionRecord):
@@ -191,7 +201,13 @@ class ServerAdmissionRuntime:
         if self._completion_journal is not None:
             try:
                 self._completion_journal.record_started(admission, operation)
-            except (CompletionJournalError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            except (
+                CompletionJournalError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
                 raise AdmissionRuntimeError("completion_journal_unavailable") from exc
         with self._lock:
             if self._revalidated.get(admission.admission_id) != revalidated_revision:
@@ -207,7 +223,13 @@ class ServerAdmissionRuntime:
         if self._completion_journal is not None:
             try:
                 self._completion_journal.record_completed(admission, operation, result)
-            except (CompletionJournalError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            except (
+                CompletionJournalError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
                 raise AdmissionRuntimeError("completion_journal_unavailable") from exc
         return dict(result)
 
@@ -217,7 +239,13 @@ class ServerAdmissionRuntime:
         if self._completion_journal is not None:
             try:
                 return self._completion_journal.execution_completed(admission) is True
-            except (CompletionJournalError, OSError, RuntimeError, TypeError, ValueError):
+            except (
+                CompletionJournalError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
                 return False
         if not callable(self._execution_completed):
             return False

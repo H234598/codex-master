@@ -182,9 +182,9 @@ def synthetic_plan(manifest, before, *, before_digest, action):
             "preserve_vault_data": True,
         },
     }
-    canonical = json.dumps(
-        payload, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return RemoteQueenSyncthingVaultPlanV1(
         schema_version="RemoteQueenSyncthingVaultPlanV1",
         manifest=manifest,
@@ -222,9 +222,7 @@ class MemoryOperations:
             preserve_vault_data=True,
         )
 
-    def rollback_configuration(
-        self, plan, journal, *, preserve_vault_data
-    ):
+    def rollback_configuration(self, plan, journal, *, preserve_vault_data):
         self.calls.append(("rollback_configuration", preserve_vault_data))
         if not preserve_vault_data:
             raise AssertionError("rollback must preserve vault data")
@@ -244,9 +242,7 @@ class RaisingOperations:
         self.calls.append("apply_configuration")
         raise ValueError(self.error_text)
 
-    def rollback_configuration(
-        self, plan, journal, *, preserve_vault_data
-    ):
+    def rollback_configuration(self, plan, journal, *, preserve_vault_data):
         self.calls.append("rollback_configuration")
         raise ValueError(self.error_text)
 
@@ -295,8 +291,7 @@ def test_manifest_constants_are_closed_and_sidecar_is_explicit():
 def test_sidecar_pattern_is_not_shadowed_by_any_exclude():
     sidecar_prefix = ANNOTATION_SIDECAR_PATTERN.removesuffix("**")
     assert all(
-        not excluded.startswith(sidecar_prefix)
-        for excluded in VAULT_EXCLUDED_PATHS
+        not excluded.startswith(sidecar_prefix) for excluded in VAULT_EXCLUDED_PATHS
     )
 
 
@@ -309,7 +304,10 @@ def test_manifest_has_exact_writer_grants_and_closed_policy():
         ),
         SingleWriterGrantV1(
             writer_id=VaultWriterIdV1.INTEGRATION_QUEEN,
-            scopes=(VaultWriteScopeV1.MASTER_PLAN, VaultWriteScopeV1.REMOTE_BOOTSTRAP_PLAN),
+            scopes=(
+                VaultWriteScopeV1.MASTER_PLAN,
+                VaultWriteScopeV1.REMOTE_BOOTSTRAP_PLAN,
+            ),
         ),
     )
     assert manifest.versioning_enabled is True
@@ -442,9 +440,7 @@ def test_manifest_rejects_malformed_digest_generation_and_tuple_inputs():
 def test_plan_absent_creates_configuration_and_fixed_before_digest():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     assert plan.action is SyncthingVaultActionV1.CREATE_CONFIGURATION
     assert plan.before == absent_snapshot()
     assert plan.before_digest == (
@@ -499,9 +495,7 @@ def test_plan_dict_is_complete_literal():
 def test_plan_exact_owned_state_is_noop():
     manifest = build_manifest()
     operations = MemoryOperations(owned_snapshot(manifest))
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     assert plan.action is None
     assert operations.calls == ["inspect"]
 
@@ -517,9 +511,7 @@ def test_plan_owned_older_generation_replaces_without_delete_action():
             device_binding_sha256="d" * 64,
         )
     )
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     assert plan.action is SyncthingVaultActionV1.REPLACE_OWNED_CONFIGURATION
     assert "delete" not in plan.action.value
 
@@ -602,9 +594,7 @@ def test_disabled_gui_and_ipv6_loopback_are_safe_policy_states():
     manifest = build_manifest()
     disabled = MemoryOperations(absent_snapshot(enabled=False, listen_address=None))
     assert (
-        plan_remote_queen_syncthing_vault(
-            manifest=manifest, operations=disabled
-        ).action
+        plan_remote_queen_syncthing_vault(manifest=manifest, operations=disabled).action
         is SyncthingVaultActionV1.CREATE_CONFIGURATION
     )
     ipv6 = MemoryOperations(
@@ -614,18 +604,14 @@ def test_disabled_gui_and_ipv6_loopback_are_safe_policy_states():
         )
     )
     assert (
-        plan_remote_queen_syncthing_vault(
-            manifest=manifest, operations=ipv6
-        ).action
+        plan_remote_queen_syncthing_vault(manifest=manifest, operations=ipv6).action
         is SyncthingVaultActionV1.CREATE_CONFIGURATION
     )
 
 
 def test_plan_conflicts_block():
     manifest = build_manifest()
-    operations = MemoryOperations(
-        owned_snapshot(manifest, unresolved_conflicts=1)
-    )
+    operations = MemoryOperations(owned_snapshot(manifest, unresolved_conflicts=1))
     assert_code(
         lambda: plan_remote_queen_syncthing_vault(
             manifest=manifest, operations=operations
@@ -681,9 +667,7 @@ def test_plan_operations_exception_is_redacted():
     sentinel = "secret-rb5-do-not-retain"
     operations = RaisingOperations(sentinel)
     with pytest.raises(RemoteQueenBootstrapError) as error:
-        plan_remote_queen_syncthing_vault(
-            manifest=manifest, operations=operations
-        )
+        plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     assert error.value.code == "RQ_E_VAULT_CONFLICT"
     assert str(error.value) == "RQ_E_VAULT_CONFLICT"
     assert sentinel not in str(error.value)
@@ -692,9 +676,7 @@ def test_plan_operations_exception_is_redacted():
 def test_apply_request_drift_happens_before_apply_call():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     operations.calls.clear()
     request = SyncthingVaultApplyRequestV1(
         generation=plan.manifest.desired_generation.generation,
@@ -713,9 +695,7 @@ def test_apply_request_drift_happens_before_apply_call():
 def test_apply_noop_inspects_once_without_configuration_call():
     manifest = build_manifest()
     operations = MemoryOperations(owned_snapshot(manifest))
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     operations.calls.clear()
     request = SyncthingVaultApplyRequestV1(
         generation=manifest.desired_generation.generation,
@@ -736,9 +716,7 @@ def test_apply_noop_inspects_once_without_configuration_call():
 def test_apply_success_has_exact_call_order_journal_and_attestation():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     operations.calls.clear()
     request = SyncthingVaultApplyRequestV1(
         generation=manifest.desired_generation.generation,
@@ -763,9 +741,7 @@ def test_apply_success_has_exact_call_order_journal_and_attestation():
 def test_plan_after_apply_is_idempotent_noop():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     request = SyncthingVaultApplyRequestV1(
         generation=manifest.desired_generation.generation,
         manifest_digest=manifest.manifest_digest,
@@ -822,27 +798,21 @@ def test_verify_request_drift_has_no_operation_call():
         (
             lambda snapshot: dataclasses.replace(
                 snapshot,
-                gui=SyncthingGuiFactV1(
-                    enabled=True, listen_address="0.0.0.0:8384"
-                ),
+                gui=SyncthingGuiFactV1(enabled=True, listen_address="0.0.0.0:8384"),
             ),
             "RQ_E_FOREIGN_STATE",
         ),
         (
             lambda snapshot: dataclasses.replace(
                 snapshot,
-                folder=dataclasses.replace(
-                    snapshot.folder, sync_complete=False
-                ),
+                folder=dataclasses.replace(snapshot.folder, sync_complete=False),
             ),
             "RQ_E_VAULT_CONFLICT",
         ),
         (
             lambda snapshot: dataclasses.replace(
                 snapshot,
-                folder=dataclasses.replace(
-                    snapshot.folder, unresolved_conflicts=1
-                ),
+                folder=dataclasses.replace(snapshot.folder, unresolved_conflicts=1),
             ),
             "RQ_E_VAULT_CONFLICT",
         ),
@@ -906,9 +876,7 @@ def test_verify_every_attestation_deviation_blocks(mutator, expected_code):
 def test_rollback_restores_exact_prior_snapshot_and_preserves_vault_data():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     apply_request = SyncthingVaultApplyRequestV1(
         generation=manifest.desired_generation.generation,
         manifest_digest=manifest.manifest_digest,
@@ -945,9 +913,7 @@ def test_rollback_rejects_synthetic_noop_journal_without_operations():
     manifest = build_manifest()
     current = owned_snapshot(manifest)
     operations = MemoryOperations(current)
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     assert plan.action is None
     journal = SyncthingVaultApplyJournalV1(
         schema_version="SyncthingVaultApplyJournalV1",
@@ -979,9 +945,7 @@ def test_rollback_rejects_synthetic_noop_journal_without_operations():
 def test_rollback_drift_does_not_call_configuration():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     request = SyncthingVaultApplyRequestV1(
         generation=manifest.desired_generation.generation,
         manifest_digest=manifest.manifest_digest,
@@ -1012,9 +976,7 @@ def test_rollback_drift_does_not_call_configuration():
 def test_rollback_foreign_or_unknown_generation_does_not_call_configuration():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     apply_request = SyncthingVaultApplyRequestV1(
         generation=manifest.desired_generation.generation,
         manifest_digest=manifest.manifest_digest,
@@ -1052,9 +1014,7 @@ def test_rollback_foreign_or_unknown_generation_does_not_call_configuration():
 def test_malformed_journal_is_redacted_and_no_rollback_call():
     manifest = build_manifest()
     operations = MemoryOperations(absent_snapshot())
-    plan = plan_remote_queen_syncthing_vault(
-        manifest=manifest, operations=operations
-    )
+    plan = plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
     sentinel = "device-id-rb5-do-not-retain"
     journal = SyncthingVaultApplyJournalV1(
         schema_version="SyncthingVaultApplyJournalV1",
@@ -1099,9 +1059,13 @@ def test_operations_exceptions_are_redacted_during_apply_and_rollback():
 def test_runtime_operations_touch_no_files_or_processes(tmp_path):
     manifest = build_manifest(remote_home=str(tmp_path / "queen"))
     operations = MemoryOperations(absent_snapshot())
-    before = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    before = sorted(
+        path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
+    )
     plan_remote_queen_syncthing_vault(manifest=manifest, operations=operations)
-    after = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    after = sorted(
+        path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
+    )
     assert before == after == []
     assert operations.calls == ["inspect"]
 
@@ -1117,10 +1081,7 @@ def dotted_name(node):
 
 def test_import_gate_has_no_forbidden_imports_or_calls():
     source_path = (
-        Path(__file__).parents[1]
-        / "src"
-        / "the_hive"
-        / "remote_queen_syncthing.py"
+        Path(__file__).parents[1] / "src" / "the_hive" / "remote_queen_syncthing.py"
     )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     forbidden_namespaces = {
@@ -1242,15 +1203,14 @@ def test_public_dataclasses_have_no_secret_fields():
         for field in dataclasses.fields(public_type):
             if field.name == "device_binding_sha256":
                 continue
-            assert not any(fragment in field.name.lower() for fragment in forbidden_fragments)
+            assert not any(
+                fragment in field.name.lower() for fragment in forbidden_fragments
+            )
 
 
 def test_vault_unchanged_and_no_live_command_strings():
     source_path = (
-        Path(__file__).parents[1]
-        / "src"
-        / "the_hive"
-        / "remote_queen_syncthing.py"
+        Path(__file__).parents[1] / "src" / "the_hive" / "remote_queen_syncthing.py"
     )
     source = source_path.read_text(encoding="utf-8").lower()
     assert "systemctl" not in source

@@ -163,7 +163,14 @@ class MetricPolicy:
 
         if self.role in _FIXED_POLICIES:
             expected = _FIXED_POLICIES[self.role]
-            actual = (self.family, self.direction, tau, enter, release, self.admission_enabled)
+            actual = (
+                self.family,
+                self.direction,
+                tau,
+                enter,
+                release,
+                self.admission_enabled,
+            )
             if any(
                 not _same_number(actual_value, expected_value)
                 if isinstance(actual_value, (float, type(None)))
@@ -401,12 +408,10 @@ class MetricState:
     def release_threshold(self) -> float | None:
         return self.policy.release_threshold
 
-    def _invalidated(self, observed_at_ns: object, reason: InterlockReason) -> MetricState:
-        observed = (
-            observed_at_ns
-            if _is_timestamp(observed_at_ns)
-            else None
-        )
+    def _invalidated(
+        self, observed_at_ns: object, reason: InterlockReason
+    ) -> MetricState:
+        observed = observed_at_ns if _is_timestamp(observed_at_ns) else None
         return MetricState(
             policy=self.policy,
             raw=None,
@@ -427,7 +432,9 @@ class MetricState:
         if (
             not _is_finite_number(raw)
             or not _is_timestamp(observed_at_ns)
-            or (interlock is not None and not _interlock_allowed(self.policy, interlock))
+            or (
+                interlock is not None and not _interlock_allowed(self.policy, interlock)
+            )
         ):
             return self._invalidated(observed_at_ns, "invalid_evidence")
 
@@ -561,7 +568,10 @@ class ResourceEMAAdmissionV1:
 
     def _replace_metric(self, updated: MetricState) -> ResourceEMAAdmissionV1:
         return ResourceEMAAdmissionV1(
-            tuple(updated if metric.role == updated.role else metric for metric in self.metrics)
+            tuple(
+                updated if metric.role == updated.role else metric
+                for metric in self.metrics
+            )
         )
 
     def observe(
@@ -655,7 +665,11 @@ class ResourceEMAAdmissionV1:
             )
         try:
             encoded = json.dumps(
-                {"metrics": metrics, "schema": SCHEMA_NAME, "schema_version": SCHEMA_VERSION},
+                {
+                    "metrics": metrics,
+                    "schema": SCHEMA_NAME,
+                    "schema_version": SCHEMA_VERSION,
+                },
                 allow_nan=False,
                 ensure_ascii=True,
                 separators=(",", ":"),
@@ -669,7 +683,11 @@ class ResourceEMAAdmissionV1:
 
     @classmethod
     def from_json(cls, payload: bytes) -> ResourceEMAAdmissionV1:
-        if not isinstance(payload, bytes) or not payload or len(payload) > MAX_SNAPSHOT_BYTES:
+        if (
+            not isinstance(payload, bytes)
+            or not payload
+            or len(payload) > MAX_SNAPSHOT_BYTES
+        ):
             _invalid()
 
         def object_pairs(pairs: list[tuple[object, object]]) -> dict[str, object]:
@@ -697,7 +715,10 @@ class ResourceEMAAdmissionV1:
             "schema_version",
         }:
             _invalid()
-        if document["schema"] != SCHEMA_NAME or document["schema_version"] != SCHEMA_VERSION:
+        if (
+            document["schema"] != SCHEMA_NAME
+            or document["schema_version"] != SCHEMA_VERSION
+        ):
             _invalid()
         if type(document["schema_version"]) is not int:
             _invalid()
@@ -749,7 +770,9 @@ class ResourceEMAAdmissionV1:
             _invalid()
         active = interlock["active"]
         reason = interlock["reason"]
-        if type(active) is not bool or (reason is not None and not isinstance(reason, str)):
+        if type(active) is not bool or (
+            reason is not None and not isinstance(reason, str)
+        ):
             _invalid()
         if active != (reason is not None):
             _invalid()

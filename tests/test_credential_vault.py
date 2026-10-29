@@ -68,7 +68,9 @@ def test_cleanup_target_repr_and_legacy_temporary_metadata_are_sparse_and_strict
     temporary.write_bytes(b"legacy")
     temporary.chmod(0o600)
     target = CredentialCleanupTarget(
-        str(tmp_path), CredentialVault._raw_directory_metadata(tmp_path.stat()), temporary.name
+        str(tmp_path),
+        CredentialVault._raw_directory_metadata(tmp_path.stat()),
+        temporary.name,
     )
 
     assert repr(target) == "CredentialCleanupTarget(<redacted>)"
@@ -120,7 +122,9 @@ def test_fork_invalidation_rotates_issuer_and_owner_liveness_is_bound(
         "owner_pid": 12345,
         "owner_start_ticks": 7,
     }
-    monkeypatch.setattr(CredentialVault, "_process_start_ticks", staticmethod(lambda _pid: 8))
+    monkeypatch.setattr(
+        CredentialVault, "_process_start_ticks", staticmethod(lambda _pid: 8)
+    )
 
     assert vault._claim_owner_dead(claim) is True
     credential_vault._invalidate_vaults_after_fork()

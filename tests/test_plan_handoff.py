@@ -6,9 +6,7 @@ from pathlib import Path
 import pytest
 
 
-MODULE = runpy.run_path(
-    Path(__file__).parents[1] / "bin/the-hive-publish-plan-path"
-)
+MODULE = runpy.run_path(Path(__file__).parents[1] / "bin/the-hive-publish-plan-path")
 
 
 def test_handoff_has_thirty_additional_message_principles():

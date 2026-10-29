@@ -1299,7 +1299,6 @@ def test_payload_reference_grammar_accepts_only_safe_kind_specific_references(
 
 
 def test_event_redacts_secret_classification_and_unsafe_scopes() -> None:
-
     with pytest.raises(HiveBusContractError, match="BUS_E_SECRET_CLASSIFICATION"):
         _build_event(_publish_request() | {"classification": "secret"})
 

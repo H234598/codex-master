@@ -103,7 +103,11 @@ class AgentHttpApplication:
     ) -> AgentHttpResponse:
         if type(principal) is not AgentPrincipalV1:
             return _problem(403, "agent.identity_invalid")
-        if type(method) is not str or type(target) is not str or type(body) is not bytes:
+        if (
+            type(method) is not str
+            or type(target) is not str
+            or type(body) is not bytes
+        ):
             return _problem(400, "agent.request_invalid")
         if len(body) > MAX_AGENT_BODY_BYTES:
             return _problem(413, "agent.request_too_large")
@@ -180,7 +184,11 @@ class AgentHttpApplication:
                 self._store.complete(_operation_principal(principal), receipt)
             return _response(
                 200,
-                {"schema_version": 1, "operation_id": receipt.operation_id, "accepted": True},
+                {
+                    "schema_version": 1,
+                    "operation_id": receipt.operation_id,
+                    "accepted": True,
+                },
             )
         except AgentOperationError as error:
             if error.code in {
@@ -207,7 +215,13 @@ class AgentHttpApplication:
             }:
                 return _problem(409, error.code)
             return _problem(400, "agent.request_invalid")
-        except (AgentContractError, UnicodeError, ValueError, TypeError, RecursionError):
+        except (
+            AgentContractError,
+            UnicodeError,
+            ValueError,
+            TypeError,
+            RecursionError,
+        ):
             return _problem(400, "agent.request_invalid")
 
     @staticmethod
@@ -232,9 +246,7 @@ def _operation_principal(principal: AgentPrincipalV1) -> OperationPrincipalV1:
     )
 
 
-def _authoritative_poll(
-    principal: AgentPrincipalV1, poll: AgentPollV1
-) -> AgentPollV1:
+def _authoritative_poll(principal: AgentPrincipalV1, poll: AgentPollV1) -> AgentPollV1:
     if poll.lease_epoch != principal.lease_epoch:
         raise AgentOperationError("host.lease_epoch_stale")
     if poll.registry_generation > principal.registry_generation:

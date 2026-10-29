@@ -307,14 +307,20 @@ def test_core_reactivates_only_pinned_sessionstart_resume(tmp_path: Path) -> Non
 def test_core_accepts_documented_first_sessionstart_sources(
     tmp_path: Path, source: str
 ) -> None:
-    _installer_value, release_root, plugin_root, abi_root, state_root = _fixture(tmp_path)
+    _installer_value, release_root, plugin_root, abi_root, state_root = _fixture(
+        tmp_path
+    )
     result = _dispatch(
         release_root=release_root,
         plugin_root=plugin_root,
         abi_root=abi_root,
         state_root=state_root,
         payload=json.dumps(
-            {"session_id": "session-one", "hook_event_name": "SessionStart", "source": source}
+            {
+                "session_id": "session-one",
+                "hook_event_name": "SessionStart",
+                "source": source,
+            }
         ).encode(),
         now=10,
     )

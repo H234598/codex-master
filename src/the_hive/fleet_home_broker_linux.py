@@ -71,17 +71,15 @@ class AgentStartPeerObservation:
 
 
 class LinuxOperations(Protocol):
-    def openat2(self, parent_fd: int, child_name: str, flags: int, resolve: int) -> int:
-        ...
+    def openat2(
+        self, parent_fd: int, child_name: str, flags: int, resolve: int
+    ) -> int: ...
 
-    def fstat(self, fd: int) -> FdStat:
-        ...
+    def fstat(self, fd: int) -> FdStat: ...
 
-    def close(self, fd: int) -> None:
-        ...
+    def close(self, fd: int) -> None: ...
 
-    def pidfd_open(self, pid: int, flags: int) -> int:
-        ...
+    def pidfd_open(self, pid: int, flags: int) -> int: ...
 
     def pidfd_reuse_check(
         self,
@@ -90,18 +88,15 @@ class LinuxOperations(Protocol):
         proc_fd: int | None,
         cgroup_fd: int | None,
         identity: PidfdIdentity | None,
-    ) -> PidfdIdentity:
-        ...
+    ) -> PidfdIdentity: ...
 
     def open_pinned_proc_pid(
         self, pidfd: int, pid: int, identity: PidfdIdentity
-    ) -> int:
-        ...
+    ) -> int: ...
 
     def open_proc_cgroup(
         self, pidfd: int, proc_fd: int, identity: PidfdIdentity
-    ) -> int:
-        ...
+    ) -> int: ...
 
     def read_proc_control_group(
         self,
@@ -110,28 +105,23 @@ class LinuxOperations(Protocol):
         cgroup_fd: int,
         cgroup_dev: int,
         cgroup_ino: int,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     def read_pid1_unit_name(
         self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
-    ) -> str:
-        ...
+    ) -> str: ...
 
     def read_pid1_unit_generation(
         self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
-    ) -> int:
-        ...
+    ) -> int: ...
 
     def read_pid1_invocation_id(
         self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
-    ) -> str:
-        ...
+    ) -> str: ...
 
     def read_pid1_control_group(
         self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
-    ) -> str:
-        ...
+    ) -> str: ...
 
     def read_peer_mcs_pair(
         self,
@@ -140,8 +130,7 @@ class LinuxOperations(Protocol):
         cgroup_fd: int,
         cgroup_dev: int,
         cgroup_ino: int,
-    ) -> str:
-        ...
+    ) -> str: ...
 
 
 _OPENAT2_FLAGS = 0o10000000 | 0o200000 | 0o400000 | 0o2000000
@@ -171,7 +160,9 @@ def _validate_directory_identity(value: object) -> DirectoryIdentity:
         raise LinuxBoundaryError("expected directory identity is invalid")
     _strict_integer(value.dev, "directory dev", 0, MAX_CHPB_DEVICE)
     _strict_integer(value.ino, "directory ino", 1, MAX_CHPB_INODE)
-    _strict_integer(value.mode, "directory mode", SAFE_DIRECTORY_MODE, SAFE_DIRECTORY_MODE)
+    _strict_integer(
+        value.mode, "directory mode", SAFE_DIRECTORY_MODE, SAFE_DIRECTORY_MODE
+    )
     return value
 
 
@@ -246,9 +237,7 @@ def _pidfd_guard(
     return observed
 
 
-def _validate_observed_peer_snapshot(
-    value: object, peer_pid: int
-) -> PeerSnapshot:
+def _validate_observed_peer_snapshot(value: object, peer_pid: int) -> PeerSnapshot:
     if type(value) is not PeerSnapshot:
         raise LinuxBoundaryError("peer snapshot is invalid")
     _positive_integer(value.pid, "snapshot pid")
@@ -403,9 +392,7 @@ def _observe_peer_snapshot_with_identity(
             operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
         )
         unit_name = _strict_text(
-            operations.read_pid1_unit_name(
-                pidfd, cgroup_fd, cgroup_dev, cgroup_ino
-            ),
+            operations.read_pid1_unit_name(pidfd, cgroup_fd, cgroup_dev, cgroup_ino),
             "PID-1 unit name",
         )
         if "/" in unit_name:
@@ -656,9 +643,7 @@ def _observe_agent_start_peer_with_identity(
             operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
         )
         unit_name = _strict_text(
-            operations.read_pid1_unit_name(
-                pidfd, cgroup_fd, cgroup_dev, cgroup_ino
-            ),
+            operations.read_pid1_unit_name(pidfd, cgroup_fd, cgroup_dev, cgroup_ino),
             "PID-1 unit name",
         )
         if "/" in unit_name:

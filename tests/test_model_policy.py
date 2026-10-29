@@ -13,25 +13,48 @@ from the_hive.selection.model_policy import (
 )
 
 
-def test_model_policy_resolves_exact_ids_and_aliases_without_duplicate_budget_keys() -> None:
-    registry = ModelPolicyRegistry((ModelDefinition("gpt-primary", ("primary",), "primary", "openai", ("tools",), "standard"),))
+def test_model_policy_resolves_exact_ids_and_aliases_without_duplicate_budget_keys() -> (
+    None
+):
+    registry = ModelPolicyRegistry(
+        (
+            ModelDefinition(
+                "gpt-primary", ("primary",), "primary", "openai", ("tools",), "standard"
+            ),
+        )
+    )
     assert registry.get_exact("gpt-primary").role == "primary"
     assert registry.resolve_alias("primary").model_id == "gpt-primary"
     with pytest.raises(ModelPolicyError, match="duplicate_model_id_or_alias"):
-        ModelPolicyRegistry((
-            ModelDefinition("gpt-primary", ("same",), "primary", "openai", (), "standard"),
-            ModelDefinition("spark", ("same",), "secondary_simple", "openai", (), "spark"),
-        ))
+        ModelPolicyRegistry(
+            (
+                ModelDefinition(
+                    "gpt-primary", ("same",), "primary", "openai", (), "standard"
+                ),
+                ModelDefinition(
+                    "spark", ("same",), "secondary_simple", "openai", (), "spark"
+                ),
+            )
+        )
     with pytest.raises(ModelPolicyError, match="duplicate_model_id_or_alias"):
-        ModelPolicyRegistry((
-            ModelDefinition("gpt-primary", (), "primary", "openai", (), "shared"),
-            ModelDefinition("spark", (), "secondary_simple", "openai", (), "shared"),
-        ))
+        ModelPolicyRegistry(
+            (
+                ModelDefinition("gpt-primary", (), "primary", "openai", (), "shared"),
+                ModelDefinition(
+                    "spark", (), "secondary_simple", "openai", (), "shared"
+                ),
+            )
+        )
 
 
-def test_model_policy_loader_rejects_unknown_fields_and_loads_strict_document(tmp_path: Path) -> None:
+def test_model_policy_loader_rejects_unknown_fields_and_loads_strict_document(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "policy.json"
-    path.write_text('{"schema_version":1,"models":[{"model_id":"gpt-primary","aliases":[],"role":"primary","provider":"openai","capabilities":["tools"],"budget_key":"standard"}]}', encoding="utf-8")
+    path.write_text(
+        '{"schema_version":1,"models":[{"model_id":"gpt-primary","aliases":[],"role":"primary","provider":"openai","capabilities":["tools"],"budget_key":"standard"}]}',
+        encoding="utf-8",
+    )
     assert load_model_policy(path).get_exact("gpt-primary") is not None
     path.write_text('{"schema_version":1,"models":[],"secret":"no"}', encoding="utf-8")
     with pytest.raises(ModelPolicyError, match="invalid_model_policy"):
@@ -39,7 +62,9 @@ def test_model_policy_loader_rejects_unknown_fields_and_loads_strict_document(tm
 
 
 def test_model_policy_loads_resolver_metadata() -> None:
-    registry = load_model_policy(Path(__file__).resolve().parents[1] / "codex-model-policy.json")
+    registry = load_model_policy(
+        Path(__file__).resolve().parents[1] / "codex-model-policy.json"
+    )
 
     sol = registry.get_exact("gpt-6-sol")
     assert sol is not None
@@ -53,15 +78,23 @@ def test_model_policy_loads_resolver_metadata() -> None:
 
 def test_model_policy_bytes_loader_matches_the_strict_path_loader() -> None:
     path = Path(__file__).resolve().parents[1] / "codex-model-policy.json"
-    assert load_model_policy_bytes(path.read_bytes()).public() == load_model_policy(path).public()
+    assert (
+        load_model_policy_bytes(path.read_bytes()).public()
+        == load_model_policy(path).public()
+    )
 
 
-def test_active_policy_does_not_turn_a_spark_id_only_availability_into_an_offer() -> None:
+def test_active_policy_does_not_turn_a_spark_id_only_availability_into_an_offer() -> (
+    None
+):
     root = Path(__file__).resolve().parents[1]
     active_policy = root / "codex-model-policy.json"
     registry = load_model_policy(active_policy)
 
-    assert active_policy.read_bytes() == (root / "examples/codex-model-policy.json").read_bytes()
+    assert (
+        active_policy.read_bytes()
+        == (root / "examples/codex-model-policy.json").read_bytes()
+    )
     assert registry.get_exact("gpt-5.3-codex-spark") is None
     assert registry.resolve_alias("spark") is None
     assert all(item["family"] != "spark" for item in registry.public())

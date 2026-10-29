@@ -235,9 +235,7 @@ class _ConsumerDynamicTeamleadRunnerExecutor:
     def __init__(self) -> None:
         raise TypeError("root_dynamic_teamlead_runner_executor_factory_required")
 
-    def execute_dynamic_teamlead_runner(
-        self, plan: DynamicTeamleadRunnerPlan
-    ) -> None:
+    def execute_dynamic_teamlead_runner(self, plan: DynamicTeamleadRunnerPlan) -> None:
         try:
             consumer = self._consumer
         except AttributeError:
@@ -421,18 +419,17 @@ class _RootDynamicTeamleadStartControl(_NonTransferable):
                     for record in consumer._runner_records.values()
                 ):
                     raise ValueError
-            composition = (
-                consumer.issue_root_owned_dynamic_teamlead_start_composition(
-                    context,
-                    registry_operations,
-                    broker_operations,
-                    operations,
-                )
+            composition = consumer.issue_root_owned_dynamic_teamlead_start_composition(
+                context,
+                registry_operations,
+                broker_operations,
+                operations,
             )
             port = build_root_owned_dynamic_teamlead_start_port(composition)
             return _normalize_dynamic_teamlead_result(dynamic_teamlead_start(port))
         except BaseException:
             return _unavailable_dynamic_teamlead_result()
+
 
 class _PeerOperations(Protocol):
     def pidfd_open(self, pid: int) -> int: ...
@@ -467,9 +464,11 @@ _SYSCALL.argtypes = (
     ctypes.c_size_t,
 )
 _SYSCALL.restype = ctypes.c_long
-_OPENAT2_SYSCALL = 437 if (
-    platform.system() == "Linux" and platform.machine() in {"x86_64", "aarch64"}
-) else None
+_OPENAT2_SYSCALL = (
+    437
+    if (platform.system() == "Linux" and platform.machine() in {"x86_64", "aarch64"})
+    else None
+)
 
 
 def _fail(code: str) -> None:
@@ -1149,7 +1148,8 @@ class TrustedPrincipalGrantConsumer:
                 expectation,
                 tuple(getattr(identity, name) for name in BrokerIdentity.__slots__),
                 tuple(
-                    getattr(selection, name) for name in DynamicTeamleadRequest.__slots__
+                    getattr(selection, name)
+                    for name in DynamicTeamleadRequest.__slots__
                 ),
                 tuple(
                     getattr(profile_binding, name) for name in ProfileBinding.__slots__
@@ -1314,10 +1314,7 @@ class TrustedPrincipalGrantConsumer:
         operations: DynamicTeamleadRunnerOperations,
     ) -> RootDynamicTeamleadStartComposition:
         service = self._bound_service
-        if (
-            self._closed
-            or type(service) is not HomeBrokerControlService
-        ):
+        if self._closed or type(service) is not HomeBrokerControlService:
             _fail("dynamic_teamlead_runner_permit_invalid")
         try:
             execute = operations.execute
@@ -1461,9 +1458,7 @@ class TrustedPrincipalGrantConsumer:
                 _fail("trusted_consumer_cleanup_failed")
             _fail("trusted_consumer_start_failed")
         try:
-            receipt = self._boundary.compare_and_start(
-                plan, snapshot.token, ownership
-            )
+            receipt = self._boundary.compare_and_start(plan, snapshot.token, ownership)
         except BrokerSystemError:
             _fail("trusted_consumer_start_failed")
         except Exception:

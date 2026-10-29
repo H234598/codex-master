@@ -34,7 +34,12 @@ def _validate_digest(value: str) -> None:
 
 
 def _validate_text(value: str, *, maximum: int = 2048) -> None:
-    if not isinstance(value, str) or not value or len(value) > maximum or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or any(ord(char) < 32 for char in value)
+    ):
         raise TestEvidenceError("test.evidence_corrupt")
 
 
@@ -56,7 +61,10 @@ class EvidenceContextV1:
     def __post_init__(self) -> None:
         _validate_text(self.repository_id, maximum=128)
         _validate_text(self.test_id)
-        if not self.function_ids or tuple(sorted(set(self.function_ids))) != self.function_ids:
+        if (
+            not self.function_ids
+            or tuple(sorted(set(self.function_ids))) != self.function_ids
+        ):
             raise TestEvidenceError("test.evidence_corrupt")
         for function_id in self.function_ids:
             _validate_text(function_id)
@@ -128,7 +136,12 @@ class EvidenceReceiptV1:
             self.runner_version_digest,
             self.environment_digest,
         )
-        for value in (self.attempt_id, self.started_at, self.finished_at, self.reason_code):
+        for value in (
+            self.attempt_id,
+            self.started_at,
+            self.finished_at,
+            self.reason_code,
+        ):
             _validate_text(value, maximum=128)
         for value in (
             self.started_monotonic_ns,
@@ -140,9 +153,15 @@ class EvidenceReceiptV1:
                 raise TestEvidenceError("test.evidence_corrupt")
         if self.finished_monotonic_ns < self.started_monotonic_ns:
             raise TestEvidenceError("test.evidence_corrupt")
-        if self.result not in _RESULTS or self.cooldown_class not in _COOLDOWN_MAX_SECONDS:
+        if (
+            self.result not in _RESULTS
+            or self.cooldown_class not in _COOLDOWN_MAX_SECONDS
+        ):
             raise TestEvidenceError("test.evidence_corrupt")
-        maximum_expiry = self.finished_monotonic_ns + _COOLDOWN_MAX_SECONDS[self.cooldown_class] * 1_000_000_000
+        maximum_expiry = (
+            self.finished_monotonic_ns
+            + _COOLDOWN_MAX_SECONDS[self.cooldown_class] * 1_000_000_000
+        )
         if self.expires_monotonic_ns > maximum_expiry:
             raise TestEvidenceError("test.evidence_corrupt")
 
@@ -157,7 +176,13 @@ class EvidenceReceiptV1:
 
     def canonical_bytes(self) -> bytes:
         return (
-            json.dumps(self.public(), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
+            json.dumps(
+                self.public(),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             + "\n"
         ).encode("utf-8")
 
@@ -182,7 +207,11 @@ def evaluate_evidence_reuse(
     superseded: bool = False,
 ) -> EvidenceReuseDecision:
     """Return reuse only for fresh Passed evidence with every identity equal."""
-    if isinstance(now_monotonic_ns, bool) or not isinstance(now_monotonic_ns, int) or now_monotonic_ns < 0:
+    if (
+        isinstance(now_monotonic_ns, bool)
+        or not isinstance(now_monotonic_ns, int)
+        or now_monotonic_ns < 0
+    ):
         raise TestEvidenceError("test.evidence_corrupt")
     if mandatory_gate:
         return EvidenceReuseDecision("run", "test.gate_required", None, 0)
@@ -208,14 +237,18 @@ def evaluate_evidence_reuse(
         "runner_version_digest",
         "environment_digest",
     )
-    if any(getattr(receipt, field) != getattr(context, field) for field in identity_fields):
+    if any(
+        getattr(receipt, field) != getattr(context, field) for field in identity_fields
+    ):
         return EvidenceReuseDecision("run", "test.evidence_stale", None, 0)
     if higher_risk_context or revoked or ambiguous or superseded:
         return EvidenceReuseDecision("run", "test.evidence_stale", None, 0)
     if now_monotonic_ns >= receipt.expires_monotonic_ns:
         return EvidenceReuseDecision("run", "test.cooldown_expired", None, 0)
     remaining = (receipt.expires_monotonic_ns - now_monotonic_ns) // 1_000_000_000
-    return EvidenceReuseDecision("reuse", "test.evidence_reused", receipt.evidence_id, remaining)
+    return EvidenceReuseDecision(
+        "reuse", "test.evidence_reused", receipt.evidence_id, remaining
+    )
 
 
 __all__ = [

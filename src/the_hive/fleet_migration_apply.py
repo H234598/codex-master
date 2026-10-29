@@ -29,8 +29,12 @@ from .fleet_registry import (
 
 
 _QUEEN_SOURCE_IDS = ("g1", "h1", "i1", "j1", "k1", "l1", "m1", "n1", "o1", "p1")
-_QUEEN_SOURCE_DIGEST = "sha256:0576c50268031a46e5fb076f842669344b01285c77de737b5f7bc62329a9b49a"
-_EXCLUDED_AGENT_IDS = frozenset({"b1", "c1", "q1", "q2", "q3", "q-inplace", "running", "running1"})
+_QUEEN_SOURCE_DIGEST = (
+    "sha256:0576c50268031a46e5fb076f842669344b01285c77de737b5f7bc62329a9b49a"
+)
+_EXCLUDED_AGENT_IDS = frozenset(
+    {"b1", "c1", "q1", "q2", "q3", "q-inplace", "running", "running1"}
+)
 
 
 class GMigrationApplyError(ValueError):
@@ -136,7 +140,10 @@ def _inventory_shape_is_valid(
         position_items = tuple(inventory.positions.items())
     except Exception:
         return None
-    if any(type(key) is not str or type(value) is not AgentDescriptor for key, value in agent_items):
+    if any(
+        type(key) is not str or type(value) is not AgentDescriptor
+        for key, value in agent_items
+    ):
         return None
     if {key for key, _value in agent_items} != set(inventory.agent_ids):
         return None
@@ -159,9 +166,13 @@ def _inventory_shape_is_valid(
         for key, value in by_series_items
     ):
         return None
-    if any(type(key) is not str or type(value) is not int for key, value in position_items):
+    if any(
+        type(key) is not str or type(value) is not int for key, value in position_items
+    ):
         return None
-    if dict(position_items) != {agent_id: index for index, agent_id in enumerate(inventory.agent_ids)}:
+    if dict(position_items) != {
+        agent_id: index for index, agent_id in enumerate(inventory.agent_ids)
+    }:
         return None
 
     expected: dict[str, FleetSeries] = {}
@@ -187,8 +198,12 @@ def _inventory_shape_is_valid(
         return None
     if {key for key, _values in by_series_items} != expected_series_keys:
         return None
-    listed_by_series = tuple(agent_id for _key, values in by_series_items for agent_id in values)
-    if len(listed_by_series) != len(set(listed_by_series)) or set(listed_by_series) != set(inventory.agent_ids):
+    listed_by_series = tuple(
+        agent_id for _key, values in by_series_items for agent_id in values
+    )
+    if len(listed_by_series) != len(set(listed_by_series)) or set(
+        listed_by_series
+    ) != set(inventory.agent_ids):
         return None
     for agent_id, descriptor in agent_items:
         series = expected.get(agent_id)
@@ -209,7 +224,9 @@ def _inventory_shape_is_valid(
         for series in migration_snapshot.series
         for member in series.members
     }
-    if set(source_members) != set(expected) or set(source_members) != set(inventory.agent_ids):
+    if set(source_members) != set(expected) or set(source_members) != set(
+        inventory.agent_ids
+    ):
         return None
     return tuple(sorted(source_members))
 

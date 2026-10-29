@@ -46,15 +46,32 @@ _ALLOWED_HOOKS = frozenset({"native_bee_event", "native_spawn_admission"})
 def _invalid() -> HookSessionPinStoreError:
     return HookSessionPinStoreError("hook_session_pin_store_invalid")
 
+
 def _validated_retirement(value, *, expected_name):
-    if (not isinstance(value, dict) or set(value) != {"schema", "session_id", "original_sha256", "transaction_id",
-            "retired_at_unix_ns", "lifecycle_sha256", "content_digest"}
-            or value["schema"] != _RETIREMENT_SCHEMA or not _safe_session_id(value["session_id"])
-            or _binding_name(value["session_id"]) != expected_name
-            or not all(_safe_digest(value[x]) for x in ["original_sha256", "lifecycle_sha256", "content_digest"])
-            or not isinstance(value["transaction_id"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["transaction_id"])
-            or not _safe_time(value["retired_at_unix_ns"])
-            or value["content_digest"] != _content_digest(value)):
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema",
+            "session_id",
+            "original_sha256",
+            "transaction_id",
+            "retired_at_unix_ns",
+            "lifecycle_sha256",
+            "content_digest",
+        }
+        or value["schema"] != _RETIREMENT_SCHEMA
+        or not _safe_session_id(value["session_id"])
+        or _binding_name(value["session_id"]) != expected_name
+        or not all(
+            _safe_digest(value[x])
+            for x in ["original_sha256", "lifecycle_sha256", "content_digest"]
+        )
+        or not isinstance(value["transaction_id"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["transaction_id"])
+        or not _safe_time(value["retired_at_unix_ns"])
+        or value["content_digest"] != _content_digest(value)
+    ):
         raise _invalid()
     return value
 
@@ -500,7 +517,11 @@ class HookSessionPinStoreV1:
             existing = bindings.get(session_id)
             if existing is None:
                 try:
-                    os.stat(_binding_name(session_id), dir_fd=directory, follow_symlinks=False)
+                    os.stat(
+                        _binding_name(session_id),
+                        dir_fd=directory,
+                        follow_symlinks=False,
+                    )
                 except FileNotFoundError:
                     pass
                 else:
@@ -668,84 +689,162 @@ class HookSessionPinStoreV1:
     @staticmethod
     def cutover_exchange(request):
         """Only the immutable root ABI calls this with inherited journal capabilities."""
-        if os.geteuid() != 0 or set(request) != {"pin_fd", "backup_fd", "journal_fd", "lock_fd", "index", "locks", "journal_lock"}:
+        if os.geteuid() != 0 or set(request) != {
+            "pin_fd",
+            "backup_fd",
+            "journal_fd",
+            "lock_fd",
+            "index",
+            "locks",
+            "journal_lock",
+        }:
             raise _invalid()
-        pin, backup, journal, lock = [request[x] for x in ["pin_fd", "backup_fd", "journal_fd", "lock_fd"]]
+        pin, backup, journal, lock = [
+            request[x] for x in ["pin_fd", "backup_fd", "journal_fd", "lock_fd"]
+        ]
+
         def ident(item):
-            return [item.st_dev, item.st_ino, item.st_uid, item.st_gid, stat.S_IMODE(item.st_mode)]
-        if (os.readlink(f"/proc/self/fd/{pin}") != "/home/teladi/.local/state/the-hive/hook-session-pins-v1"
-                or ident(os.fstat(pin))[2:] != [0, 0, 0]
-                or ident(os.fstat(backup))[2:] != [0, 0, 0o700]
-                or ident(os.fstat(journal))[2:] != [0, 0, 0o700]
-                or os.readlink(f"/proc/self/fd/{backup}") != os.readlink(f"/proc/self/fd/{journal}") + "/pin-backups"
-                or os.fstat(pin).st_dev != os.fstat(backup).st_dev
-                or ident(os.fstat(lock))[2:] != [1000, 1000, 0o600]
-                or os.fstat(lock).st_nlink != 1
-                or ident(os.stat(_LOCK_NAME, dir_fd=pin, follow_symlinks=False)) != ident(os.fstat(lock))):
+            return [
+                item.st_dev,
+                item.st_ino,
+                item.st_uid,
+                item.st_gid,
+                stat.S_IMODE(item.st_mode),
+            ]
+
+        if (
+            os.readlink(f"/proc/self/fd/{pin}")
+            != "/home/teladi/.local/state/the-hive/hook-session-pins-v1"
+            or ident(os.fstat(pin))[2:] != [0, 0, 0]
+            or ident(os.fstat(backup))[2:] != [0, 0, 0o700]
+            or ident(os.fstat(journal))[2:] != [0, 0, 0o700]
+            or os.readlink(f"/proc/self/fd/{backup}")
+            != os.readlink(f"/proc/self/fd/{journal}") + "/pin-backups"
+            or os.fstat(pin).st_dev != os.fstat(backup).st_dev
+            or ident(os.fstat(lock))[2:] != [1000, 1000, 0o600]
+            or os.fstat(lock).st_nlink != 1
+            or ident(os.stat(_LOCK_NAME, dir_fd=pin, follow_symlinks=False))
+            != ident(os.fstat(lock))
+        ):
             raise _invalid()
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fd = os.open("journal.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=journal)
         try:
             meta = os.fstat(fd)
-            if not stat.S_ISREG(meta.st_mode) or ident(meta)[2:] != [0, 0, 0o600] or meta.st_nlink != 1 or meta.st_size > 8 * 1024 * 1024:
+            if (
+                not stat.S_ISREG(meta.st_mode)
+                or ident(meta)[2:] != [0, 0, 0o600]
+                or meta.st_nlink != 1
+                or meta.st_size > 8 * 1024 * 1024
+            ):
                 raise _invalid()
             raw = b""
             while chunk := os.read(fd, 65536):
                 raw += chunk
-            if ident(os.stat("journal.json", dir_fd=journal, follow_symlinks=False)) != ident(meta):
+            if ident(
+                os.stat("journal.json", dir_fd=journal, follow_symlinks=False)
+            ) != ident(meta):
                 raise _invalid()
         finally:
             os.close(fd)
         state = json.loads(raw, object_pairs_hook=_unique_object)
         receipt = state["quiescence"]
         entry = state["steps"][request["index"]]
-        if len(request["locks"]) != len(receipt["locks"]) or request["locks"][-1] != lock:
+        if (
+            len(request["locks"]) != len(receipt["locks"])
+            or request["locks"][-1] != lock
+        ):
             raise _invalid()
         for descriptor, item in zip(request["locks"], receipt["locks"]):
-            if os.readlink(f"/proc/self/fd/{descriptor}") != item["path"] or ident(os.fstat(descriptor)) != item["expected"]["id"]:
+            if (
+                os.readlink(f"/proc/self/fd/{descriptor}") != item["path"]
+                or ident(os.fstat(descriptor)) != item["expected"]["id"]
+            ):
                 raise _invalid()
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if ident(os.fstat(request["journal_lock"])) != ident(os.stat("lock", dir_fd=journal, follow_symlinks=False)):
+        if ident(os.fstat(request["journal_lock"])) != ident(
+            os.stat("lock", dir_fd=journal, follow_symlinks=False)
+        ):
             raise _invalid()
         fcntl.flock(request["journal_lock"], fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if (entry.get("kind") != "pin_retirement" or entry["status"] not in ["intent", "undo_intent"]
-                or state["phase"] not in ["inhibition", "rollback"]
-                or receipt["plan"] != state["plan"] or receipt["closed"] is not True
-                or receipt["scope"] != "forced_closed_Hive_writers_only"
-                or receipt["boot_id"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-                or not 0 <= time.time_ns() - receipt["at_unix_ns"] <= 60 * 1_000_000_000
-                or any(x["closed_identity"][2:] != [0, 0, 0] or ident(Path(x["path"]).lstat()) != x["closed_identity"] for x in receipt["fences"])):
+        if (
+            entry.get("kind") != "pin_retirement"
+            or entry["status"] not in ["intent", "undo_intent"]
+            or state["phase"] not in ["inhibition", "rollback"]
+            or receipt["plan"] != state["plan"]
+            or receipt["closed"] is not True
+            or receipt["scope"] != "forced_closed_Hive_writers_only"
+            or receipt["boot_id"]
+            != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            or not 0 <= time.time_ns() - receipt["at_unix_ns"] <= 60 * 1_000_000_000
+            or any(
+                x["closed_identity"][2:] != [0, 0, 0]
+                or ident(Path(x["path"]).lstat()) != x["closed_identity"]
+                for x in receipt["fences"]
+            )
+        ):
             raise _invalid()
         name, saved = Path(entry["path"]).name, Path(entry["stage"]).name
-        if (not _BINDING_NAME.fullmatch(name) or Path(entry["path"]).parent != Path(os.readlink(f"/proc/self/fd/{pin}"))
-                or Path(entry["stage"]).parent != Path(os.readlink(f"/proc/self/fd/{backup}"))
-                or saved != name or ident(os.fstat(pin)) != entry["parent"]
-                or ident(os.fstat(backup)) != entry["stage_parent"]):
+        if (
+            not _BINDING_NAME.fullmatch(name)
+            or Path(entry["path"]).parent != Path(os.readlink(f"/proc/self/fd/{pin}"))
+            or Path(entry["stage"]).parent
+            != Path(os.readlink(f"/proc/self/fd/{backup}"))
+            or saved != name
+            or ident(os.fstat(pin)) != entry["parent"]
+            or ident(os.fstat(backup)) != entry["stage_parent"]
+        ):
             raise _invalid()
+
         def read(directory):
             descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
             try:
                 before = os.fstat(descriptor)
                 data = os.read(descriptor, 65537)
-                if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or ident(before)[2:] != [1000, 1000, 0o600]
-                        or len(data) != before.st_size or len(data) > 65536
-                        or (before.st_mtime_ns, before.st_ctime_ns, ident(before)) !=
-                        (os.fstat(descriptor).st_mtime_ns, os.fstat(descriptor).st_ctime_ns, ident(os.fstat(descriptor)))
-                        or ident(os.stat(name, dir_fd=directory, follow_symlinks=False)) != ident(before)):
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_nlink != 1
+                    or ident(before)[2:] != [1000, 1000, 0o600]
+                    or len(data) != before.st_size
+                    or len(data) > 65536
+                    or (before.st_mtime_ns, before.st_ctime_ns, ident(before))
+                    != (
+                        os.fstat(descriptor).st_mtime_ns,
+                        os.fstat(descriptor).st_ctime_ns,
+                        ident(os.fstat(descriptor)),
+                    )
+                    or ident(os.stat(name, dir_fd=directory, follow_symlinks=False))
+                    != ident(before)
+                ):
                     raise _invalid()
-                return {"id": ident(before), "sha256": hashlib.sha256(data).hexdigest()}, json.loads(data, object_pairs_hook=_unique_object)
+                return {
+                    "id": ident(before),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }, json.loads(data, object_pairs_hook=_unique_object)
             finally:
                 os.close(descriptor)
+
         live, live_value = read(pin)
         stored, stored_value = read(backup)
-        expected = (entry["before"], entry["after"]) if entry["status"] == "intent" else (entry["after"], entry["before"])
+        expected = (
+            (entry["before"], entry["after"])
+            if entry["status"] == "intent"
+            else (entry["after"], entry["before"])
+        )
         if (live, stored) != expected:
             raise _invalid()
-        original, tombstone = (live_value, stored_value) if entry["status"] == "intent" else (stored_value, live_value)
+        original, tombstone = (
+            (live_value, stored_value)
+            if entry["status"] == "intent"
+            else (stored_value, live_value)
+        )
         _validated_binding(original, expected_name=name)
         _validated_retirement(tombstone, expected_name=name)
-        if (original["session_id"] != tombstone["session_id"] or tombstone["transaction_id"] != state["plan"]
-                or tombstone["original_sha256"] != "sha256:" + entry["before"]["sha256"]):
+        if (
+            original["session_id"] != tombstone["session_id"]
+            or tombstone["transaction_id"] != state["plan"]
+            or tombstone["original_sha256"] != "sha256:" + entry["before"]["sha256"]
+        ):
             raise _invalid()
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.renameat2(pin, name.encode(), backup, saved.encode(), 2):

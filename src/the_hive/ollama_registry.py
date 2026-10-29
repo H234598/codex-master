@@ -143,7 +143,9 @@ class OllamaInstanceV1:
         if (
             not isinstance(self.selected_model_refs, tuple)
             or not self.selected_model_refs
-            or any(not isinstance(ref, str) or not ref for ref in self.selected_model_refs)
+            or any(
+                not isinstance(ref, str) or not ref for ref in self.selected_model_refs
+            )
             or len(set(self.selected_model_refs)) != len(self.selected_model_refs)
             or type(self.cpu_quota_percent) is not int
             or self.cpu_quota_percent < 1
@@ -169,12 +171,16 @@ class OllamaRegistryV1:
             _fail("ollama.registry_schema_invalid")
         if not all(isinstance(model, OllamaModelV1) for model in self.models):
             _fail("ollama.registry_schema_invalid")
-        if not all(isinstance(instance, OllamaInstanceV1) for instance in self.instances):
+        if not all(
+            isinstance(instance, OllamaInstanceV1) for instance in self.instances
+        ):
             _fail("ollama.registry_schema_invalid")
 
         model_refs = tuple(model.ref for model in self.models)
         instance_refs = tuple(instance.ref for instance in self.instances)
-        if len(set((*model_refs, *instance_refs))) != len(model_refs) + len(instance_refs):
+        if len(set((*model_refs, *instance_refs))) != len(model_refs) + len(
+            instance_refs
+        ):
             _fail("ollama.registry_ref_duplicate")
         known_models = set(model_refs)
         if any(
@@ -183,10 +189,13 @@ class OllamaRegistryV1:
             for ref in instance.selected_model_refs
         ):
             _fail("ollama.instance_model_missing")
-        if sum(
-            instance.host_ref == "local" and instance.lifecycle_state == "running"
-            for instance in self.instances
-        ) > _MAX_LOCAL_RUNNING_INSTANCES:
+        if (
+            sum(
+                instance.host_ref == "local" and instance.lifecycle_state == "running"
+                for instance in self.instances
+            )
+            > _MAX_LOCAL_RUNNING_INSTANCES
+        ):
             _fail("ollama.instance_count_invalid")
 
 
@@ -195,9 +204,13 @@ class OllamaRegistryStore:
 
     __slots__ = ("_path", "_lock_path", "_shared_gid")
 
-    def __init__(self, path: Path = _DEFAULT_PATH, *, shared_gid: int | None = None) -> None:
+    def __init__(
+        self, path: Path = _DEFAULT_PATH, *, shared_gid: int | None = None
+    ) -> None:
         if shared_gid is not None and (
-            isinstance(shared_gid, bool) or not isinstance(shared_gid, int) or shared_gid < 0
+            isinstance(shared_gid, bool)
+            or not isinstance(shared_gid, int)
+            or shared_gid < 0
         ):
             _fail("ollama.registry_store_unavailable")
         self._path = Path(path)

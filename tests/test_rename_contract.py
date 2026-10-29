@@ -61,17 +61,29 @@ def _write_target_ready_tree(root: Path) -> None:
         for template in family.target_path_templates:
             path = root / matrix.render_template(template)
             path.parent.mkdir(parents=True, exist_ok=True)
-            marker = matrix.canonical[family.target_content_identifiers[0]] if family.target_content_identifiers else "unchanged-hook"
+            marker = (
+                matrix.canonical[family.target_content_identifiers[0]]
+                if family.target_content_identifiers
+                else "unchanged-hook"
+            )
             if path.suffix == ".py":
                 content = f"TARGET = {marker!r}\n"
-            elif family.semantic_kind == "tracked_cli_path_set" or "/libexec/" in path.as_posix():
+            elif (
+                family.semantic_kind == "tracked_cli_path_set"
+                or "/libexec/" in path.as_posix()
+            ):
                 content = f"#!/bin/sh\n# {marker}\nexit 0\n"
-            elif family.semantic_kind == "tracked_plugin_hook_path_set" and path.name == "hooks.json":
+            elif (
+                family.semantic_kind == "tracked_plugin_hook_path_set"
+                and path.name == "hooks.json"
+            ):
                 content = json.dumps({"hooks": {}})
             elif family.semantic_kind == "tracked_plugin_hook_path_set":
                 content = f"# {marker}\n"
             elif path.suffix == ".service":
-                content = f"[Unit]\nDescription={marker}\n[Service]\nExecStart=/bin/true\n"
+                content = (
+                    f"[Unit]\nDescription={marker}\n[Service]\nExecStart=/bin/true\n"
+                )
             elif path.suffix == ".timer":
                 content = f"[Unit]\nDescription={marker}\n[Timer]\nOnCalendar=hourly\n"
             elif path.suffix == ".slice":
@@ -90,31 +102,49 @@ def _write_target_ready_tree(root: Path) -> None:
                 content = marker
             path.write_text(content, encoding="utf-8")
     cinnamon = matrix.cinnamon_surface
-    cinnamon_prefix = root / matrix.render_template(cinnamon.target_path_prefix_template + "/placeholder").parent
+    cinnamon_prefix = (
+        root
+        / matrix.render_template(
+            cinnamon.target_path_prefix_template + "/placeholder"
+        ).parent
+    )
     cinnamon_prefix.mkdir(parents=True, exist_ok=True)
     (cinnamon_prefix / cinnamon.metadata_name).write_text(
-        json.dumps({"uuid": matrix.render_value(cinnamon.target_metadata_value_template)}), encoding="utf-8"
+        json.dumps(
+            {"uuid": matrix.render_value(cinnamon.target_metadata_value_template)}
+        ),
+        encoding="utf-8",
     )
     (cinnamon_prefix / cinnamon.applet_name).write_text(
         matrix.render_value(cinnamon.target_applet_value_template), encoding="utf-8"
     )
     for index in range(cinnamon.member_count - 2):
-        (cinnamon_prefix / f"asset-{index:02d}.txt").write_text("target Cinnamon asset\n", encoding="utf-8")
+        (cinnamon_prefix / f"asset-{index:02d}.txt").write_text(
+            "target Cinnamon asset\n", encoding="utf-8"
+        )
     structured = {
         "pyproject.toml": (
             "[project]\n"
-            f"name = \"{matrix.canonical['slug']}\"\n"
+            f'name = "{matrix.canonical["slug"]}"\n'
             "[project.scripts]\n"
-            f"{matrix.canonical['slug']}-mcp = \"{matrix.canonical['python']}.server:main\"\n"
-            f"{matrix.canonical['slug']}-admin = \"{matrix.canonical['python']}.admin_daemon:main\"\n"
-            f"{matrix.canonical['slug']}-agent-api = \"{matrix.canonical['python']}.agent_daemon:main\"\n"
-            f"{matrix.canonical['slug']}-host-agent = \"{matrix.canonical['python']}.host_agent:main\"\n"
-            f"google-account-manager = \"{matrix.canonical['python']}.google_account_manager_cli:main\"\n"
+            f'{matrix.canonical["slug"]}-mcp = "{matrix.canonical["python"]}.server:main"\n'
+            f'{matrix.canonical["slug"]}-admin = "{matrix.canonical["python"]}.admin_daemon:main"\n'
+            f'{matrix.canonical["slug"]}-agent-api = "{matrix.canonical["python"]}.agent_daemon:main"\n'
+            f'{matrix.canonical["slug"]}-host-agent = "{matrix.canonical["python"]}.host_agent:main"\n'
+            f'google-account-manager = "{matrix.canonical["python"]}.google_account_manager_cli:main"\n'
         ),
         ".mcp.json": json.dumps(
-            {"mcpServers": {matrix.canonical["mcp_name"]: {"command": f"/home/teladi/.local/lib/{matrix.canonical['runtime_root']}/{matrix.canonical['mcp_name']}"}}}
+            {
+                "mcpServers": {
+                    matrix.canonical["mcp_name"]: {
+                        "command": f"/home/teladi/.local/lib/{matrix.canonical['runtime_root']}/{matrix.canonical['mcp_name']}"
+                    }
+                }
+            }
         ),
-        ".app.json": json.dumps({"apps": {matrix.canonical["slug"]: {"id": "fixture"}}}),
+        ".app.json": json.dumps(
+            {"apps": {matrix.canonical["slug"]: {"id": "fixture"}}}
+        ),
         ".codex-plugin/plugin.json": json.dumps(
             {
                 "name": matrix.canonical["plugin"],
@@ -141,7 +171,12 @@ def _write_target_ready_tree(root: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         path.write_text(
-            existing + "\n" + "\n".join(matrix.render_value(value) for value in expectation.target_value_templates),
+            existing
+            + "\n"
+            + "\n".join(
+                matrix.render_value(value)
+                for value in expectation.target_value_templates
+            ),
             encoding="utf-8",
         )
     for readiness in matrix.target_readiness:
@@ -150,14 +185,23 @@ def _write_target_ready_tree(root: Path) -> None:
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        path.write_text(existing + matrix.canonical[readiness.target_identifier], encoding="utf-8")
+        path.write_text(
+            existing + matrix.canonical[readiness.target_identifier], encoding="utf-8"
+        )
     contract = root / "src" / matrix.canonical["python"] / "rename_contract.v1.json"
     contract.parent.mkdir(parents=True, exist_ok=True)
-    contract.write_text(files("the_hive").joinpath("rename_contract.v1.json").read_text(), encoding="utf-8")
+    contract.write_text(
+        files("the_hive").joinpath("rename_contract.v1.json").read_text(),
+        encoding="utf-8",
+    )
     retirement = matrix.retirement_artifacts[0]
-    target_caller = root / matrix.render_template(retirement.target_caller_path_template)
+    target_caller = root / matrix.render_template(
+        retirement.target_caller_path_template
+    )
     target_caller.parent.mkdir(parents=True, exist_ok=True)
-    target_caller.write_text("def load_evidence() -> None:\n    return None\n", encoding="utf-8")
+    target_caller.write_text(
+        "def load_evidence() -> None:\n    return None\n", encoding="utf-8"
+    )
 
 
 def _write_d73_tree_with_contract(root: Path) -> None:
@@ -169,7 +213,10 @@ def _write_d73_tree_with_contract(root: Path) -> None:
     matrix = load_rename_matrix()
     contract = root / "src" / matrix.canonical["python"] / "rename_contract.v1.json"
     contract.parent.mkdir(parents=True, exist_ok=True)
-    contract.write_text(files("the_hive").joinpath("rename_contract.v1.json").read_text(), encoding="utf-8")
+    contract.write_text(
+        files("the_hive").joinpath("rename_contract.v1.json").read_text(),
+        encoding="utf-8",
+    )
     _commit_tree(root)
 
 
@@ -238,14 +285,39 @@ def test_matrix_records_current_and_target_semantic_edges() -> None:
         assert matrix.render_template(edge.target_path_template)
     assert matrix.cinnamon_surface.identifier == "cinnamon_uuid"
     assert matrix.cinnamon_surface.member_count == 28
-    assert matrix.render_template(matrix.cinnamon_surface.target_path_prefix_template + "/placeholder").parent.as_posix() == "cinnamon/applets/the-hive@H234598"
+    assert (
+        matrix.render_template(
+            matrix.cinnamon_surface.target_path_prefix_template + "/placeholder"
+        ).parent.as_posix()
+        == "cinnamon/applets/the-hive@H234598"
+    )
     assert matrix.retirement_artifacts[0].identifier == "hive_test_index"
     assert matrix.retirement_artifacts[0].disposition == "remove_from_product_tree_only"
     assert {family.identifier for family in matrix.bounded_families} == {
-        "cli_entry_points", "systemd_artifacts", "hook_artifacts"
+        "cli_entry_points",
+        "systemd_artifacts",
+        "hook_artifacts",
     }
-    assert len(next(family for family in matrix.bounded_families if family.identifier == "cli_entry_points").legacy_path_templates) == 9
-    assert len(next(family for family in matrix.bounded_families if family.identifier == "systemd_artifacts").legacy_path_templates) == 32
+    assert (
+        len(
+            next(
+                family
+                for family in matrix.bounded_families
+                if family.identifier == "cli_entry_points"
+            ).legacy_path_templates
+        )
+        == 9
+    )
+    assert (
+        len(
+            next(
+                family
+                for family in matrix.bounded_families
+                if family.identifier == "systemd_artifacts"
+            ).legacy_path_templates
+        )
+        == 32
+    )
 
 
 def test_release_gate_rejects_a_tampered_selected_tree_contract(tmp_path: Path) -> None:
@@ -270,11 +342,21 @@ def test_release_gate_rejects_invalid_structured_target_surface(tmp_path: Path) 
     assert "surface:mcp_manifest" in report.missing_target_identifiers
 
 
-def test_release_gate_rejects_a_valid_manifest_with_the_target_in_the_wrong_field(tmp_path: Path) -> None:
+def test_release_gate_rejects_a_valid_manifest_with_the_target_in_the_wrong_field(
+    tmp_path: Path,
+) -> None:
     _write_target_ready_tree(tmp_path)
     matrix = load_rename_matrix()
     (tmp_path / ".mcp.json").write_text(
-        json.dumps({"mcpServers": {"wrong": {"command": f"/home/teladi/.local/lib/{matrix.canonical['runtime_root']}/{matrix.canonical['mcp_name']}"}}}),
+        json.dumps(
+            {
+                "mcpServers": {
+                    "wrong": {
+                        "command": f"/home/teladi/.local/lib/{matrix.canonical['runtime_root']}/{matrix.canonical['mcp_name']}"
+                    }
+                }
+            }
+        ),
         encoding="utf-8",
     )
     _commit_tree(tmp_path)
@@ -284,7 +366,9 @@ def test_release_gate_rejects_a_valid_manifest_with_the_target_in_the_wrong_fiel
     assert "surface:mcp_manifest" in report.missing_target_identifiers
 
 
-def test_release_gate_rejects_a_valid_plugin_with_wrong_display_or_manifest_pointer(tmp_path: Path) -> None:
+def test_release_gate_rejects_a_valid_plugin_with_wrong_display_or_manifest_pointer(
+    tmp_path: Path,
+) -> None:
     _write_target_ready_tree(tmp_path)
     plugin_path = tmp_path / ".codex-plugin" / "plugin.json"
     plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
@@ -299,7 +383,9 @@ def test_release_gate_rejects_a_valid_plugin_with_wrong_display_or_manifest_poin
     assert "surface:plugin" in report.missing_target_identifiers
 
 
-def test_release_gate_rejects_the_plugin_masterjet_compatibility_alias(tmp_path: Path) -> None:
+def test_release_gate_rejects_the_plugin_masterjet_compatibility_alias(
+    tmp_path: Path,
+) -> None:
     _write_target_ready_tree(tmp_path)
     plugin_path = tmp_path / ".codex-plugin" / "plugin.json"
     plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
@@ -309,10 +395,14 @@ def test_release_gate_rejects_the_plugin_masterjet_compatibility_alias(tmp_path:
 
     report = RenameReleaseValidator().validate_tree(tmp_path)
 
-    assert "alias:plugin_description_masterjet_alias" in report.missing_target_identifiers
+    assert (
+        "alias:plugin_description_masterjet_alias" in report.missing_target_identifiers
+    )
 
 
-def test_release_gate_preserves_a_non_alias_masterjet_component_reference(tmp_path: Path) -> None:
+def test_release_gate_preserves_a_non_alias_masterjet_component_reference(
+    tmp_path: Path,
+) -> None:
     _write_target_ready_tree(tmp_path)
     plugin_path = tmp_path / ".codex-plugin" / "plugin.json"
     plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
@@ -322,14 +412,21 @@ def test_release_gate_preserves_a_non_alias_masterjet_component_reference(tmp_pa
 
     report = RenameReleaseValidator().validate_tree(tmp_path)
 
-    assert "alias:plugin_description_masterjet_alias" not in report.missing_target_identifiers
+    assert (
+        "alias:plugin_description_masterjet_alias"
+        not in report.missing_target_identifiers
+    )
 
 
 def test_release_gate_rejects_a_placeholder_cli_family_member(tmp_path: Path) -> None:
     _write_target_ready_tree(tmp_path)
     matrix = load_rename_matrix()
     target = tmp_path / matrix.render_template(
-        next(family for family in matrix.bounded_families if family.identifier == "cli_entry_points").target_path_templates[0]
+        next(
+            family
+            for family in matrix.bounded_families
+            if family.identifier == "cli_entry_points"
+        ).target_path_templates[0]
     )
     target.write_text("target family member", encoding="utf-8")
     _commit_tree(tmp_path)
@@ -339,11 +436,17 @@ def test_release_gate_rejects_a_placeholder_cli_family_member(tmp_path: Path) ->
     assert "family:cli_entry_points" in report.missing_target_identifiers
 
 
-def test_release_gate_rejects_a_placeholder_systemd_family_member(tmp_path: Path) -> None:
+def test_release_gate_rejects_a_placeholder_systemd_family_member(
+    tmp_path: Path,
+) -> None:
     _write_target_ready_tree(tmp_path)
     matrix = load_rename_matrix()
     target = tmp_path / matrix.render_template(
-        next(family for family in matrix.bounded_families if family.identifier == "systemd_artifacts").target_path_templates[0]
+        next(
+            family
+            for family in matrix.bounded_families
+            if family.identifier == "systemd_artifacts"
+        ).target_path_templates[0]
     )
     target.write_text(matrix.canonical["slug"], encoding="utf-8")
     _commit_tree(tmp_path)
@@ -353,7 +456,9 @@ def test_release_gate_rejects_a_placeholder_systemd_family_member(tmp_path: Path
     assert "family:systemd_artifacts" in report.missing_target_identifiers
 
 
-def test_release_gate_requires_removal_of_the_hive_test_index_from_the_product_tree(tmp_path: Path) -> None:
+def test_release_gate_requires_removal_of_the_hive_test_index_from_the_product_tree(
+    tmp_path: Path,
+) -> None:
     _write_target_ready_tree(tmp_path)
     index = tmp_path / ".hive" / "test-index.v1.json"
     index.parent.mkdir(parents=True, exist_ok=True)
@@ -369,7 +474,9 @@ def test_release_gate_rejects_a_stale_target_test_index_reader(tmp_path: Path) -
     _write_target_ready_tree(tmp_path)
     matrix = load_rename_matrix()
     retirement = matrix.retirement_artifacts[0]
-    target_caller = tmp_path / matrix.render_template(retirement.target_caller_path_template)
+    target_caller = tmp_path / matrix.render_template(
+        retirement.target_caller_path_template
+    )
     target_caller.write_text(retirement.target_forbidden_symbol, encoding="utf-8")
     _commit_tree(tmp_path)
 
@@ -378,13 +485,30 @@ def test_release_gate_rejects_a_stale_target_test_index_reader(tmp_path: Path) -
     assert "retire:hive_test_index" in report.missing_target_identifiers
 
 
-def test_characterization_rejects_a_missing_in_repo_family_caller(tmp_path: Path) -> None:
+def test_characterization_rejects_a_missing_in_repo_family_caller(
+    tmp_path: Path,
+) -> None:
     _write_d73_tree_with_contract(tmp_path)
     pyproject = tmp_path / "pyproject.toml"
-    pyproject.write_text(pyproject.read_text(encoding="utf-8").replace("[project.scripts]", "[tool.fixture]"), encoding="utf-8")
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            "[project.scripts]", "[tool.fixture]"
+        ),
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", "pyproject.toml"], cwd=tmp_path, check=True)
     subprocess.run(
-        ["git", "-c", "user.name=TH-R1 test", "-c", "user.email=th-r1@example.invalid", "commit", "--quiet", "-m", "missing family caller"],
+        [
+            "git",
+            "-c",
+            "user.name=TH-R1 test",
+            "-c",
+            "user.email=th-r1@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "missing family caller",
+        ],
         cwd=tmp_path,
         check=True,
     )
@@ -396,7 +520,9 @@ def test_characterization_rejects_a_missing_in_repo_family_caller(tmp_path: Path
     }
 
 
-def test_current_d73_tree_is_intentionally_red_but_legacy_characterization_is_green(tmp_path: Path) -> None:
+def test_current_d73_tree_is_intentionally_red_but_legacy_characterization_is_green(
+    tmp_path: Path,
+) -> None:
     validator = RenameReleaseValidator()
 
     _write_d73_tree_with_contract(tmp_path)
@@ -408,7 +534,9 @@ def test_current_d73_tree_is_intentionally_red_but_legacy_characterization_is_gr
     assert not report.ready
 
 
-def test_release_gate_rejects_all_legacy_forms_in_paths_and_raw_blobs(tmp_path: Path) -> None:
+def test_release_gate_rejects_all_legacy_forms_in_paths_and_raw_blobs(
+    tmp_path: Path,
+) -> None:
     matrix = load_rename_matrix()
     for index, form in enumerate(matrix.legacy_forms.values()):
         path = tmp_path / f"item-{index}" / form.value
@@ -419,13 +547,20 @@ def test_release_gate_rejects_all_legacy_forms_in_paths_and_raw_blobs(tmp_path: 
 
     report = RenameReleaseValidator(matrix).validate_tree(tmp_path)
 
-    assert {finding.location for finding in report.legacy_findings} == {"content", "path"}
-    assert {finding.form_identifier for finding in report.legacy_findings} == set(matrix.legacy_forms)
+    assert {finding.location for finding in report.legacy_findings} == {
+        "content",
+        "path",
+    }
+    assert {finding.form_identifier for finding in report.legacy_findings} == set(
+        matrix.legacy_forms
+    )
     assert report.missing_target_identifiers == ()
     assert not report.ready
 
 
-def test_release_gate_preserves_protected_terms_when_the_cinnamon_target_is_complete(tmp_path: Path) -> None:
+def test_release_gate_preserves_protected_terms_when_the_cinnamon_target_is_complete(
+    tmp_path: Path,
+) -> None:
     matrix = load_rename_matrix()
     _write_target_ready_tree(tmp_path)
     protected = tmp_path / "protected.txt"
@@ -439,11 +574,24 @@ def test_release_gate_preserves_protected_terms_when_the_cinnamon_target_is_comp
     assert report.ready
 
 
-@pytest.mark.parametrize(("member", "content"), (("metadata.json", json.dumps({"uuid": "wrong"})), ("applet.js", 'const UUID = "wrong";')))
-def test_release_gate_rejects_a_cinnamon_uuid_target_drift(tmp_path: Path, member: str, content: str) -> None:
+@pytest.mark.parametrize(
+    ("member", "content"),
+    (
+        ("metadata.json", json.dumps({"uuid": "wrong"})),
+        ("applet.js", 'const UUID = "wrong";'),
+    ),
+)
+def test_release_gate_rejects_a_cinnamon_uuid_target_drift(
+    tmp_path: Path, member: str, content: str
+) -> None:
     _write_target_ready_tree(tmp_path)
     matrix = load_rename_matrix()
-    cinnamon_prefix = tmp_path / matrix.render_template(matrix.cinnamon_surface.target_path_prefix_template + "/placeholder").parent
+    cinnamon_prefix = (
+        tmp_path
+        / matrix.render_template(
+            matrix.cinnamon_surface.target_path_prefix_template + "/placeholder"
+        ).parent
+    )
     (cinnamon_prefix / member).write_text(content, encoding="utf-8")
     _commit_tree(tmp_path)
 
@@ -452,12 +600,17 @@ def test_release_gate_rejects_a_cinnamon_uuid_target_drift(tmp_path: Path, membe
     assert "cinnamon_uuid" in report.missing_target_identifiers
 
 
-def test_release_gate_rejects_a_cinnamon_target_member_count_drift(tmp_path: Path) -> None:
+def test_release_gate_rejects_a_cinnamon_target_member_count_drift(
+    tmp_path: Path,
+) -> None:
     _write_target_ready_tree(tmp_path)
     matrix = load_rename_matrix()
-    cinnamon_prefix = tmp_path / matrix.render_template(
-        matrix.cinnamon_surface.target_path_prefix_template + "/placeholder"
-    ).parent
+    cinnamon_prefix = (
+        tmp_path
+        / matrix.render_template(
+            matrix.cinnamon_surface.target_path_prefix_template + "/placeholder"
+        ).parent
+    )
     (cinnamon_prefix / "asset-00.txt").unlink()
     _commit_tree(tmp_path)
 
@@ -466,7 +619,9 @@ def test_release_gate_rejects_a_cinnamon_target_member_count_drift(tmp_path: Pat
     assert "cinnamon_uuid" in report.missing_target_identifiers
 
 
-def test_release_gate_requires_a_git_top_level_and_local_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_release_gate_requires_a_git_top_level_and_local_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _write_target_ready_tree(tmp_path)
     _commit_tree(tmp_path)
 

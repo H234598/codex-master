@@ -150,7 +150,10 @@ def _digest(value: object) -> bool:
 
 
 def _bounded_global_pilot_readiness(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or frozenset(value) != _GLOBAL_PILOT_READINESS_KEYS:
+    if (
+        not isinstance(value, Mapping)
+        or frozenset(value) != _GLOBAL_PILOT_READINESS_KEYS
+    ):
         return {
             "schema_version": 1,
             "pilot": "blocked",
@@ -284,7 +287,10 @@ def _valid_alarm_owner(value: object) -> bool:
 
 
 def _valid_diagnostic(value: object, *, command_ready: bool) -> bool:
-    if not isinstance(value, Mapping) or frozenset(value) != _PROBE_DIAGNOSTIC_VALUE_KEYS:
+    if (
+        not isinstance(value, Mapping)
+        or frozenset(value) != _PROBE_DIAGNOSTIC_VALUE_KEYS
+    ):
         return False
     code = value.get("code")
     exit_code = value.get("exit_code")
@@ -292,7 +298,10 @@ def _valid_diagnostic(value: object, *, command_ready: bool) -> bool:
     if (
         not isinstance(code, str)
         or code not in _SAFE_DIAGNOSTIC_CODES
-        or (exit_code is not None and (type(exit_code) is not int or not -255 <= exit_code <= 255))
+        or (
+            exit_code is not None
+            and (type(exit_code) is not int or not -255 <= exit_code <= 255)
+        )
         or not isinstance(stderr, Mapping)
         or frozenset(stderr) != _PROBE_STDERR_KEYS
         or stderr.get("state") not in _SAFE_DIAGNOSTIC_STDERR
@@ -328,7 +337,9 @@ def _valid_alarm(value: object, checks: Mapping[str, object]) -> bool:
             and reasons == []
             and _valid_alarm_owner(owner)
         )
-    expected_reasons = failed_checks + ([] if owner is not None else ["alarm_owner_unavailable"])
+    expected_reasons = failed_checks + (
+        [] if owner is not None else ["alarm_owner_unavailable"]
+    )
     return (
         value.get("status") == "active"
         and reasons == expected_reasons
@@ -711,7 +722,10 @@ def _probe_alarm_owner(layout: RuntimeLayout) -> dict[str, str] | None:
         return None
     candidates: list[dict[str, str]] = []
     for principal in value["principals"]:
-        if not isinstance(principal, Mapping) or principal.get("class_id") != "koenigin":
+        if (
+            not isinstance(principal, Mapping)
+            or principal.get("class_id") != "koenigin"
+        ):
             continue
         principal_id = principal.get("principal_id")
         repository_id = principal.get("repo_id")
@@ -889,7 +903,9 @@ def _run_json(
             return (
                 {},
                 False,
-                _diagnostic("command_exit_nonzero", completed.returncode, completed.stderr),
+                _diagnostic(
+                    "command_exit_nonzero", completed.returncode, completed.stderr
+                ),
             )
         if completed.stderr:
             return (
@@ -925,7 +941,9 @@ def _run_json(
             {},
             False,
             {
-                "code": exc.code if exc.code in _SAFE_DIAGNOSTIC_CODES else "command_failed",
+                "code": exc.code
+                if exc.code in _SAFE_DIAGNOSTIC_CODES
+                else "command_failed",
                 "exit_code": None,
                 "stderr": _not_returned_stderr(),
             },
@@ -959,11 +977,15 @@ def _runtime_status_json(
         _emit_phase_timeout("direct_mcp_cleanup")
     ready = value.get("ok") is True
     if ready:
-        return value, True, {
-            "code": "ok",
-            "exit_code": 0,
-            "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
-        }
+        return (
+            value,
+            True,
+            {
+                "code": "ok",
+                "exit_code": 0,
+                "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+            },
+        )
     return (
         value,
         False,
@@ -1010,7 +1032,9 @@ def _current_release_binding(layout: RuntimeLayout) -> tuple[RuntimeLayout, Path
     return current, release_root, generation
 
 
-def _injected_command_result(value: object) -> tuple[dict[str, Any], bool, dict[str, object]]:
+def _injected_command_result(
+    value: object,
+) -> tuple[dict[str, Any], bool, dict[str, object]]:
     """Normalize the narrow test seam without hiding failed injected commands."""
 
     if (
@@ -1089,7 +1113,9 @@ def run_probe(
             runner(active_layout.mcp_entrypoint, "hive", "doctor")
         )
     else:
-        current_layout, release_root, generation = _current_release_binding(active_layout)
+        current_layout, release_root, generation = _current_release_binding(
+            active_layout
+        )
         runtime, runtime_command, runtime_diagnostic = (
             _runtime_status_json(current_layout, protected_home_runtime=True)
             if protected_home_runtime
@@ -1198,7 +1224,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 2
     checks = result.get("checks")
     if not isinstance(checks, Mapping):
-        print("hive_hourly_probe_error code=probe_result_invalid", file=sys.stderr, flush=True)
+        print(
+            "hive_hourly_probe_error code=probe_result_invalid",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
     print(
         json.dumps(

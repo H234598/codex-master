@@ -203,9 +203,9 @@ def test_control_has_only_start_method_and_constant_redacted_identity() -> None:
 
     assert not hasattr(first, "__dict__")
     assert not hasattr(first, "exchange")
-    assert {
-        name for name in dir(first) if not name.startswith("_")
-    } == {"start_dynamic_teamlead"}
+    assert {name for name in dir(first) if not name.startswith("_")} == {
+        "start_dynamic_teamlead"
+    }
     assert repr(first) == repr(second)
     assert str(first) == repr(first)
     assert "RecordingExchange" not in repr(first)
@@ -224,7 +224,9 @@ def test_exchange_protocol_exposes_only_zero_argument_operation() -> None:
     ) == ["self"]
 
 
-def test_root_control_module_has_no_transport_or_root_service_imports_or_calls() -> None:
+def test_root_control_module_has_no_transport_or_root_service_imports_or_calls() -> (
+    None
+):
     path = Path(__file__).resolve().parents[1] / (
         "src/the_hive/dynamic_teamlead_root_ipc.py"
     )

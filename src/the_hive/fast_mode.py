@@ -61,13 +61,21 @@ def _validate_account(account: object) -> str:
 
 
 def _validate_now(value: object) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
         _error("invalid_fast_mode_time")
     return value.astimezone(timezone.utc)
 
 
 def _parse_rfc3339(value: object) -> tuple[datetime, str]:
-    if not isinstance(value, str) or len(value) > 64 or not _RFC3339_RE.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or len(value) > 64
+        or not _RFC3339_RE.fullmatch(value)
+    ):
         _error("invalid_fast_mode_expiry")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -91,7 +99,11 @@ def _state_template() -> dict[str, object]:
 
 def _validate_mode(account: object, value: object) -> dict[str, object]:
     _validate_account(account)
-    if not isinstance(value, Mapping) or set(value) != {"reason", "until_utc", "last_notified_at_utc"}:
+    if not isinstance(value, Mapping) or set(value) != {
+        "reason",
+        "until_utc",
+        "last_notified_at_utc",
+    }:
         _error("fast_mode_state_invalid")
     reason = value["reason"]
     until_utc = value["until_utc"]
@@ -102,7 +114,11 @@ def _validate_mode(account: object, value: object) -> dict[str, object]:
         _parse_rfc3339(until_utc)
     if last_notified is not None:
         _parse_rfc3339(last_notified)
-    return {"reason": reason, "until_utc": until_utc, "last_notified_at_utc": last_notified}
+    return {
+        "reason": reason,
+        "until_utc": until_utc,
+        "last_notified_at_utc": last_notified,
+    }
 
 
 def _validate_state(value: object) -> dict[str, object]:
@@ -116,7 +132,12 @@ def _validate_state(value: object) -> dict[str, object]:
     modes = value["modes"]
     if not isinstance(modes, Mapping) or len(modes) > 128:
         _error("fast_mode_state_invalid")
-    return {"schema_version": 1, "modes": {account: _validate_mode(account, mode) for account, mode in modes.items()}}
+    return {
+        "schema_version": 1,
+        "modes": {
+            account: _validate_mode(account, mode) for account, mode in modes.items()
+        },
+    }
 
 
 def _same_identity(first: os.stat_result, current: os.stat_result) -> bool:
@@ -151,7 +172,11 @@ def _same_directory_identity(first: os.stat_result, current: os.stat_result) -> 
 
 def _safe_directory(item: os.stat_result, *, private: bool) -> bool:
     mode = stat.S_IMODE(item.st_mode)
-    if not stat.S_ISDIR(item.st_mode) or item.st_uid not in {0, os.geteuid()} or mode & 0o022:
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or item.st_uid not in {0, os.geteuid()}
+        or mode & 0o022
+    ):
         return False
     return not private or (item.st_uid == os.geteuid() and mode == 0o700)
 
@@ -177,7 +202,12 @@ def _safe_usage_file(item: os.stat_result) -> bool:
 
 
 def _path_parts(path: Path, anchor: Path, *, error: str) -> tuple[str, ...]:
-    if not isinstance(path, Path) or not isinstance(anchor, Path) or not path.is_absolute() or not anchor.is_absolute():
+    if (
+        not isinstance(path, Path)
+        or not isinstance(anchor, Path)
+        or not path.is_absolute()
+        or not anchor.is_absolute()
+    ):
         _error(error)
     try:
         relative = path.relative_to(anchor)
@@ -194,11 +224,15 @@ def _open_anchor(anchor: Path, *, error: str) -> int:
         before = anchor.lstat()
         if stat.S_ISLNK(before.st_mode) or not _safe_directory(before, private=False):
             _error(error)
-        descriptor = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(
+            anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
     except OSError:
         _error(error)
     opened = os.fstat(descriptor)
-    if not _same_directory_identity(before, opened) or not _safe_directory(opened, private=False):
+    if not _same_directory_identity(before, opened) or not _safe_directory(
+        opened, private=False
+    ):
         os.close(descriptor)
         _error(error)
     return descriptor
@@ -245,7 +279,9 @@ def _open_directory_chain(
             except OSError:
                 _error(error)
             opened = os.fstat(child)
-            if not _same_directory_identity(before, opened) or not _safe_directory(opened, private=private):
+            if not _same_directory_identity(before, opened) or not _safe_directory(
+                opened, private=private
+            ):
                 os.close(child)
                 _error(error)
             os.close(descriptor)
@@ -331,7 +367,9 @@ def _open_lock(parent_fd: int) -> int:
         if not _safe_state_file(before):
             _error("fast_mode_lock_invalid")
         try:
-            descriptor = os.open(name, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+            descriptor = os.open(
+                name, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
         except OSError:
             _error("fast_mode_lock_invalid")
         opened = os.fstat(descriptor)
@@ -387,7 +425,12 @@ def _read_state() -> dict[str, object]:
 
 def _write_state_to_parent(parent_fd: int, state_value: Mapping[str, object]) -> None:
     state_value = _validate_state(state_value)
-    encoded = (json.dumps(state_value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(
+            state_value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        + "\n"
+    ).encode("utf-8")
     if len(encoded) > _MAX_STATE_BYTES:
         _error("fast_mode_state_too_large")
     temporary = f".{_STATE_PATH.name}.{secrets.token_hex(8)}.tmp"
@@ -406,7 +449,9 @@ def _write_state_to_parent(parent_fd: int, state_value: Mapping[str, object]) ->
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        os.replace(temporary, _STATE_PATH.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.replace(
+            temporary, _STATE_PATH.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+        )
         os.fsync(parent_fd)
     except OSError:
         _error("fast_mode_state_write_failed")
@@ -431,8 +476,14 @@ def _usage_root_path() -> Path | None:
     if _USAGE_ROOT is not None:
         root = _USAGE_ROOT
     else:
-        value = os.environ.get("CODEX_USAGE_STATE_ROOT") or os.environ.get("XDG_DATA_HOME")
-        root = Path(value) / "codex-usage" if value else Path.home() / ".local" / "share" / "codex-usage"
+        value = os.environ.get("CODEX_USAGE_STATE_ROOT") or os.environ.get(
+            "XDG_DATA_HOME"
+        )
+        root = (
+            Path(value) / "codex-usage"
+            if value
+            else Path.home() / ".local" / "share" / "codex-usage"
+        )
     return root if isinstance(root, Path) and root.is_absolute() else None
 
 
@@ -456,7 +507,9 @@ def _read_usage_candidate(path: Path) -> tuple[bool, Mapping[str, object] | None
         if not _safe_usage_file(before):
             _error("fast_mode_usage_invalid")
         try:
-            descriptor = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+            descriptor = os.open(
+                path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
         except OSError:
             _error("fast_mode_usage_invalid")
         try:
@@ -480,13 +533,23 @@ def _read_usage_candidate(path: Path) -> tuple[bool, Mapping[str, object] | None
 
 
 def _finite_nonnegative(value: object) -> float:
-    if type(value) not in {int, float} or not math.isfinite(float(value)) or float(value) < 0:
+    if (
+        type(value) not in {int, float}
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
         _error("fast_mode_usage_invalid")
     return float(value)
 
 
-def _usage_exhausted(payload: Mapping[str, object], account: str, *, now: datetime) -> bool:
-    if payload.get("account") != account or payload.get("status") not in {"ok", "blocked"} or payload.get("stale", False) is not False:
+def _usage_exhausted(
+    payload: Mapping[str, object], account: str, *, now: datetime
+) -> bool:
+    if (
+        payload.get("account") != account
+        or payload.get("status") not in {"ok", "blocked"}
+        or payload.get("stale", False) is not False
+    ):
         _error("fast_mode_usage_invalid")
     captured_at = payload.get("values_captured_at") or payload.get("captured_at")
     captured, _canonical = _parse_rfc3339(captured_at)
@@ -541,7 +604,9 @@ def _default_usage_snapshot(account: str) -> Mapping[str, object] | None:
             if not found:
                 continue
             assert payload is not None
-            exhausted = _usage_exhausted(payload, account, now=_validate_now(_now_utc()))
+            exhausted = _usage_exhausted(
+                payload, account, now=_validate_now(_now_utc())
+            )
             return {"schema_version": 1, "account": account, "exhausted": exhausted}
     except FastModeError:
         return None
@@ -615,7 +680,10 @@ def _desktop_notify(title: str, body: str) -> None:
         try:
             proxy.call(
                 "Notify",
-                GLib.Variant("(susssasa{sv}i)", ("Codex Master", 0, "dialog-warning", title, body, [], {}, 5000)),
+                GLib.Variant(
+                    "(susssasa{sv}i)",
+                    ("Codex Master", 0, "dialog-warning", title, body, [], {}, 5000),
+                ),
                 Gio.DBusCallFlags.NONE,
                 timeout_msec,
                 operation_cancellable,
@@ -669,7 +737,13 @@ def _default_notifier(payload: Mapping[str, object]) -> None:
     account = _validate_account(payload["account"])
     state = payload["state"]
     reason = payload["reason"]
-    if state not in {"fast", "flex"} or reason not in {"unspecified", "operator_request", "disabled", "expired", "limit_exhausted"}:
+    if state not in {"fast", "flex"} or reason not in {
+        "unspecified",
+        "operator_request",
+        "disabled",
+        "expired",
+        "limit_exhausted",
+    }:
         _error("fast_mode_notification_invalid")
     body = f"Fast mode {'active' if state == 'fast' else 'inactive'} for {account}."
     _desktop_notify("Codex Master", body)
@@ -687,7 +761,9 @@ def _valid_exhaustion(account: str) -> bool:
         source = reader(account)
         if not isinstance(source, Mapping):
             return False
-        encoded = json.dumps(source, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(
+            source, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
     except (OverflowError, TypeError, ValueError, OSError):
         return False
     return (
@@ -702,7 +778,12 @@ def _valid_exhaustion(account: str) -> bool:
 
 
 def _mode_view(account: str, mode: Mapping[str, object]) -> dict[str, object]:
-    return {"account": account, "state": "fast", "reason": mode["reason"], "until_utc": mode["until_utc"]}
+    return {
+        "account": account,
+        "state": "fast",
+        "reason": mode["reason"],
+        "until_utc": mode["until_utc"],
+    }
 
 
 def _notify(payload: Mapping[str, object]) -> bool:
@@ -716,7 +797,9 @@ def _notify(payload: Mapping[str, object]) -> bool:
     return True
 
 
-def _remove_mode(parent_fd: int, state_value: Mapping[str, object], account: str) -> None:
+def _remove_mode(
+    parent_fd: int, state_value: Mapping[str, object], account: str
+) -> None:
     modes = dict(state_value["modes"])
     modes.pop(account, None)
     _write_state_to_parent(parent_fd, {"schema_version": 1, "modes": modes})
@@ -752,11 +835,16 @@ def _record_notification(account: str, *, now: datetime) -> Mapping[str, object]
         if parent_fd is None:
             return None
         state_value = _read_state_from_parent(parent_fd)
-        active, transition = _active_mode_in_transaction(account, now=now, parent_fd=parent_fd)
+        active, transition = _active_mode_in_transaction(
+            account, now=now, parent_fd=parent_fd
+        )
         if active is None:
             return transition
         modes = dict(state_value["modes"])
-        modes[account] = {**modes[account], "last_notified_at_utc": now.isoformat().replace("+00:00", "Z")}
+        modes[account] = {
+            **modes[account],
+            "last_notified_at_utc": now.isoformat().replace("+00:00", "Z"),
+        }
         _write_state_to_parent(parent_fd, {"schema_version": 1, "modes": modes})
         return None
 
@@ -770,7 +858,9 @@ def active_mode(account: str) -> Mapping[str, object] | None:
         with _state_transaction(create=False) as parent_fd:
             if parent_fd is None:
                 return None
-            result, transition = _active_mode_in_transaction(account, now=_validate_now(_now_utc()), parent_fd=parent_fd)
+            result, transition = _active_mode_in_transaction(
+                account, now=_validate_now(_now_utc()), parent_fd=parent_fd
+            )
     except FastModeError:
         return None
     if transition is not None:
@@ -804,16 +894,24 @@ def set_mode(
         modes = dict(state_value["modes"])
         previous = modes.get(account)
         if enabled:
-            previous_mode = _validate_mode(account, previous) if previous is not None else None
+            previous_mode = (
+                _validate_mode(account, previous) if previous is not None else None
+            )
             modes[account] = {
                 "reason": reason_code,
                 "until_utc": expiry,
-                "last_notified_at_utc": None if previous_mode is None else previous_mode["last_notified_at_utc"],
+                "last_notified_at_utc": None
+                if previous_mode is None
+                else previous_mode["last_notified_at_utc"],
             }
             _write_state_to_parent(parent_fd, {"schema_version": 1, "modes": modes})
             result = _mode_view(account, modes[account])
             if previous_mode is None:
-                transition = {"account": account, "state": "fast", "reason": reason_code}
+                transition = {
+                    "account": account,
+                    "state": "fast",
+                    "reason": reason_code,
+                }
         else:
             modes.pop(account, None)
             _write_state_to_parent(parent_fd, {"schema_version": 1, "modes": modes})
@@ -842,7 +940,9 @@ def maybe_notify_fast(account: str, *, now: datetime | None = None) -> bool:
         with _state_transaction(create=False) as parent_fd:
             if parent_fd is None:
                 return False
-            active, transition = _active_mode_in_transaction(account, now=checked_now, parent_fd=parent_fd)
+            active, transition = _active_mode_in_transaction(
+                account, now=checked_now, parent_fd=parent_fd
+            )
             if active is None:
                 return False
             state_value = _read_state_from_parent(parent_fd)
@@ -850,7 +950,10 @@ def maybe_notify_fast(account: str, *, now: datetime | None = None) -> bool:
             assert isinstance(modes, Mapping)
             stored = _validate_mode(account, modes[account])
             last = stored["last_notified_at_utc"]
-            if last is not None and checked_now - _parse_rfc3339(last)[0] < _REMINDER_INTERVAL:
+            if (
+                last is not None
+                and checked_now - _parse_rfc3339(last)[0] < _REMINDER_INTERVAL
+            ):
                 return False
             reminder = {"account": account, "state": "fast", "reason": stored["reason"]}
     except FastModeError:

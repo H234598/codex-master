@@ -122,19 +122,37 @@ class HostProbeEvidenceV1:
     agent_generation: int = 1
 
     def __post_init__(self) -> None:
-        if self.kernel_class not in {"linux", "other"} or self.architecture_class not in {"x86_64", "arm64", "other"}:
+        if self.kernel_class not in {
+            "linux",
+            "other",
+        } or self.architecture_class not in {"x86_64", "arm64", "other"}:
             raise HostProbeError()
         _integer(self.cpu_count)
-        if self.memory_class not in {"under-8-gib", "8-31-gib", "32-127-gib", "128-plus-gib"}:
+        if self.memory_class not in {
+            "under-8-gib",
+            "8-31-gib",
+            "32-127-gib",
+            "128-plus-gib",
+        }:
             raise HostProbeError()
-        if type(self.cgroup_v2) is not bool or type(self.systemd) is not bool or type(self.ollama_capability) is not bool:
+        if (
+            type(self.cgroup_v2) is not bool
+            or type(self.systemd) is not bool
+            or type(self.ollama_capability) is not bool
+        ):
             raise HostProbeError()
-        if self.load_class not in {"idle", "busy", "saturated"} or self.pressure_class not in {"none", "low", "elevated"}:
+        if self.load_class not in {
+            "idle",
+            "busy",
+            "saturated",
+        } or self.pressure_class not in {"none", "low", "elevated"}:
             raise HostProbeError()
         if type(self.observed_at) is not str:
             raise HostProbeError()
         try:
-            observed = datetime.strptime(self.observed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+            observed = datetime.strptime(
+                self.observed_at, "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=UTC)
         except ValueError:
             raise HostProbeError() from None
         if observed.strftime("%Y-%m-%dT%H:%M:%SZ") != self.observed_at:
@@ -143,28 +161,55 @@ class HostProbeEvidenceV1:
 
     def public(self) -> dict[str, object]:
         value = {
-            "kernel_class": self.kernel_class, "architecture_class": self.architecture_class,
-            "cpu_count": self.cpu_count, "memory_class": self.memory_class,
-            "cgroup_v2": self.cgroup_v2, "systemd": self.systemd,
-            "load_class": self.load_class, "pressure_class": self.pressure_class,
-            "ollama_capability": self.ollama_capability, "observed_at": self.observed_at,
+            "kernel_class": self.kernel_class,
+            "architecture_class": self.architecture_class,
+            "cpu_count": self.cpu_count,
+            "memory_class": self.memory_class,
+            "cgroup_v2": self.cgroup_v2,
+            "systemd": self.systemd,
+            "load_class": self.load_class,
+            "pressure_class": self.pressure_class,
+            "ollama_capability": self.ollama_capability,
+            "observed_at": self.observed_at,
             "agent_generation": self.agent_generation,
         }
-        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
-        return {**value, "evidence_digest": "sha256:" + hashlib.sha256(canonical).hexdigest()}
+        canonical = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+        return {
+            **value,
+            "evidence_digest": "sha256:" + hashlib.sha256(canonical).hexdigest(),
+        }
 
     @classmethod
     def from_public(cls, value: object) -> "HostProbeEvidenceV1":
         if type(value) is not dict or set(value) != {
-            "kernel_class", "architecture_class", "cpu_count", "memory_class",
-            "cgroup_v2", "systemd", "load_class", "pressure_class",
-            "ollama_capability", "observed_at", "agent_generation", "evidence_digest",
+            "kernel_class",
+            "architecture_class",
+            "cpu_count",
+            "memory_class",
+            "cgroup_v2",
+            "systemd",
+            "load_class",
+            "pressure_class",
+            "ollama_capability",
+            "observed_at",
+            "agent_generation",
+            "evidence_digest",
         }:
             raise HostProbeError()
         evidence = cls(
-            value["kernel_class"], value["architecture_class"], value["cpu_count"], value["memory_class"],
-            value["cgroup_v2"], value["systemd"], value["load_class"], value["pressure_class"],
-            value["ollama_capability"], value["observed_at"], value["agent_generation"],
+            value["kernel_class"],
+            value["architecture_class"],
+            value["cpu_count"],
+            value["memory_class"],
+            value["cgroup_v2"],
+            value["systemd"],
+            value["load_class"],
+            value["pressure_class"],
+            value["ollama_capability"],
+            value["observed_at"],
+            value["agent_generation"],
         )
         if evidence.public()["evidence_digest"] != value["evidence_digest"]:
             raise HostProbeError()
@@ -182,10 +227,18 @@ class LocalHostProbeCollector:
             cpu_count = _integer(source.cpu_count)
             return HostProbeEvidenceV1(
                 "linux" if system.lower() == "linux" else "other",
-                "x86_64" if machine.lower() in {"x86_64", "amd64"} else "arm64" if machine.lower() in {"aarch64", "arm64"} else "other",
-                cpu_count, _classify_memory(source.memory_bytes), source.cgroup_v2(),
-                source.systemd(), _classify_load(source.load(), cpu_count),
-                _classify_pressure(source.pressure()), source.ollama_available(),
+                "x86_64"
+                if machine.lower() in {"x86_64", "amd64"}
+                else "arm64"
+                if machine.lower() in {"aarch64", "arm64"}
+                else "other",
+                cpu_count,
+                _classify_memory(source.memory_bytes),
+                source.cgroup_v2(),
+                source.systemd(),
+                _classify_load(source.load(), cpu_count),
+                _classify_pressure(source.pressure()),
+                source.ollama_available(),
                 _utc_timestamp(self._clock()),
             )
         except HostProbeError:
@@ -220,7 +273,9 @@ class _SystemKernel:
 
     def pressure(self) -> float:
         line = Path("/proc/pressure/cpu").read_text(encoding="ascii").splitlines()[0]
-        return float(next(item[4:] for item in line.split() if item.startswith("avg10=")))
+        return float(
+            next(item[4:] for item in line.split() if item.startswith("avg10="))
+        )
 
     def ollama_available(self) -> bool:
         return Path("/run/ollama/ollama.sock").is_socket()
@@ -244,12 +299,16 @@ class LocalHostProbeAdapter:
         self, host_ref: str, *, expected_generation: int, idempotency_key: str
     ) -> OperationV1:
         plan = self._operations.plan(
-            kind="hosts.probe", generation=expected_generation,
-            key=_operation_key(host_ref, idempotency_key), steps=("host.probe.collect",),
+            kind="hosts.probe",
+            generation=expected_generation,
+            key=_operation_key(host_ref, idempotency_key),
+            steps=("host.probe.collect",),
         )
         if plan.operation.state != "planned":
             return plan.operation
-        self._operations.begin(plan.operation.id, current_generation=expected_generation)
+        self._operations.begin(
+            plan.operation.id, current_generation=expected_generation
+        )
         try:
             evidence = self._collector.collect()
             resulting_generation = _next_generation(expected_generation)
@@ -264,13 +323,19 @@ class LocalHostProbeAdapter:
             )
         except Exception:
             self._operations.record_step(
-                plan.operation.id, "host.probe.collect", succeeded=False,
+                plan.operation.id,
+                "host.probe.collect",
+                succeeded=False,
                 reason_code="host.probe_failed",
             )
             return self._operations.finish(
-                plan.operation.id, state="failed", reason_codes=("host.probe_failed",),
+                plan.operation.id,
+                state="failed",
+                reason_codes=("host.probe_failed",),
             )
-        self._operations.record_step(plan.operation.id, "host.probe.collect", succeeded=True)
+        self._operations.record_step(
+            plan.operation.id, "host.probe.collect", succeeded=True
+        )
         return self._operations.finish(
             plan.operation.id,
             state="succeeded",
@@ -298,19 +363,26 @@ class RemoteHostProbeAdapter:
         self, host_ref: str, *, expected_generation: int, idempotency_key: str
     ) -> OperationV1:
         plan = self._operations.plan(
-            kind="hosts.probe", generation=expected_generation,
-            key=_operation_key(host_ref, idempotency_key), steps=("host.probe.collect",),
+            kind="hosts.probe",
+            generation=expected_generation,
+            key=_operation_key(host_ref, idempotency_key),
+            steps=("host.probe.collect",),
         )
         if plan.operation.state != "planned":
             return plan.operation
         document_generation = self._registry.document_generation()
         agent_operation = self._agent_operations.enqueue(
             AgentOperationRequestV1(
-                key=_operation_key(host_ref, idempotency_key), kind="host.probe", action="collect",
+                key=_operation_key(host_ref, idempotency_key),
+                kind="host.probe",
+                action="collect",
                 registry_generation=document_generation,
                 plan_digest=plan.plan_digest,
                 arguments={"admin_operation_id": plan.operation_id, "probe_schema": 1},
-                deadline=(self._clock().astimezone(UTC).replace(microsecond=0) + timedelta(minutes=5)),
+                deadline=(
+                    self._clock().astimezone(UTC).replace(microsecond=0)
+                    + timedelta(minutes=5)
+                ),
                 target_host_ref=host_ref,
             )
         )
@@ -348,10 +420,7 @@ class RemoteHostProbeCompletionOwner:
             return False
         target = exhaustion.target_host_ref
         arguments = exhaustion.arguments
-        if (
-            type(target) is not str
-            or exhaustion.host_ref != target
-        ):
+        if type(target) is not str or exhaustion.host_ref != target:
             raise HostProbeError()
         operation_id = _probe_operation_id(arguments)
         lifecycle = self._operations.claim_host_probe_agent(
@@ -396,10 +465,7 @@ class RemoteHostProbeCompletionOwner:
             return False
         target = expiry.target_host_ref
         arguments = expiry.arguments
-        if (
-            type(target) is not str
-            or expiry.host_ref != target
-        ):
+        if type(target) is not str or expiry.host_ref != target:
             raise HostProbeError()
         operation_id = _probe_operation_id(arguments)
         lifecycle = self._operations.claim_host_probe_agent(
@@ -448,10 +514,7 @@ class RemoteHostProbeCompletionOwner:
             return
         target = lifecycle.target_host_ref
         arguments = lifecycle.arguments
-        if (
-            type(target) is not str
-            or lifecycle.host_ref != target
-        ):
+        if type(target) is not str or lifecycle.host_ref != target:
             raise HostProbeError()
         operation_id = _probe_operation_id(arguments)
         terminal = self._agent_operations.get(lifecycle.operation_id)
@@ -460,9 +523,7 @@ class RemoteHostProbeCompletionOwner:
             if type(lifecycle) is AgentAttemptExhaustionV1
             else "host.lease_expired"
         )
-        if terminal.state != "unknown" or terminal.reason_codes != (
-            expected_reason,
-        ):
+        if terminal.state != "unknown" or terminal.reason_codes != (expected_reason,):
             raise AgentOperationError("host.operation_store_unavailable")
         self._operations.acknowledge_host_probe_agent(
             operation_id,
@@ -488,9 +549,7 @@ class RemoteHostProbeCompletionOwner:
             raise AgentOperationError("host.identity_mismatch")
         operation_id = _probe_operation_id(arguments)
         document_generation = context["registry_generation"]
-        if (
-            type(document_generation) is not int
-        ):
+        if type(document_generation) is not int:
             raise HostProbeError()
         lifecycle = self._operations.claim_host_probe_agent(
             operation_id,
@@ -541,12 +600,9 @@ class RemoteHostProbeCompletionOwner:
                 "host.probe_failed",
             )
         allowed_host_generations = {host_generation}
-        if (
-            host_generation < _MAX_GENERATION
-            and (
-                operation.state in {"running", *_TERMINAL_ADMIN_STATES}
-                or operation.reason_codes == ("control.restart_reconciled",)
-            )
+        if host_generation < _MAX_GENERATION and (
+            operation.state in {"running", *_TERMINAL_ADMIN_STATES}
+            or operation.reason_codes == ("control.restart_reconciled",)
         ):
             allowed_host_generations.add(host_generation + 1)
         if host.generation not in allowed_host_generations:
@@ -678,9 +734,7 @@ class RemoteHostProbeCompletionOwner:
             return operation.reason_codes[0]
         return None
 
-    def _active_operation(
-        self, operation_id: str, generation: int
-    ) -> OperationV1:
+    def _active_operation(self, operation_id: str, generation: int) -> OperationV1:
         operation = self._operations.get(operation_id)
         if operation.state == "partial" and operation.reason_codes == (
             "control.restart_reconciled",
@@ -841,8 +895,10 @@ class HostProbeRouter:
 
 def _memory_floor(memory_class: str) -> int:
     return {
-        "under-8-gib": 1 * 1024**3, "8-31-gib": 8 * 1024**3,
-        "32-127-gib": 32 * 1024**3, "128-plus-gib": 128 * 1024**3,
+        "under-8-gib": 1 * 1024**3,
+        "8-31-gib": 8 * 1024**3,
+        "32-127-gib": 32 * 1024**3,
+        "128-plus-gib": 128 * 1024**3,
     }[memory_class]
 
 
@@ -867,4 +923,7 @@ def _operation_principal(principal: object) -> OperationPrincipalV1:
 def _operation_key(host_ref: str, idempotency_key: str) -> str:
     if type(host_ref) is not str or type(idempotency_key) is not str:
         raise HostProbeError()
-    return "probe-" + hashlib.sha256(f"{host_ref}\0{idempotency_key}".encode("ascii")).hexdigest()
+    return (
+        "probe-"
+        + hashlib.sha256(f"{host_ref}\0{idempotency_key}".encode("ascii")).hexdigest()
+    )

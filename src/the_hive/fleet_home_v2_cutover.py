@@ -27,15 +27,30 @@ _AGENT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _OPERATION_ID_RE = re.compile(r"[0-9a-f]{48}\Z")
 _MARKER_FIELDS = frozenset(
     {
-        "schema_version", "kind", "agent_id", "prefix", "runner", "provider",
-        "model", "common_policy", "managed_files", "files",
+        "schema_version",
+        "kind",
+        "agent_id",
+        "prefix",
+        "runner",
+        "provider",
+        "model",
+        "common_policy",
+        "managed_files",
+        "files",
     }
 )
 _MARKER_RUNTIME_FIELD = "runtime_skill_profile"
 _POLICY_FIELDS = frozenset({"schema_version", "generation", "digest"})
 _JOURNAL_STATES = (
-    "planned", "staged", "exchanged", "backup-bound", "cutover-complete",
-    "rollback-exchanged", "rolled-back", "cleanup-intent", "cleanup-quarantined",
+    "planned",
+    "staged",
+    "exchanged",
+    "backup-bound",
+    "cutover-complete",
+    "rollback-exchanged",
+    "rolled-back",
+    "cleanup-intent",
+    "cleanup-quarantined",
     "cleanup-retired",
 )
 _JOURNAL_TRANSITIONS = {
@@ -214,14 +229,22 @@ class LocalFleetHomeV2Filesystem:
     @staticmethod
     def identity_from_stat(value: os.stat_result) -> _FilesystemIdentity:
         return _FilesystemIdentity(
-            value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
-            value.st_nlink, value.st_size, value.st_mtime_ns,
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
         )
 
     @classmethod
     def identity_at(cls, parent_fd: int, name: str) -> _FilesystemIdentity:
         try:
-            return cls.identity_from_stat(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+            return cls.identity_from_stat(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            )
         except OSError as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_source_invalid") from exc
 
@@ -248,7 +271,9 @@ class LocalFleetHomeV2Filesystem:
         try:
             return os.open(
                 parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
             )
         except OSError as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_source_invalid") from exc
@@ -258,11 +283,15 @@ class LocalFleetHomeV2Filesystem:
         try:
             return os.open(
                 name,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=parent_fd,
             )
         except OSError as exc:
-            raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed") from exc
+            raise FleetHomeV2CutoverError(
+                "fleet_home_v2_artifact_attestation_failed"
+            ) from exc
 
     @staticmethod
     def _private_directory(identity: _FilesystemIdentity, uid: int, gid: int) -> bool:
@@ -322,8 +351,11 @@ class LocalFleetHomeV2Filesystem:
             os.fsync(file_fd)
             current = self.identity_from_stat(os.fstat(file_fd))
             if (
-                not stat.S_ISREG(current.mode) or stat.S_IMODE(current.mode) != mode
-                or current.uid != uid or current.gid != gid or current.nlink != 1
+                not stat.S_ISREG(current.mode)
+                or stat.S_IMODE(current.mode) != mode
+                or current.uid != uid
+                or current.gid != gid
+                or current.nlink != 1
                 or current.size != len(data)
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid")
@@ -339,7 +371,8 @@ class LocalFleetHomeV2Filesystem:
         enumeration_fd = -1
         try:
             enumeration_fd = os.open(
-                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                ".",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                 dir_fd=directory_fd,
             )
             bound = os.fstat(directory_fd)
@@ -363,10 +396,16 @@ class LocalFleetHomeV2Filesystem:
             elif stat.S_ISREG(current.mode) and current.nlink == 1:
                 file_fd = -1
                 try:
-                    file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+                    file_fd = os.open(
+                        name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
                     os.fsync(file_fd)
                 except OSError as exc:
-                    raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid") from exc
+                    raise FleetHomeV2CutoverError(
+                        "fleet_home_v2_stage_invalid"
+                    ) from exc
                 finally:
                     if file_fd >= 0:
                         os.close(file_fd)
@@ -396,7 +435,13 @@ class LocalFleetHomeV2Filesystem:
         renameat2 = getattr(libc, "renameat2", None)
         if renameat2 is None:
             raise FleetHomeV2CutoverError("fleet_home_v2_exchange_unavailable")
-        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
         renameat2.restype = ctypes.c_int
         if (
             renameat2(
@@ -428,7 +473,9 @@ class LocalFleetHomeV2Filesystem:
         target_parent_fd: int,
         target: str,
     ) -> None:
-        self._renameat2(source_parent_fd, source, target_parent_fd, target, 1)  # RENAME_NOREPLACE
+        self._renameat2(
+            source_parent_fd, source, target_parent_fd, target, 1
+        )  # RENAME_NOREPLACE
 
     @staticmethod
     def unlink_at(parent_fd: int, name: str) -> None:
@@ -463,13 +510,17 @@ class LocalFleetHomeV2Filesystem:
                 self.fsync_directory(parent_fd)
             else:
                 grave_fd = self._open_dir_at(parent_fd, grave_name)
-                if not self._private_directory(self.parent_identity(grave_fd), uid, gid):
+                if not self._private_directory(
+                    self.parent_identity(grave_fd), uid, gid
+                ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
 
             if not self._lstat_absent(grave_fd, "root"):
                 directory_fd = self._open_dir_at(grave_fd, "root")
                 try:
-                    if not self._same_object(self.parent_identity(directory_fd), expected):
+                    if not self._same_object(
+                        self.parent_identity(directory_fd), expected
+                    ):
                         raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
                     self._remove_tree_contents(directory_fd, grave_name, uid, gid)
                 finally:
@@ -483,7 +534,9 @@ class LocalFleetHomeV2Filesystem:
                 if os.listdir(grave_fd):
                     raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
             except OSError as exc:
-                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_recovery_required"
+                ) from exc
         except FleetHomeV2CutoverError:
             if grave_fd >= 0:
                 self._mark_grave_poison(parent_fd, grave_name, uid, gid)
@@ -499,7 +552,9 @@ class LocalFleetHomeV2Filesystem:
         except OSError as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
 
-    def _mark_grave_poison(self, parent_fd: int, grave_name: str, uid: int, gid: int) -> None:
+    def _mark_grave_poison(
+        self, parent_fd: int, grave_name: str, uid: int, gid: int
+    ) -> None:
         poison_name = f"{grave_name}.poison"
         if self._lstat_absent(parent_fd, poison_name):
             poison_fd = self.mkdir_private_at(parent_fd, poison_name, uid, gid)
@@ -525,15 +580,21 @@ class LocalFleetHomeV2Filesystem:
                 if stat.S_ISDIR(current.mode):
                     child_fd = self._open_dir_at(grab_fd, name)
                     try:
-                        if not self._same_object(self.parent_identity(child_fd), current):
-                            raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+                        if not self._same_object(
+                            self.parent_identity(child_fd), current
+                        ):
+                            raise FleetHomeV2CutoverError(
+                                "fleet_home_v2_recovery_required"
+                            )
                         self._remove_tree_contents(child_fd, grave_name, uid, gid)
                     finally:
                         os.close(child_fd)
                     try:
                         os.rmdir(name, dir_fd=grab_fd)
                     except OSError as exc:
-                        raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
+                        raise FleetHomeV2CutoverError(
+                            "fleet_home_v2_recovery_required"
+                        ) from exc
                 elif stat.S_ISREG(current.mode) and current.nlink == 1:
                     self.unlink_at(grab_fd, name)
                 else:
@@ -546,8 +607,16 @@ class LocalFleetHomeV2Filesystem:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
 
     @staticmethod
-    def _same_object(current: _FilesystemIdentity, expected: _FilesystemIdentity) -> bool:
-        return (current.device, current.inode, current.mode, current.uid, current.gid) == (
+    def _same_object(
+        current: _FilesystemIdentity, expected: _FilesystemIdentity
+    ) -> bool:
+        return (
+            current.device,
+            current.inode,
+            current.mode,
+            current.uid,
+            current.gid,
+        ) == (
             expected.device,
             expected.inode,
             expected.mode,
@@ -614,7 +683,9 @@ class FleetHomeV2CutoverService:
         self._observations_lock = threading.Lock()
 
     def plan(self, target_ids: tuple[str, ...]) -> FleetHomeV2PlanHandle:
-        if not isinstance(target_ids, tuple) or any(type(item) is not str for item in target_ids):
+        if not isinstance(target_ids, tuple) or any(
+            type(item) is not str for item in target_ids
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
         operation_id = self._reserve_operation_id()
         try:
@@ -639,12 +710,20 @@ class FleetHomeV2CutoverService:
             try:
                 if target.already_current:
                     self._require_current_v2(target)
-                    results.append(FleetHomeV2Result(target.authority.agent_id, "already-current", "fleet_home_v2_already_current"))
+                    results.append(
+                        FleetHomeV2Result(
+                            target.authority.agent_id,
+                            "already-current",
+                            "fleet_home_v2_already_current",
+                        )
+                    )
                 else:
                     self._validate_plan(plan, require_source=True)
                     results.append(self._apply_target(plan, target))
             except FleetHomeV2CutoverError as exc:
-                results.append(self._result_for_error(target.authority.agent_id, exc.code))
+                results.append(
+                    self._result_for_error(target.authority.agent_id, exc.code)
+                )
         return tuple(results)
 
     def recover(self, handle: FleetHomeV2PlanHandle) -> tuple[FleetHomeV2Result, ...]:
@@ -655,7 +734,13 @@ class FleetHomeV2CutoverService:
             try:
                 results.append(self._recover_target(plan, target))
             except FleetHomeV2CutoverError as exc:
-                results.append(FleetHomeV2Result(target.authority.agent_id, "recovery-required", self._recovery_code(exc.code)))
+                results.append(
+                    FleetHomeV2Result(
+                        target.authority.agent_id,
+                        "recovery-required",
+                        self._recovery_code(exc.code),
+                    )
+                )
         return tuple(results)
 
     def verify(self, handle: FleetHomeV2PlanHandle) -> tuple[FleetHomeV2Result, ...]:
@@ -668,7 +753,9 @@ class FleetHomeV2CutoverService:
             try:
                 if target.already_current:
                     self._require_current_v2(target)
-                    results.append(FleetHomeV2Result(target.authority.agent_id, "already-current"))
+                    results.append(
+                        FleetHomeV2Result(target.authority.agent_id, "already-current")
+                    )
                     continue
                 parent_fd = self._open_bound_parent(target)
                 try:
@@ -685,7 +772,9 @@ class FleetHomeV2CutoverService:
                     if parent_fd >= 0:
                         os.close(parent_fd)
                         parent_fd = -1
-                results.append(FleetHomeV2Result(target.authority.agent_id, "cutover-complete"))
+                results.append(
+                    FleetHomeV2Result(target.authority.agent_id, "cutover-complete")
+                )
             except FleetHomeV2CutoverError as exc:
                 if parent_fd >= 0:
                     mutation_possible = self._mutation_possible(
@@ -694,7 +783,11 @@ class FleetHomeV2CutoverService:
                     os.close(parent_fd)
                     parent_fd = -1
                 state = "recovery-required" if mutation_possible else "failed-terminal"
-                results.append(FleetHomeV2Result(target.authority.agent_id, state, self._recovery_code(exc.code)))
+                results.append(
+                    FleetHomeV2Result(
+                        target.authority.agent_id, state, self._recovery_code(exc.code)
+                    )
+                )
         return tuple(results)
 
     def rollback(self, handle: FleetHomeV2PlanHandle) -> tuple[FleetHomeV2Result, ...]:
@@ -705,17 +798,30 @@ class FleetHomeV2CutoverService:
             try:
                 results.append(self._rollback_target(plan, target))
             except FleetHomeV2CutoverError as exc:
-                results.append(FleetHomeV2Result(target.authority.agent_id, "recovery-required", self._recovery_code(exc.code)))
+                results.append(
+                    FleetHomeV2Result(
+                        target.authority.agent_id,
+                        "recovery-required",
+                        self._recovery_code(exc.code),
+                    )
+                )
         return tuple(results)
 
     def _snapshot(self) -> FleetHomeV2Inventory:
         snapshot = self._authority_port.snapshot()
-        if not isinstance(snapshot, FleetHomeV2Inventory) or type(snapshot.generation) is not int or snapshot.generation <= 0:
+        if (
+            not isinstance(snapshot, FleetHomeV2Inventory)
+            or type(snapshot.generation) is not int
+            or snapshot.generation <= 0
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
         return snapshot
 
     def _resolve_handle(self, handle: FleetHomeV2PlanHandle) -> FleetHomeV2Plan:
-        if not isinstance(handle, FleetHomeV2PlanHandle) or _OPERATION_ID_RE.fullmatch(handle.operation_id) is None:
+        if (
+            not isinstance(handle, FleetHomeV2PlanHandle)
+            or _OPERATION_ID_RE.fullmatch(handle.operation_id) is None
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
         snapshot = self._snapshot()
         document: dict[str, object] | None = None
@@ -738,7 +844,12 @@ class FleetHomeV2CutoverService:
         for target in plan.targets:
             parent_fd = self._open_bound_parent(target)
             try:
-                if self._load_plan_binding(parent_fd, self._names(plan, target)["plan"], target.authority) != document:
+                if (
+                    self._load_plan_binding(
+                        parent_fd, self._names(plan, target)["plan"], target.authority
+                    )
+                    != document
+                ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
             finally:
                 os.close(parent_fd)
@@ -762,7 +873,9 @@ class FleetHomeV2CutoverService:
 
     def _persist_plan(self, plan: FleetHomeV2Plan) -> None:
         document = self._plan_document(plan)
-        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        encoded = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
         written: list[FleetHomeV2TargetPlan] = []
         try:
             for target in plan.targets:
@@ -784,12 +897,16 @@ class FleetHomeV2CutoverService:
             for target in written:
                 parent_fd = self._filesystem.open_parent(target.authority.home.parent)
                 try:
-                    self._filesystem.unlink_at(parent_fd, self._names(plan, target)["plan"])
+                    self._filesystem.unlink_at(
+                        parent_fd, self._names(plan, target)["plan"]
+                    )
                     self._filesystem.fsync_directory(parent_fd)
                 finally:
                     os.close(parent_fd)
             if exc.code == "fleet_home_v2_cutover_collision":
-                raise FleetHomeV2CutoverError("fleet_home_v2_operation_collision") from exc
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_operation_collision"
+                ) from exc
             raise
 
     def _load_plan_binding(
@@ -805,7 +922,9 @@ class FleetHomeV2CutoverService:
                 or identity.nlink != 1
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
-            file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+            file_fd = os.open(
+                name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+            )
             try:
                 data = b"".join(iter(lambda: os.read(file_fd, 64 * 1024), b""))
                 if self._filesystem.identity_from_stat(os.fstat(file_fd)) != identity:
@@ -824,7 +943,14 @@ class FleetHomeV2CutoverService:
     def _plan_from_binding(
         self, document: Mapping[str, object], snapshot: FleetHomeV2Inventory
     ) -> FleetHomeV2Plan:
-        fields = {"schema_version", "kind", "operation_id", "registry_generation", "digest", "targets"}
+        fields = {
+            "schema_version",
+            "kind",
+            "operation_id",
+            "registry_generation",
+            "digest",
+            "targets",
+        }
         if (
             set(document) != fields
             or document.get("schema_version") != 2
@@ -839,9 +965,18 @@ class FleetHomeV2CutoverService:
         targets: list[FleetHomeV2TargetPlan] = []
         for value in document["targets"]:
             target_fields = {
-                "agent_id", "authority", "home_identity", "parent_identity", "manifest_digest", "already_current"
+                "agent_id",
+                "authority",
+                "home_identity",
+                "parent_identity",
+                "manifest_digest",
+                "already_current",
             }
-            if not isinstance(value, dict) or set(value) != target_fields or not isinstance(value.get("agent_id"), str):
+            if (
+                not isinstance(value, dict)
+                or set(value) != target_fields
+                or not isinstance(value.get("agent_id"), str)
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
             authority = snapshot.homes.get(value["agent_id"])
             if (
@@ -861,10 +996,16 @@ class FleetHomeV2CutoverService:
                 )
             )
         plan = FleetHomeV2Plan(
-            document["operation_id"], snapshot.generation, tuple(targets), document["digest"]
+            document["operation_id"],
+            snapshot.generation,
+            tuple(targets),
+            document["digest"],
         )
         self._validate_plan_structure(plan)
-        if self._plan_digest(plan.operation_id, plan.registry_generation, plan.targets) != plan.digest:
+        if (
+            self._plan_digest(plan.operation_id, plan.registry_generation, plan.targets)
+            != plan.digest
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
         return plan
 
@@ -888,8 +1029,14 @@ class FleetHomeV2CutoverService:
             ],
         }
 
-    def _build_targets(self, snapshot: FleetHomeV2Inventory, target_ids: tuple[str, ...]) -> tuple[FleetHomeV2TargetPlan, ...]:
-        if not target_ids or len(target_ids) > MAX_TARGETS or len(set(target_ids)) != len(target_ids):
+    def _build_targets(
+        self, snapshot: FleetHomeV2Inventory, target_ids: tuple[str, ...]
+    ) -> tuple[FleetHomeV2TargetPlan, ...]:
+        if (
+            not target_ids
+            or len(target_ids) > MAX_TARGETS
+            or len(set(target_ids)) != len(target_ids)
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
         if any(_AGENT_ID_RE.fullmatch(item) is None for item in target_ids):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
@@ -897,21 +1044,40 @@ class FleetHomeV2CutoverService:
         targets: list[FleetHomeV2TargetPlan] = []
         for agent_id in ordered:
             authority = snapshot.homes.get(agent_id)
-            if not isinstance(authority, FleetHomeV2Authority) or authority.agent_id != agent_id:
+            if (
+                not isinstance(authority, FleetHomeV2Authority)
+                or authority.agent_id != agent_id
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
             self._validate_authority(authority, snapshot.generation)
             parent_fd = self._filesystem.open_parent(authority.home.parent)
             try:
                 parent_identity = self._filesystem.parent_identity(parent_fd)
-                home_identity = self._filesystem.identity_at(parent_fd, authority.home.name)
-                if not self._filesystem._private_directory(parent_identity, authority.owner_uid, authority.owner_gid):
+                home_identity = self._filesystem.identity_at(
+                    parent_fd, authority.home.name
+                )
+                if not self._filesystem._private_directory(
+                    parent_identity, authority.owner_uid, authority.owner_gid
+                ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_source_invalid")
-                if not self._filesystem._private_directory(home_identity, authority.owner_uid, authority.owner_gid):
+                if not self._filesystem._private_directory(
+                    home_identity, authority.owner_uid, authority.owner_gid
+                ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_source_invalid")
-                already_current = self._attest_tree_at(parent_fd, authority.home.name, authority)
+                already_current = self._attest_tree_at(
+                    parent_fd, authority.home.name, authority
+                )
             finally:
                 os.close(parent_fd)
-            targets.append(FleetHomeV2TargetPlan(authority, home_identity, parent_identity, self._manifest_digest(authority), already_current))
+            targets.append(
+                FleetHomeV2TargetPlan(
+                    authority,
+                    home_identity,
+                    parent_identity,
+                    self._manifest_digest(authority),
+                    already_current,
+                )
+            )
         return tuple(targets)
 
     def _validate_plan(self, plan: FleetHomeV2Plan, *, require_source: bool) -> None:
@@ -922,48 +1088,80 @@ class FleetHomeV2CutoverService:
             raise FleetHomeV2CutoverError("fleet_home_v2_generation_stale")
         if require_source:
             expected = self._build_targets(snapshot, ids)
-            if any(
-                current.authority != planned.authority
-                or current.home_identity != planned.home_identity
-                or not self._same_parent(current.parent_identity, planned.parent_identity)
-                or current.manifest_digest != planned.manifest_digest
-                or current.already_current != planned.already_current
-                for current, planned in zip(expected, plan.targets, strict=True)
-            ) or self._plan_digest(plan.operation_id, plan.registry_generation, plan.targets) != plan.digest:
+            if (
+                any(
+                    current.authority != planned.authority
+                    or current.home_identity != planned.home_identity
+                    or not self._same_parent(
+                        current.parent_identity, planned.parent_identity
+                    )
+                    or current.manifest_digest != planned.manifest_digest
+                    or current.already_current != planned.already_current
+                    for current, planned in zip(expected, plan.targets, strict=True)
+                )
+                or self._plan_digest(
+                    plan.operation_id, plan.registry_generation, plan.targets
+                )
+                != plan.digest
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
             return
         for target in plan.targets:
             current = snapshot.homes.get(target.authority.agent_id)
-            if current != target.authority or self._manifest_digest(target.authority) != target.manifest_digest:
+            if (
+                current != target.authority
+                or self._manifest_digest(target.authority) != target.manifest_digest
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_generation_stale")
-        if self._plan_digest(plan.operation_id, plan.registry_generation, plan.targets) != plan.digest:
+        if (
+            self._plan_digest(plan.operation_id, plan.registry_generation, plan.targets)
+            != plan.digest
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
 
     @staticmethod
     def _validate_plan_structure(plan: FleetHomeV2Plan) -> None:
         if (
-            not isinstance(plan, FleetHomeV2Plan) or _OPERATION_ID_RE.fullmatch(plan.operation_id) is None
-            or not isinstance(plan.targets, tuple) or not plan.targets or len(plan.targets) > MAX_TARGETS
+            not isinstance(plan, FleetHomeV2Plan)
+            or _OPERATION_ID_RE.fullmatch(plan.operation_id) is None
+            or not isinstance(plan.targets, tuple)
+            or not plan.targets
+            or len(plan.targets) > MAX_TARGETS
             or not isinstance(plan.digest, str)
         ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
-        ids = tuple(target.authority.agent_id for target in plan.targets if isinstance(target, FleetHomeV2TargetPlan))
-        if len(ids) != len(plan.targets) or ids != tuple(sorted(ids, key=lambda item: (item != "g1", item))):
+        ids = tuple(
+            target.authority.agent_id
+            for target in plan.targets
+            if isinstance(target, FleetHomeV2TargetPlan)
+        )
+        if len(ids) != len(plan.targets) or ids != tuple(
+            sorted(ids, key=lambda item: (item != "g1", item))
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
 
-    def _validate_authority(self, authority: FleetHomeV2Authority, generation: int) -> None:
+    def _validate_authority(
+        self, authority: FleetHomeV2Authority, generation: int
+    ) -> None:
         if (
-            _AGENT_ID_RE.fullmatch(authority.agent_id) is None or authority.home.name != authority.agent_id
-            or authority.registry_generation != generation or authority.authority_generation <= 0
-            or authority.policy.schema_version != 1 or authority.policy.generation <= 0
+            _AGENT_ID_RE.fullmatch(authority.agent_id) is None
+            or authority.home.name != authority.agent_id
+            or authority.registry_generation != generation
+            or authority.authority_generation <= 0
+            or authority.policy.schema_version != 1
+            or authority.policy.generation <= 0
             or re.fullmatch(r"[0-9a-f]{64}", authority.policy.digest) is None
-            or not authority.lease_generation or not authority.process_generation
-            or type(authority.owner_uid) is not int or type(authority.owner_gid) is not int
+            or not authority.lease_generation
+            or not authority.process_generation
+            or type(authority.owner_uid) is not int
+            or type(authority.owner_gid) is not int
         ):
             raise FleetHomeV2CutoverError("fleet_home_v2_plan_invalid")
         self._artifact_map(authority)
 
-    def _apply_target(self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan) -> FleetHomeV2Result:
+    def _apply_target(
+        self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan
+    ) -> FleetHomeV2Result:
         parent_fd = self._open_bound_parent(target)
         mutated = False
         try:
@@ -972,66 +1170,122 @@ class FleetHomeV2CutoverService:
             self._acquire_home_lock(parent_fd, plan, target, names)
             self._require_operation_absent(parent_fd, names)
             journal = self._new_journal(plan, target, names)
-            self._store_journal(parent_fd, names["journal"], journal, previous_identity=None)
+            self._store_journal(
+                parent_fd, names["journal"], journal, previous_identity=None
+            )
             self._filesystem.checkpoint("after-journal-planned")
-            stage_fd = self._filesystem.mkdir_private_at(parent_fd, names["stage"], target.authority.owner_uid, target.authority.owner_gid)
+            stage_fd = self._filesystem.mkdir_private_at(
+                parent_fd,
+                names["stage"],
+                target.authority.owner_uid,
+                target.authority.owner_gid,
+            )
             try:
                 self._write_stage(stage_fd, target.authority)
                 self._filesystem.fsync_tree_at(stage_fd)
                 stage_identity = self._filesystem.parent_identity(stage_fd)
             finally:
                 os.close(stage_fd)
-            if not self._filesystem._private_directory(stage_identity, target.authority.owner_uid, target.authority.owner_gid):
+            if not self._filesystem._private_directory(
+                stage_identity, target.authority.owner_uid, target.authority.owner_gid
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid")
             self._filesystem.fsync_directory(parent_fd)
             if not self._attest_tree_at(parent_fd, names["stage"], target.authority):
-                raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed")
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_artifact_attestation_failed"
+                )
             journal = self._advance_journal(journal, "staged", stage_identity)
-            self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+            self._store_journal(
+                parent_fd,
+                names["journal"],
+                journal,
+                self._filesystem.identity_at(parent_fd, names["journal"]),
+            )
             self._filesystem.checkpoint("after-stage-fsync")
             self._validate_plan(plan, require_source=True)
             self._require_quiescent(target, target.home_identity)
-            if self._filesystem.identity_at(parent_fd, target.authority.home.name) != target.home_identity:
+            if (
+                self._filesystem.identity_at(parent_fd, target.authority.home.name)
+                != target.home_identity
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_source_invalid")
-            if self._filesystem.identity_at(parent_fd, names["stage"]) != stage_identity:
+            if (
+                self._filesystem.identity_at(parent_fd, names["stage"])
+                != stage_identity
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid")
-            self._filesystem.exchange_at(parent_fd, target.authority.home.name, names["stage"])
+            self._filesystem.exchange_at(
+                parent_fd, target.authority.home.name, names["stage"]
+            )
             mutated = True
             try:
                 if (
-                    self._filesystem.identity_at(parent_fd, target.authority.home.name) != stage_identity
-                    or self._filesystem.identity_at(parent_fd, names["stage"]) != target.home_identity
+                    self._filesystem.identity_at(parent_fd, target.authority.home.name)
+                    != stage_identity
+                    or self._filesystem.identity_at(parent_fd, names["stage"])
+                    != target.home_identity
                 ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
             except FleetHomeV2CutoverError:
-                if self._restore_exchange_if_bound(parent_fd, target, names, stage_identity):
+                if self._restore_exchange_if_bound(
+                    parent_fd, target, names, stage_identity
+                ):
                     mutated = False
-                    raise FleetHomeV2CutoverError("fleet_home_v2_source_invalid") from None
-                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from None
+                    raise FleetHomeV2CutoverError(
+                        "fleet_home_v2_source_invalid"
+                    ) from None
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_recovery_required"
+                ) from None
             self._filesystem.fsync_directory(parent_fd)
             journal = self._advance_journal(journal, "exchanged", stage_identity)
-            self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+            self._store_journal(
+                parent_fd,
+                names["journal"],
+                journal,
+                self._filesystem.identity_at(parent_fd, names["journal"]),
+            )
             self._filesystem.checkpoint("after-exchange")
-            self._filesystem.rename_noreplace_at(parent_fd, names["stage"], names["backup"])
-            if self._filesystem.identity_at(parent_fd, names["backup"]) != target.home_identity:
+            self._filesystem.rename_noreplace_at(
+                parent_fd, names["stage"], names["backup"]
+            )
+            if (
+                self._filesystem.identity_at(parent_fd, names["backup"])
+                != target.home_identity
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
             self._filesystem.fsync_directory(parent_fd)
             journal = self._advance_journal(journal, "backup-bound", stage_identity)
-            self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+            self._store_journal(
+                parent_fd,
+                names["journal"],
+                journal,
+                self._filesystem.identity_at(parent_fd, names["journal"]),
+            )
             self._filesystem.checkpoint("after-stage-to-backup")
             self._require_v2_and_backup(parent_fd, target, journal)
             journal = self._advance_journal(journal, "cutover-complete", stage_identity)
-            self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+            self._store_journal(
+                parent_fd,
+                names["journal"],
+                journal,
+                self._filesystem.identity_at(parent_fd, names["journal"]),
+            )
             self._filesystem.checkpoint("after-v2-verify")
             return FleetHomeV2Result(target.authority.agent_id, "cutover-complete")
         except FleetHomeV2CutoverError as exc:
             if mutated:
-                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_recovery_required"
+                ) from exc
             raise
         finally:
             os.close(parent_fd)
 
-    def _recover_target(self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan) -> FleetHomeV2Result:
+    def _recover_target(
+        self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan
+    ) -> FleetHomeV2Result:
         if target.already_current:
             self._require_current_v2(target)
             return FleetHomeV2Result(target.authority.agent_id, "already-current")
@@ -1040,12 +1294,11 @@ class FleetHomeV2CutoverService:
             names = self._names(plan, target)
             self._acquire_home_lock(parent_fd, plan, target, names)
             if self._filesystem._lstat_absent(parent_fd, names["journal"]):
-                if (
-                    self._optional_identity(parent_fd, target.authority.home.name) == target.home_identity
-                    and all(
-                        self._optional_identity(parent_fd, names[key]) is None
-                        for key in ("stage", "backup", "archive", "cleanup")
-                    )
+                if self._optional_identity(
+                    parent_fd, target.authority.home.name
+                ) == target.home_identity and all(
+                    self._optional_identity(parent_fd, names[key]) is None
+                    for key in ("stage", "backup", "archive", "cleanup")
                 ):
                     self._release_home_lock(parent_fd, plan, target, names)
                     return FleetHomeV2Result(
@@ -1072,33 +1325,87 @@ class FleetHomeV2CutoverService:
                 self._require_quiescent(target, target.home_identity)
                 self._filesystem.unlink_at(parent_fd, names["journal"])
                 self._release_home_lock(parent_fd, plan, target, names)
-                return FleetHomeV2Result(target.authority.agent_id, "failed-retryable", "fleet_home_v2_cutover_failed")
+                return FleetHomeV2Result(
+                    target.authority.agent_id,
+                    "failed-retryable",
+                    "fleet_home_v2_cutover_failed",
+                )
             v2_identity = self._journal_v2_identity(journal)
-            if home == v2_identity and backup == target.home_identity and stage is None and cleanup is None:
+            if (
+                home == v2_identity
+                and backup == target.home_identity
+                and stage is None
+                and cleanup is None
+            ):
                 self._require_quiescent(target, v2_identity)
-                journal = self._advance_until(parent_fd, names["journal"], journal, "cutover-complete", v2_identity)
+                journal = self._advance_until(
+                    parent_fd,
+                    names["journal"],
+                    journal,
+                    "cutover-complete",
+                    v2_identity,
+                )
                 self._require_v2_and_backup(parent_fd, target, journal)
                 return FleetHomeV2Result(target.authority.agent_id, "cutover-complete")
-            if home == v2_identity and stage == target.home_identity and backup is None and cleanup is None:
+            if (
+                home == v2_identity
+                and stage == target.home_identity
+                and backup is None
+                and cleanup is None
+            ):
                 self._require_quiescent(target, v2_identity)
-                journal = self._advance_until(parent_fd, names["journal"], journal, "exchanged", v2_identity)
-                self._filesystem.rename_noreplace_at(parent_fd, names["stage"], names["backup"])
+                journal = self._advance_until(
+                    parent_fd, names["journal"], journal, "exchanged", v2_identity
+                )
+                self._filesystem.rename_noreplace_at(
+                    parent_fd, names["stage"], names["backup"]
+                )
                 self._filesystem.fsync_directory(parent_fd)
-                journal = self._advance_until(parent_fd, names["journal"], journal, "backup-bound", v2_identity)
+                journal = self._advance_until(
+                    parent_fd, names["journal"], journal, "backup-bound", v2_identity
+                )
                 self._require_v2_and_backup(parent_fd, target, journal)
-                journal = self._advance_until(parent_fd, names["journal"], journal, "cutover-complete", v2_identity)
+                journal = self._advance_until(
+                    parent_fd,
+                    names["journal"],
+                    journal,
+                    "cutover-complete",
+                    v2_identity,
+                )
                 return FleetHomeV2Result(target.authority.agent_id, "cutover-complete")
-            if home == target.home_identity and backup == v2_identity and archive is None and cleanup is None:
+            if (
+                home == target.home_identity
+                and backup == v2_identity
+                and archive is None
+                and cleanup is None
+            ):
                 self._require_quiescent(target, target.home_identity)
-                journal = self._advance_until(parent_fd, names["journal"], journal, "rollback-exchanged", v2_identity)
-                self._filesystem.rename_noreplace_at(parent_fd, names["backup"], names["archive"])
+                journal = self._advance_until(
+                    parent_fd,
+                    names["journal"],
+                    journal,
+                    "rollback-exchanged",
+                    v2_identity,
+                )
+                self._filesystem.rename_noreplace_at(
+                    parent_fd, names["backup"], names["archive"]
+                )
                 self._filesystem.fsync_directory(parent_fd)
-                journal = self._advance_until(parent_fd, names["journal"], journal, "rolled-back", v2_identity)
+                journal = self._advance_until(
+                    parent_fd, names["journal"], journal, "rolled-back", v2_identity
+                )
                 self._retire_rolled_back(parent_fd, plan, target, names)
                 return FleetHomeV2Result(target.authority.agent_id, "rolled-back")
-            if home == target.home_identity and backup is None and archive == v2_identity and cleanup is None:
+            if (
+                home == target.home_identity
+                and backup is None
+                and archive == v2_identity
+                and cleanup is None
+            ):
                 self._require_quiescent(target, target.home_identity)
-                journal = self._advance_until(parent_fd, names["journal"], journal, "rolled-back", v2_identity)
+                journal = self._advance_until(
+                    parent_fd, names["journal"], journal, "rolled-back", v2_identity
+                )
                 self._retire_rolled_back(parent_fd, plan, target, names)
                 return FleetHomeV2Result(target.authority.agent_id, "rolled-back")
             if (
@@ -1109,20 +1416,41 @@ class FleetHomeV2CutoverService:
                 and archive is None
                 and cleanup is None
             ):
-                if not self._attest_tree_at(parent_fd, names["stage"], target.authority):
+                if not self._attest_tree_at(
+                    parent_fd, names["stage"], target.authority
+                ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
                 self._require_quiescent(target, target.home_identity)
                 journal = self._advance_journal(journal, "cleanup-intent", v2_identity)
-                self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+                self._store_journal(
+                    parent_fd,
+                    names["journal"],
+                    journal,
+                    self._filesystem.identity_at(parent_fd, names["journal"]),
+                )
                 self._filesystem.checkpoint("before-stage-quarantine")
-                self._filesystem.rename_noreplace_at(parent_fd, names["stage"], names["cleanup"])
-                if not self._same_object(self._filesystem.identity_at(parent_fd, names["cleanup"]), v2_identity):
+                self._filesystem.rename_noreplace_at(
+                    parent_fd, names["stage"], names["cleanup"]
+                )
+                if not self._same_object(
+                    self._filesystem.identity_at(parent_fd, names["cleanup"]),
+                    v2_identity,
+                ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
                 self._filesystem.fsync_directory(parent_fd)
-                journal = self._advance_journal(journal, "cleanup-quarantined", v2_identity)
-                self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+                journal = self._advance_journal(
+                    journal, "cleanup-quarantined", v2_identity
+                )
+                self._store_journal(
+                    parent_fd,
+                    names["journal"],
+                    journal,
+                    self._filesystem.identity_at(parent_fd, names["journal"]),
+                )
                 self._filesystem.checkpoint("after-stage-quarantine")
-                return self._finish_pre_active_cleanup(parent_fd, plan, target, names, journal, v2_identity)
+                return self._finish_pre_active_cleanup(
+                    parent_fd, plan, target, names, journal, v2_identity
+                )
             if (
                 state == "cleanup-intent"
                 and home == target.home_identity
@@ -1132,17 +1460,30 @@ class FleetHomeV2CutoverService:
                 and stage is not None
                 and self._same_object(stage, v2_identity)
             ):
-                if not self._attest_tree_at(parent_fd, names["stage"], target.authority):
+                if not self._attest_tree_at(
+                    parent_fd, names["stage"], target.authority
+                ):
                     raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
                 self._require_quiescent(target, target.home_identity)
-                self._filesystem.rename_noreplace_at(parent_fd, names["stage"], names["cleanup"])
+                self._filesystem.rename_noreplace_at(
+                    parent_fd, names["stage"], names["cleanup"]
+                )
                 cleanup = self._filesystem.identity_at(parent_fd, names["cleanup"])
                 if not self._same_object(cleanup, v2_identity):
                     raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
                 self._filesystem.fsync_directory(parent_fd)
-                journal = self._advance_journal(journal, "cleanup-quarantined", v2_identity)
-                self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
-                return self._finish_pre_active_cleanup(parent_fd, plan, target, names, journal, v2_identity)
+                journal = self._advance_journal(
+                    journal, "cleanup-quarantined", v2_identity
+                )
+                self._store_journal(
+                    parent_fd,
+                    names["journal"],
+                    journal,
+                    self._filesystem.identity_at(parent_fd, names["journal"]),
+                )
+                return self._finish_pre_active_cleanup(
+                    parent_fd, plan, target, names, journal, v2_identity
+                )
             if (
                 state in {"cleanup-intent", "cleanup-quarantined"}
                 and home == target.home_identity
@@ -1153,9 +1494,18 @@ class FleetHomeV2CutoverService:
                 and self._same_object(cleanup, v2_identity)
             ):
                 if state == "cleanup-intent":
-                    journal = self._advance_journal(journal, "cleanup-quarantined", v2_identity)
-                    self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
-                return self._finish_pre_active_cleanup(parent_fd, plan, target, names, journal, v2_identity)
+                    journal = self._advance_journal(
+                        journal, "cleanup-quarantined", v2_identity
+                    )
+                    self._store_journal(
+                        parent_fd,
+                        names["journal"],
+                        journal,
+                        self._filesystem.identity_at(parent_fd, names["journal"]),
+                    )
+                return self._finish_pre_active_cleanup(
+                    parent_fd, plan, target, names, journal, v2_identity
+                )
             if (
                 state == "cleanup-quarantined"
                 and home == target.home_identity
@@ -1164,7 +1514,9 @@ class FleetHomeV2CutoverService:
                 and archive is None
                 and cleanup is None
             ):
-                return self._finish_pre_active_cleanup(parent_fd, plan, target, names, journal, v2_identity)
+                return self._finish_pre_active_cleanup(
+                    parent_fd, plan, target, names, journal, v2_identity
+                )
             if (
                 state == "cleanup-retired"
                 and home == target.home_identity
@@ -1175,7 +1527,11 @@ class FleetHomeV2CutoverService:
             ):
                 self._filesystem.unlink_at(parent_fd, names["journal"])
                 self._release_home_lock(parent_fd, plan, target, names)
-                return FleetHomeV2Result(target.authority.agent_id, "failed-retryable", "fleet_home_v2_cutover_failed")
+                return FleetHomeV2Result(
+                    target.authority.agent_id,
+                    "failed-retryable",
+                    "fleet_home_v2_cutover_failed",
+                )
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
         finally:
             os.close(parent_fd)
@@ -1214,16 +1570,27 @@ class FleetHomeV2CutoverService:
         ):
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
         journal = self._advance_journal(journal, "cleanup-retired", v2_identity)
-        self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+        self._store_journal(
+            parent_fd,
+            names["journal"],
+            journal,
+            self._filesystem.identity_at(parent_fd, names["journal"]),
+        )
         self._filesystem.checkpoint("after-cleanup-retired")
         self._filesystem.unlink_at(parent_fd, names["journal"])
         self._filesystem.fsync_directory(parent_fd)
         self._filesystem.checkpoint("after-cleanup-journal-retired")
         self._release_home_lock(parent_fd, plan, target, names)
         self._filesystem.checkpoint("after-cleanup-lock-retired")
-        return FleetHomeV2Result(target.authority.agent_id, "failed-retryable", "fleet_home_v2_cutover_failed")
+        return FleetHomeV2Result(
+            target.authority.agent_id,
+            "failed-retryable",
+            "fleet_home_v2_cutover_failed",
+        )
 
-    def _rollback_target(self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan) -> FleetHomeV2Result:
+    def _rollback_target(
+        self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan
+    ) -> FleetHomeV2Result:
         if target.already_current:
             raise FleetHomeV2CutoverError("fleet_home_v2_rollback_failed")
         parent_fd = self._open_bound_parent(target)
@@ -1238,27 +1605,45 @@ class FleetHomeV2CutoverService:
             if not self._filesystem._lstat_absent(parent_fd, names["archive"]):
                 raise FleetHomeV2CutoverError("fleet_home_v2_rollback_failed")
             self._require_quiescent(target, v2_identity)
-            self._filesystem.exchange_at(parent_fd, target.authority.home.name, names["backup"])
+            self._filesystem.exchange_at(
+                parent_fd, target.authority.home.name, names["backup"]
+            )
             mutated = True
             if (
-                self._filesystem.identity_at(parent_fd, target.authority.home.name) != target.home_identity
-                or self._filesystem.identity_at(parent_fd, names["backup"]) != v2_identity
+                self._filesystem.identity_at(parent_fd, target.authority.home.name)
+                != target.home_identity
+                or self._filesystem.identity_at(parent_fd, names["backup"])
+                != v2_identity
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
             self._filesystem.fsync_directory(parent_fd)
             journal = self._advance_journal(journal, "rollback-exchanged", v2_identity)
-            self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+            self._store_journal(
+                parent_fd,
+                names["journal"],
+                journal,
+                self._filesystem.identity_at(parent_fd, names["journal"]),
+            )
             self._filesystem.checkpoint("after-rollback-exchange")
-            self._filesystem.rename_noreplace_at(parent_fd, names["backup"], names["archive"])
+            self._filesystem.rename_noreplace_at(
+                parent_fd, names["backup"], names["archive"]
+            )
             self._filesystem.fsync_directory(parent_fd)
             journal = self._advance_journal(journal, "rolled-back", v2_identity)
-            self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
+            self._store_journal(
+                parent_fd,
+                names["journal"],
+                journal,
+                self._filesystem.identity_at(parent_fd, names["journal"]),
+            )
             self._filesystem.checkpoint("after-v2-archive")
             self._retire_rolled_back(parent_fd, plan, target, names)
             return FleetHomeV2Result(target.authority.agent_id, "rolled-back")
         except FleetHomeV2CutoverError as exc:
             if mutated:
-                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_recovery_required"
+                ) from exc
             raise
         finally:
             os.close(parent_fd)
@@ -1277,19 +1662,35 @@ class FleetHomeV2CutoverService:
 
     def _open_bound_parent(self, target: FleetHomeV2TargetPlan) -> int:
         parent_fd = self._filesystem.open_parent(target.authority.home.parent)
-        if not self._same_parent(self._filesystem.parent_identity(parent_fd), target.parent_identity):
+        if not self._same_parent(
+            self._filesystem.parent_identity(parent_fd), target.parent_identity
+        ):
             os.close(parent_fd)
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
         return parent_fd
 
     @staticmethod
-    def _same_parent(current: _FilesystemIdentity, expected: _FilesystemIdentity) -> bool:
-        return (current.device, current.inode, current.mode, current.uid, current.gid) == (
-            expected.device, expected.inode, expected.mode, expected.uid, expected.gid,
+    def _same_parent(
+        current: _FilesystemIdentity, expected: _FilesystemIdentity
+    ) -> bool:
+        return (
+            current.device,
+            current.inode,
+            current.mode,
+            current.uid,
+            current.gid,
+        ) == (
+            expected.device,
+            expected.inode,
+            expected.mode,
+            expected.uid,
+            expected.gid,
         )
 
     @staticmethod
-    def _same_object(current: _FilesystemIdentity, expected: _FilesystemIdentity) -> bool:
+    def _same_object(
+        current: _FilesystemIdentity, expected: _FilesystemIdentity
+    ) -> bool:
         return LocalFleetHomeV2Filesystem._same_object(current, expected)
 
     def _require_quiescent(
@@ -1305,7 +1706,8 @@ class FleetHomeV2CutoverService:
                 or evidence.home_identity != active_identity
                 or evidence.registry_generation != target.authority.registry_generation
                 or evidence.policy_generation != target.authority.policy.generation
-                or evidence.authority_generation != target.authority.authority_generation
+                or evidence.authority_generation
+                != target.authority.authority_generation
                 or evidence.lease_generation != target.authority.lease_generation
                 or evidence.process_generation != target.authority.process_generation
                 or evidence.observation_generation <= previous
@@ -1313,16 +1715,22 @@ class FleetHomeV2CutoverService:
                 or now - evidence.observed_monotonic_ns > 5_000_000_000
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_quiescence_invalid")
-            self._observations[target.authority.agent_id] = evidence.observation_generation
+            self._observations[target.authority.agent_id] = (
+                evidence.observation_generation
+            )
         if not evidence.process_scan_available:
             raise FleetHomeV2CutoverError("fleet_home_v2_process_scan_unavailable")
         if (
-            not evidence.stopped or evidence.lease_state not in {"none", "released"}
-            or evidence.managed_processes != 0 or evidence.external_processes != 0
+            not evidence.stopped
+            or evidence.lease_state not in {"none", "released"}
+            or evidence.managed_processes != 0
+            or evidence.external_processes != 0
         ):
             raise FleetHomeV2CutoverError("fleet_home_v2_target_not_quiescent")
 
-    def _require_operation_absent(self, parent_fd: int, names: Mapping[str, str]) -> None:
+    def _require_operation_absent(
+        self, parent_fd: int, names: Mapping[str, str]
+    ) -> None:
         for key, name in names.items():
             if key in {"lock", "plan"}:
                 continue
@@ -1345,10 +1753,15 @@ class FleetHomeV2CutoverService:
         for operation_id, kinds in foreign.items():
             if kinds == {"plan.json"}:
                 continue
-            journal = self._plan_name(operation_id, agent_id).removesuffix("plan.json") + "journal.json"
-            if kinds <= {"plan.json", "journal.json", "rollback-v2"} and self._terminal_journal_at(
-                parent_fd, journal, agent_id, operation_id
-            ):
+            journal = (
+                self._plan_name(operation_id, agent_id).removesuffix("plan.json")
+                + "journal.json"
+            )
+            if kinds <= {
+                "plan.json",
+                "journal.json",
+                "rollback-v2",
+            } and self._terminal_journal_at(parent_fd, journal, agent_id, operation_id):
                 continue
             raise FleetHomeV2CutoverError("fleet_home_v2_operation_active")
 
@@ -1357,9 +1770,15 @@ class FleetHomeV2CutoverService:
         parent_fd: int, name: str, agent_id: str, operation_id: str
     ) -> bool:
         try:
-            file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+            file_fd = os.open(
+                name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+            )
             try:
-                document = json.loads(b"".join(iter(lambda: os.read(file_fd, 64 * 1024), b"")).decode("utf-8"))
+                document = json.loads(
+                    b"".join(iter(lambda: os.read(file_fd, 64 * 1024), b"")).decode(
+                        "utf-8"
+                    )
+                )
             finally:
                 os.close(file_fd)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -1396,7 +1815,9 @@ class FleetHomeV2CutoverService:
             "parent_identity": self._identity_document(target.parent_identity),
             "journal": names["journal"],
         }
-        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        encoded = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
         try:
             self._filesystem.write_file_at(
                 parent_fd,
@@ -1422,7 +1843,9 @@ class FleetHomeV2CutoverService:
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
             lock_fd = os.open(
-                names["lock"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+                names["lock"],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
             )
             try:
                 data = b"".join(iter(lambda: os.read(lock_fd, 64 * 1024), b""))
@@ -1457,27 +1880,46 @@ class FleetHomeV2CutoverService:
                 parts = PurePosixPath(artifact.relative_path).parts
                 for part in parts[:-1]:
                     if self._filesystem._lstat_absent(parent_fd, part):
-                        child_fd = self._filesystem.mkdir_private_at(parent_fd, part, authority.owner_uid, authority.owner_gid)
+                        child_fd = self._filesystem.mkdir_private_at(
+                            parent_fd, part, authority.owner_uid, authority.owner_gid
+                        )
                     else:
                         child_fd = self._filesystem._open_dir_at(parent_fd, part)
-                        if not self._filesystem._private_directory(self._filesystem.parent_identity(child_fd), authority.owner_uid, authority.owner_gid):
+                        if not self._filesystem._private_directory(
+                            self._filesystem.parent_identity(child_fd),
+                            authority.owner_uid,
+                            authority.owner_gid,
+                        ):
                             os.close(child_fd)
                             raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid")
                     opened.append(child_fd)
                     parent_fd = child_fd
-                self._filesystem.write_file_at(parent_fd, parts[-1], artifact.data, artifact.mode, authority.owner_uid, authority.owner_gid)
+                self._filesystem.write_file_at(
+                    parent_fd,
+                    parts[-1],
+                    artifact.data,
+                    artifact.mode,
+                    authority.owner_uid,
+                    authority.owner_gid,
+                )
             finally:
                 for fd in reversed(opened):
                     os.close(fd)
 
-    def _artifact_map(self, authority: FleetHomeV2Authority) -> dict[str, FleetHomeV2Artifact]:
+    def _artifact_map(
+        self, authority: FleetHomeV2Authority
+    ) -> dict[str, FleetHomeV2Artifact]:
         artifacts: dict[str, FleetHomeV2Artifact] = {}
         for artifact in authority.artifacts:
             path = PurePosixPath(artifact.relative_path)
             if (
-                not isinstance(artifact.data, bytes) or not artifact.relative_path or path.is_absolute()
-                or path.as_posix() != artifact.relative_path or any(part in {"", ".", ".."} for part in path.parts)
-                or artifact.mode not in {0o600, 0o700} or artifact.relative_path in artifacts
+                not isinstance(artifact.data, bytes)
+                or not artifact.relative_path
+                or path.is_absolute()
+                or path.as_posix() != artifact.relative_path
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or artifact.mode not in {0o600, 0o700}
+                or artifact.relative_path in artifacts
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid")
             artifacts[artifact.relative_path] = artifact
@@ -1487,13 +1929,19 @@ class FleetHomeV2CutoverService:
         self._validate_marker(marker.data, authority, artifacts)
         return artifacts
 
-    def _attest_tree_at(self, parent_fd: int, name: str, authority: FleetHomeV2Authority) -> bool:
+    def _attest_tree_at(
+        self, parent_fd: int, name: str, authority: FleetHomeV2Authority
+    ) -> bool:
         try:
             root_fd = self._filesystem._open_dir_at(parent_fd, name)
         except FleetHomeV2CutoverError:
             return False
         try:
-            if not self._filesystem._private_directory(self._filesystem.parent_identity(root_fd), authority.owner_uid, authority.owner_gid):
+            if not self._filesystem._private_directory(
+                self._filesystem.parent_identity(root_fd),
+                authority.owner_uid,
+                authority.owner_gid,
+            ):
                 return False
             expected = self._artifact_map(authority)
             observed: dict[str, tuple[bytes, _FilesystemIdentity]] = {}
@@ -1515,14 +1963,21 @@ class FleetHomeV2CutoverService:
                 while parent.as_posix() != ".":
                     expected_directories.add(parent.as_posix())
                     parent = parent.parent
-            if set(observed) != set(expected) or observed_directories != expected_directories:
+            if (
+                set(observed) != set(expected)
+                or observed_directories != expected_directories
+            ):
                 return False
             for relative, artifact in expected.items():
                 data, current = observed[relative]
                 if (
-                    data != artifact.data or not stat.S_ISREG(current.mode)
-                    or stat.S_IMODE(current.mode) != artifact.mode or current.uid != authority.owner_uid
-                    or current.gid != authority.owner_gid or current.nlink != 1 or current.size != len(artifact.data)
+                    data != artifact.data
+                    or not stat.S_ISREG(current.mode)
+                    or stat.S_IMODE(current.mode) != artifact.mode
+                    or current.uid != authority.owner_uid
+                    or current.gid != authority.owner_gid
+                    or current.nlink != 1
+                    or current.size != len(artifact.data)
                 ):
                     return False
             self._validate_marker(observed[MARKER_FILE][0], authority, expected)
@@ -1545,19 +2000,29 @@ class FleetHomeV2CutoverService:
         try:
             names = os.listdir(directory_fd)
         except OSError as exc:
-            raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed") from exc
+            raise FleetHomeV2CutoverError(
+                "fleet_home_v2_artifact_attestation_failed"
+            ) from exc
         for name in names:
             relative = f"{prefix}/{name}" if prefix else name
             current = self._filesystem.identity_at(directory_fd, name)
             if current.device != root_device:
-                raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed")
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_artifact_attestation_failed"
+                )
             if stat.S_ISDIR(current.mode):
-                if not self._filesystem._private_directory(current, authority.owner_uid, authority.owner_gid):
-                    raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed")
+                if not self._filesystem._private_directory(
+                    current, authority.owner_uid, authority.owner_gid
+                ):
+                    raise FleetHomeV2CutoverError(
+                        "fleet_home_v2_artifact_attestation_failed"
+                    )
                 child_fd = self._filesystem._open_dir_at(directory_fd, name)
                 try:
                     if self._filesystem.mount_id(child_fd) != root_mount_id:
-                        raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed")
+                        raise FleetHomeV2CutoverError(
+                            "fleet_home_v2_artifact_attestation_failed"
+                        )
                     observed_directories.add(relative)
                     self._attest_directory(
                         child_fd,
@@ -1572,42 +2037,81 @@ class FleetHomeV2CutoverService:
                     os.close(child_fd)
                 continue
             if not stat.S_ISREG(current.mode) or current.nlink != 1:
-                raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed")
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_artifact_attestation_failed"
+                )
             file_fd = -1
             try:
-                file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+                file_fd = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
                 chunks: list[bytes] = []
                 while chunk := os.read(file_fd, 64 * 1024):
                     chunks.append(chunk)
                 opened = self._filesystem.identity_from_stat(os.fstat(file_fd))
                 if self._filesystem.mount_id(file_fd) != root_mount_id:
-                    raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed")
+                    raise FleetHomeV2CutoverError(
+                        "fleet_home_v2_artifact_attestation_failed"
+                    )
             except OSError as exc:
-                raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed") from exc
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_artifact_attestation_failed"
+                ) from exc
             finally:
                 if file_fd >= 0:
                     os.close(file_fd)
             if opened != current:
-                raise FleetHomeV2CutoverError("fleet_home_v2_artifact_attestation_failed")
+                raise FleetHomeV2CutoverError(
+                    "fleet_home_v2_artifact_attestation_failed"
+                )
             observed[relative] = (b"".join(chunks), current)
 
-    def _validate_marker(self, marker_bytes: bytes, authority: FleetHomeV2Authority, artifacts: Mapping[str, FleetHomeV2Artifact]) -> None:
+    def _validate_marker(
+        self,
+        marker_bytes: bytes,
+        authority: FleetHomeV2Authority,
+        artifacts: Mapping[str, FleetHomeV2Artifact],
+    ) -> None:
         try:
             marker = json.loads(marker_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_marker_invalid") from exc
-        expected_fields = _MARKER_FIELDS | ({_MARKER_RUNTIME_FIELD} if authority.runtime_skill_profile is not None else set())
-        expected_files = {name: hashlib.sha256(item.data).hexdigest() for name, item in artifacts.items() if name != MARKER_FILE}
-        policy = {"schema_version": authority.policy.schema_version, "generation": authority.policy.generation, "digest": authority.policy.digest}
+        expected_fields = _MARKER_FIELDS | (
+            {_MARKER_RUNTIME_FIELD}
+            if authority.runtime_skill_profile is not None
+            else set()
+        )
+        expected_files = {
+            name: hashlib.sha256(item.data).hexdigest()
+            for name, item in artifacts.items()
+            if name != MARKER_FILE
+        }
+        policy = {
+            "schema_version": authority.policy.schema_version,
+            "generation": authority.policy.generation,
+            "digest": authority.policy.digest,
+        }
         if (
-            not isinstance(marker, dict) or set(marker) != expected_fields
-            or marker.get("schema_version") != 2 or marker.get("kind") != "codex_master_fleet_agent"
-            or marker.get("agent_id") != authority.agent_id or marker.get("prefix") != authority.prefix
-            or marker.get("runner") != authority.runner or marker.get("provider") != authority.provider
-            or marker.get("model") != authority.model or marker.get("common_policy") != policy
-            or not isinstance(marker.get("common_policy"), dict) or set(marker["common_policy"]) != _POLICY_FIELDS
-            or marker.get("managed_files") != sorted(expected_files) or marker.get("files") != expected_files
-            or (authority.runtime_skill_profile is not None and marker.get(_MARKER_RUNTIME_FIELD) != authority.runtime_skill_profile)
+            not isinstance(marker, dict)
+            or set(marker) != expected_fields
+            or marker.get("schema_version") != 2
+            or marker.get("kind") != "codex_master_fleet_agent"
+            or marker.get("agent_id") != authority.agent_id
+            or marker.get("prefix") != authority.prefix
+            or marker.get("runner") != authority.runner
+            or marker.get("provider") != authority.provider
+            or marker.get("model") != authority.model
+            or marker.get("common_policy") != policy
+            or not isinstance(marker.get("common_policy"), dict)
+            or set(marker["common_policy"]) != _POLICY_FIELDS
+            or marker.get("managed_files") != sorted(expected_files)
+            or marker.get("files") != expected_files
+            or (
+                authority.runtime_skill_profile is not None
+                and marker.get(_MARKER_RUNTIME_FIELD) != authority.runtime_skill_profile
+            )
         ):
             raise FleetHomeV2CutoverError("fleet_home_v2_marker_invalid")
 
@@ -1615,32 +2119,52 @@ class FleetHomeV2CutoverService:
         artifacts = self._artifact_map(authority)
         return self._digest(
             {
-                "agent_id": authority.agent_id, "prefix": authority.prefix, "provider": authority.provider,
-                "runner": authority.runner, "model": authority.model, "registry_generation": authority.registry_generation,
-                "policy": asdict(authority.policy), "authority_generation": authority.authority_generation,
-                "lease_generation": authority.lease_generation, "process_generation": authority.process_generation,
-                "artifacts": [(name, hashlib.sha256(item.data).hexdigest(), item.mode) for name, item in sorted(artifacts.items())],
+                "agent_id": authority.agent_id,
+                "prefix": authority.prefix,
+                "provider": authority.provider,
+                "runner": authority.runner,
+                "model": authority.model,
+                "registry_generation": authority.registry_generation,
+                "policy": asdict(authority.policy),
+                "authority_generation": authority.authority_generation,
+                "lease_generation": authority.lease_generation,
+                "process_generation": authority.process_generation,
+                "artifacts": [
+                    (name, hashlib.sha256(item.data).hexdigest(), item.mode)
+                    for name, item in sorted(artifacts.items())
+                ],
             }
         )
 
-    def _plan_digest(self, operation_id: str, generation: int, targets: tuple[FleetHomeV2TargetPlan, ...]) -> str:
+    def _plan_digest(
+        self,
+        operation_id: str,
+        generation: int,
+        targets: tuple[FleetHomeV2TargetPlan, ...],
+    ) -> str:
         return self._digest(
             {
-                "operation_id": operation_id, "registry_generation": generation,
+                "operation_id": operation_id,
+                "registry_generation": generation,
                 "targets": [
                     {
                         "agent_id": target.authority.agent_id,
                         "authority": self._authority_document(target.authority),
                         "home_identity": self._identity_document(target.home_identity),
-                        "parent_identity": self._identity_document(target.parent_identity),
-                        "manifest_digest": target.manifest_digest, "already_current": target.already_current,
+                        "parent_identity": self._identity_document(
+                            target.parent_identity
+                        ),
+                        "manifest_digest": target.manifest_digest,
+                        "already_current": target.already_current,
                     }
                     for target in targets
                 ],
             }
         )
 
-    def _names(self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan) -> dict[str, str]:
+    def _names(
+        self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan
+    ) -> dict[str, str]:
         stem = f".fleet-home-v2-cutover-{plan.operation_id}-{target.authority.agent_id}"
         return {
             "stage": f"{stem}.stage",
@@ -1657,29 +2181,54 @@ class FleetHomeV2CutoverService:
     def _plan_name(operation_id: str, agent_id: str) -> str:
         return f".fleet-home-v2-cutover-{operation_id}-{agent_id}.plan.json"
 
-    def _new_journal(self, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan, names: Mapping[str, str]) -> dict[str, object]:
+    def _new_journal(
+        self,
+        plan: FleetHomeV2Plan,
+        target: FleetHomeV2TargetPlan,
+        names: Mapping[str, str],
+    ) -> dict[str, object]:
         document: dict[str, object] = {
-            "schema_version": 2, "kind": "fleet_home_v2_cutover_journal", "operation_id": plan.operation_id,
-            "plan_digest": plan.digest, "agent_id": target.authority.agent_id,
-            "registry_generation": target.authority.registry_generation, "policy_generation": target.authority.policy.generation,
-            "authority_generation": target.authority.authority_generation, "lease_generation": target.authority.lease_generation,
-            "process_generation": target.authority.process_generation, "manifest_digest": target.manifest_digest,
-            "home_identity": self._identity_document(target.home_identity), "parent_identity": self._identity_document(target.parent_identity),
-            "stage": names["stage"], "backup": names["backup"], "archive": names["archive"],
-            "cleanup": names["cleanup"], "v2_identity": None, "history": [],
+            "schema_version": 2,
+            "kind": "fleet_home_v2_cutover_journal",
+            "operation_id": plan.operation_id,
+            "plan_digest": plan.digest,
+            "agent_id": target.authority.agent_id,
+            "registry_generation": target.authority.registry_generation,
+            "policy_generation": target.authority.policy.generation,
+            "authority_generation": target.authority.authority_generation,
+            "lease_generation": target.authority.lease_generation,
+            "process_generation": target.authority.process_generation,
+            "manifest_digest": target.manifest_digest,
+            "home_identity": self._identity_document(target.home_identity),
+            "parent_identity": self._identity_document(target.parent_identity),
+            "stage": names["stage"],
+            "backup": names["backup"],
+            "archive": names["archive"],
+            "cleanup": names["cleanup"],
+            "v2_identity": None,
+            "history": [],
         }
         return self._append_journal_state(document, "planned")
 
-    def _load_journal(self, parent_fd: int, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan) -> dict[str, object]:
+    def _load_journal(
+        self, parent_fd: int, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan
+    ) -> dict[str, object]:
         names = self._names(plan, target)
         try:
             identity = self._filesystem.identity_at(parent_fd, names["journal"])
             if (
-                not stat.S_ISREG(identity.mode) or stat.S_IMODE(identity.mode) != 0o600
-                or identity.uid != target.authority.owner_uid or identity.gid != target.authority.owner_gid or identity.nlink != 1
+                not stat.S_ISREG(identity.mode)
+                or stat.S_IMODE(identity.mode) != 0o600
+                or identity.uid != target.authority.owner_uid
+                or identity.gid != target.authority.owner_gid
+                or identity.nlink != 1
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
-            file_fd = os.open(names["journal"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+            file_fd = os.open(
+                names["journal"],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
             try:
                 data = b"".join(iter(lambda: os.read(file_fd, 64 * 1024), b""))
                 if self._filesystem.identity_from_stat(os.fstat(file_fd)) != identity:
@@ -1694,11 +2243,33 @@ class FleetHomeV2CutoverService:
         self._validate_journal(document, plan, target, names)
         return document
 
-    def _validate_journal(self, document: object, plan: FleetHomeV2Plan, target: FleetHomeV2TargetPlan, names: Mapping[str, str]) -> None:
+    def _validate_journal(
+        self,
+        document: object,
+        plan: FleetHomeV2Plan,
+        target: FleetHomeV2TargetPlan,
+        names: Mapping[str, str],
+    ) -> None:
         fields = {
-            "schema_version", "kind", "operation_id", "plan_digest", "agent_id", "registry_generation", "policy_generation",
-            "authority_generation", "lease_generation", "process_generation", "manifest_digest", "home_identity", "parent_identity",
-            "stage", "backup", "archive", "cleanup", "v2_identity", "history",
+            "schema_version",
+            "kind",
+            "operation_id",
+            "plan_digest",
+            "agent_id",
+            "registry_generation",
+            "policy_generation",
+            "authority_generation",
+            "lease_generation",
+            "process_generation",
+            "manifest_digest",
+            "home_identity",
+            "parent_identity",
+            "stage",
+            "backup",
+            "archive",
+            "cleanup",
+            "v2_identity",
+            "history",
         }
         if not isinstance(document, dict) or set(document) != fields:
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
@@ -1722,7 +2293,11 @@ class FleetHomeV2CutoverService:
         previous_state: str | None = None
         for generation, entry in enumerate(history):
             if not isinstance(entry, dict) or set(entry) != {
-                "generation", "state", "previous_digest", "identities", "digest"
+                "generation",
+                "state",
+                "previous_digest",
+                "identities",
+                "digest",
             }:
                 raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
             state = entry.get("state")
@@ -1731,10 +2306,13 @@ class FleetHomeV2CutoverService:
             except FleetHomeV2CutoverError:
                 raise
             if (
-                type(entry.get("generation")) is not int or entry["generation"] != generation or state not in _JOURNAL_STATES
+                type(entry.get("generation")) is not int
+                or entry["generation"] != generation
+                or state not in _JOURNAL_STATES
                 or entry.get("previous_digest") != previous
                 or entry.get("identities") != identities
-                or entry.get("digest") != self._digest(
+                or entry.get("digest")
+                != self._digest(
                     {
                         "binding": binding,
                         "generation": generation,
@@ -1743,7 +2321,10 @@ class FleetHomeV2CutoverService:
                         "identities": identities,
                     }
                 )
-                or (previous_state is not None and state not in _JOURNAL_TRANSITIONS[previous_state])
+                or (
+                    previous_state is not None
+                    and state not in _JOURNAL_TRANSITIONS[previous_state]
+                )
             ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
             previous, previous_state = entry["digest"], state
@@ -1754,7 +2335,9 @@ class FleetHomeV2CutoverService:
         ):
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
 
-    def _advance_journal(self, document: dict[str, object], state: str, v2_identity: _FilesystemIdentity) -> dict[str, object]:
+    def _advance_journal(
+        self, document: dict[str, object], state: str, v2_identity: _FilesystemIdentity
+    ) -> dict[str, object]:
         current = self._journal_state(document)
         if current == state:
             return document
@@ -1765,14 +2348,30 @@ class FleetHomeV2CutoverService:
         clone["history"] = list(document["history"])
         return self._append_journal_state(clone, state)
 
-    def _advance_until(self, parent_fd: int, journal_name: str, document: dict[str, object], state: str, v2_identity: _FilesystemIdentity) -> dict[str, object]:
+    def _advance_until(
+        self,
+        parent_fd: int,
+        journal_name: str,
+        document: dict[str, object],
+        state: str,
+        v2_identity: _FilesystemIdentity,
+    ) -> dict[str, object]:
         while self._journal_state(document) != state:
-            next_state = _JOURNAL_STATES[_JOURNAL_STATES.index(self._journal_state(document)) + 1]
+            next_state = _JOURNAL_STATES[
+                _JOURNAL_STATES.index(self._journal_state(document)) + 1
+            ]
             document = self._advance_journal(document, next_state, v2_identity)
-            self._store_journal(parent_fd, journal_name, document, self._filesystem.identity_at(parent_fd, journal_name))
+            self._store_journal(
+                parent_fd,
+                journal_name,
+                document,
+                self._filesystem.identity_at(parent_fd, journal_name),
+            )
         return document
 
-    def _append_journal_state(self, document: dict[str, object], state: str) -> dict[str, object]:
+    def _append_journal_state(
+        self, document: dict[str, object], state: str
+    ) -> dict[str, object]:
         history = list(document["history"])
         binding = self._digest(
             {
@@ -1804,7 +2403,9 @@ class FleetHomeV2CutoverService:
         document["history"] = history
         return document
 
-    def _journal_identities(self, document: Mapping[str, object], state: object) -> dict[str, object]:
+    def _journal_identities(
+        self, document: Mapping[str, object], state: object
+    ) -> dict[str, object]:
         if state not in _JOURNAL_STATES:
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
         home = document.get("home_identity")
@@ -1887,15 +2488,30 @@ class FleetHomeV2CutoverService:
             "v2": v2,
         }
 
-    def _store_journal(self, parent_fd: int, journal_name: str, document: dict[str, object], previous_identity: _FilesystemIdentity | None) -> None:
-        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    def _store_journal(
+        self,
+        parent_fd: int,
+        journal_name: str,
+        document: dict[str, object],
+        previous_identity: _FilesystemIdentity | None,
+    ) -> None:
+        encoded = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
         temporary = f".{journal_name}.{self._entropy.token_hex(16)}.tmp"
         if not self._filesystem._lstat_absent(parent_fd, temporary):
             raise FleetHomeV2CutoverError("fleet_home_v2_operation_collision")
         home_document = document["home_identity"]
         if not isinstance(home_document, dict):
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
-        self._filesystem.write_file_at(parent_fd, temporary, encoded, 0o600, int(home_document["uid"]), int(home_document["gid"]))
+        self._filesystem.write_file_at(
+            parent_fd,
+            temporary,
+            encoded,
+            0o600,
+            int(home_document["uid"]),
+            int(home_document["gid"]),
+        )
         if previous_identity is None:
             self._filesystem.rename_noreplace_at(parent_fd, temporary, journal_name)
         else:
@@ -1907,49 +2523,86 @@ class FleetHomeV2CutoverService:
 
     def _journal_state(self, document: Mapping[str, object]) -> str:
         history = document["history"]
-        if not isinstance(history, list) or not history or not isinstance(history[-1], dict):
+        if (
+            not isinstance(history, list)
+            or not history
+            or not isinstance(history[-1], dict)
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
         state = history[-1].get("state")
         if state not in _JOURNAL_STATES:
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
         return state
 
-    def _journal_v2_identity(self, document: Mapping[str, object]) -> _FilesystemIdentity:
+    def _journal_v2_identity(
+        self, document: Mapping[str, object]
+    ) -> _FilesystemIdentity:
         value = document.get("v2_identity")
         if value is None:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
         return self._identity_from_document(value)
 
-    def _require_v2_and_backup(self, parent_fd: int, target: FleetHomeV2TargetPlan, journal: Mapping[str, object]) -> None:
+    def _require_v2_and_backup(
+        self,
+        parent_fd: int,
+        target: FleetHomeV2TargetPlan,
+        journal: Mapping[str, object],
+    ) -> None:
         v2_identity = self._journal_v2_identity(journal)
-        if self._filesystem.identity_at(parent_fd, target.authority.home.name) != v2_identity:
+        if (
+            self._filesystem.identity_at(parent_fd, target.authority.home.name)
+            != v2_identity
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
-        if self._filesystem.identity_at(parent_fd, str(journal["backup"])) != target.home_identity:
+        if (
+            self._filesystem.identity_at(parent_fd, str(journal["backup"]))
+            != target.home_identity
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
-        if not self._attest_tree_at(parent_fd, target.authority.home.name, target.authority):
+        if not self._attest_tree_at(
+            parent_fd, target.authority.home.name, target.authority
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_marker_invalid")
 
     def _require_current_v2(self, target: FleetHomeV2TargetPlan) -> None:
         parent_fd = self._open_bound_parent(target)
         try:
-            if self._filesystem.identity_at(parent_fd, target.authority.home.name) != target.home_identity or not self._attest_tree_at(parent_fd, target.authority.home.name, target.authority):
+            if self._filesystem.identity_at(
+                parent_fd, target.authority.home.name
+            ) != target.home_identity or not self._attest_tree_at(
+                parent_fd, target.authority.home.name, target.authority
+            ):
                 raise FleetHomeV2CutoverError("fleet_home_v2_source_invalid")
         finally:
             os.close(parent_fd)
 
-    def _restore_exchange_if_bound(self, parent_fd: int, target: FleetHomeV2TargetPlan, names: Mapping[str, str], v2_identity: _FilesystemIdentity) -> bool:
+    def _restore_exchange_if_bound(
+        self,
+        parent_fd: int,
+        target: FleetHomeV2TargetPlan,
+        names: Mapping[str, str],
+        v2_identity: _FilesystemIdentity,
+    ) -> bool:
         if (
-            self._optional_identity(parent_fd, target.authority.home.name) == v2_identity
-            and self._optional_identity(parent_fd, names["stage"]) == target.home_identity
+            self._optional_identity(parent_fd, target.authority.home.name)
+            == v2_identity
+            and self._optional_identity(parent_fd, names["stage"])
+            == target.home_identity
         ):
-            self._filesystem.exchange_at(parent_fd, target.authority.home.name, names["stage"])
+            self._filesystem.exchange_at(
+                parent_fd, target.authority.home.name, names["stage"]
+            )
             self._filesystem.fsync_directory(parent_fd)
             return True
         return False
 
-    def _optional_identity(self, parent_fd: int, name: str) -> _FilesystemIdentity | None:
+    def _optional_identity(
+        self, parent_fd: int, name: str
+    ) -> _FilesystemIdentity | None:
         try:
-            return self._filesystem.identity_from_stat(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+            return self._filesystem.identity_from_stat(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            )
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -1969,39 +2622,72 @@ class FleetHomeV2CutoverService:
 
     @staticmethod
     def _identity_document(value: _FilesystemIdentity) -> dict[str, int]:
-        return {"device": value.device, "inode": value.inode, "mode": value.mode, "uid": value.uid, "gid": value.gid, "nlink": value.nlink, "size": value.size, "mtime_ns": value.mtime_ns}
+        return {
+            "device": value.device,
+            "inode": value.inode,
+            "mode": value.mode,
+            "uid": value.uid,
+            "gid": value.gid,
+            "nlink": value.nlink,
+            "size": value.size,
+            "mtime_ns": value.mtime_ns,
+        }
 
     @staticmethod
     def _identity_from_document(value: object) -> _FilesystemIdentity:
         fields = {"device", "inode", "mode", "uid", "gid", "nlink", "size", "mtime_ns"}
-        if not isinstance(value, dict) or set(value) != fields or any(type(value[field]) is not int for field in fields):
+        if (
+            not isinstance(value, dict)
+            or set(value) != fields
+            or any(type(value[field]) is not int for field in fields)
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
         return _FilesystemIdentity(**value)
 
     @staticmethod
     def _authority_document(value: FleetHomeV2Authority) -> dict[str, object]:
         return {
-            "agent_id": value.agent_id, "prefix": value.prefix, "provider": value.provider, "runner": value.runner,
-            "model": value.model, "home": str(value.home), "registry_generation": value.registry_generation,
-            "policy": asdict(value.policy), "owner_uid": value.owner_uid, "owner_gid": value.owner_gid,
-            "authority_generation": value.authority_generation, "lease_generation": value.lease_generation,
-            "process_generation": value.process_generation, "runtime_skill_profile": value.runtime_skill_profile,
+            "agent_id": value.agent_id,
+            "prefix": value.prefix,
+            "provider": value.provider,
+            "runner": value.runner,
+            "model": value.model,
+            "home": str(value.home),
+            "registry_generation": value.registry_generation,
+            "policy": asdict(value.policy),
+            "owner_uid": value.owner_uid,
+            "owner_gid": value.owner_gid,
+            "authority_generation": value.authority_generation,
+            "lease_generation": value.lease_generation,
+            "process_generation": value.process_generation,
+            "runtime_skill_profile": value.runtime_skill_profile,
         }
 
     @staticmethod
     def _digest(value: object) -> str:
-        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
     @staticmethod
     def _recovery_code(code: str) -> str:
-        return "fleet_home_v2_recovery_required" if code != "fleet_home_v2_journal_invalid" else code
+        return (
+            "fleet_home_v2_recovery_required"
+            if code != "fleet_home_v2_journal_invalid"
+            else code
+        )
 
     @staticmethod
     def _result_for_error(agent_id: str, code: str) -> FleetHomeV2Result:
         if code in {
-            "fleet_home_v2_journal_invalid", "fleet_home_v2_marker_invalid", "fleet_home_v2_artifact_attestation_failed",
-            "fleet_home_v2_stage_invalid", "fleet_home_v2_source_invalid", "fleet_home_v2_plan_invalid",
-            "fleet_home_v2_exchange_unavailable", "fleet_home_v2_operation_collision",
+            "fleet_home_v2_journal_invalid",
+            "fleet_home_v2_marker_invalid",
+            "fleet_home_v2_artifact_attestation_failed",
+            "fleet_home_v2_stage_invalid",
+            "fleet_home_v2_source_invalid",
+            "fleet_home_v2_plan_invalid",
+            "fleet_home_v2_exchange_unavailable",
+            "fleet_home_v2_operation_collision",
             "fleet_home_v2_operation_active",
         }:
             return FleetHomeV2Result(agent_id, "failed-terminal", code)

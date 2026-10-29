@@ -411,9 +411,7 @@ def test_documented_rest_queries_bind_exact_operation(
     assert status == 200
     assert headers["Cache-Control"] == "no-store"
     assert json.loads(payload)["operation"] == operation
-    assert service.calls[0][1] == AdminRequestV1(
-        operation, arguments, None, None, None
-    )
+    assert service.calls[0][1] == AdminRequestV1(operation, arguments, None, None, None)
 
 
 def test_documented_rest_response_keeps_exact_service_contract(tmp_path) -> None:
@@ -818,15 +816,20 @@ def test_fresh_totp_is_bound_to_only_current_request(tmp_path) -> None:
 
 def test_host_probe_route_requires_https_step_up_and_binds_ref(tmp_path) -> None:
     body = _document(
-        "hosts.probe", {"host_ref": "worker-one"},
-        expected_generation=4, idempotency_key="probe-one",
+        "hosts.probe",
+        {"host_ref": "worker-one"},
+        expected_generation=4,
+        idempotency_key="probe-one",
     )
     with _running_server(tmp_path) as (server, service):
         denied, _headers_out, _payload = _request(
             server, "POST", "/admin/v1/hosts/worker-one/probe", body, _headers()
         )
         accepted, _headers_out, _payload = _request(
-            server, "POST", "/admin/v1/hosts/worker-one/probe", body,
+            server,
+            "POST",
+            "/admin/v1/hosts/worker-one/probe",
+            body,
             _headers(**{"X-Masterjet-Step-Up": _totp()}),
         )
 
@@ -1378,7 +1381,9 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
     service = compose()
     google = composed["google"]
     plan = google.plan_oauth_client_import(
-        "google-synthetic-account-01", expected_generation=1, idempotency_key="google-plan"
+        "google-synthetic-account-01",
+        expected_generation=1,
+        idempotency_key="google-plan",
     )
     create_body = _document(
         "secret.ingress.create",
@@ -1507,7 +1512,9 @@ def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
 
     document = json.loads(payload)
     account = next(
-        item for item in document["accounts"] if item["ref"] == "google-synthetic-account-01"
+        item
+        for item in document["accounts"]
+        if item["ref"] == "google-synthetic-account-01"
     )
     assert status == 200
     assert document["schema_version"] == 1
@@ -1560,7 +1567,9 @@ def test_google_accounts_http_degrades_oauth_journal_lock_fault(
 
     document = json.loads(payload)
     account = next(
-        item for item in document["accounts"] if item["ref"] == "google-synthetic-account-01"
+        item
+        for item in document["accounts"]
+        if item["ref"] == "google-synthetic-account-01"
     )
     assert status == 200
     assert document["schema_version"] == 1

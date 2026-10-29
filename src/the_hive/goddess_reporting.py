@@ -14,11 +14,28 @@ from pathlib import Path
 
 MAX_STATE_BYTES = 512 * 1024
 MAX_BUCKET_RECORDS = 744
-_TASK_STATUSES = frozenset({
-    "assigned", "queued", "executing", "integrating", "completed", "failed", "cancelled", "timeout",
-    "rate_limited", "planned", "ready", "admission_planned", "admitted", "blocked", "decision_required",
-    "compensating", "failed_final", "paused",
-})
+_TASK_STATUSES = frozenset(
+    {
+        "assigned",
+        "queued",
+        "executing",
+        "integrating",
+        "completed",
+        "failed",
+        "cancelled",
+        "timeout",
+        "rate_limited",
+        "planned",
+        "ready",
+        "admission_planned",
+        "admitted",
+        "blocked",
+        "decision_required",
+        "compensating",
+        "failed_final",
+        "paused",
+    }
+)
 _TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "timeout"})
 _SECRET_RE = re.compile(
     r"(?:Bearer\s+|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.|"
@@ -135,10 +152,26 @@ def aggregate_task_rows(
         events_for_task = sorted(record["events"], key=lambda item: item[0])
         latest = events_for_task[-1][1] if events_for_task else "assigned"
         latest_at = events_for_task[-1][0] if events_for_task else None
-        if latest in _TASK_TERMINAL_STATUSES and latest_at is not None and latest_at >= start:
-            completed.append({"title": assignment_id, "status": latest, "agent_id": record["agent_id"]})
+        if (
+            latest in _TASK_TERMINAL_STATUSES
+            and latest_at is not None
+            and latest_at >= start
+        ):
+            completed.append(
+                {
+                    "title": assignment_id,
+                    "status": latest,
+                    "agent_id": record["agent_id"],
+                }
+            )
         elif latest not in _TASK_TERMINAL_STATUSES:
-            pending.append({"title": assignment_id, "status": latest, "agent_id": record["agent_id"]})
+            pending.append(
+                {
+                    "title": assignment_id,
+                    "status": latest,
+                    "agent_id": record["agent_id"],
+                }
+            )
     return tuple(completed), tuple(pending)
 
 
@@ -177,7 +210,15 @@ def render_markdown(
         lines.extend(_task_line(row) for row in report.pending)
     else:
         lines.append("- Keine.")
-    lines.extend(["", "## Aktive Flotte", "", "| Biene | Serie | Provider | Account | Zustand |", "|---|---|---|---|---|"])
+    lines.extend(
+        [
+            "",
+            "## Aktive Flotte",
+            "",
+            "| Biene | Serie | Provider | Account | Zustand |",
+            "|---|---|---|---|---|",
+        ]
+    )
     lines.extend(
         f"| {row['agent_id']} | {row['series']} | {row['provider']} | "
         f"{row['account_label']} | {row['state']} |"
@@ -245,7 +286,11 @@ def _usage_row(value: Mapping[str, object]) -> dict[str, object]:
             if not isinstance(cost, Mapping):
                 continue
             number = cost.get("consumed_percentage_points")
-            if isinstance(number, (int, float)) and not isinstance(number, bool) and math.isfinite(float(number)):
+            if (
+                isinstance(number, (int, float))
+                and not isinstance(number, bool)
+                and math.isfinite(float(number))
+            ):
                 rendered.append(f"{float(number):g} %-Pkt.")
     return {"account_id": account_id, "cost_text": ", ".join(rendered) or "—"}
 
@@ -284,7 +329,11 @@ def _task_timestamp(value: object) -> datetime | None:
 
 
 def _utc(value: datetime) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
         raise ValueError("timestamp must be timezone-aware")
     return value.astimezone(UTC)
 
@@ -347,7 +396,10 @@ class ReporterStateStore:
             return {"schema_version": 1, "buckets": {}}
         if self.path.is_symlink() or not self.path.is_file():
             raise ValueError("reporter state must be a regular file")
-        if stat.S_IMODE(self.path.stat().st_mode) != 0o600 or self.path.stat().st_size > MAX_STATE_BYTES:
+        if (
+            stat.S_IMODE(self.path.stat().st_mode) != 0o600
+            or self.path.stat().st_size > MAX_STATE_BYTES
+        ):
             raise ValueError("reporter state permissions or size are invalid")
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -365,7 +417,12 @@ class ReporterStateStore:
     def save(self, payload: Mapping[str, object]) -> None:
         if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
             raise ValueError("reporter state is invalid")
-        encoded = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        encoded = (
+            json.dumps(
+                payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode()
         if len(encoded) > MAX_STATE_BYTES:
             raise ValueError("reporter state is too large")
         parent = self.path.parent
@@ -412,7 +469,11 @@ class ReporterStateStore:
         key = canonical
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         previous = buckets.get(key)
-        if isinstance(previous, Mapping) and previous.get("status") == "final" and not replace:
+        if (
+            isinstance(previous, Mapping)
+            and previous.get("status") == "final"
+            and not replace
+        ):
             if previous.get("content_sha256") == digest:
                 return dict(previous), False
             raise ValueError("final report already exists; replace is required")
@@ -421,7 +482,9 @@ class ReporterStateStore:
             "content_sha256": digest,
             "vault_path": str(vault_path) if vault_path is not None else None,
             "emitted_at": datetime.now(UTC).isoformat(),
-            "retry_count": int(previous.get("retry_count", 0)) + 1 if isinstance(previous, Mapping) else 0,
+            "retry_count": int(previous.get("retry_count", 0)) + 1
+            if isinstance(previous, Mapping)
+            else 0,
         }
         buckets[key] = record
         if len(buckets) > MAX_BUCKET_RECORDS:

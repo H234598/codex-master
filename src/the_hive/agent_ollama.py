@@ -186,8 +186,11 @@ class ProductionAgentOllamaAdapter:
                 saved["unit_name"] = (
                     f"codex-master-ollama-{secrets.token_hex(16)}.scope"
                 )
-                saved["port"] = (self._runtime.allocate_loopback_port()
-                    if self._runtime is not None else self._allocate_port())
+                saved["port"] = (
+                    self._runtime.allocate_loopback_port()
+                    if self._runtime is not None
+                    else self._allocate_port()
+                )
             saved["state"] = "intent"
             saved["claim"] = self._claim()
             self._write_locked(document)
@@ -233,9 +236,7 @@ class ProductionAgentOllamaAdapter:
                 document = self._read_locked()
                 current = document["plans"].get(plan_ref)
                 if current == saved:
-                    current.update(
-                        state="ready", claim=None, unit_name=None, port=None
-                    )
+                    current.update(state="ready", claim=None, unit_name=None, port=None)
                     self._write_locked(document)
             raise
 
@@ -265,9 +266,7 @@ class ProductionAgentOllamaAdapter:
                     "state": "running",
                     "claim": None,
                     "queue_plan_digest": saved["queue_plan_digest"],
-                    "queue_resource_generation": saved[
-                        "queue_resource_generation"
-                    ],
+                    "queue_resource_generation": saved["queue_resource_generation"],
                 }
                 self._write_locked(document)
         if conflict:
@@ -410,7 +409,9 @@ class ProductionAgentOllamaAdapter:
             saved["claim"] = self._claim()
             self._write_locked(document)
         try:
-            running = self._running_instance(instance_ref, generation, allow_stopping=True)
+            running = self._running_instance(
+                instance_ref, generation, allow_stopping=True
+            )
         except OllamaRuntimeError as error:
             if str(error) != "provider.instance_absent":
                 self._reset_stopping(instance_ref, saved)
@@ -441,9 +442,7 @@ class ProductionAgentOllamaAdapter:
             self._write_locked(document)
         return {"stopped": True}
 
-    def _reset_stopping(
-        self, instance_ref: str, saved: Mapping[str, object]
-    ) -> None:
+    def _reset_stopping(self, instance_ref: str, saved: Mapping[str, object]) -> None:
         with self._state.locked():
             document = self._read_locked()
             current = document["running"].get(instance_ref)
@@ -453,8 +452,7 @@ class ProductionAgentOllamaAdapter:
                 and current["claim"] == saved["claim"]
                 and current["unit_name"] == saved["unit_name"]
                 and current["ollama_pid"] == saved["ollama_pid"]
-                and current["process_start_ticks"]
-                == saved["process_start_ticks"]
+                and current["process_start_ticks"] == saved["process_start_ticks"]
             ):
                 current.update(state="running", claim=None)
                 self._write_locked(document)
@@ -486,13 +484,20 @@ class ProductionAgentOllamaAdapter:
         _registry, plan = self._fresh_plan_current(instance_ref)
         if ollama_plan_digest(plan) != saved["plan_digest"]:
             _no_effect("provider.plan_changed")
-        running = adopt_running_instance(plan, runtime=self._runtime, **{
-            key: saved[key]
-            for key in (
-                "unit_name", "port", "ollama_pid", "control_group",
-                "process_start_ticks",
-            )
-        })
+        running = adopt_running_instance(
+            plan,
+            runtime=self._runtime,
+            **{
+                key: saved[key]
+                for key in (
+                    "unit_name",
+                    "port",
+                    "ollama_pid",
+                    "control_group",
+                    "process_start_ticks",
+                )
+            },
+        )
         if saved["generation"] != generation:
             with self._state.locked():
                 document = self._read_locked()
@@ -512,13 +517,20 @@ class ProductionAgentOllamaAdapter:
             _registry, plan = self._fresh_plan_current(instance_ref)
             if ollama_plan_digest(plan) != saved["plan_digest"]:
                 return
-            adopt_running_instance(plan, runtime=self._runtime, **{
-                key: saved[key]
-                for key in (
-                    "unit_name", "port", "ollama_pid", "control_group",
-                    "process_start_ticks",
-                )
-            })
+            adopt_running_instance(
+                plan,
+                runtime=self._runtime,
+                **{
+                    key: saved[key]
+                    for key in (
+                        "unit_name",
+                        "port",
+                        "ollama_pid",
+                        "control_group",
+                        "process_start_ticks",
+                    )
+                },
+            )
             return
         except OllamaRuntimeError as error:
             if str(error) != "provider.instance_absent":
@@ -545,10 +557,7 @@ class ProductionAgentOllamaAdapter:
             if plan_ref == skip_ref:
                 continue
             saved = plans[plan_ref]
-            if (
-                saved["state"] != "intent"
-                or self._claim_alive(saved["claim"])
-            ):
+            if saved["state"] != "intent" or self._claim_alive(saved["claim"]):
                 continue
             try:
                 _registry, plan = self._fresh_plan_current(saved["instance_ref"])
@@ -581,9 +590,12 @@ class ProductionAgentOllamaAdapter:
         return registry
 
     @staticmethod
-    def _local_instance(registry: OllamaRegistryV1, instance_ref: str) -> OllamaInstanceV1:
+    def _local_instance(
+        registry: OllamaRegistryV1, instance_ref: str
+    ) -> OllamaInstanceV1:
         matches = [
-            item for item in registry.instances
+            item
+            for item in registry.instances
             if item.ref == instance_ref and item.host_ref == "local"
         ]
         if len(matches) != 1:
@@ -594,9 +606,11 @@ class ProductionAgentOllamaAdapter:
         self, document: dict[str, Any], *, now: int, generation: int | None
     ) -> None:
         expired = sorted(
-            ref for ref, value in document["plans"].items()
+            ref
+            for ref, value in document["plans"].items()
             if (
-                value["state"] == "ready" and (
+                value["state"] == "ready"
+                and (
                     now - value["created_at"] >= self._plan_max_age
                     or (generation is not None and value["generation"] != generation)
                 )
@@ -665,7 +679,8 @@ class ProductionAgentOllamaAdapter:
             item.setdefault("queue_resource_generation", None)
         for ref, item in value["plans"].items():
             if (
-                type(ref) is not str or _PLAN_REF.fullmatch(ref) is None
+                type(ref) is not str
+                or _PLAN_REF.fullmatch(ref) is None
                 or type(item) is not dict
                 or set(item)
                 != {
@@ -717,7 +732,8 @@ class ProductionAgentOllamaAdapter:
                 _fail("provider.journal_unavailable")
         for ref, item in value["running"].items():
             if (
-                type(ref) is not str or _TOKEN.fullmatch(ref) is None
+                type(ref) is not str
+                or _TOKEN.fullmatch(ref) is None
                 or type(item) is not dict
                 or set(item)
                 != {
@@ -834,9 +850,12 @@ class ProductionAgentOllamaAdapter:
         )
 
     def _write_locked(self, document: Mapping[str, object]) -> None:
-        encoded = json.dumps(
-            document, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode("ascii") + b"\n"
+        encoded = (
+            json.dumps(
+                document, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("ascii")
+            + b"\n"
+        )
         if len(encoded) > MAX_AGENT_OLLAMA_JOURNAL_BYTES:
             _fail("provider.journal_unavailable")
         self._state.replace_private_bytes(_DOCUMENT, encoded)
@@ -940,7 +959,10 @@ class AgentOllamaExecutor:
 
 
 __all__ = [
-    "AgentOllamaError", "AgentOllamaExecutor", "AgentOllamaNoEffectError",
-    "AgentOllamaOperations", "MAX_AGENT_OLLAMA_PLANS",
+    "AgentOllamaError",
+    "AgentOllamaExecutor",
+    "AgentOllamaNoEffectError",
+    "AgentOllamaOperations",
+    "MAX_AGENT_OLLAMA_PLANS",
     "ProductionAgentOllamaAdapter",
 ]

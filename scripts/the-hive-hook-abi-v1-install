@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import argparse
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
@@ -10,9 +11,12 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 
 
 ABI = "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
+ROOT_EFFECT_RECEIPT = "root-hook-effect-receipt-v1.json"
+ROOT_OWNER_LOCK = ".root-hook-abi-owner.lock"
 TRIO = {
     "launcher": ("bin/the-hive-plugin-hook-stable", 0o755),
     "companion": ("src/the_hive/hook_session_pin_store.py", 0o644),
@@ -195,6 +199,192 @@ def _existing(parent, payload, uid, gid, name="v1"):
         os.close(root)
 
 
+def _receipt_payload(payload, uid, generation, pin, root_uid, issued_at_unix_ns):
+    files = {}
+    for name, raw in payload.items():
+        mode = 0o755 if name == "launcher" else 0o644
+        files[name] = {
+            "mode": mode,
+            "nlink": 1,
+            "sha256": _sha(raw),
+            "size": len(raw),
+        }
+    return {
+        "effect": "root_hook_abi_verified_present",
+        "files": files,
+        "generation": generation,
+        "issued_at_unix_ns": issued_at_unix_ns,
+        "manifest_digest": pin,
+        "owner": "root_hook_abi_v1",
+        "root_uid": root_uid,
+        "schema_version": 1,
+        "source_uid": uid,
+        "target": ABI.rsplit("/", 1)[0],
+    }
+
+
+def _open_owner_lock(parent, root_uid, root_gid):
+    created = False
+    try:
+        descriptor = os.open(
+            ROOT_OWNER_LOCK,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+            dir_fd=parent,
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(
+            ROOT_OWNER_LOCK,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+    try:
+        if created:
+            os.fchmod(descriptor, 0o644)
+        info = os.fstat(descriptor)
+        _need(
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == root_uid
+            and info.st_gid == root_gid
+            and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) == 0o644,
+            "hook_abi_gate_owner_lock_untrusted",
+        )
+        if created:
+            os.fsync(descriptor)
+            os.fsync(parent)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise GateError("hook_abi_gate_busy") from exc
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise GateError("hook_abi_gate_lock_durability_unknown") from exc
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_effect_receipt(parent, payload, uid, generation, pin, root_uid, root_gid):
+    issued_at_unix_ns = time.time_ns()
+    value = _receipt_payload(
+        payload, uid, generation, pin, root_uid, issued_at_unix_ns
+    )
+    encoded = _canonical(value)
+    existing = None
+    existing_info = None
+    try:
+        descriptor = os.open(
+            ROOT_EFFECT_RECEIPT,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        try:
+            existing_info = os.fstat(descriptor)
+            _need(
+                stat.S_ISREG(existing_info.st_mode)
+                and existing_info.st_uid == root_uid
+                and existing_info.st_gid == root_gid
+                and existing_info.st_nlink == 1
+                and stat.S_IMODE(existing_info.st_mode) == 0o644
+                and 0 < existing_info.st_size <= 65536,
+                "hook_abi_gate_receipt_untrusted",
+            )
+            chunks = []
+            remaining = existing_info.st_size + 1
+            while remaining:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(descriptor)
+            _need(
+                len(raw) == existing_info.st_size
+                and existing_info[:7] == after[:7]
+                and existing_info.st_mtime_ns == after.st_mtime_ns
+                and existing_info.st_ctime_ns == after.st_ctime_ns,
+                "hook_abi_gate_receipt_untrusted",
+            )
+            existing = _json(raw)
+        finally:
+            os.close(descriptor)
+        _need(
+            isinstance(existing, dict)
+            and set(existing) == set(value)
+            and {
+                key: item for key, item in existing.items()
+                if key != "issued_at_unix_ns"
+            }
+            == {
+                key: item for key, item in value.items()
+                if key != "issued_at_unix_ns"
+            }
+            and type(existing.get("issued_at_unix_ns")) is int
+            and existing["issued_at_unix_ns"] > 0,
+            "hook_abi_gate_receipt_conflict",
+        )
+
+    stage = f".{ROOT_EFFECT_RECEIPT}.{os.urandom(16).hex()}"
+    descriptor = -1
+    visible = False
+    try:
+        descriptor = os.open(
+            stage,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+            dir_fd=parent,
+        )
+        os.fchmod(descriptor, 0o644)
+        view = memoryview(encoded)
+        while view:
+            view = view[os.write(descriptor, view):]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        if existing_info is None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.renameat2(parent, stage.encode(), parent, ROOT_EFFECT_RECEIPT.encode(), 1):
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+        else:
+            current = os.stat(
+                ROOT_EFFECT_RECEIPT, dir_fd=parent, follow_symlinks=False
+            )
+            _need(
+                (current.st_dev, current.st_ino)
+                == (existing_info.st_dev, existing_info.st_ino),
+                "hook_abi_gate_receipt_raced",
+            )
+            os.replace(
+                stage,
+                ROOT_EFFECT_RECEIPT,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+        visible = True
+        os.fsync(parent)
+    except GateError:
+        raise
+    except OSError as exc:
+        raise GateError("hook_abi_gate_receipt_durability_unknown") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not visible:
+            try:
+                os.unlink(stage, dir_fd=parent)
+                os.fsync(parent)
+            except FileNotFoundError:
+                pass
+
+
 def _publish(parent, payload, uid, gid, verify):
     _need(not any(name.startswith(".v1.stage-") for name in os.listdir(parent)),
           "hook_abi_gate_stale_stage_hold")
@@ -250,19 +440,37 @@ def _publish(parent, payload, uid, gid, verify):
 def install(home, uid, generation, pin, *, parent_path=Path("/usr/local/libexec/the-hive/hook-abi"), root_uid=0, root_gid=0):
     _need(isinstance(uid, int) and uid > 0 and re.fullmatch("[0-9a-f]{40}", generation) is not None and
           re.fullmatch("sha256:[0-9a-f]{64}", pin) is not None)
-    payload = _payload(home, uid, generation, pin)
     parent = _absolute(parent_path, root_uid, root_gid, mode=0o755)
+    lock = -1
     try:
+        payload = _payload(home, uid, generation, pin)
+        lock = _open_owner_lock(parent, root_uid, root_gid)
+        try:
+            fresh_payload = _payload(home, uid, generation, pin)
+        except GateError:
+            raise
+        if fresh_payload != payload:
+            raise GateError("hook_abi_gate_source_changed")
         try:
             os.stat("v1", dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             _publish(parent, payload, root_uid, root_gid,
                      lambda: _payload(home, uid, generation, pin))
-            return "installed"
+            result = "installed"
         else:
             _existing(parent, payload, root_uid, root_gid)
-            return "already_installed"
+            result = "already_installed"
+        _existing(parent, payload, root_uid, root_gid)
+        _write_effect_receipt(
+            parent, payload, uid, generation, pin, root_uid, root_gid
+        )
+        return result
     finally:
+        if lock >= 0:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            finally:
+                os.close(lock)
         os.close(parent)
 
 

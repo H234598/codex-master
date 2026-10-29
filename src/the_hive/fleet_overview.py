@@ -108,7 +108,9 @@ def _valid_usage_token(value: object, maximum: int) -> bool:
     )
 
 
-def _valid_usage_integer(value: object, maximum: int, *, allow_zero: bool = False) -> bool:
+def _valid_usage_integer(
+    value: object, maximum: int, *, allow_zero: bool = False
+) -> bool:
     minimum = 0 if allow_zero else 1
     return type(value) is int and minimum <= value <= maximum
 
@@ -144,7 +146,9 @@ def _context_for_agent(
     return FleetOverviewAgentContext(descriptor.enabled, "unknown")
 
 
-def _account_limit_rows(snapshot: FleetSnapshot | FleetSnapshotV2) -> tuple[FleetOverviewAccountLimitRow, ...]:
+def _account_limit_rows(
+    snapshot: FleetSnapshot | FleetSnapshotV2,
+) -> tuple[FleetOverviewAccountLimitRow, ...]:
     return tuple(
         FleetOverviewAccountLimitRow(
             account.account_id,
@@ -167,7 +171,11 @@ def _agent_row(
     series_by_prefix: Mapping[str, object],
     accounts_by_id: Mapping[str, object],
 ) -> FleetOverviewAgentRow:
-    account = accounts_by_id.get(descriptor.account_id) if descriptor.account_id is not None else None
+    account = (
+        accounts_by_id.get(descriptor.account_id)
+        if descriptor.account_id is not None
+        else None
+    )
     series = series_by_prefix[descriptor.series_prefix]
     return FleetOverviewAgentRow(
         descriptor.agent_id,
@@ -199,7 +207,11 @@ def _series_rows(
     for series in sorted(snapshot.series, key=lambda item: item.prefix):
         members = tuple(
             sorted(
-                (descriptor for descriptor in descriptors if descriptor.series_prefix == series.prefix),
+                (
+                    descriptor
+                    for descriptor in descriptors
+                    if descriptor.series_prefix == series.prefix
+                ),
                 key=lambda descriptor: (descriptor.ordinal, descriptor.agent_id),
             )
         )
@@ -210,7 +222,10 @@ def _series_rows(
                 series.provider.value,
                 series.runner.value,
                 series.model,
-                sum(_context_for_agent(item.agent_id, item, contexts).active for item in members),
+                sum(
+                    _context_for_agent(item.agent_id, item, contexts).active
+                    for item in members
+                ),
                 len(members),
                 tuple(item.agent_id for item in members),
             )
@@ -235,7 +250,13 @@ def _limit_label(limit: UsageLimit) -> str:
 
 
 def _format_limit_windows(limits: tuple[UsageLimit, ...]) -> str:
-    return ",".join(f"{_limit_label(item)}={_format_percent(item.remaining_percent)}" for item in limits) or "—"
+    return (
+        ",".join(
+            f"{_limit_label(item)}={_format_percent(item.remaining_percent)}"
+            for item in limits
+        )
+        or "—"
+    )
 
 
 def _validate_usage_snapshot(usage_snapshot: UsageSnapshot) -> None:
@@ -253,7 +274,9 @@ def _validate_usage_snapshot(usage_snapshot: UsageSnapshot) -> None:
             _invalid_overview_input()
         if source == "live" and (usage_snapshot.stale or usage_snapshot.warnings != ()):
             _invalid_overview_input()
-        if source == "cache" and (not usage_snapshot.stale or usage_snapshot.warnings != ()):
+        if source == "cache" and (
+            not usage_snapshot.stale or usage_snapshot.warnings != ()
+        ):
             _invalid_overview_input()
         if source == "unavailable" and (
             not usage_snapshot.stale
@@ -303,13 +326,17 @@ def _validate_usage_snapshot(usage_snapshot: UsageSnapshot) -> None:
                     or not _valid_usage_percent(window.consumed_percentage_points)
                     or type(window.coverage) is not str
                     or window.coverage not in _COST_COVERAGES
-                    or not _valid_usage_integer(window.sample_count, 10_000, allow_zero=True)
+                    or not _valid_usage_integer(
+                        window.sample_count, 10_000, allow_zero=True
+                    )
                 ):
                     _invalid_overview_input()
             for reset in account.usage_resets:
                 if (
                     type(reset) is not UsageReset
-                    or not _valid_usage_integer(reset.available, 10_000, allow_zero=True)
+                    or not _valid_usage_integer(
+                        reset.available, 10_000, allow_zero=True
+                    )
                     or type(reset.known) is not bool
                     or type(reset.redeem_capability) is not bool
                 ):
@@ -330,8 +357,13 @@ def _validate_overview_rows(overview: FleetOverviewSnapshot) -> None:
             or type(overview.warnings) is not tuple
             or any(type(row) is not FleetOverviewSeriesRow for row in overview.series)
             or any(type(row) is not FleetOverviewAgentRow for row in overview.agents)
-            or any(type(row) is not FleetOverviewAccountLimitRow for row in overview.account_limits)
-            or any(type(row.account_id) not in (str, type(None)) for row in overview.agents)
+            or any(
+                type(row) is not FleetOverviewAccountLimitRow
+                for row in overview.account_limits
+            )
+            or any(
+                type(row.account_id) not in (str, type(None)) for row in overview.agents
+            )
             or any(type(row.account_id) is not str for row in overview.account_limits)
         ):
             _invalid_overview_input()
@@ -348,7 +380,9 @@ def _usage_account_for_id(
     if account_id is None:
         return None
     matches = tuple(
-        account for account in usage_snapshot.accounts if account.account_id == account_id
+        account
+        for account in usage_snapshot.accounts
+        if account.account_id == account_id
     )
     return matches[0] if len(matches) == 1 else None
 
@@ -370,7 +404,15 @@ def _usage_limit_document(limit: UsageLimit) -> dict[str, object]:
 def _usage_fields(
     usage_snapshot: UsageSnapshot,
     account_id: str | None,
-) -> tuple[float | None, str | None, float | None, str | None, float | None, str, tuple[UsageLimit, ...]]:
+) -> tuple[
+    float | None,
+    str | None,
+    float | None,
+    str | None,
+    float | None,
+    str,
+    tuple[UsageLimit, ...],
+]:
     account = _usage_account_for_id(usage_snapshot, account_id)
     if (
         account is None
@@ -380,9 +422,15 @@ def _usage_fields(
         return None, None, None, None, None, "unavailable", ()
 
     short_limits = tuple(
-        limit for limit in account.limits if limit.pool == "primary" and limit.window_seconds == 18000
+        limit
+        for limit in account.limits
+        if limit.pool == "primary" and limit.window_seconds == 18000
     ) or tuple(limit for limit in account.limits if limit.window_seconds == 18000)
-    week_limits = tuple(limit for limit in account.limits if limit.pool == "primary" and limit.window_seconds == 604800)
+    week_limits = tuple(
+        limit
+        for limit in account.limits
+        if limit.pool == "primary" and limit.window_seconds == 604800
+    )
     short = short_limits[0] if len(short_limits) == 1 else None
     week = week_limits[0] if len(week_limits) == 1 else None
     cost: UsageCostWindow | None = None
@@ -409,7 +457,12 @@ def _usage_fields(
         tuple(
             sorted(
                 account.limits,
-                key=lambda item: (item.pool, item.window_seconds, item.reset_at is not None, item.reset_at or datetime.min),
+                key=lambda item: (
+                    item.pool,
+                    item.window_seconds,
+                    item.reset_at is not None,
+                    item.reset_at or datetime.min,
+                ),
             )
         ),
     )
@@ -502,7 +555,10 @@ def build_fleet_overview(
         except Exception:
             raise FleetOverviewError("invalid_overview_context") from None
         for agent_id, context in context_mapping.items():
-            if agent_id not in inventory.agent_ids or type(context) is not FleetOverviewAgentContext:
+            if (
+                agent_id not in inventory.agent_ids
+                or type(context) is not FleetOverviewAgentContext
+            ):
                 raise FleetOverviewError("invalid_overview_context")
             if (
                 type(context.active) is not bool
@@ -549,7 +605,9 @@ def build_fleet_overview(
             or set(inventory_keys) != set(expected_agent_metadata)
         ):
             raise FleetOverviewError("invalid_overview_input")
-        descriptors = tuple(inventory.agents[agent_id] for agent_id in inventory.agent_ids)
+        descriptors = tuple(
+            inventory.agents[agent_id] for agent_id in inventory.agent_ids
+        )
         for agent_id, descriptor in zip(inventory_ids, descriptors):
             expected_prefix, expected_ordinal = expected_agent_metadata[agent_id]
             if (
@@ -571,7 +629,10 @@ def build_fleet_overview(
         raise FleetOverviewError("invalid_overview_input")
 
     ordered_descriptors = tuple(
-        sorted(descriptors, key=lambda item: (item.series_prefix, item.ordinal, item.agent_id))
+        sorted(
+            descriptors,
+            key=lambda item: (item.series_prefix, item.ordinal, item.agent_id),
+        )
     )
     rows_with_context = tuple(
         (
@@ -605,7 +666,10 @@ def fleet_overview_document(overview: FleetOverviewSnapshot) -> dict[str, object
             type(overview) is FleetOverviewSnapshot
             and all(type(row) is FleetOverviewSeriesRow for row in overview.series)
             and all(type(row) is FleetOverviewAgentRow for row in overview.agents)
-            and all(type(row) is FleetOverviewAccountLimitRow for row in overview.account_limits)
+            and all(
+                type(row) is FleetOverviewAccountLimitRow
+                for row in overview.account_limits
+            )
         )
     except Exception:
         valid_overview = False
@@ -646,7 +710,9 @@ def fleet_overview_document(overview: FleetOverviewSnapshot) -> dict[str, object
                 "limit_week_reset_at": row.limit_week_reset_at,
                 "cost_last_hour_percentage_points": row.cost_last_hour_percentage_points,
                 "usage_freshness": row.usage_freshness,
-                "limit_windows": [_usage_limit_document(item) for item in row.limit_windows],
+                "limit_windows": [
+                    _usage_limit_document(item) for item in row.limit_windows
+                ],
             }
             for row in overview.agents
         ],
@@ -661,7 +727,9 @@ def fleet_overview_document(overview: FleetOverviewSnapshot) -> dict[str, object
                 "week_reset_at": row.week_reset_at,
                 "cost_last_hour_percentage_points": row.cost_last_hour_percentage_points,
                 "usage_freshness": row.usage_freshness,
-                "limit_windows": [_usage_limit_document(item) for item in row.limit_windows],
+                "limit_windows": [
+                    _usage_limit_document(item) for item in row.limit_windows
+                ],
             }
             for row in overview.account_limits
         ],
@@ -679,7 +747,10 @@ def render_fleet_overview(
             type(overview) is FleetOverviewSnapshot
             and all(type(row) is FleetOverviewSeriesRow for row in overview.series)
             and all(type(row) is FleetOverviewAgentRow for row in overview.agents)
-            and all(type(row) is FleetOverviewAccountLimitRow for row in overview.account_limits)
+            and all(
+                type(row) is FleetOverviewAccountLimitRow
+                for row in overview.account_limits
+            )
         )
     except Exception:
         valid_overview = False

@@ -85,9 +85,7 @@ class PoolExecutionPort(Protocol):
 class HiveAssignmentExecutionBridge(Protocol):
     """Narrow server adapter around the one existing Hive admission gate."""
 
-    def scope_digest(
-        self, repo_id: str, mode: str, paths: tuple[str, ...]
-    ) -> str:
+    def scope_digest(self, repo_id: str, mode: str, paths: tuple[str, ...]) -> str:
         """Read the existing repository-owned canonical scope digest."""
 
     def base_admission_id(self) -> str:
@@ -118,7 +116,10 @@ class HiveWorkTransition:
             raise HiveWorkDispatcherError("invalid_hive_work_generation")
         if self.state not in _ALLOWED_TRANSITIONS:
             raise HiveWorkDispatcherError("invalid_hive_work_state")
-        if not isinstance(self.digest, str) or _DIGEST_RE.fullmatch(self.digest) is None:
+        if (
+            not isinstance(self.digest, str)
+            or _DIGEST_RE.fullmatch(self.digest) is None
+        ):
             raise HiveWorkDispatcherError("invalid_hive_work_digest")
 
 
@@ -155,15 +156,24 @@ class HiveWorkAggregate:
         )
         if type(self.generation) is not int or self.generation < 1:
             raise HiveWorkDispatcherError("invalid_hive_work_generation")
-        if not isinstance(self.scope_digest, str) or _DIGEST_RE.fullmatch(self.scope_digest) is None:
+        if (
+            not isinstance(self.scope_digest, str)
+            or _DIGEST_RE.fullmatch(self.scope_digest) is None
+        ):
             raise HiveWorkDispatcherError("invalid_hive_work_scope_digest")
         if not _is_valid_base_admission_id(self.base_admission_id):
             raise HiveWorkDispatcherError("invalid_hive_work_admission_id")
         if self.state not in _ALLOWED_TRANSITIONS:
             raise HiveWorkDispatcherError("invalid_hive_work_state")
-        if not isinstance(self.digest, str) or _DIGEST_RE.fullmatch(self.digest) is None:
+        if (
+            not isinstance(self.digest, str)
+            or _DIGEST_RE.fullmatch(self.digest) is None
+        ):
             raise HiveWorkDispatcherError("invalid_hive_work_digest")
-        if not isinstance(self.transitions, tuple) or len(self.transitions) != self.generation:
+        if (
+            not isinstance(self.transitions, tuple)
+            or len(self.transitions) != self.generation
+        ):
             raise HiveWorkDispatcherError("invalid_hive_work_transitions")
         for expected_generation, transition in enumerate(self.transitions, start=1):
             if (
@@ -236,7 +246,9 @@ class HiveWorkDispatcher:
     ) -> None:
         if not isinstance(control_plane, HiveControlPlaneStore):
             raise HiveWorkDispatcherError("invalid_hive_work_control_plane")
-        if execution_port is not None and not callable(getattr(execution_port, "execute", None)):
+        if execution_port is not None and not callable(
+            getattr(execution_port, "execute", None)
+        ):
             raise HiveWorkDispatcherError("invalid_pool_execution_port")
         self._control_plane = control_plane
         self._execution_port = execution_port
@@ -315,9 +327,7 @@ class HiveWorkDispatcher:
             raise HiveWorkDispatcherError("invalid_hive_execution_bridge")
         if not callable(pool_authority_reader):
             raise HiveWorkDispatcherError("invalid_pool_authority_reader")
-        _validate_planner_input(
-            planner_input, workpackage, intent, selection
-        )
+        _validate_planner_input(planner_input, workpackage, intent, selection)
         try:
             base_admission_id = execution_bridge.base_admission_id()
         except Exception as exc:
@@ -330,7 +340,10 @@ class HiveWorkDispatcher:
             )
         except Exception as exc:
             raise HiveWorkDispatcherError("hive_work_scope_unavailable") from exc
-        if not isinstance(scope_digest, str) or _DIGEST_RE.fullmatch(scope_digest) is None:
+        if (
+            not isinstance(scope_digest, str)
+            or _DIGEST_RE.fullmatch(scope_digest) is None
+        ):
             raise HiveWorkDispatcherError("invalid_hive_work_scope_digest")
         aggregate = self.persist(
             workpackage=workpackage,
@@ -365,7 +378,9 @@ class HiveWorkDispatcher:
         )
         return dict(result)
 
-    def _replace(self, aggregate: HiveWorkAggregate, *, now: datetime) -> HiveWorkAggregate:
+    def _replace(
+        self, aggregate: HiveWorkAggregate, *, now: datetime
+    ) -> HiveWorkAggregate:
         document = self._control_plane.load_task9()
         records = _records(document)
         matches = [
@@ -395,7 +410,9 @@ class HiveWorkDispatcher:
     ) -> Mapping[str, object]:
         """Call only the explicitly bound resolver-free product effect port."""
 
-        if not isinstance(admission, AdmissionRecord) or not isinstance(fresh_lease, Mapping):
+        if not isinstance(admission, AdmissionRecord) or not isinstance(
+            fresh_lease, Mapping
+        ):
             return {"allowed": False, "reason_code": "pool_execution_unavailable"}
         if self._execution_port is None:
             return {"allowed": False, "reason_code": "pool_execution_unavailable"}
@@ -461,7 +478,11 @@ def _initial_aggregate(
         1,
         "persisted",
         digest,
-        (HiveWorkTransition(1, "persisted", _transition_digest(1, "persisted", digest)),),
+        (
+            HiveWorkTransition(
+                1, "persisted", _transition_digest(1, "persisted", digest)
+            ),
+        ),
     )
 
 
@@ -482,8 +503,19 @@ def _advance(aggregate: HiveWorkAggregate, state: str) -> HiveWorkAggregate:
         generation=generation,
         state=state,
     )
-    transitions = (*aggregate.transitions, HiveWorkTransition(generation, state, _transition_digest(generation, state, digest)))
-    return replace(aggregate, generation=generation, state=state, digest=digest, transitions=transitions)
+    transitions = (
+        *aggregate.transitions,
+        HiveWorkTransition(
+            generation, state, _transition_digest(generation, state, digest)
+        ),
+    )
+    return replace(
+        aggregate,
+        generation=generation,
+        state=state,
+        digest=digest,
+        transitions=transitions,
+    )
 
 
 def _bind(
@@ -493,7 +525,9 @@ def _bind(
 
     if aggregate.state != "persisted" or not isinstance(binding, AccountPoolBindingV1):
         raise HiveWorkDispatcherError("invalid_hive_work_binding")
-    expected = _inventory_binding(aggregate.dynamic_inventory, aggregate.selection.agent_id)
+    expected = _inventory_binding(
+        aggregate.dynamic_inventory, aggregate.selection.agent_id
+    )
     if binding != expected:
         raise HiveWorkDispatcherError("hive_work_binding_mismatch")
     generation = aggregate.generation + 1
@@ -510,15 +544,20 @@ def _bind(
         generation=generation,
         state="bound",
     )
-    transitions = (*aggregate.transitions, HiveWorkTransition(
-        generation,
-        "bound",
-        _transition_digest(generation, "bound", digest),
-    ))
+    transitions = (
+        *aggregate.transitions,
+        HiveWorkTransition(
+            generation,
+            "bound",
+            _transition_digest(generation, "bound", digest),
+        ),
+    )
     return replace(
         aggregate,
         bound_account_pool_binding=binding,
-        bound_dynamic_pool_digest=_dynamic_pool_binding_digest(aggregate.selection.agent_id, binding),
+        bound_dynamic_pool_digest=_dynamic_pool_binding_digest(
+            aggregate.selection.agent_id, binding
+        ),
         generation=generation,
         state="bound",
         digest=digest,
@@ -566,7 +605,10 @@ def _validate_unit(
     except Exception as exc:
         raise HiveWorkDispatcherError("hive_work_inventory_mismatch") from exc
     if bound_account_pool_binding is None:
-        if bound_dynamic_pool_digest is not None or state in {"bound", "bridge_returned"}:
+        if bound_dynamic_pool_digest is not None or state in {
+            "bound",
+            "bridge_returned",
+        }:
             raise HiveWorkDispatcherError("hive_work_binding_mismatch")
         return
     if (
@@ -584,7 +626,10 @@ def _validate_planner_input(
     intent: AssignmentIntent,
     selection: SelectionResult,
 ) -> None:
-    if not isinstance(planner_input, Mapping) or "account_pool_binding" in planner_input:
+    if (
+        not isinstance(planner_input, Mapping)
+        or "account_pool_binding" in planner_input
+    ):
         raise HiveWorkDispatcherError("invalid_hive_planner_input")
     expected = {
         "workpackage_id": workpackage.workpackage_id,
@@ -651,7 +696,11 @@ def _record_from_aggregate(aggregate: HiveWorkAggregate) -> dict[str, object]:
 
 
 def _aggregate_from_record(record: Mapping[str, object]) -> HiveWorkAggregate:
-    if not isinstance(record, Mapping) or set(record) != _RECORD_KEYS or record.get("kind") != _RECORD_KIND:
+    if (
+        not isinstance(record, Mapping)
+        or set(record) != _RECORD_KEYS
+        or record.get("kind") != _RECORD_KIND
+    ):
         raise HiveWorkDispatcherError("invalid_hive_work_record")
     try:
         workpackage = _workpackage_from_payload(record["workpackage"])
@@ -672,9 +721,7 @@ def _aggregate_from_record(record: Mapping[str, object]) -> HiveWorkAggregate:
         if not isinstance(raw_transitions, list):
             raise ValueError
         transitions = tuple(
-            HiveWorkTransition(
-                raw["generation"], raw["state"], raw["digest"]
-            )
+            HiveWorkTransition(raw["generation"], raw["state"], raw["digest"])
             for raw in raw_transitions
             if isinstance(raw, Mapping) and set(raw) == _TRANSITION_KEYS
         )
@@ -718,16 +765,29 @@ def _workpackage_payload(value: WorkPackage) -> dict[str, object]:
         "depends_on_workpackage_ids": list(value.depends_on_workpackage_ids),
         "resource_profile": dict(value.resource_profile),
         "state": value.state,
-        "ready_since_utc": value.ready_since_utc.isoformat() if value.ready_since_utc is not None else None,
+        "ready_since_utc": value.ready_since_utc.isoformat()
+        if value.ready_since_utc is not None
+        else None,
         "version": value.version,
     }
 
 
 def _workpackage_from_payload(raw: object) -> WorkPackage:
     expected = {
-        "workpackage_id", "dispatch_id", "owner_teamlead_principal_id", "objective", "scope", "write_paths",
-        "success_criteria", "test_requirements", "release_policy", "depends_on_workpackage_ids", "resource_profile",
-        "state", "ready_since_utc", "version",
+        "workpackage_id",
+        "dispatch_id",
+        "owner_teamlead_principal_id",
+        "objective",
+        "scope",
+        "write_paths",
+        "success_criteria",
+        "test_requirements",
+        "release_policy",
+        "depends_on_workpackage_ids",
+        "resource_profile",
+        "state",
+        "ready_since_utc",
+        "version",
     }
     if not isinstance(raw, Mapping) or set(raw) != expected:
         raise HiveWorkDispatcherError("invalid_hive_workpackage")
@@ -737,9 +797,20 @@ def _workpackage_from_payload(raw: object) -> WorkPackage:
             raise HiveWorkDispatcherError("invalid_hive_workpackage")
         ready = datetime.fromisoformat(ready)
     return WorkPackage(
-        raw["workpackage_id"], raw["dispatch_id"], raw["owner_teamlead_principal_id"], raw["objective"],
-        tuple(raw["scope"]), tuple(raw["write_paths"]), tuple(raw["success_criteria"]), tuple(raw["test_requirements"]),
-        raw["release_policy"], tuple(raw["depends_on_workpackage_ids"]), raw["resource_profile"], raw["state"], ready, raw["version"],
+        raw["workpackage_id"],
+        raw["dispatch_id"],
+        raw["owner_teamlead_principal_id"],
+        raw["objective"],
+        tuple(raw["scope"]),
+        tuple(raw["write_paths"]),
+        tuple(raw["success_criteria"]),
+        tuple(raw["test_requirements"]),
+        raw["release_policy"],
+        tuple(raw["depends_on_workpackage_ids"]),
+        raw["resource_profile"],
+        raw["state"],
+        ready,
+        raw["version"],
     )
 
 
@@ -765,17 +836,40 @@ def _intent_payload(value: AssignmentIntent) -> dict[str, object]:
 
 def _intent_from_payload(raw: object) -> AssignmentIntent:
     expected = {
-        "assignment_intent_id", "request_id", "dispatch_id", "workpackage_id", "repo_id", "parent_principal_id",
-        "grant_id", "class_id", "dispatch_priority", "task_complexity", "model_policy_constraints",
-        "scope_reservation_request", "expected_usage_bucket", "decision_refs", "context_digest",
+        "assignment_intent_id",
+        "request_id",
+        "dispatch_id",
+        "workpackage_id",
+        "repo_id",
+        "parent_principal_id",
+        "grant_id",
+        "class_id",
+        "dispatch_priority",
+        "task_complexity",
+        "model_policy_constraints",
+        "scope_reservation_request",
+        "expected_usage_bucket",
+        "decision_refs",
+        "context_digest",
     }
     if not isinstance(raw, Mapping) or set(raw) != expected:
         raise HiveWorkDispatcherError("invalid_hive_assignment_intent")
     return AssignmentIntent(
-        raw["assignment_intent_id"], raw["request_id"], raw["dispatch_id"], raw["workpackage_id"], raw["repo_id"],
-        raw["parent_principal_id"], raw["grant_id"], raw["class_id"], DispatchPriority(raw["dispatch_priority"]),
-        TaskComplexity(raw["task_complexity"]), raw["model_policy_constraints"], raw["scope_reservation_request"],
-        raw["expected_usage_bucket"], tuple(raw["decision_refs"]), raw["context_digest"],
+        raw["assignment_intent_id"],
+        raw["request_id"],
+        raw["dispatch_id"],
+        raw["workpackage_id"],
+        raw["repo_id"],
+        raw["parent_principal_id"],
+        raw["grant_id"],
+        raw["class_id"],
+        DispatchPriority(raw["dispatch_priority"]),
+        TaskComplexity(raw["task_complexity"]),
+        raw["model_policy_constraints"],
+        raw["scope_reservation_request"],
+        raw["expected_usage_bucket"],
+        tuple(raw["decision_refs"]),
+        raw["context_digest"],
     )
 
 
@@ -802,17 +896,42 @@ def _grant_payload(value: DelegationGrant) -> dict[str, object]:
 
 def _grant_from_payload(raw: object) -> DelegationGrant:
     expected = {
-        "schema_version", "grant_id", "issuer_principal_id", "subject_principal_id", "repo_id", "dispatch_id",
-        "capabilities", "scope", "write_paths", "max_delegation_depth", "issued_at_utc", "expires_at_utc",
-        "nonce_digest", "request_digest", "status", "version",
+        "schema_version",
+        "grant_id",
+        "issuer_principal_id",
+        "subject_principal_id",
+        "repo_id",
+        "dispatch_id",
+        "capabilities",
+        "scope",
+        "write_paths",
+        "max_delegation_depth",
+        "issued_at_utc",
+        "expires_at_utc",
+        "nonce_digest",
+        "request_digest",
+        "status",
+        "version",
     }
     if not isinstance(raw, Mapping) or set(raw) != expected:
         raise HiveWorkDispatcherError("invalid_hive_delegation_grant")
     return DelegationGrant(
-        raw["schema_version"], raw["grant_id"], raw["issuer_principal_id"], raw["subject_principal_id"], raw["repo_id"],
-        raw["dispatch_id"], tuple(raw["capabilities"]), tuple(raw["scope"]), tuple(raw["write_paths"]),
-        raw["max_delegation_depth"], datetime.fromisoformat(raw["issued_at_utc"]), datetime.fromisoformat(raw["expires_at_utc"]),
-        raw["nonce_digest"], raw["request_digest"], raw["status"], raw["version"],
+        raw["schema_version"],
+        raw["grant_id"],
+        raw["issuer_principal_id"],
+        raw["subject_principal_id"],
+        raw["repo_id"],
+        raw["dispatch_id"],
+        tuple(raw["capabilities"]),
+        tuple(raw["scope"]),
+        tuple(raw["write_paths"]),
+        raw["max_delegation_depth"],
+        datetime.fromisoformat(raw["issued_at_utc"]),
+        datetime.fromisoformat(raw["expires_at_utc"]),
+        raw["nonce_digest"],
+        raw["request_digest"],
+        raw["status"],
+        raw["version"],
     )
 
 
@@ -829,12 +948,21 @@ def _selection_payload(value: SelectionResult) -> dict[str, object]:
 
 
 def _selection_from_payload(raw: object) -> SelectionResult:
-    expected = {"agent_id", "model_id", "band", "fairness_micro", "account_pool_binding"}
+    expected = {
+        "agent_id",
+        "model_id",
+        "band",
+        "fairness_micro",
+        "account_pool_binding",
+    }
     if not isinstance(raw, Mapping) or set(raw) != expected:
         raise HiveWorkDispatcherError("invalid_hive_selection")
     binding = raw["account_pool_binding"]
     return SelectionResult(
-        raw["agent_id"], raw["model_id"], SelectionBand(raw["band"]), raw["fairness_micro"],
+        raw["agent_id"],
+        raw["model_id"],
+        SelectionBand(raw["band"]),
+        raw["fairness_micro"],
         account_pool_binding_from_payload(binding) if binding is not None else None,
     )
 
@@ -860,7 +988,10 @@ def _inventory_from_payload(raw: object) -> DynamicPoolInventoryV1:
         if not isinstance(entry, Mapping) or set(entry) != expected:
             raise HiveWorkDispatcherError("invalid_hive_dynamic_inventory")
         entries[agent_id] = DynamicPoolInventoryEntryV1(
-            entry["account_id"], entry["pool_id"], entry["authority_provider"], entry["runtime_provider"]
+            entry["account_id"],
+            entry["pool_id"],
+            entry["authority_provider"],
+            entry["runtime_provider"],
         )
     return DynamicPoolInventoryV1(entries)
 
@@ -913,9 +1044,7 @@ def _inventory_binding(
     )
 
 
-def _dynamic_pool_binding_digest(
-    agent_id: str, binding: AccountPoolBindingV1
-) -> str:
+def _dynamic_pool_binding_digest(agent_id: str, binding: AccountPoolBindingV1) -> str:
     return _digest(
         {
             "agent_id": agent_id,
@@ -939,7 +1068,10 @@ def _fresh_lease_matches_admission(
         ):
             return False
         expected_lease_id = admission.lease_context.lease_id
-        return expected_lease_id is None or fresh_lease.get("lease_id") == expected_lease_id
+        return (
+            expected_lease_id is None
+            or fresh_lease.get("lease_id") == expected_lease_id
+        )
     return fresh_lease.get("state") == expected
 
 
@@ -962,14 +1094,19 @@ def _admission_id_matches_base(admission_id: object, base_admission_id: object) 
         return False
     if admission_id == base_admission_id:
         return True
-    match = re.fullmatch(r"(?P<prefix>.*)-attempt-(?P<attempt>[1-9][0-9]*)", admission_id)
+    match = re.fullmatch(
+        r"(?P<prefix>.*)-attempt-(?P<attempt>[1-9][0-9]*)", admission_id
+    )
     if match is None:
         return False
     attempt = int(match.group("attempt"))
     if not 2 <= attempt <= MAX_EXECUTION_ATTEMPTS:
         return False
     suffix = f"-attempt-{attempt}"
-    return admission_id == f"{base_admission_id[: MAX_ADMISSION_ID_LENGTH - len(suffix)]}{suffix}"
+    return (
+        admission_id
+        == f"{base_admission_id[: MAX_ADMISSION_ID_LENGTH - len(suffix)]}{suffix}"
+    )
 
 
 def _admission_matches_bound_aggregate(
@@ -984,7 +1121,9 @@ def _admission_matches_bound_aggregate(
         admission.state is AdmissionState.EXECUTING
         and isinstance(admission.admission_id, str)
         and bool(admission.admission_id)
-        and _admission_id_matches_base(admission.admission_id, aggregate.base_admission_id)
+        and _admission_id_matches_base(
+            admission.admission_id, aggregate.base_admission_id
+        )
         and admission.revision >= 4
         and admission.revision % 2 == 0
         and not admission.is_expired(datetime.now(timezone.utc))
@@ -1016,7 +1155,9 @@ def _admission_matches_bound_aggregate(
     )
 
 
-def _transition_digest(generation: int, state: str, aggregate_digest: str | None) -> str:
+def _transition_digest(
+    generation: int, state: str, aggregate_digest: str | None
+) -> str:
     return _digest(
         {
             "generation": generation,
@@ -1028,7 +1169,9 @@ def _transition_digest(generation: int, state: str, aggregate_digest: str | None
 
 def _digest(value: Mapping[str, object]) -> str:
     try:
-        encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        encoded = json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
     except (TypeError, ValueError, RecursionError) as exc:
         raise HiveWorkDispatcherError("invalid_hive_work_payload") from exc
     return f"sha256:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"

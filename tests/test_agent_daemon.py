@@ -17,7 +17,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from the_hive import agent_daemon
-from the_hive.agent_daemon import AgentApiServer, AgentCredentialFds, open_systemd_credentials
+from the_hive.agent_daemon import (
+    AgentApiServer,
+    AgentCredentialFds,
+    open_systemd_credentials,
+)
 from the_hive.admin_hosts import HostRegistry, HostRegistryError
 from the_hive.admin_hosts import AgentPrincipalV1
 from the_hive.admin_operations import AdminOperationError
@@ -61,7 +65,9 @@ def _credential_directory(tmp_path: Path) -> Path:
 
 def test_systemd_credentials_are_opened_as_fds_and_names_are_fixed(tmp_path) -> None:
     directory = _credential_directory(tmp_path)
-    with open_systemd_credentials({"CREDENTIALS_DIRECTORY": str(directory)}) as credentials:
+    with open_systemd_credentials(
+        {"CREDENTIALS_DIRECTORY": str(directory)}
+    ) as credentials:
         assert isinstance(credentials, AgentCredentialFds)
         assert [os.read(fd, 64) for fd in credentials] == [
             b"agent-server-cert",
@@ -84,7 +90,6 @@ def test_ollama_receipts_cross_real_agent_http_router_and_store_for_every_action
     tmp_path: Path,
 ) -> None:
     """The Ollama owner receives the HTTP registry principal only at its typed edge."""
-
 
     from the_hive.admin_contracts import OperationV1
     from the_hive.admin_hosts import AgentBindingV1, HostRegistry
@@ -140,9 +145,7 @@ def test_ollama_receipts_cross_real_agent_http_router_and_store_for_every_action
     )
     application = AgentHttpApplication(
         store,
-        agent_daemon._AgentCompletionRouter(
-            store, _NoopHostProbeOwner(), fleet
-        ),
+        agent_daemon._AgentCompletionRouter(store, _NoopHostProbeOwner(), fleet),
     )
     principal = AgentPrincipalV1("worker-west", hosts.document_generation(), 3)
     instance = OllamaInstanceV1(
@@ -322,7 +325,11 @@ def _post_ollama_receipt(
         deadline=datetime.strptime(wire["deadline"], "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=UTC
         ),
-        **{key: value for key, value in wire.items() if key not in {"schema_version", "deadline"}},
+        **{
+            key: value
+            for key, value in wire.items()
+            if key not in {"schema_version", "deadline"}
+        },
     )
     assert isinstance(result, AgentResultV1)
     receipt = AgentReceiptV1(
@@ -336,7 +343,9 @@ def _post_ollama_receipt(
         ("host.operation_succeeded",),
         "sha256:"
         + hashlib.sha256(
-            json.dumps(serialize_agent_result(result), sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                serialize_agent_result(result), sort_keys=True, separators=(",", ":")
+            ).encode()
         ).hexdigest(),
         result,
         lease.envelope_digest,
@@ -358,24 +367,26 @@ def _receipt_wire(receipt: object) -> bytes:
 
     assert type(receipt) is AgentReceiptV1
     wire = {
-            "schema_version": 2 if receipt.result.kind == "ollama.instance" else 1,
-            "operation_id": receipt.operation_id,
-            "lease_id": receipt.lease_id,
-            "lease_epoch": receipt.lease_epoch,
-            "attempt": receipt.attempt,
-            "plan_digest": receipt.plan_digest,
-            "arguments_digest": receipt.arguments_digest,
-            "state": receipt.state,
-            "reason_codes": list(receipt.reason_codes),
-            "result_digest": receipt.result_digest,
-            "result": serialize_agent_result(receipt.result),
+        "schema_version": 2 if receipt.result.kind == "ollama.instance" else 1,
+        "operation_id": receipt.operation_id,
+        "lease_id": receipt.lease_id,
+        "lease_epoch": receipt.lease_epoch,
+        "attempt": receipt.attempt,
+        "plan_digest": receipt.plan_digest,
+        "arguments_digest": receipt.arguments_digest,
+        "state": receipt.state,
+        "reason_codes": list(receipt.reason_codes),
+        "result_digest": receipt.result_digest,
+        "result": serialize_agent_result(receipt.result),
     }
     if receipt.result.kind == "ollama.instance":
         wire["envelope_digest"] = receipt.envelope_digest
     return json.dumps(wire).encode()
 
 
-def test_tls_context_is_tls13_client_certificate_only_and_loads_fd_paths(monkeypatch) -> None:
+def test_tls_context_is_tls13_client_certificate_only_and_loads_fd_paths(
+    monkeypatch,
+) -> None:
     context = FakeContext()
     monkeypatch.setattr(agent_daemon.ssl, "SSLContext", lambda protocol: context)
     result = agent_daemon.create_agent_ssl_context(AgentCredentialFds(11, 12, 13))
@@ -402,7 +413,10 @@ def test_server_wraps_every_accepted_connection_before_http(monkeypatch) -> None
     server = AgentApiServer(("127.0.0.1", 0), Application(), Resolver(), context)
     try:
         marker = object()
-        assert server.get_request_from_socket(marker, ("127.0.0.1", 1)) == (marker, ("127.0.0.1", 1))
+        assert server.get_request_from_socket(marker, ("127.0.0.1", 1)) == (
+            marker,
+            ("127.0.0.1", 1),
+        )
     finally:
         server.server_close()
 
@@ -418,7 +432,9 @@ def test_server_bounds_request_threads_before_tls_handshake(monkeypatch) -> None
         "process_request",
         lambda _server, request, _address: started.append(request),
     )
-    monkeypatch.setattr(server, "shutdown_request", lambda request: closed.append(request))
+    monkeypatch.setattr(
+        server, "shutdown_request", lambda request: closed.append(request)
+    )
     first, rejected, later = object(), object(), object()
     try:
         for request in (first, rejected):
@@ -453,7 +469,9 @@ def test_server_bounds_request_threads_before_tls_handshake(monkeypatch) -> None
         ("9" * 5000, b" 413 "),
     ],
 )
-def test_content_length_text_is_bounded_before_integer_conversion(length, status) -> None:
+def test_content_length_text_is_bounded_before_integer_conversion(
+    length, status
+) -> None:
     wire = _WireSocket(
         b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json\r\n"
         + f"Content-Length: {length}\r\n\r\n".encode()
@@ -531,7 +549,9 @@ def test_peer_certificate_selects_principal_before_body_parse() -> None:
             raise AssertionError("body reached application")
 
     agent_daemon._AgentRequestHandler(
-        wire, ("127.0.0.1", 1), _HandlerServer(RejectingResolver(), UntouchedApplication())
+        wire,
+        ("127.0.0.1", 1),
+        _HandlerServer(RejectingResolver(), UntouchedApplication()),
     )
     assert wire.certificate_reads == 1
     assert wire.input.read() == b"not-json"
@@ -541,12 +561,23 @@ def test_peer_certificate_selects_principal_before_body_parse() -> None:
 @pytest.mark.parametrize(
     ("request_bytes", "status"),
     [
-        (b"POST /agent/v1/polls HTTP/1.1\r\nX: " + b"a" * (16 * 1024) + b"\r\n\r\n", b" 431 "),
-        (b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 0\r\n\r\n", b" 415 "),
-        (b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 65537\r\n\r\n", b" 413 "),
+        (
+            b"POST /agent/v1/polls HTTP/1.1\r\nX: " + b"a" * (16 * 1024) + b"\r\n\r\n",
+            b" 431 ",
+        ),
+        (
+            b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 0\r\n\r\n",
+            b" 415 ",
+        ),
+        (
+            b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 65537\r\n\r\n",
+            b" 413 ",
+        ),
     ],
 )
-def test_transport_enforces_header_body_and_exact_content_type(request_bytes, status) -> None:
+def test_transport_enforces_header_body_and_exact_content_type(
+    request_bytes, status
+) -> None:
     wire = _WireSocket(request_bytes)
 
     class ResolverValue:
@@ -581,11 +612,17 @@ def test_sigterm_stops_acceptance_and_drains_owned_server(monkeypatch) -> None:
     assert events == ["serve", "stop", "stop", "drain:5.0", "close"]
 
 
-def test_assemble_server_wires_task_two_store_and_task_three_resolver(monkeypatch) -> None:
+def test_assemble_server_wires_task_two_store_and_task_three_resolver(
+    monkeypatch,
+) -> None:
     values: dict[str, object] = {}
     monkeypatch.setattr(agent_daemon, "HostRegistry", lambda root: ("registry", root))
-    monkeypatch.setattr(agent_daemon, "AgentOperationStore", lambda root: ("store", root))
-    monkeypatch.setattr(agent_daemon, "AgentIdentityResolver", lambda registry: ("resolver", registry))
+    monkeypatch.setattr(
+        agent_daemon, "AgentOperationStore", lambda root: ("store", root)
+    )
+    monkeypatch.setattr(
+        agent_daemon, "AgentIdentityResolver", lambda registry: ("resolver", registry)
+    )
     monkeypatch.setattr(
         agent_daemon,
         "AdminOperationStore",
@@ -604,26 +641,32 @@ def test_assemble_server_wires_task_two_store_and_task_three_resolver(monkeypatc
     monkeypatch.setattr(
         agent_daemon,
         "_AgentCompletionRouter",
-        lambda store, host_probe, ollama: ("completion-router", store, host_probe, ollama),
+        lambda store, host_probe, ollama: (
+            "completion-router",
+            store,
+            host_probe,
+            ollama,
+        ),
     )
     monkeypatch.setattr(
         agent_daemon,
         "AgentHttpApplication",
         lambda store, owner: ("application", store, owner),
     )
-    monkeypatch.setattr(agent_daemon, "create_agent_ssl_context", lambda fds: ("tls", fds))
+    monkeypatch.setattr(
+        agent_daemon, "create_agent_ssl_context", lambda fds: ("tls", fds)
+    )
     monkeypatch.setattr(
         agent_daemon,
         "AgentApiServer",
         lambda address, application, resolver, context: values.update(
             address=address, application=application, resolver=resolver, context=context
-        ) or values,
+        )
+        or values,
     )
     fds = AgentCredentialFds(1, 2, 3)
     state_root = Path("/test-agent-state")
-    result = agent_daemon.assemble_server(
-        "127.0.0.1", 9443, fds, state_root=state_root
-    )
+    result = agent_daemon.assemble_server("127.0.0.1", 9443, fds, state_root=state_root)
     assert result is values
     assert values["address"] == ("127.0.0.1", 9443)
     assert values["application"][0] == "application"
@@ -655,7 +698,13 @@ def test_main_accepts_only_listen_address_and_port(monkeypatch, capsys) -> None:
 
 @pytest.mark.parametrize(
     "payload",
-    (b"127.0.0.1\n", b"0.0.0.0\n", b"8.8.8.8\n", b"not-an-address\n", b"10.0.0.1\nextra"),
+    (
+        b"127.0.0.1\n",
+        b"0.0.0.0\n",
+        b"8.8.8.8\n",
+        b"not-an-address\n",
+        b"10.0.0.1\nextra",
+    ),
 )
 def test_agent_ingress_credential_requires_one_private_reachable_ipv4(
     tmp_path: Path, payload: bytes
@@ -676,12 +725,17 @@ def test_agent_ingress_credential_accepts_rfc1918_and_cgnat(tmp_path: Path) -> N
         path.write_bytes(payload)
         descriptor = os.open(path, os.O_RDONLY)
         try:
-            assert agent_daemon.load_agent_listen_address(descriptor) == payload.decode().strip()
+            assert (
+                agent_daemon.load_agent_listen_address(descriptor)
+                == payload.decode().strip()
+            )
         finally:
             os.close(descriptor)
 
 
-def test_main_assembles_from_credential_directory_without_secret_arguments(monkeypatch, tmp_path) -> None:
+def test_main_assembles_from_credential_directory_without_secret_arguments(
+    monkeypatch, tmp_path
+) -> None:
     directory = _credential_directory(tmp_path)
     observed: dict[str, object] = {}
 
@@ -702,7 +756,9 @@ def test_main_assembles_from_credential_directory_without_secret_arguments(monke
     assert observed["shared_gid"] == 4321
 
 
-def test_main_uses_private_address_from_systemd_credential(monkeypatch, tmp_path) -> None:
+def test_main_uses_private_address_from_systemd_credential(
+    monkeypatch, tmp_path
+) -> None:
     directory = _credential_directory(tmp_path)
     observed: dict[str, object] = {}
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(directory))
@@ -724,8 +780,14 @@ def test_main_uses_private_address_from_systemd_credential(monkeypatch, tmp_path
     ("constructor", "error"),
     (
         ("HostRegistry", HostRegistryError("control.host_store_unavailable")),
-        ("AgentOperationStore", AgentOperationError("host.operation_store_unavailable")),
-        ("AdminOperationStore", AdminOperationError("control.operation_store_unavailable")),
+        (
+            "AgentOperationStore",
+            AgentOperationError("host.operation_store_unavailable"),
+        ),
+        (
+            "AdminOperationStore",
+            AdminOperationError("control.operation_store_unavailable"),
+        ),
     ),
 )
 def test_startup_maps_each_production_store_constructor_failure_to_stable_unavailable(
@@ -746,7 +808,10 @@ def test_startup_maps_each_production_store_constructor_failure_to_stable_unavai
 
     monkeypatch.setattr(agent_daemon, constructor, unavailable)
 
-    assert agent_daemon.main(["--listen-address", "127.0.0.1", "--port", "9443"]) == os.EX_UNAVAILABLE
+    assert (
+        agent_daemon.main(["--listen-address", "127.0.0.1", "--port", "9443"])
+        == os.EX_UNAVAILABLE
+    )
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "codex-master-agent-api: agent.startup_failed\n"
@@ -779,7 +844,9 @@ def _issue_certificate(
     client: bool,
 ) -> x509.Certificate:
     now = datetime.now(UTC)
-    usage = ExtendedKeyUsageOID.CLIENT_AUTH if client else ExtendedKeyUsageOID.SERVER_AUTH
+    usage = (
+        ExtendedKeyUsageOID.CLIENT_AUTH if client else ExtendedKeyUsageOID.SERVER_AUTH
+    )
     builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject)]))
@@ -808,7 +875,9 @@ def _issue_certificate(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
             critical=False,
         )
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False
+        )
     )
     if not client:
         builder = builder.add_extension(
@@ -844,9 +913,12 @@ def _test_ca(name: str):
             ),
             critical=True,
         )
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
         .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), critical=False
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()),
+            critical=False,
         )
         .sign(key, hashes.SHA256())
     )
@@ -898,7 +970,11 @@ class _LiveResolver:
 
 
 class _LiveApplication:
-    def __init__(self, entered: threading.Event | None = None, release: threading.Event | None = None):
+    def __init__(
+        self,
+        entered: threading.Event | None = None,
+        release: threading.Event | None = None,
+    ):
         self.entered = entered
         self.release = release
 
@@ -907,11 +983,13 @@ class _LiveApplication:
             self.entered.set()
         if self.release is not None:
             assert self.release.wait(2)
-        return AgentHttpResponse(200, b'{}')
+        return AgentHttpResponse(200, b"{}")
 
 
 def _live_server(live_pki: Path, application=None):
-    with open_systemd_credentials({"CREDENTIALS_DIRECTORY": str(live_pki)}) as credentials:
+    with open_systemd_credentials(
+        {"CREDENTIALS_DIRECTORY": str(live_pki)}
+    ) as credentials:
         context = agent_daemon.create_agent_ssl_context(credentials)
     server = AgentApiServer(
         ("127.0.0.1", 0), application or _LiveApplication(), _LiveResolver(), context
@@ -946,10 +1024,16 @@ def test_live_mtls_rejects_tls12_missing_certificate_and_wrong_ca(live_pki) -> N
         tls12 = _client_context(live_pki)
         tls12.minimum_version = ssl.TLSVersion.TLSv1_2
         tls12.maximum_version = ssl.TLSVersion.TLSv1_2
-        for context in (tls12, _client_context(live_pki, certificate=None), _client_context(live_pki, certificate="wrong-client")):
+        for context in (
+            tls12,
+            _client_context(live_pki, certificate=None),
+            _client_context(live_pki, certificate="wrong-client"),
+        ):
             with socket.create_connection(address, timeout=1) as plain:
                 with pytest.raises((ssl.SSLError, ConnectionError, OSError)):
-                    with context.wrap_socket(plain, server_hostname="localhost") as client:
+                    with context.wrap_socket(
+                        plain, server_hostname="localhost"
+                    ) as client:
                         client.sendall(b"GET / HTTP/1.1\r\n\r\n")
                         client.recv(1)
     finally:
@@ -960,9 +1044,16 @@ def test_live_mtls_presents_server_leaf_and_accepts_configured_agent(live_pki) -
     server, thread = _live_server(live_pki)
     try:
         with socket.create_connection(server.server_address, timeout=1) as plain:
-            with _client_context(live_pki).wrap_socket(plain, server_hostname="localhost") as client:
-                peer = x509.load_der_x509_certificate(client.getpeercert(binary_form=True))
-                assert peer.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == "localhost"
+            with _client_context(live_pki).wrap_socket(
+                plain, server_hostname="localhost"
+            ) as client:
+                peer = x509.load_der_x509_certificate(
+                    client.getpeercert(binary_form=True)
+                )
+                assert (
+                    peer.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                    == "localhost"
+                )
                 client.sendall(
                     b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json\r\n"
                     b"Content-Length: 0\r\n\r\n"
@@ -979,7 +1070,9 @@ def test_live_slow_clients_do_not_make_shutdown_unbounded(live_pki, stall) -> No
     client = plain
     try:
         if stall != "handshake":
-            client = _client_context(live_pki).wrap_socket(plain, server_hostname="localhost")
+            client = _client_context(live_pki).wrap_socket(
+                plain, server_hostname="localhost"
+            )
             if stall == "header":
                 client.sendall(b"POST /agent/v1/polls HTTP/1.1\r\nX: partial")
             else:
@@ -1012,7 +1105,9 @@ def test_live_handshake_header_and_body_deadlines_close_stalled_peer(
     client = plain
     try:
         if phase != "handshake":
-            client = _client_context(live_pki).wrap_socket(plain, server_hostname="localhost")
+            client = _client_context(live_pki).wrap_socket(
+                plain, server_hostname="localhost"
+            )
             if phase == "header":
                 client.sendall(b"POST /agent/v1/polls HTTP/1.1\r\nX: partial")
             else:
@@ -1039,7 +1134,9 @@ def test_live_trickle_progress_cannot_extend_absolute_request_phase_deadline(
     send_count = 0
     try:
         with socket.create_connection(server.server_address, timeout=1) as plain:
-            with _client_context(live_pki).wrap_socket(plain, server_hostname="localhost") as client:
+            with _client_context(live_pki).wrap_socket(
+                plain, server_hostname="localhost"
+            ) as client:
                 if phase == "header":
                     client.sendall(b"POST /agent/v1/polls HTTP/1.1\r\nX-Trickle: ")
                 else:
@@ -1079,7 +1176,9 @@ def test_live_drain_preserves_successful_inflight_completion(live_pki) -> None:
     server, thread = _live_server(live_pki, _LiveApplication(entered, release))
     try:
         with socket.create_connection(server.server_address, timeout=1) as plain:
-            with _client_context(live_pki).wrap_socket(plain, server_hostname="localhost") as client:
+            with _client_context(live_pki).wrap_socket(
+                plain, server_hostname="localhost"
+            ) as client:
                 client.sendall(
                     b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json\r\n"
                     b"Content-Length: 0\r\n\r\n"

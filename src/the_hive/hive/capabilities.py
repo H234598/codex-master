@@ -11,7 +11,9 @@ if TYPE_CHECKING:
     from the_hive.hive.principals import Principal, PrincipalRegistry
 
 
-ROOT_EXECUTIVE_CLASSES: frozenset[str] = frozenset({"gottbiene", "godbee", "goettin", "goddess"})
+ROOT_EXECUTIVE_CLASSES: frozenset[str] = frozenset(
+    {"gottbiene", "godbee", "goettin", "goddess"}
+)
 QUEEN_CLASSES: frozenset[str] = frozenset({"koenigin", "queen"})
 GODDESS_REPORT_AUTO_CAPABILITY: str = "goddess.report.auto"
 
@@ -37,7 +39,9 @@ def requires_goddess_auto_report(
         raise CapabilityError("invalid_principal")
     if type(registry) is not PrincipalRegistry:
         raise CapabilityError("invalid_principal_registry")
-    if type(capabilities) is not frozenset or any(type(value) is not str for value in capabilities):
+    if type(capabilities) is not frozenset or any(
+        type(value) is not str for value in capabilities
+    ):
         raise CapabilityError("invalid_capability")
     if not isinstance(now, datetime):
         raise CapabilityError("invalid_capability_time")
@@ -59,7 +63,9 @@ def requires_goddess_auto_report(
     if authoritative_principal != principal:
         return False
     try:
-        result = registry.has_active_execution_binding(principal.principal_id, now=normalized_now)
+        result = registry.has_active_execution_binding(
+            principal.principal_id, now=normalized_now
+        )
     except Exception:
         raise CapabilityError("binding_check_unavailable") from None
     if type(result) is not bool:

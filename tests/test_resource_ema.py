@@ -285,9 +285,7 @@ def test_iops_rate_required_device_loss_remains_an_immediate_block() -> None:
         "reason": "required_device_lost",
     }
     assert core.decision(0).blocked is True
-    assert core.decision(0).interlocks == (
-        ("io_iops_rate", "required_device_lost"),
-    )
+    assert core.decision(0).interlocks == (("io_iops_rate", "required_device_lost"),)
 
 
 def test_thermal_thresholds_follow_advertised_high_and_crit_contract() -> None:
@@ -356,7 +354,9 @@ def test_snapshot_roundtrip_is_strict_bounded_and_deterministic() -> None:
         lambda document: document.update({"schema": "ResourceSnapshotV1"}),
         lambda document: document.update({"schema_version": 0}),
         lambda document: document["metrics"][0].update({"provider_path": "/secret"}),
-        lambda document: document["metrics"][0]["interlock"].update({"reason": "unknown"}),
+        lambda document: document["metrics"][0]["interlock"].update(
+            {"reason": "unknown"}
+        ),
     ],
 )
 def test_snapshot_rejects_unknown_fields_states_and_v1(mutate: object) -> None:
@@ -441,12 +441,16 @@ def test_snapshot_rejects_latch_states_incompatible_with_thresholds() -> None:
     cpu_release_blocked["metrics"][0]["latched"] = True
 
     memory_enter_clear = json.loads(
-        _core("memory_available_mib").observe("memory_available_mib", 7168.0, 0).to_json()
+        _core("memory_available_mib")
+        .observe("memory_available_mib", 7168.0, 0)
+        .to_json()
     )
     memory_enter_clear["metrics"][0]["latched"] = False
 
     memory_release_blocked = json.loads(
-        _core("memory_available_mib").observe("memory_available_mib", 8192.0, 0).to_json()
+        _core("memory_available_mib")
+        .observe("memory_available_mib", 8192.0, 0)
+        .to_json()
     )
     memory_release_blocked["metrics"][0]["latched"] = True
 
@@ -483,8 +487,8 @@ def test_huge_numbers_and_timestamps_are_normalized_to_contract_failures() -> No
     with pytest.raises(ResourceEMAError, match="^resource_ema_invalid$"):
         ResourceEMAAdmissionV1.from_json(json.dumps(timestamp_document).encode())
 
-    digit_overflow = _core("cpu_busy").to_json().replace(
-        b'"raw":null', b'"raw":' + (b"9" * 5000)
+    digit_overflow = (
+        _core("cpu_busy").to_json().replace(b'"raw":null', b'"raw":' + (b"9" * 5000))
     )
     with pytest.raises(ResourceEMAError, match="^resource_ema_invalid$"):
         ResourceEMAAdmissionV1.from_json(digit_overflow)

@@ -39,9 +39,17 @@ UUID_C = UUID("33333333-3333-4333-8333-333333333333")
 UUID_D = UUID("44444444-4444-4444-8444-444444444444")
 
 
-def account(account_id: str, provider: Provider, *, enabled: bool = True) -> FleetAccount:
-    auth_kind = AuthKind.API_KEY if provider is not Provider.OLLAMA_LOCAL else AuthKind.NONE
-    secret_state = SecretState.CONFIGURED if auth_kind is AuthKind.API_KEY else SecretState.NOT_REQUIRED
+def account(
+    account_id: str, provider: Provider, *, enabled: bool = True
+) -> FleetAccount:
+    auth_kind = (
+        AuthKind.API_KEY if provider is not Provider.OLLAMA_LOCAL else AuthKind.NONE
+    )
+    secret_state = (
+        SecretState.CONFIGURED
+        if auth_kind is AuthKind.API_KEY
+        else SecretState.NOT_REQUIRED
+    )
     return FleetAccount(
         account_id,
         f"Synthetic {account_id}",
@@ -101,7 +109,9 @@ def series(
     )
 
 
-def source_snapshot(*, extra_series: tuple[FleetMigrationSeries, ...] = ()) -> FleetMigrationSnapshot:
+def source_snapshot(
+    *, extra_series: tuple[FleetMigrationSeries, ...] = ()
+) -> FleetMigrationSnapshot:
     accounts = (
         account("codex-account", Provider.OPENAI_API),
         account("gem-a", Provider.GEMINI_API),
@@ -117,7 +127,11 @@ def source_snapshot(*, extra_series: tuple[FleetMigrationSeries, ...] = ()) -> F
                 Provider.OPENAI_API,
                 RunnerKind.CODEX_CLI,
                 "codex-base",
-                (member("v1:c:1", 1, "codex-account", model_override="codex-override"),),
+                (
+                    member(
+                        "v1:c:1", 1, "codex-account", model_override="codex-override"
+                    ),
+                ),
                 skill_profile="codex-skill",
                 task_profile="codex-task",
             ),
@@ -187,7 +201,9 @@ def allocations_for(
     return allocate_final_member_ids(source, plan, uuid4=lambda: next(values))
 
 
-def test_allocate_reuses_journalled_ids_and_calls_factory_once_per_remaining_final_member() -> None:
+def test_allocate_reuses_journalled_ids_and_calls_factory_once_per_remaining_final_member() -> (
+    None
+):
     source = source_snapshot()
     plan = migration_plan(source, unique_bindings())
     journaled = (MemberIdAllocation("v1:c:1", str(UUID_A)),)
@@ -198,7 +214,9 @@ def test_allocate_reuses_journalled_ids_and_calls_factory_once_per_remaining_fin
         calls.append(1)
         return next(values)
 
-    allocations = allocate_final_member_ids(source, plan, journaled=journaled, uuid4=uuid4)
+    allocations = allocate_final_member_ids(
+        source, plan, journaled=journaled, uuid4=uuid4
+    )
     assert allocations[0] == journaled[0]
     assert [item.migration_identity for item in allocations] == sorted(
         item.migration_identity for item in allocations
@@ -217,7 +235,9 @@ def test_allocate_excludes_retired_duplicate_from_final_member_ids() -> None:
     assert "v1:n:1" not in identities
 
 
-def test_allocate_rejects_foreign_duplicate_unsorted_or_non_v4_journalled_records() -> None:
+def test_allocate_rejects_foreign_duplicate_unsorted_or_non_v4_journalled_records() -> (
+    None
+):
     source = source_snapshot()
     plan = migration_plan(source, unique_bindings())
     valid = (
@@ -232,8 +252,12 @@ def test_allocate_rejects_foreign_duplicate_unsorted_or_non_v4_journalled_record
     )
     for journaled in invalid_collections:
         calls: list[int] = []
-        with pytest.raises(GMigrationMaterializationError, match="invalid_member_id_allocation"):
-            allocate_final_member_ids(source, plan, journaled=journaled, uuid4=lambda: calls.append(1))
+        with pytest.raises(
+            GMigrationMaterializationError, match="invalid_member_id_allocation"
+        ):
+            allocate_final_member_ids(
+                source, plan, journaled=journaled, uuid4=lambda: calls.append(1)
+            )
         assert calls == []
 
 
@@ -243,7 +267,9 @@ def test_allocate_rejects_sorted_list_journaled_before_factory() -> None:
     valid = allocations_for(source, plan)
     calls: list[int] = []
 
-    with pytest.raises(GMigrationMaterializationError, match="invalid_member_id_allocation"):
+    with pytest.raises(
+        GMigrationMaterializationError, match="invalid_member_id_allocation"
+    ):
         allocate_final_member_ids(
             source,
             plan,
@@ -259,7 +285,9 @@ def test_allocate_rejects_mapping_journaled_before_factory() -> None:
     valid = allocations_for(source, plan)
     calls: list[int] = []
 
-    with pytest.raises(GMigrationMaterializationError, match="invalid_member_id_allocation"):
+    with pytest.raises(
+        GMigrationMaterializationError, match="invalid_member_id_allocation"
+    ):
         allocate_final_member_ids(
             source,
             plan,
@@ -275,7 +303,9 @@ def test_materialize_rejects_sorted_list_allocations() -> None:
     plan = migration_plan(source, bindings)
     allocations = allocations_for(source, plan)
 
-    with pytest.raises(GMigrationMaterializationError, match="invalid_member_id_allocation"):
+    with pytest.raises(
+        GMigrationMaterializationError, match="invalid_member_id_allocation"
+    ):
         materialize_g_series_v2(
             source,
             plan,
@@ -290,12 +320,16 @@ def test_materialize_rejects_mapping_allocations() -> None:
     plan = migration_plan(source, bindings)
     allocations = allocations_for(source, plan)
 
-    with pytest.raises(GMigrationMaterializationError, match="invalid_member_id_allocation"):
+    with pytest.raises(
+        GMigrationMaterializationError, match="invalid_member_id_allocation"
+    ):
         materialize_g_series_v2(
             source,
             plan,
             credential_bindings=bindings,
-            allocations={item.migration_identity: item.member_id for item in allocations},
+            allocations={
+                item.migration_identity: item.member_id for item in allocations
+            },
         )
 
 
@@ -317,7 +351,9 @@ def test_materialize_preserves_non_gemini_and_relocates_occupied_g() -> None:
     assert by_prefix["g"].provider is Provider.GEMINI_API
 
 
-def test_materialize_emits_empty_runtime_principals_and_roundtrips_canonically() -> None:
+def test_materialize_emits_empty_runtime_principals_and_roundtrips_canonically() -> (
+    None
+):
     source = source_snapshot()
     bindings = unique_bindings()
     plan = migration_plan(source, bindings)
@@ -334,7 +370,9 @@ def test_materialize_emits_empty_runtime_principals_and_roundtrips_canonically()
     assert normalize_fleet_document(document) == candidate
 
 
-def test_materialize_merges_g_winners_and_preserves_source_profiles_as_overrides() -> None:
+def test_materialize_merges_g_winners_and_preserves_source_profiles_as_overrides() -> (
+    None
+):
     source = source_snapshot()
     plan = migration_plan(source, unique_bindings())
     candidate = materialize_g_series_v2(
@@ -365,7 +403,11 @@ def test_materialize_retains_exclusive_duplicate_loser_account_disabled() -> Non
     gem_b = next(item for item in candidate.accounts if item.account_id == "gem-b")
     assert type(gem_b) is FleetAccountV2
     assert gem_b.enabled is False
-    assert all(member.account_id != "gem-b" for item in candidate.series for member in item.members)
+    assert all(
+        member.account_id != "gem-b"
+        for item in candidate.series
+        for member in item.members
+    )
 
 
 def test_materialize_rejects_duplicate_loser_with_foreign_account_reference() -> None:
@@ -379,7 +421,9 @@ def test_materialize_rejects_duplicate_loser_with_foreign_account_reference() ->
     source = source_snapshot(extra_series=(foreign_reference,))
     bindings = {"gem-a": HMAC_A, "gem-b": HMAC_A}
     plan = migration_plan(source, bindings, active={"v1:m:1"})
-    with pytest.raises(GMigrationMaterializationError, match="migration_duplicate_account_conflict"):
+    with pytest.raises(
+        GMigrationMaterializationError, match="migration_duplicate_account_conflict"
+    ):
         materialize_g_series_v2(
             source,
             plan,
@@ -393,7 +437,9 @@ def test_materialize_rejects_duplicate_loser_with_foreign_account_reference() ->
         )
 
 
-def test_materialize_rejects_missing_invalid_or_extra_hmac_binding_without_marker_leak() -> None:
+def test_materialize_rejects_missing_invalid_or_extra_hmac_binding_without_marker_leak() -> (
+    None
+):
     source = source_snapshot()
     plan = migration_plan(source, unique_bindings())
     allocations = allocations_for(source, plan)
@@ -404,7 +450,9 @@ def test_materialize_rejects_missing_invalid_or_extra_hmac_binding_without_marke
     )
     for bindings in invalid_bindings:
         with pytest.raises(GMigrationMaterializationError) as raised:
-            materialize_g_series_v2(source, plan, credential_bindings=bindings, allocations=allocations)
+            materialize_g_series_v2(
+                source, plan, credential_bindings=bindings, allocations=allocations
+            )
         assert raised.value.code == "credential_binding_unknown"
         assert HMAC_A not in str(raised.value)
         assert HMAC_B not in repr(raised.value)
@@ -425,7 +473,13 @@ def test_materialize_rejects_plan_snapshot_mismatch_and_exact_type_lookalikes() 
     with pytest.raises(GMigrationMaterializationError, match="invalid_migration_plan"):
         materialize_g_series_v2(
             source,
-            replace(plan, members=(replace(plan.members[0], migration_identity="foreign"), *plan.members[1:])),
+            replace(
+                plan,
+                members=(
+                    replace(plan.members[0], migration_identity="foreign"),
+                    *plan.members[1:],
+                ),
+            ),
             credential_bindings=bindings,
             allocations=allocations,
         )
@@ -436,9 +490,18 @@ def test_materialize_rejects_plan_snapshot_mismatch_and_exact_type_lookalikes() 
     class PlanSubclass(GSeriesMigrationPlan):
         pass
 
-    subclass_snapshot = SnapshotSubclass(source.source_schema_version, source.generation, source.accounts, source.series)
-    subclass_plan = PlanSubclass(plan.source_generation, plan.target_prefix, plan.g_relocation_target, plan.members)
-    with pytest.raises(GMigrationMaterializationError, match="invalid_migration_materialization"):
+    subclass_snapshot = SnapshotSubclass(
+        source.source_schema_version, source.generation, source.accounts, source.series
+    )
+    subclass_plan = PlanSubclass(
+        plan.source_generation,
+        plan.target_prefix,
+        plan.g_relocation_target,
+        plan.members,
+    )
+    with pytest.raises(
+        GMigrationMaterializationError, match="invalid_migration_materialization"
+    ):
         materialize_g_series_v2(
             subclass_snapshot,
             plan,

@@ -670,9 +670,7 @@ def test_loader_rejects_each_post_read_descriptor_snapshot_drift(
     changed_value: dict[str, int],
 ) -> None:
     snapshots = [_trusted_policy_file(), _trusted_policy_file(), _trusted_policy_file()]
-    snapshots[changed_snapshot] = _synthetic_stat(
-        stat.S_IFREG | 0o644, **changed_value
-    )
+    snapshots[changed_snapshot] = _synthetic_stat(stat.S_IFREG | 0o644, **changed_value)
     fake_os = _FakePolicyOs(
         stats=[_trusted_root(), _trusted_policy_directory(), *snapshots]
     )
@@ -707,9 +705,7 @@ def test_loader_reports_close_failure_after_closing_every_open_fd(
 def test_loader_closes_each_open_fd_when_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_os = _FakePolicyOs(
-        pread_results=[asyncio.CancelledError(), _GOLDEN_BYTES]
-    )
+    fake_os = _FakePolicyOs(pread_results=[asyncio.CancelledError(), _GOLDEN_BYTES])
     _install_fake_os(monkeypatch, fake_os)
 
     with pytest.raises(asyncio.CancelledError):

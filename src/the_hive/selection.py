@@ -20,9 +20,17 @@ HALF_LIFE_SECONDS = 7 * 24 * 60 * 60
 MAX_SERVICE_MICRO = 10**18
 MAX_USAGE_WINDOWS = 64
 MAX_USAGE_QUANTITY = 10**18
-_USAGE_FIELDS = frozenset({
-    "semantics", "unit", "value", "reset_kind", "confidence", "observed_at", "stale_after_seconds",
-})
+_USAGE_FIELDS = frozenset(
+    {
+        "semantics",
+        "unit",
+        "value",
+        "reset_kind",
+        "confidence",
+        "observed_at",
+        "stale_after_seconds",
+    }
+)
 
 
 class SelectionError(ValueError):
@@ -88,7 +96,11 @@ class UsageObservation:
             raise SelectionError("invalid_usage_semantics")
         if self.unit != "percent":
             raise SelectionError("invalid_usage_unit")
-        if isinstance(self.value, bool) or not isinstance(self.value, int) or not 0 <= self.value <= 100:
+        if (
+            isinstance(self.value, bool)
+            or not isinstance(self.value, int)
+            or not 0 <= self.value <= 100
+        ):
             raise SelectionError("invalid_usage_value")
         if self.reset_kind not in {"rolling_unanchored", "rolling_anchored", "fixed"}:
             raise SelectionError("invalid_usage_reset_kind")
@@ -151,7 +163,7 @@ def normalize_usage_observation(payload: object) -> UsageObservation | None:
         payload["confidence"],
         parsed,
         payload.get("stale_after_seconds", 900),
-        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +208,11 @@ class LimitWindow:
         ):
             raise SelectionError("invalid_usage_model_scope")
         for item in (*self.applies_to_model_ids, *self.applies_to_model_roles):
-            if not isinstance(item, str) or not 1 <= len(item) <= 128 or any(ord(char) < 32 for char in item):
+            if (
+                not isinstance(item, str)
+                or not 1 <= len(item) <= 128
+                or any(ord(char) < 32 for char in item)
+            ):
                 raise SelectionError("invalid_usage_model_scope")
         if self.quantity_semantics not in {"remaining", "consumed"}:
             raise SelectionError("invalid_usage_semantics")
@@ -210,28 +226,45 @@ class LimitWindow:
             raise SelectionError("invalid_usage_value")
         if self.quantity_unit == "percent" and self.quantity_value > 100:
             raise SelectionError("invalid_usage_value")
-        for value, code in ((self.capacity, "invalid_usage_capacity"), (self.absolute_remaining, "invalid_usage_remaining")):
+        for value, code in (
+            (self.capacity, "invalid_usage_capacity"),
+            (self.absolute_remaining, "invalid_usage_remaining"),
+        ):
             if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_USAGE_QUANTITY
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= MAX_USAGE_QUANTITY
             ):
                 raise SelectionError(code)
         if self.window_kind not in {"rolling_5h", "rolling_unanchored", "fixed"}:
             raise SelectionError("invalid_usage_window_kind")
         if self.constraint_relation not in {"conjunctive", "alternative"}:
             raise SelectionError("invalid_usage_relation")
-        if self.reset_kind is not None and self.reset_kind not in {"rolling", "fixed", "unanchored"}:
+        if self.reset_kind is not None and self.reset_kind not in {
+            "rolling",
+            "fixed",
+            "unanchored",
+        }:
             raise SelectionError("invalid_usage_reset_kind")
         _aware(self.observed_at_utc, "invalid_usage_timestamp")
         if self.reset_at_utc is not None:
             _aware(self.reset_at_utc, "invalid_usage_timestamp")
         if self.confidence not in {"verified", "observed", "unknown"}:
             raise SelectionError("invalid_usage_confidence")
-        if not isinstance(self.includes_inflight_usage, bool) or not isinstance(self.blocked, bool) or not isinstance(self.exhausted, bool):
+        if (
+            not isinstance(self.includes_inflight_usage, bool)
+            or not isinstance(self.blocked, bool)
+            or not isinstance(self.exhausted, bool)
+        ):
             raise SelectionError("invalid_usage_flags")
 
     def is_fresh(self, now: datetime, *, max_age_seconds: int = 900) -> bool:
         now = _aware(now, "invalid_selection_time")
-        if isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, int) or not 1 <= max_age_seconds <= 86_400:
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, int)
+            or not 1 <= max_age_seconds <= 86_400
+        ):
             raise SelectionError("invalid_usage_freshness")
         age = (now - self.observed_at_utc).total_seconds()
         return 0 <= age <= max_age_seconds
@@ -262,7 +295,11 @@ def _usage_datetime(value: object) -> datetime:
 
 
 def _usage_text(value: object, *, maximum: int, code: str) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= maximum or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= maximum
+        or any(ord(char) < 32 for char in value)
+    ):
         raise SelectionError(code)
     return value
 
@@ -282,18 +319,43 @@ def normalize_usage_v2(payload: object) -> tuple[LimitWindow, ...] | None:
         raise SelectionError("invalid_usage_windows")
     windows: list[LimitWindow] = []
     allowed = {
-        "window_id", "budget_key", "applies_to_model_ids", "applies_to_model_roles",
-        "quantity_semantics", "quantity_unit", "quantity_value", "capacity", "absolute_remaining",
-        "window_kind", "constraint_relation", "reset_at_utc", "reset_kind", "observed_at_utc",
-        "source", "confidence", "includes_inflight_usage", "blocked", "exhausted",
+        "window_id",
+        "budget_key",
+        "applies_to_model_ids",
+        "applies_to_model_roles",
+        "quantity_semantics",
+        "quantity_unit",
+        "quantity_value",
+        "capacity",
+        "absolute_remaining",
+        "window_kind",
+        "constraint_relation",
+        "reset_at_utc",
+        "reset_kind",
+        "observed_at_utc",
+        "source",
+        "confidence",
+        "includes_inflight_usage",
+        "blocked",
+        "exhausted",
     }
     for raw in raw_windows:
         if not isinstance(raw, Mapping) or set(raw) - allowed:
             raise SelectionError("invalid_usage_window")
         required = {
-            "window_id", "budget_key", "quantity_semantics", "quantity_unit", "quantity_value",
-            "window_kind", "constraint_relation", "observed_at_utc", "source", "confidence",
-            "includes_inflight_usage", "blocked", "exhausted",
+            "window_id",
+            "budget_key",
+            "quantity_semantics",
+            "quantity_unit",
+            "quantity_value",
+            "window_kind",
+            "constraint_relation",
+            "observed_at_utc",
+            "source",
+            "confidence",
+            "includes_inflight_usage",
+            "blocked",
+            "exhausted",
         }
         if not required.issubset(raw):
             raise SelectionError("invalid_usage_window")
@@ -301,19 +363,41 @@ def normalize_usage_v2(payload: object) -> tuple[LimitWindow, ...] | None:
         model_roles = raw.get("applies_to_model_roles", [])
         if not isinstance(model_ids, list) or not isinstance(model_roles, list):
             raise SelectionError("invalid_usage_model_scope")
-        windows.append(LimitWindow(
-            _usage_text(raw["window_id"], maximum=128, code="invalid_usage_window_id"),
-            _usage_text(raw["budget_key"], maximum=128, code="invalid_usage_budget_key"),
-            tuple(_usage_text(item, maximum=128, code="invalid_usage_model_scope") for item in model_ids),
-            tuple(_usage_text(item, maximum=128, code="invalid_usage_model_scope") for item in model_roles),
-            raw["quantity_semantics"], raw["quantity_unit"], raw["quantity_value"],
-            raw.get("capacity"), raw.get("absolute_remaining"), raw["window_kind"],
-            raw["constraint_relation"],
-            _usage_datetime(raw["reset_at_utc"]) if raw.get("reset_at_utc") is not None else None,
-            raw.get("reset_kind"), _usage_datetime(raw["observed_at_utc"]),
-            _usage_text(raw["source"], maximum=64, code="invalid_usage_source"), raw["confidence"],
-            raw["includes_inflight_usage"], raw["blocked"], raw["exhausted"],
-        ))
+        windows.append(
+            LimitWindow(
+                _usage_text(
+                    raw["window_id"], maximum=128, code="invalid_usage_window_id"
+                ),
+                _usage_text(
+                    raw["budget_key"], maximum=128, code="invalid_usage_budget_key"
+                ),
+                tuple(
+                    _usage_text(item, maximum=128, code="invalid_usage_model_scope")
+                    for item in model_ids
+                ),
+                tuple(
+                    _usage_text(item, maximum=128, code="invalid_usage_model_scope")
+                    for item in model_roles
+                ),
+                raw["quantity_semantics"],
+                raw["quantity_unit"],
+                raw["quantity_value"],
+                raw.get("capacity"),
+                raw.get("absolute_remaining"),
+                raw["window_kind"],
+                raw["constraint_relation"],
+                _usage_datetime(raw["reset_at_utc"])
+                if raw.get("reset_at_utc") is not None
+                else None,
+                raw.get("reset_kind"),
+                _usage_datetime(raw["observed_at_utc"]),
+                _usage_text(raw["source"], maximum=64, code="invalid_usage_source"),
+                raw["confidence"],
+                raw["includes_inflight_usage"],
+                raw["blocked"],
+                raw["exhausted"],
+            )
+        )
     return tuple(windows)
 
 
@@ -331,7 +415,10 @@ def usage_windows_usable_for_sp1(
         or not any(window.window_kind == "rolling_5h" for window in windows)
     ):
         return False
-    return all(window.usable_for_sp1(now, max_age_seconds=max_age_seconds) for window in windows)
+    return all(
+        window.usable_for_sp1(now, max_age_seconds=max_age_seconds)
+        for window in windows
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,7 +481,9 @@ class FairnessLedger:
         record = self.records.get(account_key)
         if record is not None:
             return record.normalized_service(now)
-        known = sorted(record.normalized_service(now) for record in self.records.values())
+        known = sorted(
+            record.normalized_service(now) for record in self.records.values()
+        )
         if not known:
             return 0
         return known[(len(known) - 1) // 2]
@@ -460,11 +549,19 @@ class SelectionCandidate:
                 raise SelectionError("invalid_selection_candidate")
             if any(ord(character) < 32 for character in value):
                 raise SelectionError("invalid_selection_candidate")
-        for name in ("sp1a_bucket", "sp1b_bucket", "sp2_bucket", "repository_affinity", "rotation_distance"):
+        for name in (
+            "sp1a_bucket",
+            "sp1b_bucket",
+            "sp2_bucket",
+            "repository_affinity",
+            "rotation_distance",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise SelectionError("invalid_selection_bucket")
-        if not isinstance(self.task_kind, TaskKind) or not isinstance(self.model_role, ModelRole):
+        if not isinstance(self.task_kind, TaskKind) or not isinstance(
+            self.model_role, ModelRole
+        ):
             raise SelectionError("invalid_selection_candidate")
 
 
@@ -547,7 +644,9 @@ class AdmissionPreview:
     missing_gates: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.selection, SelectionPreview) or not isinstance(self.mode, AdmissionMode):
+        if not isinstance(self.selection, SelectionPreview) or not isinstance(
+            self.mode, AdmissionMode
+        ):
             raise SelectionError("invalid_admission_preview")
         if not isinstance(self.planned, bool) or not isinstance(self.executable, bool):
             raise SelectionError("invalid_admission_preview")
@@ -574,13 +673,22 @@ def eligibility_reason(candidate: SelectionCandidate) -> str | None:
         return "model_capacity"
     if not candidate.lease_available:
         return "lease_busy"
-    if candidate.task_kind is not TaskKind.SIMPLE and candidate.model_role is ModelRole.SECONDARY_SIMPLE:
+    if (
+        candidate.task_kind is not TaskKind.SIMPLE
+        and candidate.model_role is ModelRole.SECONDARY_SIMPLE
+    ):
         return "secondary_requires_simple_task"
     return None
 
 
-def _band(candidate: SelectionCandidate, policy: SelectionPolicy, now: datetime) -> SelectionBand | None:
-    if policy.sp0 and candidate.usage is not None and candidate.usage.is_passive_sp0_due(now):
+def _band(
+    candidate: SelectionCandidate, policy: SelectionPolicy, now: datetime
+) -> SelectionBand | None:
+    if (
+        policy.sp0
+        and candidate.usage is not None
+        and candidate.usage.is_passive_sp0_due(now)
+    ):
         return SelectionBand.SP0
     if policy.sp1a and candidate.sp1a_eligible:
         return SelectionBand.SP1A
@@ -689,11 +797,36 @@ def preview_selection_admission(
     )
     missing = admission_policy.missing_gates()
     if admission_policy.mode is AdmissionMode.OFF:
-        return AdmissionPreview(selection, admission_policy.mode, False, False, "admission_disabled", missing)
+        return AdmissionPreview(
+            selection,
+            admission_policy.mode,
+            False,
+            False,
+            "admission_disabled",
+            missing,
+        )
     if selection.selected is None:
-        return AdmissionPreview(selection, admission_policy.mode, False, False, "no_eligible_candidate", missing)
+        return AdmissionPreview(
+            selection,
+            admission_policy.mode,
+            False,
+            False,
+            "no_eligible_candidate",
+            missing,
+        )
     if admission_policy.mode is AdmissionMode.SHADOW:
-        return AdmissionPreview(selection, admission_policy.mode, True, False, "shadow_only", missing)
+        return AdmissionPreview(
+            selection, admission_policy.mode, True, False, "shadow_only", missing
+        )
     if missing:
-        return AdmissionPreview(selection, admission_policy.mode, False, False, "admission_gate_blocked", missing)
-    return AdmissionPreview(selection, admission_policy.mode, True, True, "admitted", ())
+        return AdmissionPreview(
+            selection,
+            admission_policy.mode,
+            False,
+            False,
+            "admission_gate_blocked",
+            missing,
+        )
+    return AdmissionPreview(
+        selection, admission_policy.mode, True, True, "admitted", ()
+    )

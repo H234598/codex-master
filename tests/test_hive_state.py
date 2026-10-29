@@ -10,18 +10,36 @@ from the_hive.hive.state import HiveStateError, HiveStateStore
 
 def test_state_store_round_trips_private_json_and_jsonl(tmp_path: Path) -> None:
     store = HiveStateStore(tmp_path / "state")
-    store.replace_json(PurePosixPath("principals.json"), {"schema_version": 1, "value": "ok"})
-    assert store.read_json(PurePosixPath("principals.json"), max_bytes=4096)["value"] == "ok"
-    store.append_bounded_jsonl(
-        PurePosixPath("audit/events.jsonl"), {"event": "one"}, max_records=2, max_bytes=4096
+    store.replace_json(
+        PurePosixPath("principals.json"), {"schema_version": 1, "value": "ok"}
+    )
+    assert (
+        store.read_json(PurePosixPath("principals.json"), max_bytes=4096)["value"]
+        == "ok"
     )
     store.append_bounded_jsonl(
-        PurePosixPath("audit/events.jsonl"), {"event": "two"}, max_records=2, max_bytes=4096
+        PurePosixPath("audit/events.jsonl"),
+        {"event": "one"},
+        max_records=2,
+        max_bytes=4096,
     )
     store.append_bounded_jsonl(
-        PurePosixPath("audit/events.jsonl"), {"event": "three"}, max_records=2, max_bytes=4096
+        PurePosixPath("audit/events.jsonl"),
+        {"event": "two"},
+        max_records=2,
+        max_bytes=4096,
     )
-    lines = (tmp_path / "state" / "audit" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    store.append_bounded_jsonl(
+        PurePosixPath("audit/events.jsonl"),
+        {"event": "three"},
+        max_records=2,
+        max_bytes=4096,
+    )
+    lines = (
+        (tmp_path / "state" / "audit" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     assert [json.loads(line)["event"] for line in lines] == ["two", "three"]
 
 
@@ -39,7 +57,10 @@ def test_read_only_state_store_rejects_all_mutations(tmp_path: Path) -> None:
         read_only.remove_private_bytes(PurePosixPath("principals.json"))
     with pytest.raises(HiveStateError, match="^state_read_only$"):
         read_only.append_bounded_jsonl(
-            PurePosixPath("events.jsonl"), {"event": "blocked"}, max_records=4, max_bytes=4096
+            PurePosixPath("events.jsonl"),
+            {"event": "blocked"},
+            max_records=4,
+            max_bytes=4096,
         )
     assert (tmp_path / "state" / "principals.json").read_bytes() == before
     assert not (tmp_path / "state" / "private.bin").exists()
@@ -51,10 +72,14 @@ def test_state_store_uses_private_modes(tmp_path: Path) -> None:
     store.replace_json(PurePosixPath("record.json"), {"ok": True})
     assert stat.S_IMODE((tmp_path / "state").stat().st_mode) == 0o700
     assert stat.S_IMODE((tmp_path / "state" / "record.json").stat().st_mode) == 0o600
-    assert stat.S_IMODE((tmp_path / "state" / ".hive-state.lock").stat().st_mode) == 0o600
+    assert (
+        stat.S_IMODE((tmp_path / "state" / ".hive-state.lock").stat().st_mode) == 0o600
+    )
 
 
-def test_state_store_can_use_one_exact_group_shared_non_secret_root(tmp_path: Path) -> None:
+def test_state_store_can_use_one_exact_group_shared_non_secret_root(
+    tmp_path: Path,
+) -> None:
     """The Agent bridge is group-scoped, while the default remains private."""
 
     root = tmp_path / "agent-state"
@@ -169,7 +194,9 @@ def test_state_store_reuses_exact_0700_root_without_chmod_and_existing_lock(
     lock.chmod(0o600)
     original_chmod = os.chmod
 
-    def deny_root_chmod(path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
+    def deny_root_chmod(
+        path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object
+    ) -> None:
         if Path(path) == root:
             raise PermissionError("root is read-only")
         original_chmod(path, mode, *args, **kwargs)
@@ -179,12 +206,17 @@ def test_state_store_reuses_exact_0700_root_without_chmod_and_existing_lock(
     store = HiveStateStore(root)
     store.replace_private_bytes(PurePosixPath("resources/snapshot.bin"), b"complete")
 
-    assert store.read_private_bytes(PurePosixPath("resources/snapshot.bin"), max_bytes=64) == b"complete"
+    assert (
+        store.read_private_bytes(PurePosixPath("resources/snapshot.bin"), max_bytes=64)
+        == b"complete"
+    )
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
     assert stat.S_IMODE(lock.stat().st_mode) == 0o600
 
 
-def test_state_store_still_rejects_untrusted_root_mode_and_root_symlink(tmp_path: Path) -> None:
+def test_state_store_still_rejects_untrusted_root_mode_and_root_symlink(
+    tmp_path: Path,
+) -> None:
     untrusted = tmp_path / "untrusted"
     untrusted.mkdir(mode=0o750)
     with pytest.raises(HiveStateError, match="state_directory_untrusted"):
@@ -198,8 +230,12 @@ def test_state_store_still_rejects_untrusted_root_mode_and_root_symlink(tmp_path
         HiveStateStore(linked)
 
 
-@pytest.mark.parametrize("relative", [PurePosixPath("../escape.json"), PurePosixPath("/absolute.json")])
-def test_state_store_rejects_path_escape(tmp_path: Path, relative: PurePosixPath) -> None:
+@pytest.mark.parametrize(
+    "relative", [PurePosixPath("../escape.json"), PurePosixPath("/absolute.json")]
+)
+def test_state_store_rejects_path_escape(
+    tmp_path: Path, relative: PurePosixPath
+) -> None:
     store = HiveStateStore(tmp_path / "state")
     with pytest.raises(HiveStateError, match="invalid_state_path"):
         store.replace_json(relative, {"x": 1})
@@ -251,7 +287,9 @@ def test_hive_state_raw_private_bytes_keep_nofollow_hardlink_parent_swap_and_ato
     path.chmod(0o600)
 
     expected_uid = os.geteuid()
-    monkeypatch.setattr(HiveStateStore, "_validate_private_directory", staticmethod(lambda _info: None))
+    monkeypatch.setattr(
+        HiveStateStore, "_validate_private_directory", staticmethod(lambda _info: None)
+    )
     monkeypatch.setattr("the_hive.hive.state.os.geteuid", lambda: expected_uid + 1)
     with pytest.raises(HiveStateError, match="state_file_untrusted"):
         store.read_private_bytes(relative, max_bytes=64)
@@ -276,7 +314,9 @@ def test_hive_state_raw_private_bytes_keep_nofollow_hardlink_parent_swap_and_ato
         store.read_private_bytes(relative, max_bytes=64)
 
 
-def test_private_bytes_reject_root_swap_inside_and_after_held_store_lock(tmp_path: Path) -> None:
+def test_private_bytes_reject_root_swap_inside_and_after_held_store_lock(
+    tmp_path: Path,
+) -> None:
     store = HiveStateStore(tmp_path / "state")
     relative = PurePosixPath("resources/snapshot.bin")
     store.replace_private_bytes(relative, b"old")
@@ -325,7 +365,9 @@ def test_private_bytes_reject_root_swap_inside_and_after_held_store_lock(tmp_pat
     assert replacement_path.read_bytes() == b"new"
 
 
-def test_state_store_removes_one_private_file_locked_without_following_links(tmp_path: Path) -> None:
+def test_state_store_removes_one_private_file_locked_without_following_links(
+    tmp_path: Path,
+) -> None:
     store = HiveStateStore(tmp_path / "state")
     relative = PurePosixPath("resources/v1.json")
     store.replace_private_bytes(relative, b"old")

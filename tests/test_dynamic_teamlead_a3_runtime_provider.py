@@ -786,7 +786,8 @@ def test_factory_rejects_foreign_registry_and_broker_identity(
     (copy.copy, copy.deepcopy, pickle.dumps, lambda value: replace(value)),
 )
 def test_port_is_factory_only_and_nontransferable(
-    root_issued_parts: dict[str, object], transfer,
+    root_issued_parts: dict[str, object],
+    transfer,
 ) -> None:
     composition = root_issued_parts["composition"]
     with pytest.raises(DynamicTeamleadA3RuntimeProviderError):
@@ -811,7 +812,9 @@ def test_consumed_root_issuance_cannot_be_repeated(
     dynamic_teamlead_start(port)
 
     with pytest.raises(Exception):
-        root_issued_parts["consumer"].issue_root_owned_dynamic_teamlead_start_composition(
+        root_issued_parts[
+            "consumer"
+        ].issue_root_owned_dynamic_teamlead_start_composition(
             root_issued_parts["context"],
             root_issued_parts["registry"],
             root_issued_parts["broker"],

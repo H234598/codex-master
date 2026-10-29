@@ -46,13 +46,21 @@ class NativeBeeHookTest(unittest.TestCase):
             check=False,
         )
 
-    def run_spawn_hook(self, payload: str, *, state_root: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run_spawn_hook(
+        self, payload: str, *, state_root: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PLUGIN_ROOT"] = str(REPO_ROOT)
         if state_root is not None:
             env["CODEX_MASTER_MCP_STATE"] = str(state_root)
         return subprocess.run(
-            [sys.executable, str(SPAWN_HOOK)], input=payload, text=True, capture_output=True, env=env, timeout=10, check=False
+            [sys.executable, str(SPAWN_HOOK)],
+            input=payload,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=False,
         )
 
     def test_hooks_manifest_uses_official_event_group_schema(self) -> None:
@@ -156,7 +164,17 @@ class NativeBeeHookTest(unittest.TestCase):
 
     def test_spawn_hook_rejects_oversized_input_without_echoing_secrets(self) -> None:
         sentinel = "SECRET_SPAWN_INPUT"
-        completed = self.run_spawn_hook(json.dumps({"hook_event_name": "PreToolUse", "tool_name": "spawn_agent", "session_id": "parent", "secret": sentinel}) + "x" * 70000)
+        completed = self.run_spawn_hook(
+            json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "spawn_agent",
+                    "session_id": "parent",
+                    "secret": sentinel,
+                }
+            )
+            + "x" * 70000
+        )
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stderr, "")
         specific = json.loads(completed.stdout)["hookSpecificOutput"]
@@ -165,7 +183,9 @@ class NativeBeeHookTest(unittest.TestCase):
         self.assertNotIn(sentinel, completed.stdout)
 
     def test_spawn_hook_allows_valid_payload_without_output(self) -> None:
-        spec = importlib.util.spec_from_file_location("native_spawn_admission_test", SPAWN_HOOK)
+        spec = importlib.util.spec_from_file_location(
+            "native_spawn_admission_test", SPAWN_HOOK
+        )
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader if spec is not None else None)
         module = importlib.util.module_from_spec(spec)
@@ -182,7 +202,10 @@ class NativeBeeHookTest(unittest.TestCase):
             patch.object(sys, "stdin", stdin),
             patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
             patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
-            patch("the_hive.server.reserve_native_agent_spawn", return_value={"allowed": True, "reservation_id": "res-token"}) as reserve,
+            patch(
+                "the_hive.server.reserve_native_agent_spawn",
+                return_value={"allowed": True, "reservation_id": "res-token"},
+            ) as reserve,
         ):
             assert spec is not None and spec.loader is not None
             spec.loader.exec_module(module)
@@ -193,7 +216,9 @@ class NativeBeeHookTest(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         reserve.assert_called_once_with(payload)
 
-    def test_plugin_and_app_manifests_bind_only_the_canonical_the_hive_identity(self) -> None:
+    def test_plugin_and_app_manifests_bind_only_the_canonical_the_hive_identity(
+        self,
+    ) -> None:
         payload = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(payload["name"], "the-hive")
         self.assertEqual(payload["homepage"], "https://github.com/H234598/the-hive")
@@ -201,9 +226,14 @@ class NativeBeeHookTest(unittest.TestCase):
         self.assertIn("the-hive-mcp", payload["description"])
         self.assertNotIn("codex-master-mcp", payload["description"])
         self.assertNotIn("compatibility alias", payload["description"].casefold())
-        self.assertNotIn("compatibility alias", payload["interface"]["longDescription"].casefold())
+        self.assertNotIn(
+            "compatibility alias", payload["interface"]["longDescription"].casefold()
+        )
         self.assertEqual(payload["hooks"], "./hooks/hooks.json")
-        self.assertEqual(json.loads(APP_MANIFEST.read_text(encoding="utf-8"))["apps"], {"the-hive": {"id": "connector_26697a678b7ec999dc005131eb5c087c"}})
+        self.assertEqual(
+            json.loads(APP_MANIFEST.read_text(encoding="utf-8"))["apps"],
+            {"the-hive": {"id": "connector_26697a678b7ec999dc005131eb5c087c"}},
+        )
 
     def test_hooks_import_only_the_canonical_python_server_package(self) -> None:
         for hook in (HOOK, SPAWN_HOOK):
@@ -244,29 +274,42 @@ class NativeBeeHookTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"
             completed = self.run_hook(
-                json.dumps({"hook_event_name": "SessionStart", "session_id": "thr_parent"}),
+                json.dumps(
+                    {"hook_event_name": "SessionStart", "session_id": "thr_parent"}
+                ),
                 state_root=state_root,
             )
 
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "")
             self.assertEqual(completed.stderr, "")
-            state = json.loads((state_root / "native-agents.json").read_text(encoding="utf-8"))
+            state = json.loads(
+                (state_root / "native-agents.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(state["schema_version"], 2)
             self.assertEqual(state["agents"], [])
             self.assertEqual(len(state["sessions"]), 1)
             self.assertEqual(
-                {key: value for key, value in state["sessions"][0].items() if key != "updated_at"},
+                {
+                    key: value
+                    for key, value in state["sessions"][0].items()
+                    if key != "updated_at"
+                },
                 {"session_id": "thr_parent", "activity_state": "active"},
             )
 
-    def test_registry_retains_all_managed_referenced_history_on_hook_server_roundtrip(self) -> None:
+    def test_registry_retains_all_managed_referenced_history_on_hook_server_roundtrip(
+        self,
+    ) -> None:
         from the_hive import server as server_module
 
         self.assertEqual(server_module.MAX_NATIVE_AGENT_RECORDS, 1024)
         self.assertEqual(server_module.MAX_NATIVE_SESSION_RECORDS, 1024)
         for original_count in (64, 1023, 1024):
-            with self.subTest(original_count=original_count), tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                self.subTest(original_count=original_count),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
                 state_root = Path(tmpdir) / "state"
                 state_root.mkdir(mode=0o700)
                 registry_path = state_root / "native-agents.json"
@@ -274,27 +317,47 @@ class NativeBeeHookTest(unittest.TestCase):
                 seed = {
                     "schema_version": 2,
                     "agents": [
-                        {"session_id": f"parent_{i}", "agent_id": f"agent_{i}",
-                         "agent_type": "worker", "activity_state": "completed", "updated_at": 1.0}
+                        {
+                            "session_id": f"parent_{i}",
+                            "agent_id": f"agent_{i}",
+                            "agent_type": "worker",
+                            "activity_state": "completed",
+                            "updated_at": 1.0,
+                        }
                         for i in rows
                     ],
                     "sessions": [
-                        {"session_id": f"parent_{i}", "managed_session": f"managed_{i}",
-                         "activity_state": "ended", "updated_at": 1.0}
+                        {
+                            "session_id": f"parent_{i}",
+                            "managed_session": f"managed_{i}",
+                            "activity_state": "ended",
+                            "updated_at": 1.0,
+                        }
                         for i in rows
                     ],
                     "reservations": [],
                 }
-                with patch.object(server_module, "NATIVE_AGENT_REGISTRY_FILE", registry_path):
+                with patch.object(
+                    server_module, "NATIVE_AGENT_REGISTRY_FILE", registry_path
+                ):
                     server_module._write_native_agent_registry(seed)
-                    completed = self.run_hook(json.dumps({
-                        "hook_event_name": "SubagentStart", "session_id": "new_parent",
-                        "agent_id": "new_agent", "agent_type": "worker",
-                    }), state_root=state_root)
+                    completed = self.run_hook(
+                        json.dumps(
+                            {
+                                "hook_event_name": "SubagentStart",
+                                "session_id": "new_parent",
+                                "agent_id": "new_agent",
+                                "agent_type": "worker",
+                            }
+                        ),
+                        state_root=state_root,
+                    )
                     self.assertEqual(completed.returncode, 0)
                     self.assertEqual(completed.stderr, "")
                     stored = json.loads(registry_path.read_text(encoding="utf-8"))
-                    normalized, read_state = server_module._read_native_agent_registry_read_only()
+                    normalized, read_state = (
+                        server_module._read_native_agent_registry_read_only()
+                    )
                     if original_count == 1024:
                         overfull = {
                             **seed,
@@ -302,36 +365,70 @@ class NativeBeeHookTest(unittest.TestCase):
                             "sessions": [*seed["sessions"], stored["sessions"][-1]],
                         }
                         server_module._write_native_agent_registry(overfull)
-                        server_trimmed = json.loads(registry_path.read_text(encoding="utf-8"))
-                        self.assertEqual(server_trimmed["agents"][0]["agent_id"], "agent_0")
-                        self.assertEqual(server_trimmed["sessions"][0]["managed_session"], "managed_0")
+                        server_trimmed = json.loads(
+                            registry_path.read_text(encoding="utf-8")
+                        )
+                        self.assertEqual(
+                            server_trimmed["agents"][0]["agent_id"], "agent_0"
+                        )
+                        self.assertEqual(
+                            server_trimmed["sessions"][0]["managed_session"],
+                            "managed_0",
+                        )
                 self.assertEqual(read_state, "ready")
                 self.assertEqual(normalized, stored)
                 self.assertEqual(len(stored["agents"]), original_count + 1)
                 self.assertEqual(len(stored["sessions"]), original_count + 1)
                 first_retained = 0
-                self.assertEqual(stored["agents"][0]["agent_id"], f"agent_{first_retained}")
-                self.assertEqual(stored["sessions"][0]["managed_session"], f"managed_{first_retained}")
+                self.assertEqual(
+                    stored["agents"][0]["agent_id"], f"agent_{first_retained}"
+                )
+                self.assertEqual(
+                    stored["sessions"][0]["managed_session"],
+                    f"managed_{first_retained}",
+                )
                 self.assertEqual(stored["agents"][-1]["agent_id"], "new_agent")
                 self.assertEqual(stored["sessions"][-1]["session_id"], "new_parent")
 
         maximal = {
             "schema_version": 2,
-            "agents": [{"session_id": f"{index:04x}" + "s" * 124,
-                        "agent_id": f"{index:04x}" + "a" * 124,
-                        "agent_type": "t" * 64, "activity_state": "unconfirmed",
-                        "updated_at": -1.7976931348623157e308} for index in range(1024)],
-            "sessions": [{"session_id": f"{index:04x}" + "s" * 124,
-                          "managed_session": "m" * 128,
-                          "activity_state": "active", "updated_at": -1.7976931348623157e308}
-                         for index in range(1024)],
-            "reservations": [{"reservation_id": f"{index:04x}" + "r" * 124,
-                              "kind": "headless_inflight",
-                              "created_at": -1.7976931348623157e308, "agent": "a" * 128,
-                              "assignment_id": "i" * 128} for index in range(64)],
+            "agents": [
+                {
+                    "session_id": f"{index:04x}" + "s" * 124,
+                    "agent_id": f"{index:04x}" + "a" * 124,
+                    "agent_type": "t" * 64,
+                    "activity_state": "unconfirmed",
+                    "updated_at": -1.7976931348623157e308,
+                }
+                for index in range(1024)
+            ],
+            "sessions": [
+                {
+                    "session_id": f"{index:04x}" + "s" * 124,
+                    "managed_session": "m" * 128,
+                    "activity_state": "active",
+                    "updated_at": -1.7976931348623157e308,
+                }
+                for index in range(1024)
+            ],
+            "reservations": [
+                {
+                    "reservation_id": f"{index:04x}" + "r" * 124,
+                    "kind": "headless_inflight",
+                    "created_at": -1.7976931348623157e308,
+                    "agent": "a" * 128,
+                    "assignment_id": "i" * 128,
+                }
+                for index in range(64)
+            ],
         }
-        self.assertEqual(len(server_module._native_agent_normalize_registry(maximal)["sessions"]), 1024)
-        self.assertLessEqual(len((json.dumps(maximal, sort_keys=True) + "\n").encode()), 1024 * 1024)
+        self.assertEqual(
+            len(server_module._native_agent_normalize_registry(maximal)["sessions"]),
+            1024,
+        )
+        self.assertLessEqual(
+            len((json.dumps(maximal, sort_keys=True) + "\n").encode()), 1024 * 1024
+        )
 
     def test_session_start_preserves_parallel_parent_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -348,15 +445,22 @@ class NativeBeeHookTest(unittest.TestCase):
                 state_root=state_root,
             )
             second = self.run_hook(
-                json.dumps({"hook_event_name": "SessionStart", "session_id": "parent-two"}),
+                json.dumps(
+                    {"hook_event_name": "SessionStart", "session_id": "parent-two"}
+                ),
                 state_root=state_root,
             )
 
             self.assertEqual(first.returncode, 0)
             self.assertEqual(second.returncode, 0)
-            state = json.loads((state_root / "native-agents.json").read_text(encoding="utf-8"))
+            state = json.loads(
+                (state_root / "native-agents.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(
-                {(record["session_id"], record["agent_id"]) for record in state["agents"]},
+                {
+                    (record["session_id"], record["agent_id"])
+                    for record in state["agents"]
+                },
                 {("parent-one", "worker-one")},
             )
             self.assertEqual(
@@ -485,7 +589,12 @@ class NativeBeeHookTest(unittest.TestCase):
                     "agent_id": "agent_1",
                 },
             ):
-                self.assertEqual(self.run_hook(json.dumps(payload), state_root=state_root).returncode, 0)
+                self.assertEqual(
+                    self.run_hook(
+                        json.dumps(payload), state_root=state_root
+                    ).returncode,
+                    0,
+                )
 
             resumed = self.run_hook(
                 json.dumps(
@@ -493,7 +602,10 @@ class NativeBeeHookTest(unittest.TestCase):
                         "hook_event_name": "PreToolUse",
                         "session_id": "thr_parent",
                         "tool_name": "multi_agent_v1__send_input",
-                        "tool_input": {"target": "agent_1", "message": "SECRET_RESUME_PROMPT"},
+                        "tool_input": {
+                            "target": "agent_1",
+                            "message": "SECRET_RESUME_PROMPT",
+                        },
                     }
                 ),
                 state_root=state_root,
@@ -502,7 +614,9 @@ class NativeBeeHookTest(unittest.TestCase):
             state_text = state_path.read_text(encoding="utf-8")
             self.assertEqual(resumed.returncode, 0)
             self.assertEqual(resumed.stdout, "")
-            self.assertEqual(json.loads(state_text)["agents"][0]["activity_state"], "active")
+            self.assertEqual(
+                json.loads(state_text)["agents"][0]["activity_state"], "active"
+            )
             self.assertNotIn("SECRET", state_text)
 
             completed = self.run_hook(
@@ -523,10 +637,14 @@ class NativeBeeHookTest(unittest.TestCase):
             state_text = state_path.read_text(encoding="utf-8")
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "")
-            self.assertEqual(json.loads(state_text)["agents"][0]["activity_state"], "completed")
+            self.assertEqual(
+                json.loads(state_text)["agents"][0]["activity_state"], "completed"
+            )
             self.assertNotIn("SECRET", state_text)
 
-    def test_parent_session_lifecycle_keeps_completed_subagent_noncounting(self) -> None:
+    def test_parent_session_lifecycle_keeps_completed_subagent_noncounting(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"
             for payload in (
@@ -544,12 +662,21 @@ class NativeBeeHookTest(unittest.TestCase):
                 {"hook_event_name": "SessionEnd", "session_id": "thr_parent"},
                 {"hook_event_name": "SessionStart", "session_id": "thr_parent"},
             ):
-                self.assertEqual(self.run_hook(json.dumps(payload), state_root=state_root).returncode, 0)
+                self.assertEqual(
+                    self.run_hook(
+                        json.dumps(payload), state_root=state_root
+                    ).returncode,
+                    0,
+                )
 
-            state = json.loads((state_root / "native-agents.json").read_text(encoding="utf-8"))
+            state = json.loads(
+                (state_root / "native-agents.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(state["agents"][0]["activity_state"], "completed")
 
-    def test_resume_hook_rejects_unknown_missing_and_foreign_targets_without_leaking_payload(self) -> None:
+    def test_resume_hook_rejects_unknown_missing_and_foreign_targets_without_leaking_payload(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"
             for payload in (
@@ -565,7 +692,12 @@ class NativeBeeHookTest(unittest.TestCase):
                     "agent_id": "agent_1",
                 },
             ):
-                self.assertEqual(self.run_hook(json.dumps(payload), state_root=state_root).returncode, 0)
+                self.assertEqual(
+                    self.run_hook(
+                        json.dumps(payload), state_root=state_root
+                    ).returncode,
+                    0,
+                )
 
             for payload in (
                 {
@@ -588,17 +720,26 @@ class NativeBeeHookTest(unittest.TestCase):
                 },
             ):
                 with self.subTest(payload=payload):
-                    completed = self.run_hook(json.dumps(payload), state_root=state_root)
+                    completed = self.run_hook(
+                        json.dumps(payload), state_root=state_root
+                    )
                     output = json.loads(completed.stdout)["hookSpecificOutput"]
                     self.assertEqual(completed.returncode, 0)
                     self.assertEqual(output["hookEventName"], "PreToolUse")
                     self.assertEqual(output["permissionDecision"], "deny")
                     self.assertNotIn("SECRET", completed.stdout)
-                    state_text = (state_root / "native-agents.json").read_text(encoding="utf-8")
-                    self.assertEqual(json.loads(state_text)["agents"][0]["activity_state"], "completed")
+                    state_text = (state_root / "native-agents.json").read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertEqual(
+                        json.loads(state_text)["agents"][0]["activity_state"],
+                        "completed",
+                    )
                     self.assertNotIn("SECRET", state_text)
 
-    def test_resume_hook_rejects_oversized_valid_json_before_state_mutation(self) -> None:
+    def test_resume_hook_rejects_oversized_valid_json_before_state_mutation(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"
             for payload in (
@@ -614,7 +755,12 @@ class NativeBeeHookTest(unittest.TestCase):
                     "agent_id": "agent_1",
                 },
             ):
-                self.assertEqual(self.run_hook(json.dumps(payload), state_root=state_root).returncode, 0)
+                self.assertEqual(
+                    self.run_hook(
+                        json.dumps(payload), state_root=state_root
+                    ).returncode,
+                    0,
+                )
             payload = json.dumps(
                 {
                     "hook_event_name": "PreToolUse",
@@ -629,7 +775,9 @@ class NativeBeeHookTest(unittest.TestCase):
             state_text = (state_root / "native-agents.json").read_text(encoding="utf-8")
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "")
-            self.assertEqual(json.loads(state_text)["agents"][0]["activity_state"], "completed")
+            self.assertEqual(
+                json.loads(state_text)["agents"][0]["activity_state"], "completed"
+            )
             self.assertNotIn("SECRET", state_text)
 
     def test_post_tool_close_completes_only_the_calling_parents_agent(self) -> None:
@@ -658,7 +806,9 @@ class NativeBeeHookTest(unittest.TestCase):
                         "session_id": "parent_a",
                         "tool_name": "close_agent",
                         "tool_input": {"id": "agent_1"},
-                        "tool_response": {"previous_status": {"completed": "SECRET_OUTPUT"}},
+                        "tool_response": {
+                            "previous_status": {"completed": "SECRET_OUTPUT"}
+                        },
                     }
                 ),
                 state_root=state_root,
@@ -666,14 +816,17 @@ class NativeBeeHookTest(unittest.TestCase):
 
             state_text = (state_root / "native-agents.json").read_text(encoding="utf-8")
             states = {
-                row["session_id"]: row["activity_state"] for row in json.loads(state_text)["agents"]
+                row["session_id"]: row["activity_state"]
+                for row in json.loads(state_text)["agents"]
             }
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "")
             self.assertEqual(states, {"parent_a": "completed", "parent_b": "active"})
             self.assertNotIn("SECRET", state_text)
 
-    def test_resumed_legacy_subagent_recovers_parent_from_its_bounded_transcript_header(self) -> None:
+    def test_resumed_legacy_subagent_recovers_parent_from_its_bounded_transcript_header(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state_root = root / "state"
@@ -718,7 +871,11 @@ class NativeBeeHookTest(unittest.TestCase):
             state_text = (state_root / "native-agents.json").read_text(encoding="utf-8")
             state = json.loads(state_text)
             self.assertEqual(
-                {key: value for key, value in state["agents"][0].items() if key != "updated_at"},
+                {
+                    key: value
+                    for key, value in state["agents"][0].items()
+                    if key != "updated_at"
+                },
                 {
                     "session_id": "thr_parent",
                     "agent_id": "agent_legacy",
@@ -743,7 +900,9 @@ class NativeBeeHookTest(unittest.TestCase):
                 state_root=state_root,
             )
             completed = self.run_hook(
-                json.dumps({"hook_event_name": "SessionEnd", "session_id": "thr_parent"}),
+                json.dumps(
+                    {"hook_event_name": "SessionEnd", "session_id": "thr_parent"}
+                ),
                 state_root=state_root,
             )
 
@@ -753,7 +912,9 @@ class NativeBeeHookTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "")
             self.assertEqual(completed.stderr, "")
-            state = json.loads((state_root / "native-agents.json").read_text(encoding="utf-8"))
+            state = json.loads(
+                (state_root / "native-agents.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(len(state["agents"]), 1)
             self.assertEqual(state["agents"][0]["activity_state"], "unconfirmed")
 
@@ -776,7 +937,10 @@ class NativeBeeHookTest(unittest.TestCase):
             }
             prefix = json.dumps(oversized_payload, separators=(",", ":"))
             oversized_payload["padding"] = "x" * (65537 - len(prefix))
-            oversized = json.dumps(oversized_payload, separators=(",", ":")) + "SECRET_TRAILING_BYTES"
+            oversized = (
+                json.dumps(oversized_payload, separators=(",", ":"))
+                + "SECRET_TRAILING_BYTES"
+            )
 
             completed = self.run_hook(oversized, state_root=Path(tmpdir) / "state")
             self.assertEqual(completed.returncode, 0)
@@ -788,7 +952,9 @@ class NativeBeeHookTest(unittest.TestCase):
             blocked_state = Path(tmpdir) / "blocked-state"
             blocked_state.write_text("not a directory", encoding="utf-8")
             completed = self.run_hook(
-                json.dumps({"hook_event_name": "SessionStart", "session_id": "thr_parent"}),
+                json.dumps(
+                    {"hook_event_name": "SessionStart", "session_id": "thr_parent"}
+                ),
                 state_root=blocked_state,
             )
 

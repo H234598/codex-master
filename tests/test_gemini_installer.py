@@ -30,11 +30,18 @@ def test_installer_uses_only_latest_channel_and_checks_version(tmp_path: Path) -
     )
     env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(tmp_path / "home")}
 
-    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        [str(SCRIPT)], env=env, text=True, capture_output=True, check=False
+    )
 
     assert result.returncode == 0
-    assert result.stdout.strip() == '{"status":"installed","version":"gemini-cli 0.53.1"}'
-    assert log.read_text(encoding="utf-8").strip() == "install -g @google/gemini-cli@latest"
+    assert (
+        result.stdout.strip() == '{"status":"installed","version":"gemini-cli 0.53.1"}'
+    )
+    assert (
+        log.read_text(encoding="utf-8").strip()
+        == "install -g @google/gemini-cli@latest"
+    )
 
 
 def test_installer_fails_before_install_when_node_is_missing(tmp_path: Path) -> None:
@@ -46,7 +53,9 @@ def test_installer_fails_before_install_when_node_is_missing(tmp_path: Path) -> 
     _write_executable(fake_bin / "bash", f"#!/bin/sh\nexec '{real_bash}' \"$@\"\n")
     env = {"PATH": str(fake_bin), "HOME": str(tmp_path / "home")}
 
-    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        [str(SCRIPT)], env=env, text=True, capture_output=True, check=False
+    )
 
     assert result.returncode == 1
     assert result.stdout.strip() == '{"status":"failed","reason":"node_or_npm_missing"}'

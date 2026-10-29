@@ -63,10 +63,7 @@ def _is_absolute_posix_path(value: object, *, user_home: bool) -> bool:
         return False
     if not value.startswith("/"):
         return False
-    if any(
-        unicodedata.category(character).startswith("C")
-        for character in value
-    ):
+    if any(unicodedata.category(character).startswith("C") for character in value):
         return False
     if user_home and value == "/":
         return False
@@ -86,9 +83,10 @@ class NetworkPathFactV1:
     reachable: bool
 
     def __post_init__(self) -> None:
-        if not isinstance(self.path_id, NetworkPathIdV1) or type(
-            self.reachable
-        ) is not bool:
+        if (
+            not isinstance(self.path_id, NetworkPathIdV1)
+            or type(self.reachable) is not bool
+        ):
             _fail("RQ_E_PLAN_INCONSISTENT")
 
 
@@ -106,8 +104,7 @@ class ManagedStateFactV1:
         if self.state is ManagedStateKindV1.ABSENT and self.generation is not None:
             _fail("RQ_E_PLAN_INCONSISTENT")
         if self.state is ManagedStateKindV1.OWNED and (
-            not _is_ascii_line(self.generation)
-            or len(self.generation) > 128
+            not _is_ascii_line(self.generation) or len(self.generation) > 128
         ):
             _fail("RQ_E_PLAN_INCONSISTENT")
         if self.state is ManagedStateKindV1.FOREIGN and self.generation is not None:
@@ -181,12 +178,8 @@ _HOST_FACT_KEYS = frozenset(
 )
 _NETWORK_PATH_KEYS = frozenset({"path_id", "reachable"})
 _MANAGED_STATE_KEYS = frozenset({"object_id", "state", "generation"})
-_SELINUX_MODES = frozenset(
-    {"enforcing", "permissive", "disabled", "unavailable"}
-)
-_APPARMOR_MODES = frozenset(
-    {"enforcing", "complain", "disabled", "unavailable"}
-)
+_SELINUX_MODES = frozenset({"enforcing", "permissive", "disabled", "unavailable"})
+_APPARMOR_MODES = frozenset({"enforcing", "complain", "disabled", "unavailable"})
 
 
 def _reject_duplicate_keys(pairs):
@@ -300,8 +293,7 @@ def _parse_host_facts(payload: object, target: SshTargetV1) -> RemoteQueenHostFa
         payload["codex_version"],
     )
     if any(
-        version is not None
-        and (not _is_ascii_line(version) or len(version) > 128)
+        version is not None and (not _is_ascii_line(version) or len(version) > 128)
         for version in versions
     ):
         _fail("RQ_E_PLAN_INCONSISTENT")
@@ -318,9 +310,10 @@ def _parse_host_facts(payload: object, target: SshTargetV1) -> RemoteQueenHostFa
     free_bytes = payload["free_bytes"]
     if type(free_bytes) is not int or not 0 <= free_bytes <= 2**63 - 1:
         _fail("RQ_E_PLAN_INCONSISTENT")
-    if payload["selinux_mode"] not in _SELINUX_MODES or payload[
-        "apparmor_mode"
-    ] not in _APPARMOR_MODES:
+    if (
+        payload["selinux_mode"] not in _SELINUX_MODES
+        or payload["apparmor_mode"] not in _APPARMOR_MODES
+    ):
         _fail("RQ_E_PLAN_INCONSISTENT")
 
     distribution_values = (
@@ -487,9 +480,11 @@ def collect_remote_queen_ssh_preflight(
     operations: RemoteQueenSshOperations,
     limits: SshOperationLimitsV1 = SshOperationLimitsV1(),
 ) -> RemoteQueenSshPreflightV1:
-    if not isinstance(ssh_target, SshTargetV1) or not isinstance(
-        desired_generation, ManifestGenerationV1
-    ) or not isinstance(limits, SshOperationLimitsV1):
+    if (
+        not isinstance(ssh_target, SshTargetV1)
+        or not isinstance(desired_generation, ManifestGenerationV1)
+        or not isinstance(limits, SshOperationLimitsV1)
+    ):
         _fail("RQ_E_PLAN_INCONSISTENT")
 
     try:

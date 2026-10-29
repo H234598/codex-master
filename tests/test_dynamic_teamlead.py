@@ -117,7 +117,9 @@ def test_prepare_keeps_teamlead_plan_when_foreign_worker_is_present() -> None:
     foreign_worker = SimpleNamespace(principal_id="dw-" + "a" * 32, enabled=True)
 
     with_worker = prepare_dynamic_teamlead(
-        snapshot(runtime_principals=(foreign_worker, expected_principal)), request(), binding()
+        snapshot(runtime_principals=(foreign_worker, expected_principal)),
+        request(),
+        binding(),
     )
 
     assert with_worker == baseline
@@ -132,14 +134,22 @@ def test_prepare_rejects_missing_runtime_principal() -> None:
 
 def test_prepare_rejects_disabled_runtime_principal() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
-        prepare_dynamic_teamlead(snapshot(runtime_principals=(principal(enabled=False),)), request(), binding())
+        prepare_dynamic_teamlead(
+            snapshot(runtime_principals=(principal(enabled=False),)),
+            request(),
+            binding(),
+        )
 
     assert caught.value.code is DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID
 
 
 def test_prepare_rejects_duplicate_runtime_principal() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
-        prepare_dynamic_teamlead(snapshot(runtime_principals=(principal(), principal())), request(), binding())
+        prepare_dynamic_teamlead(
+            snapshot(runtime_principals=(principal(), principal())),
+            request(),
+            binding(),
+        )
 
     assert caught.value.code is DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID
 
@@ -147,7 +157,9 @@ def test_prepare_rejects_duplicate_runtime_principal() -> None:
 def test_prepare_rejects_wrong_runtime_principal_type() -> None:
     wrong_type = SimpleNamespace(principal_id=AGENT_ID, enabled=True)
     with pytest.raises(DynamicTeamleadError) as caught:
-        prepare_dynamic_teamlead(snapshot(runtime_principals=(wrong_type,)), request(), binding())
+        prepare_dynamic_teamlead(
+            snapshot(runtime_principals=(wrong_type,)), request(), binding()
+        )
 
     assert caught.value.code is DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID
 
@@ -155,7 +167,9 @@ def test_prepare_rejects_wrong_runtime_principal_type() -> None:
 def test_prepare_rejects_runtime_principal_account_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(account_id="openai-secondary"),)), request(), binding()
+            snapshot(runtime_principals=(principal(account_id="openai-secondary"),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH
@@ -187,12 +201,16 @@ def test_prepare_rejects_foreign_principals_independent_of_count_or_status(
     runtime_principals: tuple[object, ...],
 ) -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
-        prepare_dynamic_teamlead(snapshot(runtime_principals=runtime_principals), request(), binding())
+        prepare_dynamic_teamlead(
+            snapshot(runtime_principals=runtime_principals), request(), binding()
+        )
 
     assert caught.value.code is DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID
 
 
-def test_prepare_resolves_requested_principal_independent_of_foreign_principals() -> None:
+def test_prepare_resolves_requested_principal_independent_of_foreign_principals() -> (
+    None
+):
     expected_principal = principal()
     plan = prepare_dynamic_teamlead(
         snapshot(
@@ -212,7 +230,9 @@ def test_prepare_resolves_requested_principal_independent_of_foreign_principals(
 def test_prepare_rejects_runtime_principal_profile_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(profile_id="other-profile"),)), request(), binding()
+            snapshot(runtime_principals=(principal(profile_id="other-profile"),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH
@@ -221,7 +241,11 @@ def test_prepare_rejects_runtime_principal_profile_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_profile_hmac_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(credential_binding_id="hmac-sha256:" + "b" * 64),)),
+            snapshot(
+                runtime_principals=(
+                    principal(credential_binding_id="hmac-sha256:" + "b" * 64),
+                )
+            ),
             request(),
             binding(),
         )
@@ -247,7 +271,9 @@ def test_prepare_rejects_runtime_principal_account_hmac_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_class_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(class_id="other-class"),)), request(), binding()
+            snapshot(runtime_principals=(principal(class_id="other-class"),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
@@ -256,7 +282,9 @@ def test_prepare_rejects_runtime_principal_class_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_lifecycle_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(lifecycle="ephemeral"),)), request(), binding()
+            snapshot(runtime_principals=(principal(lifecycle="ephemeral"),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
@@ -265,7 +293,9 @@ def test_prepare_rejects_runtime_principal_lifecycle_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_provider_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(provider=Provider.OPENAI_API),)), request(), binding()
+            snapshot(runtime_principals=(principal(provider=Provider.OPENAI_API),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
@@ -274,7 +304,9 @@ def test_prepare_rejects_runtime_principal_provider_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_runner_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(runner=RunnerKind.GEMINI_CLI),)), request(), binding()
+            snapshot(runtime_principals=(principal(runner=RunnerKind.GEMINI_CLI),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
@@ -283,7 +315,9 @@ def test_prepare_rejects_runtime_principal_runner_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_model_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(model="gpt-6-luna"),)), request(), binding()
+            snapshot(runtime_principals=(principal(model="gpt-6-luna"),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
@@ -292,7 +326,9 @@ def test_prepare_rejects_runtime_principal_model_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_reasoning_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(reasoning="high"),)), request(), binding()
+            snapshot(runtime_principals=(principal(reasoning="high"),)),
+            request(),
+            binding(),
         )
 
     assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
@@ -372,9 +408,7 @@ def test_prepare_prioritizes_capability_over_principal_eligibility() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
             snapshot(
-                runtime_principals=(
-                    principal(enabled=False, class_id="other-class"),
-                )
+                runtime_principals=(principal(enabled=False, class_id="other-class"),)
             ),
             request(),
             binding(),
@@ -485,7 +519,9 @@ def test_prepare_rejects_ineligible_or_unbound_account(
     account_change: dict[str, object], expected: DynamicTeamleadCode
 ) -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
-        prepare_dynamic_teamlead(snapshot(accounts=(account(**account_change),)), request(), binding())
+        prepare_dynamic_teamlead(
+            snapshot(accounts=(account(**account_change),)), request(), binding()
+        )
 
     assert caught.value.code is expected
 
@@ -510,7 +546,11 @@ def test_prepare_rejects_legacy_target_stale_registry_and_non_teamlead_selection
 
 def test_prepare_rejects_profile_binding_that_does_not_match_account() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
-        prepare_dynamic_teamlead(snapshot(), request(), binding(credential_binding_id="hmac-sha256:" + "b" * 64))
+        prepare_dynamic_teamlead(
+            snapshot(),
+            request(),
+            binding(credential_binding_id="hmac-sha256:" + "b" * 64),
+        )
 
     assert caught.value.code is DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH
 

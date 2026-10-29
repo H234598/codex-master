@@ -14,7 +14,12 @@ from datetime import datetime, timezone
 import time
 from typing import Protocol
 
-from the_hive.admission import AdmissionError, AdmissionRecord, AdmissionState, AdmissionStore
+from the_hive.admission import (
+    AdmissionError,
+    AdmissionRecord,
+    AdmissionState,
+    AdmissionStore,
+)
 from the_hive.selection import (
     AdmissionPolicy,
     AdmissionPreview,
@@ -50,7 +55,9 @@ class SelectionRuntime(Protocol):
     def revalidate(self, admission: AdmissionRecord) -> bool:
         """Re-check all authority, scope, account, model, lease and process gates."""
 
-    def execute(self, admission: AdmissionRecord, operation: str) -> Mapping[str, object]:
+    def execute(
+        self, admission: AdmissionRecord, operation: str
+    ) -> Mapping[str, object]:
         """Invoke one existing low-level operation after revalidation."""
 
     def execution_completed(self, admission: AdmissionRecord) -> bool:
@@ -89,7 +96,9 @@ class SelectionService:
     ) -> None:
         if not isinstance(store, AdmissionStore):
             raise SelectionServiceError("invalid admission store")
-        if not all(isinstance(delay, (int, float)) and delay >= 0 for delay in backoff_seconds):
+        if not all(
+            isinstance(delay, (int, float)) and delay >= 0 for delay in backoff_seconds
+        ):
             raise SelectionServiceError("invalid retry backoff")
         if len(backoff_seconds) != MAX_EXECUTION_ATTEMPTS:
             raise SelectionServiceError("retry backoff must contain three delays")
@@ -126,13 +135,18 @@ class SelectionService:
             ledger=request.ledger,
         )
 
-    def plan_admission(self, plan_factory: Callable[[], AdmissionRecord]) -> AdmissionRecord:
+    def plan_admission(
+        self, plan_factory: Callable[[], AdmissionRecord]
+    ) -> AdmissionRecord:
         """Obtain one fresh planned record without reserving it."""
 
         if not callable(plan_factory):
             raise SelectionServiceError("invalid admission plan factory")
         record = plan_factory()
-        if not isinstance(record, AdmissionRecord) or record.state is not AdmissionState.PLANNED:
+        if (
+            not isinstance(record, AdmissionRecord)
+            or record.state is not AdmissionState.PLANNED
+        ):
             raise SelectionServiceError("admission plan must be planned")
         return record
 
@@ -143,7 +157,10 @@ class SelectionService:
     ) -> Mapping[str, object]:
         """Execute at most three fresh plans, compensating every failed attempt."""
 
-        if not isinstance(operation, str) or not 1 <= len(operation) <= MAX_OPERATION_LENGTH:
+        if (
+            not isinstance(operation, str)
+            or not 1 <= len(operation) <= MAX_OPERATION_LENGTH
+        ):
             raise SelectionServiceError("invalid operation")
         if self._runtime is None:
             raise SelectionServiceError("selection runtime is unavailable")
@@ -154,18 +171,28 @@ class SelectionService:
                 planned = self.plan_admission(plan_factory)
                 current = self._store.reserve(planned, now=self._now())
                 current = self._store.begin_revalidation(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
                 if self._runtime.revalidate(current) is not True:
                     current = self._store.complete_revalidation(
-                        current.admission_id, expected_revision=current.revision, valid=False, now=self._now()
+                        current.admission_id,
+                        expected_revision=current.revision,
+                        valid=False,
+                        now=self._now(),
                     )
                     current = self._store.compensate(
-                        current.admission_id, expected_revision=current.revision, now=self._now()
+                        current.admission_id,
+                        expected_revision=current.revision,
+                        now=self._now(),
                     )
                     raise SelectionDeniedError("admission revalidation denied")
                 current = self._store.complete_revalidation(
-                    current.admission_id, expected_revision=current.revision, valid=True, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    valid=True,
+                    now=self._now(),
                 )
                 if current.resource.account_pool_binding is not None:
                     fresh_check = getattr(
@@ -184,13 +211,17 @@ class SelectionService:
                         )
                         raise SelectionDeniedError("pool authority revalidation denied")
                 current = self._store.begin_execution(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
                 result = self._runtime.execute(current, operation)
                 if not isinstance(result, Mapping):
                     raise SelectionServiceError("runtime result must be a mapping")
                 current = self._store.finalize(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
                 return {
                     "result": dict(result),
@@ -228,7 +259,9 @@ class SelectionService:
             if record.state is AdmissionState.EXECUTING:
                 if self._runtime.execution_completed(record):
                     recovered_record = self._store.recover_after_crash(
-                        record.admission_id, expected_revision=record.revision, now=self._now()
+                        record.admission_id,
+                        expected_revision=record.revision,
+                        now=self._now(),
                     )
                     self._store.finalize(
                         recovered_record.admission_id,
@@ -244,7 +277,11 @@ class SelectionService:
                 AdmissionState.DENIED,
                 AdmissionState.CANCELLED,
             }:
-                self._store.compensate(record.admission_id, expected_revision=record.revision, now=self._now())
+                self._store.compensate(
+                    record.admission_id,
+                    expected_revision=record.revision,
+                    now=self._now(),
+                )
                 compensated += 1
         return {
             "recovered": recovered,
@@ -264,23 +301,38 @@ class SelectionService:
                 AdmissionState.ADMITTED,
             }:
                 current = self._store.cancel(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
-            if current.state in {AdmissionState.CANCELLED, AdmissionState.CONFLICT, AdmissionState.EXPIRED, AdmissionState.DENIED}:
+            if current.state in {
+                AdmissionState.CANCELLED,
+                AdmissionState.CONFLICT,
+                AdmissionState.EXPIRED,
+                AdmissionState.DENIED,
+            }:
                 current = self._store.compensate(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
             elif current.state in {AdmissionState.EXECUTING, AdmissionState.ADMITTED}:
                 current = self._store.mark_execution_failed(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
             if current.state is AdmissionState.EXECUTION_FAILED:
                 current = self._store.begin_compensation(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
             if current.state is AdmissionState.COMPENSATING:
                 self._store.finish_compensation(
-                    current.admission_id, expected_revision=current.revision, now=self._now()
+                    current.admission_id,
+                    expected_revision=current.revision,
+                    now=self._now(),
                 )
         except AdmissionError:
             # The original runtime failure remains authoritative; cleanup is
@@ -291,5 +343,10 @@ class SelectionService:
 def _is_retryable_admission_error(error: AdmissionError) -> bool:
     return any(
         marker in str(error)
-        for marker in ("conflict", "capacity", "stale_admission_revision", "admission_expired")
+        for marker in (
+            "conflict",
+            "capacity",
+            "stale_admission_revision",
+            "admission_expired",
+        )
     )

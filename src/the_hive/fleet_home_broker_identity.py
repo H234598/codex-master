@@ -98,10 +98,7 @@ class BrokerIdentity:
             ("fencing_epoch", str(self.fencing_epoch)),
         )
         return b"broker-identity-v1\n" + b"".join(
-            key.encode("ascii")
-            + b"\0"
-            + value.encode("utf-8")
-            + b"\n"
+            key.encode("ascii") + b"\0" + value.encode("utf-8") + b"\n"
             for key, value in fields
         )
 
@@ -170,10 +167,7 @@ class ImportClosure:
 
     def canonical_bytes(self) -> bytes:
         return b"import-closure-v1\n" + b"".join(
-            entry.path.encode("utf-8")
-            + b"\0"
-            + entry.digest.encode("ascii")
-            + b"\n"
+            entry.path.encode("utf-8") + b"\0" + entry.digest.encode("ascii") + b"\n"
             for entry in self.entries
         )
 

@@ -29,8 +29,7 @@ _MAX_OWNER_METADATA_BYTES = len(
     b'"pid":2147483647,"start_ticks":9223372036854775807}'
 )
 MAX_OPERATION_V2_STATE_BYTES = (
-    MAX_OPERATION_V1_STATE_BYTES
-    + MAX_OPERATION_RECORDS * _MAX_OWNER_METADATA_BYTES
+    MAX_OPERATION_V1_STATE_BYTES + MAX_OPERATION_RECORDS * _MAX_OWNER_METADATA_BYTES
 )
 OPERATION_LIFETIME = timedelta(minutes=15)
 
@@ -88,9 +87,11 @@ class _LinuxOwnerProbe:
     @staticmethod
     def _boot_id() -> str:
         try:
-            value = Path("/proc/sys/kernel/random/boot_id").read_text(
-                encoding="ascii"
-            ).strip()
+            value = (
+                Path("/proc/sys/kernel/random/boot_id")
+                .read_text(encoding="ascii")
+                .strip()
+            )
         except (OSError, UnicodeError):
             raise AdminOperationError("control.operation_owner_unavailable") from None
         if _BOOT_ID.fullmatch(value) is None:
@@ -195,9 +196,7 @@ class AdminOperationStore:
                         owner["plan_digest"],
                     )
                     if owner["expected_generation"] != record["expected_generation"]:
-                        raise AdminOperationError(
-                            "control.operation_store_unavailable"
-                        )
+                        raise AdminOperationError("control.operation_store_unavailable")
             self._reconcile_running()
         except (HiveStateError, OSError, ValueError):
             raise AdminOperationError("control.operation_store_unavailable") from None
@@ -348,7 +347,11 @@ class AdminOperationStore:
             if record["state"] != "running":
                 raise AdminOperationError("control.operation_state_conflict")
             matched = next(
-                (candidate for candidate in record["steps"] if candidate["name"] == step),
+                (
+                    candidate
+                    for candidate in record["steps"]
+                    if candidate["name"] == step
+                ),
                 None,
             )
             if matched is None:
@@ -401,8 +404,7 @@ class AdminOperationStore:
                     dict.fromkeys(
                         step["reason_code"]
                         for step in record["steps"]
-                        if step["state"] == "failed"
-                        and step["reason_code"] is not None
+                        if step["state"] == "failed" and step["reason_code"] is not None
                     )
                 )
             record["state"] = state
@@ -761,29 +763,34 @@ class AdminOperationStore:
         )
         state = record["state"]
         valid = (
-            state == "planned"
-            and not_attempted
-            and record["resulting_generation"] is None
-            and record["reason_codes"] == ["control.plan_ready"]
-        ) or (
-            state == "running"
-            and (not_attempted or succeeded or failed_reason is not None)
-            and record["resulting_generation"] is None
-        ) or (
-            state == "partial"
-            and (not_attempted or succeeded or failed_reason is not None)
-            and record["resulting_generation"] is None
-            and record["reason_codes"] == ["control.restart_reconciled"]
-        ) or (
-            state == "failed"
-            and failed_reason is not None
-            and record["resulting_generation"] is None
-            and record["reason_codes"] == [failed_reason]
-        ) or (
-            state == "succeeded"
-            and succeeded
-            and record["resulting_generation"]
-            == record["expected_generation"] + 1
+            (
+                state == "planned"
+                and not_attempted
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == ["control.plan_ready"]
+            )
+            or (
+                state == "running"
+                and (not_attempted or succeeded or failed_reason is not None)
+                and record["resulting_generation"] is None
+            )
+            or (
+                state == "partial"
+                and (not_attempted or succeeded or failed_reason is not None)
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == ["control.restart_reconciled"]
+            )
+            or (
+                state == "failed"
+                and failed_reason is not None
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == [failed_reason]
+            )
+            or (
+                state == "succeeded"
+                and succeeded
+                and record["resulting_generation"] == record["expected_generation"] + 1
+            )
         )
         if not valid:
             raise AdminOperationError("control.operation_state_conflict")
@@ -829,13 +836,14 @@ class AdminOperationStore:
         operation_ids: set[str] = set()
         agent_operation_ids: set[str] = set()
         for value in document["owners"]:
-            if not isinstance(value, Mapping) or set(value) != _HOST_PROBE_LIFECYCLE_FIELDS:
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != _HOST_PROBE_LIFECYCLE_FIELDS
+            ):
                 raise AdminOperationError("control.operation_store_unavailable")
             owner = {
                 "operation_id": self._stored_token(value["operation_id"]),
-                "agent_operation_id": self._stored_token(
-                    value["agent_operation_id"]
-                ),
+                "agent_operation_id": self._stored_token(value["agent_operation_id"]),
                 "target_host_ref": self._stored_token(value["target_host_ref"]),
                 "expected_generation": self._stored_generation(
                     value["expected_generation"]
@@ -856,9 +864,7 @@ class AdminOperationStore:
             owners.append(owner)
         return owners
 
-    def _write_host_probe_lifecycle_locked(
-        self, owners: list[dict[str, Any]]
-    ) -> None:
+    def _write_host_probe_lifecycle_locked(self, owners: list[dict[str, Any]]) -> None:
         if len(owners) > MAX_HOST_PROBE_LIFECYCLE_OWNERS:
             raise AdminOperationError("control.operation_limit")
         try:
@@ -1028,9 +1034,7 @@ class AdminOperationStore:
             raise AdminOperationError("control.operation_store_unavailable")
         legacy = document.get("schema_version") == 1
         if len(raw) > (
-            MAX_OPERATION_V1_STATE_BYTES
-            if legacy
-            else MAX_OPERATION_V2_STATE_BYTES
+            MAX_OPERATION_V1_STATE_BYTES if legacy else MAX_OPERATION_V2_STATE_BYTES
         ):
             raise AdminOperationError("control.operation_store_unavailable")
         records: list[dict[str, Any]] = []
@@ -1065,9 +1069,7 @@ class AdminOperationStore:
             owners = self._read_host_probe_lifecycle_locked()
             self._migrate_host_probe_lifecycle_locked(records, owners, now)
             protected = {
-                owner["operation_id"]
-                for owner in owners
-                if not owner["acknowledged"]
+                owner["operation_id"] for owner in owners if not owner["acknowledged"]
             }
             self._prune_expired(records, now, protected)
             self._write_locked(records)
@@ -1101,9 +1103,7 @@ class AdminOperationStore:
         )
 
     @staticmethod
-    def _encoded_document(
-        schema_version: int, records: list[dict[str, Any]]
-    ) -> bytes:
+    def _encoded_document(schema_version: int, records: list[dict[str, Any]]) -> bytes:
         return (
             json.dumps(
                 {"schema_version": schema_version, "operations": records},
@@ -1129,17 +1129,19 @@ class AdminOperationStore:
             record["resulting_generation"] = self._stored_generation(
                 record["resulting_generation"]
             )
-        if type(record["plan_digest"]) is not str or _DIGEST.fullmatch(
-            record["plan_digest"]
-        ) is None:
+        if (
+            type(record["plan_digest"]) is not str
+            or _DIGEST.fullmatch(record["plan_digest"]) is None
+        ):
             raise AdminOperationError("control.operation_store_unavailable")
         created = self._parse_time(record["created_at"])
         expires = self._parse_time(record["expires_at"])
         if expires != created + OPERATION_LIFETIME:
             raise AdminOperationError("control.operation_store_unavailable")
-        if type(record["steps"]) is not list or not 1 <= len(
-            record["steps"]
-        ) <= MAX_OPERATION_STEPS:
+        if (
+            type(record["steps"]) is not list
+            or not 1 <= len(record["steps"]) <= MAX_OPERATION_STEPS
+        ):
             raise AdminOperationError("control.operation_store_unavailable")
         names: set[str] = set()
         steps: list[dict[str, str | None]] = []
@@ -1183,8 +1185,7 @@ class AdminOperationStore:
             for step in record["steps"]
         )
         generation_valid = (
-            resulting_generation is None
-            or resulting_generation >= expected_generation
+            resulting_generation is None or resulting_generation >= expected_generation
         )
         if state in {"planned", "queued"}:
             valid = (
@@ -1361,28 +1362,32 @@ class AdminOperationStore:
             },
         )
         return (
-            record["state"] == "planned"
-            and record["resulting_generation"] is None
-            and record["reason_codes"] == ["control.plan_ready"]
-            and step["state"] == "not_attempted"
-        ) or (
-            record["state"] == "partial"
-            and record["resulting_generation"] is None
-            and record["reason_codes"] == ["control.restart_reconciled"]
-            and valid_step
-        ) or (
-            record["state"] == "failed"
-            and record["resulting_generation"] is None
-            and record["reason_codes"]
-            in (["host.probe_unknown"], ["host.probe_failed"])
-            and step["state"] == "failed"
-            and step["reason_code"] == record["reason_codes"][0]
-        ) or (
-            record["state"] == "succeeded"
-            and record["reason_codes"] == []
-            and record["resulting_generation"]
-            == record["expected_generation"] + 1
-            and step["state"] == "succeeded"
+            (
+                record["state"] == "planned"
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == ["control.plan_ready"]
+                and step["state"] == "not_attempted"
+            )
+            or (
+                record["state"] == "partial"
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == ["control.restart_reconciled"]
+                and valid_step
+            )
+            or (
+                record["state"] == "failed"
+                and record["resulting_generation"] is None
+                and record["reason_codes"]
+                in (["host.probe_unknown"], ["host.probe_failed"])
+                and step["state"] == "failed"
+                and step["reason_code"] == record["reason_codes"][0]
+            )
+            or (
+                record["state"] == "succeeded"
+                and record["reason_codes"] == []
+                and record["resulting_generation"] == record["expected_generation"] + 1
+                and step["state"] == "succeeded"
+            )
         )
 
     @staticmethod
@@ -1464,7 +1469,11 @@ class AdminOperationStore:
 
     def _now(self) -> datetime:
         value = self._clock()
-        if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timedelta(0):
+        if (
+            type(value) is not datetime
+            or value.tzinfo is None
+            or value.utcoffset() != timedelta(0)
+        ):
             raise AdminOperationError("control.operation_store_unavailable")
         return value.astimezone(UTC)
 

@@ -2088,7 +2088,9 @@ def _ollama_fleet_service(
     return service, registry, transport
 
 
-def test_ollama_models_and_instances_remain_separate_registry_views(tmp_path: Path) -> None:
+def test_ollama_models_and_instances_remain_separate_registry_views(
+    tmp_path: Path,
+) -> None:
     placed = _ollama_instance()
     service, _registry, _transport = _ollama_fleet_service(
         tmp_path, instances=(placed,)
@@ -2122,9 +2124,7 @@ def test_failed_readiness_stops_only_new_execution_and_publishes_nothing(
     tmp_path: Path,
 ) -> None:
     service, registry, transport = _ollama_fleet_service(tmp_path, ready=False)
-    planned = service.plan_ollama_instance(
-        _ollama_instance(), expected_generation=1
-    )
+    planned = service.plan_ollama_instance(_ollama_instance(), expected_generation=1)
 
     with pytest.raises(FleetConflictError, match="ollama.instance_not_ready"):
         service.apply_ollama_instance(planned.plan_id, expected_generation=1)
@@ -2140,9 +2140,7 @@ def test_failed_readiness_surfaces_cleanup_failure_without_private_detail(
     service, _registry, _transport = _ollama_fleet_service(
         tmp_path, ready=False, stop_fails=True
     )
-    planned = service.plan_ollama_instance(
-        _ollama_instance(), expected_generation=1
-    )
+    planned = service.plan_ollama_instance(_ollama_instance(), expected_generation=1)
 
     with pytest.raises(FleetConflictError, match="^ollama.cleanup_failed$") as error:
         service.apply_ollama_instance(planned.plan_id, expected_generation=1)
@@ -2150,14 +2148,17 @@ def test_failed_readiness_surfaces_cleanup_failure_without_private_detail(
     assert "private cleanup detail" not in str(error.value)
 
 
-def test_four_running_local_instances_block_fifth_before_host_plan(tmp_path: Path) -> None:
+def test_four_running_local_instances_block_fifth_before_host_plan(
+    tmp_path: Path,
+) -> None:
     instances = tuple(
-        replace(_ollama_instance(f"local-{letter}", state="running"), selected_model_refs=("model-a",))
+        replace(
+            _ollama_instance(f"local-{letter}", state="running"),
+            selected_model_refs=("model-a",),
+        )
         for letter in "abcd"
     )
-    service, _registry, transport = _ollama_fleet_service(
-        tmp_path, instances=instances
-    )
+    service, _registry, transport = _ollama_fleet_service(tmp_path, instances=instances)
 
     with pytest.raises(FleetConflictError, match="ollama.local_limit_reached"):
         service.plan_ollama_instance(
@@ -2174,7 +2175,10 @@ def test_third_local_instance_requires_green_sixty_minute_attestation(
     from the_hive.fleet_service import OllamaResourceSnapshotV1
 
     instances = tuple(
-        replace(_ollama_instance(f"local-{letter}", state="running"), selected_model_refs=("model-a",))
+        replace(
+            _ollama_instance(f"local-{letter}", state="running"),
+            selected_model_refs=("model-a",),
+        )
         for letter in "ab"
     )
     denied, _registry, denied_transport = _ollama_fleet_service(
@@ -2212,9 +2216,7 @@ def test_third_local_instance_requires_green_sixty_minute_attestation(
 
 def test_successful_ollama_apply_retry_is_idempotent(tmp_path: Path) -> None:
     service, registry, transport = _ollama_fleet_service(tmp_path)
-    planned = service.plan_ollama_instance(
-        _ollama_instance(), expected_generation=1
-    )
+    planned = service.plan_ollama_instance(_ollama_instance(), expected_generation=1)
 
     first = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
     second = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
@@ -2228,15 +2230,11 @@ def test_ollama_probe_withdraws_lanes_when_runtime_loses_readiness(
     tmp_path: Path,
 ) -> None:
     service, registry, transport = _ollama_fleet_service(tmp_path)
-    planned = service.plan_ollama_instance(
-        _ollama_instance(), expected_generation=1
-    )
+    planned = service.plan_ollama_instance(_ollama_instance(), expected_generation=1)
     service.apply_ollama_instance(planned.plan_id, expected_generation=1)
     transport.ready = False
 
-    status = service.probe_ollama_instance(
-        "local-main", expected_generation=2
-    )
+    status = service.probe_ollama_instance("local-main", expected_generation=2)
 
     assert status.ready is False
     assert service.ollama_hive_lanes() == ()
@@ -2309,9 +2307,7 @@ def test_remote_apply_unknown_never_publishes_lane_and_plan_survives_restart(
     assert operation.state == "queued"
 
     principal = AgentPrincipalV1("worker-west", hosts.document_generation())
-    poll = AgentPollV1(
-        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
-    )
+    poll = AgentPollV1(hosts.document_generation(), 3, "sha256:" + "c" * 64, 0)
     plan_lease = agent_operations.poll(principal, poll)
     plan_result = AgentResultV1(
         "ollama.instance", "plan", {"plan_ref": "remote-plan-one"}
@@ -2511,9 +2507,7 @@ def test_remote_completion_redelivery_recovers_every_owner_phase(
         )
 
     principal = AgentPrincipalV1("worker-west", hosts.document_generation())
-    poll = AgentPollV1(
-        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
-    )
+    poll = AgentPollV1(hosts.document_generation(), 3, "sha256:" + "c" * 64, 0)
 
     def complete_after_interruption(
         service: FleetService, receipt: object
@@ -2610,7 +2604,9 @@ def test_remote_completion_redelivery_recovers_every_owner_phase(
     def crash_after_queue_terminal(*_args, **_kwargs) -> None:
         raise RuntimeError("injected_completion_journal_interruption")
 
-    monkeypatch.setattr(FleetService, "_mark_remote_completed", crash_after_queue_terminal)
+    monkeypatch.setattr(
+        FleetService, "_mark_remote_completed", crash_after_queue_terminal
+    )
     with pytest.raises(RuntimeError, match="injected_completion_journal_interruption"):
         service.accept_agent_result(principal, stop_receipt)
     assert store.get(stop.id).state == "succeeded"
@@ -2640,15 +2636,9 @@ def test_remote_completion_redelivery_recovers_every_owner_phase(
     monkeypatch.setattr(
         FleetService, "_mark_remote_owner_applied", owner_effect_must_not_run
     )
-    monkeypatch.setattr(
-        FleetService, "_accept_remote_apply", owner_effect_must_not_run
-    )
-    monkeypatch.setattr(
-        FleetService, "_accept_remote_probe", owner_effect_must_not_run
-    )
-    monkeypatch.setattr(
-        FleetService, "_accept_remote_stop", owner_effect_must_not_run
-    )
+    monkeypatch.setattr(FleetService, "_accept_remote_apply", owner_effect_must_not_run)
+    monkeypatch.setattr(FleetService, "_accept_remote_probe", owner_effect_must_not_run)
+    monkeypatch.setattr(FleetService, "_accept_remote_stop", owner_effect_must_not_run)
     for receipt in (
         plan_receipt,
         apply_receipt,
@@ -2656,7 +2646,9 @@ def test_remote_completion_redelivery_recovers_every_owner_phase(
         stop_receipt,
         failed_receipt,
     ):
-        assert new_service().accept_agent_result(principal, receipt).state == receipt.state
+        assert (
+            new_service().accept_agent_result(principal, receipt).state == receipt.state
+        )
     assert registry.load() == before_terminal_replays
 
 
@@ -2680,7 +2672,9 @@ def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
         {
-            "ref": "worker-west", "label": "Worker West", "role": "execution",
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
             "capabilities": ["ollama.execute", "resource.probe"],
         },
         AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
@@ -2689,7 +2683,9 @@ def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
     store = AgentOperationStore.for_test(tmp_path / "operations")
     registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
     registry.replace(
-        models=(_ollama_model("model-a", "provider-a"),), instances=(), expected_generation=0
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=(),
+        expected_generation=0,
     )
     transport = OllamaHostTransport(
         registry=registry,
@@ -2702,8 +2698,12 @@ def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
 
     def new_service() -> FleetService:
         return FleetService(
-            paths, build_fleet_private_io(paths), pool_root=tmp_path / "pool",
-            ollama_registry=registry, ollama_transport=transport, agent_operations=store,
+            paths,
+            build_fleet_private_io(paths),
+            pool_root=tmp_path / "pool",
+            ollama_registry=registry,
+            ollama_transport=transport,
+            agent_operations=store,
         )
 
     principal = AgentPrincipalV1("worker-west", hosts.document_generation())
@@ -2726,7 +2726,9 @@ def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
 
     service = new_service()
     instance = replace(
-        _ollama_instance("remote-west"), host_ref="worker-west", selected_model_refs=("model-a",)
+        _ollama_instance("remote-west"),
+        host_ref="worker-west",
+        selected_model_refs=("model-a",),
     )
     plan = crash_after_enqueue(
         service, lambda: service.plan_ollama_instance(instance, expected_generation=1)
@@ -2735,7 +2737,9 @@ def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
     assert plan_lease.operation_id == plan.id
     service = new_service()
     plan_receipt = _ollama_receipt(
-        plan_lease, "succeeded", AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"})
+        plan_lease,
+        "succeeded",
+        AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
     )
     assert service.accept_agent_result(principal, plan_receipt).state == "succeeded"
     assert service.accept_agent_result(principal, plan_receipt).state == "succeeded"
@@ -2758,37 +2762,50 @@ def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
     apply_lease = store.poll(principal, agent_poll)
     service = new_service()
     apply_receipt = _ollama_receipt(
-        apply_lease, "succeeded", AgentResultV1(
+        apply_lease,
+        "succeeded",
+        AgentResultV1(
             "ollama.instance", "apply", {"instance_ref": "remote-west", "generation": 1}
-        )
+        ),
     )
     assert service.accept_agent_result(principal, apply_receipt).state == "succeeded"
     assert store.get(apply.id).state == "succeeded"
 
     probe = crash_after_enqueue(
-        service, lambda: service.probe_ollama_instance("remote-west", expected_generation=2)
+        service,
+        lambda: service.probe_ollama_instance("remote-west", expected_generation=2),
     )
     probe_lease = store.poll(principal, agent_poll)
     service = new_service()
     probe_receipt = _ollama_receipt(
-        probe_lease, "succeeded", AgentResultV1(
-            "ollama.instance", "probe", {
-                "ready": True, "reason_codes": ("resource.ready",), "process_running": True,
-                "cgroup_member": True, "loopback_endpoint_reachable": True,
+        probe_lease,
+        "succeeded",
+        AgentResultV1(
+            "ollama.instance",
+            "probe",
+            {
+                "ready": True,
+                "reason_codes": ("resource.ready",),
+                "process_running": True,
+                "cgroup_member": True,
+                "loopback_endpoint_reachable": True,
                 "available_model_ids": ("provider-a",),
-            }
-        )
+            },
+        ),
     )
     assert service.accept_agent_result(principal, probe_receipt).state == "succeeded"
     assert store.get(probe.id).state == "succeeded"
 
     stop = crash_after_enqueue(
-        service, lambda: service.stop_ollama_instance("remote-west", expected_generation=3)
+        service,
+        lambda: service.stop_ollama_instance("remote-west", expected_generation=3),
     )
     stop_lease = store.poll(principal, agent_poll)
     service = new_service()
     stop_receipt = _ollama_receipt(
-        stop_lease, "succeeded", AgentResultV1("ollama.instance", "stop", {"stopped": True})
+        stop_lease,
+        "succeeded",
+        AgentResultV1("ollama.instance", "stop", {"stopped": True}),
     )
     assert service.accept_agent_result(principal, stop_receipt).state == "succeeded"
     assert store.get(stop.id).state == "succeeded"
@@ -2978,9 +2995,7 @@ def _remote_apply_receipt_before_queue_completion(tmp_path: Path):
         )
 
     principal = AgentPrincipalV1("worker-west", hosts.document_generation())
-    poll = AgentPollV1(
-        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
-    )
+    poll = AgentPollV1(hosts.document_generation(), 3, "sha256:" + "c" * 64, 0)
     service = new_service()
     planned = replace(
         _ollama_instance("remote-west"),
@@ -2989,14 +3004,17 @@ def _remote_apply_receipt_before_queue_completion(tmp_path: Path):
     )
     plan = service.plan_ollama_instance(planned, expected_generation=1)
     plan_lease = store.poll(principal, poll)
-    assert service.accept_agent_result(
-        principal,
-        _ollama_receipt(
-            plan_lease,
-            "succeeded",
-            AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
-        ),
-    ).state == "succeeded"
+    assert (
+        service.accept_agent_result(
+            principal,
+            _ollama_receipt(
+                plan_lease,
+                "succeeded",
+                AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
+            ),
+        ).state
+        == "succeeded"
+    )
     apply = service.apply_ollama_instance(plan.id, expected_generation=1)
     apply_lease = store.poll(principal, poll)
     receipt = _ollama_receipt(
@@ -3008,9 +3026,7 @@ def _remote_apply_receipt_before_queue_completion(tmp_path: Path):
             {"instance_ref": "remote-west", "generation": 1},
         ),
     )
-    running = replace(
-        planned, lifecycle_state="running", readiness_state="unknown"
-    )
+    running = replace(planned, lifecycle_state="running", readiness_state="unknown")
     return service, new_service, store, registry, principal, apply, receipt, running
 
 
@@ -3179,9 +3195,7 @@ def test_completed_remote_apply_receipt_ignores_later_target_instance_drift(
     assert operation["completion"]["phase"] == "queue_completed"
     assert store.get(apply.id).state == "succeeded"
 
-    changed = replace(
-        running, lifecycle_state="failed", readiness_state="not_ready"
-    )
+    changed = replace(running, lifecycle_state="failed", readiness_state="not_ready")
     completed = registry.load()
     drifted = registry.replace(
         models=completed.models,
@@ -3245,9 +3259,7 @@ def test_completed_remote_apply_receipt_replay_is_persistently_read_only(
         running,
     ) = _remote_apply_receipt_before_queue_completion(tmp_path)
     assert service.accept_agent_result(principal, receipt).state == "succeeded"
-    changed = replace(
-        running, lifecycle_state="failed", readiness_state="not_ready"
-    )
+    changed = replace(running, lifecycle_state="failed", readiness_state="not_ready")
     completed = registry.load()
     drifted = registry.replace(
         models=completed.models,
@@ -3261,16 +3273,10 @@ def test_completed_remote_apply_receipt_replay_is_persistently_read_only(
         return status.st_ino, status.st_size, content
 
     remote_saga = (
-        tmp_path
-        / "owner"
-        / "fleet"
-        / "ollama-remote"
-        / "remote-ollama-operations.json"
+        tmp_path / "owner" / "fleet" / "ollama-remote" / "remote-ollama-operations.json"
     )
     queue_operations = tmp_path / "operations" / "agent-operations" / "operations.json"
-    queue_result = (
-        tmp_path / "operations" / "agent-operations" / "results" / apply.id
-    )
+    queue_result = tmp_path / "operations" / "agent-operations" / "results" / apply.id
     before_files = {
         "remote_saga": snapshot(remote_saga),
         "queue_operations": snapshot(queue_operations),

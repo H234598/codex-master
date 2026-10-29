@@ -237,9 +237,7 @@ class UsageEvidenceV2:
     captured_at: datetime | None
     generated_at: datetime | None
     pool_authorities: tuple["PoolAuthorityV2", ...] = ()
-    model_invocability: ModelInvocabilityProjectionV1 = (
-        _UNATTESTED_MODEL_INVOCABILITY
-    )
+    model_invocability: ModelInvocabilityProjectionV1 = _UNATTESTED_MODEL_INVOCABILITY
     generation_id: str | None = None
 
 
@@ -763,9 +761,7 @@ def _binding_v2(payload: bytes) -> _EvidenceBindingV2:
         payload_size_bytes=usage["payload_size_bytes"],
         published_at=_canonical_timestamp(usage["published_at"]),
         release_id=_release_id(usage["release_id"]),
-        source_manifest_sha256=_source_manifest_digest(
-            usage["source_manifest_sha256"]
-        ),
+        source_manifest_sha256=_source_manifest_digest(usage["source_manifest_sha256"]),
         pool_authority_sha256=_hex(value["pool_authority_sha256"]),
         pool_authority_size_bytes=value["pool_authority_size_bytes"],
         source_inputs_sha256=_hex(value["source_inputs_sha256"]),
@@ -914,9 +910,7 @@ def _source_inputs_v2(payload: bytes) -> None:
 
 
 def _invalid_model_invocability() -> ModelInvocabilityProjectionV1:
-    return ModelInvocabilityProjectionV1(
-        "invalid", _MODEL_INVOCABILITY_SOURCE, ()
-    )
+    return ModelInvocabilityProjectionV1("invalid", _MODEL_INVOCABILITY_SOURCE, ())
 
 
 def _model_invocability_v1(
@@ -1039,9 +1033,7 @@ def _model_invocability_v1(
     )
 
 
-def _pool_authority_v2(
-    payload: bytes, *, now: datetime
-) -> _PoolAuthorityProjectionV2:
+def _pool_authority_v2(payload: bytes, *, now: datetime) -> _PoolAuthorityProjectionV2:
     value = _canonical_json(payload, _MAX_POOL_AUTHORITY_BYTES)
     schema_version = value.get("pool_authority_schema_version")
     if schema_version == 2:
@@ -1149,9 +1141,7 @@ def _pool_authority_v2(
                 "long_running_leadership_eligible": raw[
                     "long_running_leadership_eligible"
                 ],
-                "persistent_leadership_eligible": raw[
-                    "persistent_leadership_eligible"
-                ],
+                "persistent_leadership_eligible": raw["persistent_leadership_eligible"],
                 "pool_id": pool_id,
                 "provider": provider,
                 "reasoning_maximum": maximum,
@@ -1166,9 +1156,7 @@ def _pool_authority_v2(
                 allowed_lifecycles=allowed_lifecycles,
                 allowed_model_families=allowed_model_families,
                 hive_available=raw["hive_available"],
-                persistent_leadership_eligible=raw[
-                    "persistent_leadership_eligible"
-                ],
+                persistent_leadership_eligible=raw["persistent_leadership_eligible"],
                 long_running_leadership_eligible=raw[
                     "long_running_leadership_eligible"
                 ],
@@ -1197,8 +1185,7 @@ def _pool_authority_v2(
     )
     model_invocability = (
         _UNATTESTED_MODEL_INVOCABILITY
-        if schema_version == 2
-        or "model_capabilities" not in value
+        if schema_version == 2 or "model_capabilities" not in value
         else _model_invocability_v1(
             value["model_capabilities"], issued_at=issued_at, now=now
         )
@@ -1299,9 +1286,7 @@ def _active_manifest(payload: bytes) -> _ActiveManifest:
         digest=hashlib.sha256(payload).hexdigest(),
         producer_version=_PRODUCER_VERSION,
         release_id=_release_id(value["release_id"]),
-        source_manifest_sha256=_source_manifest_digest(
-            value["source_manifest_sha256"]
-        ),
+        source_manifest_sha256=_source_manifest_digest(value["source_manifest_sha256"]),
     )
 
 
@@ -1430,9 +1415,10 @@ def _pointer_v1(value: dict[str, object]) -> tuple[str, str, str | None, str | N
             "previous_binding_sha256",
         },
     )
-    if type(value["pointer_schema_version"]) is not int or value[
-        "pointer_schema_version"
-    ] != 1:
+    if (
+        type(value["pointer_schema_version"]) is not int
+        or value["pointer_schema_version"] != 1
+    ):
         raise _Invalid()
     generation = _generation_id(value["current_generation_id"])
     digest = _hex(value["current_binding_sha256"])
@@ -1456,16 +1442,12 @@ def _read_attestation_fd(descriptor: int, expected: _Metadata) -> bytes:
     chunks: list[bytes] = []
     total = 0
     while total <= _MAX_ATTESTATION_FILE_BYTES:
-        block = os.read(
-            descriptor, min(65536, _MAX_ATTESTATION_FILE_BYTES + 1 - total)
-        )
+        block = os.read(descriptor, min(65536, _MAX_ATTESTATION_FILE_BYTES + 1 - total))
         if not block:
             break
         chunks.append(block)
         total += len(block)
-    if total > _MAX_ATTESTATION_FILE_BYTES or not _same(
-        os.fstat(descriptor), expected
-    ):
+    if total > _MAX_ATTESTATION_FILE_BYTES or not _same(os.fstat(descriptor), expected):
         raise _Invalid()
     return b"".join(chunks)
 
@@ -1507,8 +1489,14 @@ def _release_tree(
                                     or "/" in name
                                     or "\\" in name
                                     or "\x00" in name
-                                    or (stat.S_ISDIR(child.st_mode) and name == "__pycache__")
-                                    or (stat.S_ISREG(child.st_mode) and name.endswith(".pyc"))
+                                    or (
+                                        stat.S_ISDIR(child.st_mode)
+                                        and name == "__pycache__"
+                                    )
+                                    or (
+                                        stat.S_ISREG(child.st_mode)
+                                        and name.endswith(".pyc")
+                                    )
                                     or not (
                                         stat.S_ISDIR(child.st_mode)
                                         or stat.S_ISREG(child.st_mode)
@@ -1584,11 +1572,11 @@ def _release_tree(
             os.close(descriptor)
 
 
-def _open_release_file(
-    release_fd: int, relative: Path, *, mode: int
-) -> bytes:
-    if not relative.parts or relative.is_absolute() or any(
-        part in {"", ".", ".."} or "\\" in part for part in relative.parts
+def _open_release_file(release_fd: int, relative: Path, *, mode: int) -> bytes:
+    if (
+        not relative.parts
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} or "\\" in part for part in relative.parts)
     ):
         raise _Invalid()
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -1631,11 +1619,9 @@ def _record_digest(value: object, payload: bytes) -> bool:
     except (ValueError, TypeError):
         return False
     expected = hashlib.sha256(payload).digest()
-    return (
-        decoded == expected
-        and encoded
-        == base64.urlsafe_b64encode(expected).decode("ascii").rstrip("=")
-    )
+    return decoded == expected and encoded == base64.urlsafe_b64encode(expected).decode(
+        "ascii"
+    ).rstrip("=")
 
 
 def _verify_record(
@@ -1705,8 +1691,12 @@ def _attest_active_release(
     releases_fd = guard.directory(integration_fd, "releases")
     release_fd = guard.directory(releases_fd, attestation.manifest.release_id)
     initial_entries, initial_rows = _release_tree(release_fd)
-    if hashlib.sha256(b"".join(initial_rows)).hexdigest() != attestation.release_tree_sha256:
+    if (
+        hashlib.sha256(b"".join(initial_rows)).hexdigest()
+        != attestation.release_tree_sha256
+    ):
         raise _Invalid()
+
     def relative(path: Path) -> Path:
         return path.relative_to(attestation.release_dir)
 
@@ -1716,7 +1706,9 @@ def _attest_active_release(
     launcher = _open_release_file(
         release_fd, relative(attestation.launcher_path), mode=0o700
     )
-    record = _open_release_file(release_fd, relative(attestation.record_path), mode=0o600)
+    record = _open_release_file(
+        release_fd, relative(attestation.record_path), mode=0o600
+    )
     wheel = _open_release_file(release_fd, relative(attestation.wheel_path), mode=0o600)
     if (
         hashlib.sha256(entrypoint).hexdigest() != attestation.entrypoint_sha256
@@ -2203,9 +2195,12 @@ def _serialize_payload_v2(value: object) -> bytes:
         for raw_limit in raw_limits:
             if type(raw_limit) is not dict:
                 raise _Invalid()
-            if not {"pool", "window_seconds", "used_percent", "remaining_percent"} <= set(
-                raw_limit
-            ) or set(raw_limit) - {
+            if not {
+                "pool",
+                "window_seconds",
+                "used_percent",
+                "remaining_percent",
+            } <= set(raw_limit) or set(raw_limit) - {
                 "pool",
                 "window_seconds",
                 "used_percent",
@@ -2284,8 +2279,12 @@ def _serialize_payload_v2(value: object) -> bytes:
             evidence_ids.add(identity)
             first_sample_at = _payload_timestamp_text(raw_tracker["first_sample_at"])
             last_sample_at = _payload_timestamp_text(raw_tracker["last_sample_at"])
-            first_sample_time = datetime.fromisoformat(first_sample_at.replace("Z", "+00:00"))
-            last_sample_time = datetime.fromisoformat(last_sample_at.replace("Z", "+00:00"))
+            first_sample_time = datetime.fromisoformat(
+                first_sample_at.replace("Z", "+00:00")
+            )
+            last_sample_time = datetime.fromisoformat(
+                last_sample_at.replace("Z", "+00:00")
+            )
             if (
                 first_sample_time > last_sample_time
                 or (sample_count == 1 and first_sample_time != last_sample_time)
@@ -2337,10 +2336,7 @@ def _serialize_payload_v2(value: object) -> bytes:
                     item["coverage"] in {"complete", "partial"}
                     and sample_age > timedelta(minutes=15)
                 )
-                or (
-                    item["coverage"] == "stale"
-                    and sample_age <= timedelta(minutes=15)
-                )
+                or (item["coverage"] == "stale" and sample_age <= timedelta(minutes=15))
             ):
                 raise _Invalid()
         account_ids.add(account_id)
@@ -2401,7 +2397,10 @@ def _payload_v2(
     for raw_account in raw_accounts:
         if type(raw_account) is not dict:
             raise _Invalid()
-        _exact(raw_account, {"account_id", "freshness", "limits", "status", "tracker_evidence"})
+        _exact(
+            raw_account,
+            {"account_id", "freshness", "limits", "status", "tracker_evidence"},
+        )
         account_id = _payload_token(raw_account["account_id"], 64)
         if account_id in {".", ".."} or _ACCOUNT_RE.fullmatch(account_id) is None:
             raise _Invalid()
@@ -2433,9 +2432,12 @@ def _payload_v2(
         for raw_limit in raw_limits:
             if type(raw_limit) is not dict:
                 raise _Invalid()
-            if not {"pool", "window_seconds", "used_percent", "remaining_percent"} <= set(
-                raw_limit
-            ) or set(raw_limit) - {
+            if not {
+                "pool",
+                "window_seconds",
+                "used_percent",
+                "remaining_percent",
+            } <= set(raw_limit) or set(raw_limit) - {
                 "pool",
                 "window_seconds",
                 "used_percent",
@@ -2728,7 +2730,9 @@ def _read_chain_v2(
         lock_fd = guard.private_lock_directory(_lock_root())
         integration_path = state_home / "codex-usage" / "integration"
         for target in ("producer-install", "current.json"):
-            descriptor = guard.lock(lock_fd, _evidence_lock_name(integration_path / target))
+            descriptor = guard.lock(
+                lock_fd, _evidence_lock_name(integration_path / target)
+            )
             _acquire_shared(descriptor)
             locked.append(descriptor)
         active_bytes = guard.read_file(
@@ -2789,9 +2793,7 @@ def _read_chain_v2(
             repeated_sha256,
             repeated_previous_id,
             repeated_previous_sha256,
-        ) = (
-            _pointer_v1(_canonical_json(repeated_pointer_bytes, _MAX_POINTER_BYTES))
-        )
+        ) = _pointer_v1(_canonical_json(repeated_pointer_bytes, _MAX_POINTER_BYTES))
         repeated_current = _validate_generation_v2(
             guard,
             generations_fd,
@@ -2917,9 +2919,7 @@ def read_usage_evidence_v2(
             authorities,
             model_invocability,
             generation_id,
-        ) = _read_chain_v2(
-            state_home or _default_state_home(), now
-        )
+        ) = _read_chain_v2(state_home or _default_state_home(), now)
         return UsageEvidenceV2(
             accounts,
             status,
@@ -2950,8 +2950,7 @@ def find_model_invocability(
         or evidence.status != "complete"
         or evidence.model_invocability.status != "complete"
         or not all(
-            type(value) is str and value
-            for value in (account_id, model_id, runner_id)
+            type(value) is str and value for value in (account_id, model_id, runner_id)
         )
     ):
         return None

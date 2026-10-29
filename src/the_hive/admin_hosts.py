@@ -35,13 +35,9 @@ _MAX_COLLECTION_ITEMS = 64
 _MAX_PRIVATE_TEXT_BYTES = 4096
 _MAX_NESTING = 6
 _ROLES = frozenset({"control", "execution", "worker"})
-_REACHABILITY_STATES = frozenset(
-    {"reachable", "unreachable", "unknown", "unavailable"}
-)
+_REACHABILITY_STATES = frozenset({"reachable", "unreachable", "unknown", "unavailable"})
 _TRANSPORT_KINDS = frozenset({"ssh", "outbound-pull-mtls"})
-_CAPABILITY_CODES = frozenset(
-    {"codex.execute", "resource.probe", "ollama.execute"}
-)
+_CAPABILITY_CODES = frozenset({"codex.execute", "resource.probe", "ollama.execute"})
 _PROBE_SOURCES = frozenset({"host-agent", "inventory-agent"})
 _HOST_SOURCES = _PROBE_SOURCES | frozenset({"static-agent-binding"})
 _HOST_REF = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z", re.ASCII)
@@ -100,9 +96,7 @@ _AGENT_BINDING_FIELDS = frozenset(
     {"ref", "client_spki_sha256", "lease_epoch", "enabled"}
 )
 _AGENT_EPOCH_FIELDS = frozenset({"ref", "lease_epoch"})
-_STATIC_REGISTRATION_INPUT_FIELDS = frozenset(
-    {"ref", "label", "role", "capabilities"}
-)
+_STATIC_REGISTRATION_INPUT_FIELDS = frozenset({"ref", "label", "role", "capabilities"})
 _TRANSPORT_FIELDS = frozenset({"kind", "binding_ref"})
 _REACHABILITY_FIELDS = frozenset({"state", "latency_ms"})
 _RESOURCE_FIELDS = frozenset({"cpu_threads", "memory_bytes"})
@@ -388,11 +382,7 @@ class HostRegistry:
                 "enabled": binding.enabled,
             }
             existing_registration = next(
-                (
-                    item
-                    for item in registrations
-                    if item["ref"] == binding.host_ref
-                ),
+                (item for item in registrations if item["ref"] == binding.host_ref),
                 None,
             )
             if (
@@ -464,9 +454,7 @@ class HostRegistry:
                 and document_generation != expected_generation
             ):
                 raise HostRegistryError("credential.generation_conflict")
-            existing_registrations = {
-                str(item["ref"]): item for item in registrations
-            }
+            existing_registrations = {str(item["ref"]): item for item in registrations}
             existing_bindings = {str(item["ref"]): item for item in agent_bindings}
             next_registrations = [
                 item
@@ -552,9 +540,7 @@ class HostRegistry:
                 str(item["ref"]) for item in next_bindings
             }
             next_observations = [
-                item
-                for item in observations
-                if item["ref"] in observation_owner_refs
+                item for item in observations if item["ref"] in observation_owner_refs
             ]
             self._write_locked(
                 next_registrations,
@@ -684,7 +670,9 @@ class HostRegistry:
             document_generation,
             epoch_history,
         ):
-            registration = next((item for item in registrations if item["ref"] == ref), None)
+            registration = next(
+                (item for item in registrations if item["ref"] == ref), None
+            )
             has_agent_binding = any(item["ref"] == ref for item in agent_bindings)
             if registration is None or (
                 ref not in ssh_bindings and not has_agent_binding
@@ -700,8 +688,13 @@ class HostRegistry:
             )
             existing = next((item for item in observations if item["ref"] == ref), None)
             if existing is not None:
-                current = _generation(existing["generation"], "control.host_store_unavailable")
-                if generation < current or (generation == current and record["probe_digest"] != existing["probe_digest"]):
+                current = _generation(
+                    existing["generation"], "control.host_store_unavailable"
+                )
+                if generation < current or (
+                    generation == current
+                    and record["probe_digest"] != existing["probe_digest"]
+                ):
                     raise HostRegistryError("credential.generation_conflict")
                 if generation == current:
                     return self._host(existing)
@@ -711,8 +704,12 @@ class HostRegistry:
             observations.append(record)
             observations.sort(key=lambda item: str(item["ref"]))
             self._write_locked(
-                registrations, ssh_bindings, agent_bindings, observations,
-                max(document_generation + 1, generation), epoch_history,
+                registrations,
+                ssh_bindings,
+                agent_bindings,
+                observations,
+                max(document_generation + 1, generation),
+                epoch_history,
             )
             return self._host(record)
 
@@ -878,14 +875,13 @@ class HostRegistry:
             if (
                 ref in observed_refs
                 or ref not in seen
-                or ref not in bindings and ref not in agent_refs
+                or ref not in bindings
+                and ref not in agent_refs
             ):
                 raise HostRegistryError("control.host_store_unavailable")
             if ref in bindings:
                 evidence = {
-                    key: item[key]
-                    for key in _EVIDENCE_FIELDS
-                    if key != "binding_state"
+                    key: item[key] for key in _EVIDENCE_FIELDS if key != "binding_state"
                 }
                 evidence["binding_state"] = bindings[ref]
                 record, normalized_binding = self._probe_record(
@@ -1141,9 +1137,7 @@ class HostRegistry:
             raise HostRegistryError("control.host_store_unavailable")
         validated_history: list[dict[str, object]] = []
         for ref in sorted(epoch_history):
-            epoch = _generation(
-                epoch_history[ref], "control.host_store_unavailable"
-            )
+            epoch = _generation(epoch_history[ref], "control.host_store_unavailable")
             if _host_ref(ref, "control.host_store_unavailable") != ref or epoch == 0:
                 raise HostRegistryError("control.host_store_unavailable")
             validated_history.append({"ref": ref, "lease_epoch": epoch})
@@ -1248,9 +1242,11 @@ def _active_probe_record(
         "source": "host-agent",
     }
     if validate_observation:
-        if metadata.get("source") != "host-agent" or _reachability(
-            metadata["reachability"], error_code
-        ) != record["reachability"]:
+        if (
+            metadata.get("source") != "host-agent"
+            or _reachability(metadata["reachability"], error_code)
+            != record["reachability"]
+        ):
             raise HostRegistryError(error_code)
     # Static registration and private bindings have separate durable owners.
     # This digest intentionally authenticates only the fresh active observation.
@@ -1282,7 +1278,9 @@ def _agent_registration_record(
             "kind": "outbound-pull-mtls",
             "binding_ref": ref,
         },
-        "capabilities": list(_capabilities(value["capabilities"], "control.host_invalid")),
+        "capabilities": list(
+            _capabilities(value["capabilities"], "control.host_invalid")
+        ),
         "reachability": {"state": "unavailable"},
         "resource_evidence": {},
         "generation": _generation(generation, "control.host_invalid"),
@@ -1292,14 +1290,12 @@ def _agent_registration_record(
 
 
 def _registration_from_probe(record: Mapping[str, object]) -> dict[str, object]:
-    return {
-        key: record[key]
-        for key in _REGISTRATION_FIELDS
-        if key in record
-    }
+    return {key: record[key] for key in _REGISTRATION_FIELDS if key in record}
 
 
-def _registration_record(value: Mapping[str, object], error_code: str) -> dict[str, object]:
+def _registration_record(
+    value: Mapping[str, object], error_code: str
+) -> dict[str, object]:
     ref = _host_ref(value["ref"], error_code)
     observed_at = value["observed_at"]
     if observed_at is not None:
@@ -1318,7 +1314,9 @@ def _registration_record(value: Mapping[str, object], error_code: str) -> dict[s
     }
 
 
-def _agent_binding_record(value: Mapping[str, object], error_code: str) -> dict[str, object]:
+def _agent_binding_record(
+    value: Mapping[str, object], error_code: str
+) -> dict[str, object]:
     ref = _host_ref(value["ref"], error_code)
     lease_epoch = _generation(value["lease_epoch"], error_code)
     if lease_epoch == 0 or type(value["enabled"]) is not bool:

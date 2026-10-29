@@ -14,12 +14,20 @@ _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _REPOSITORY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _LANGUAGES = frozenset({"python", "javascript", "typescript"})
 _RUNNERS = frozenset({"pytest", "node_test", "repository_adapter"})
-_COOLDOWNS = frozenset({"deterministic", "integration", "environmental", "external", "mandatory"})
-_RISKS = frozenset({"read_only", "mutating", "credential_boundary", "lifecycle", "release"})
-_KINDS = frozenset({"unit", "boundary", "integration", "regression", "packaging", "external", "gate"})
+_COOLDOWNS = frozenset(
+    {"deterministic", "integration", "environmental", "external", "mandatory"}
+)
+_RISKS = frozenset(
+    {"read_only", "mutating", "credential_boundary", "lifecycle", "release"}
+)
+_KINDS = frozenset(
+    {"unit", "boundary", "integration", "regression", "packaging", "external", "gate"}
+)
 _HERMETICITY = frozenset({"hermetic", "executor_bound", "external"})
 _PHASES = frozenset({"change", "branch", "merge", "release"})
-_RESOURCES = frozenset({"network", "database", "browser", "gpu", "system_bus", "external_api"})
+_RESOURCES = frozenset(
+    {"network", "database", "browser", "gpu", "system_bus", "external_api"}
+)
 _TOP_FIELDS = frozenset(
     {
         "schema_version",
@@ -44,14 +52,21 @@ def _fail(reason: str) -> None:
     raise TestIndexError(reason)
 
 
-def _exact_fields(value: object, expected: frozenset[str], *, reason: str = "test.index_invalid") -> Mapping[str, object]:
+def _exact_fields(
+    value: object, expected: frozenset[str], *, reason: str = "test.index_invalid"
+) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or set(value) != expected:
         _fail(reason)
     return value
 
 
 def _text(value: object, *, maximum: int = 512) -> str:
-    if not isinstance(value, str) or not value or len(value) > maximum or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or any(ord(char) < 32 for char in value)
+    ):
         _fail("test.index_invalid")
     return value
 
@@ -78,7 +93,12 @@ def _digest(value: object, *, assertion: bool = False) -> str:
 def _path(value: object) -> str:
     text = _text(value, maximum=512)
     path = PurePosixPath(text)
-    if path.is_absolute() or text != path.as_posix() or ".." in path.parts or "." in path.parts:
+    if (
+        path.is_absolute()
+        or text != path.as_posix()
+        or ".." in path.parts
+        or "." in path.parts
+    ):
         _fail("test.index_invalid")
     return text
 
@@ -242,7 +262,9 @@ class TestIndexV1:
         if raw["schema_version"] != 1 or isinstance(raw["schema_version"], bool):
             _fail("test.index_invalid")
         repository_id = raw["repository_id"]
-        if not isinstance(repository_id, str) or not _REPOSITORY_RE.fullmatch(repository_id):
+        if not isinstance(repository_id, str) or not _REPOSITORY_RE.fullmatch(
+            repository_id
+        ):
             _fail("test.index_invalid")
         if not isinstance(raw["functions"], (list, tuple)) or not raw["functions"]:
             _fail("test.index_invalid")
@@ -250,7 +272,9 @@ class TestIndexV1:
             _fail("test.index_invalid")
         if not isinstance(raw["gates"], (list, tuple)):
             _fail("test.index_invalid")
-        functions = tuple(FunctionEntryV1.from_mapping(item) for item in raw["functions"])
+        functions = tuple(
+            FunctionEntryV1.from_mapping(item) for item in raw["functions"]
+        )
         tests = tuple(TestEntryV1.from_mapping(item) for item in raw["tests"])
         gates = tuple(GateEntryV1.from_mapping(item) for item in raw["gates"])
         cls._validate_relations(functions, tests, gates)
@@ -276,7 +300,9 @@ class TestIndexV1:
         function_ids = tuple(item.function_id for item in functions)
         test_ids = tuple(item.test_id for item in tests)
         gate_ids = tuple(item.gate_id for item in gates)
-        if list(function_ids) != sorted(set(function_ids)) or list(test_ids) != sorted(set(test_ids)):
+        if list(function_ids) != sorted(set(function_ids)) or list(test_ids) != sorted(
+            set(test_ids)
+        ):
             _fail("test.index_invalid")
         if list(gate_ids) != sorted(set(gate_ids)):
             _fail("test.index_invalid")
@@ -313,7 +339,13 @@ class TestIndexV1:
 
     def canonical_bytes(self) -> bytes:
         return (
-            json.dumps(self.public(), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
+            json.dumps(
+                self.public(),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             + "\n"
         ).encode("utf-8")
 
@@ -358,7 +390,10 @@ def combine_test_indexes(*indexes: TestIndexV1) -> TestIndexV1:
                 [f"{item.function_id}:{item.source_digest}" for item in functions]
             ),
             "test_root_digest": digest_rows(
-                [f"{item.test_id}:{item.test_digest}:{item.assertion_digest}" for item in tests]
+                [
+                    f"{item.test_id}:{item.test_digest}:{item.assertion_digest}"
+                    for item in tests
+                ]
             ),
             "dependency_policy_digest": digest_rows(
                 sorted(index.dependency_policy_digest for index in indexes)

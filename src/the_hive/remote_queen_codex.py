@@ -12,12 +12,8 @@ from the_hive.remote_queen_bootstrap import ManifestGenerationV1
 from the_hive.remote_queen_bootstrap import RemoteQueenBootstrapError
 
 
-OPENAI_CODEX_CLI_DOCUMENTATION_URL = (
-    "https://developers.openai.com/codex/cli/"
-)
-OPENAI_CODEX_STANDALONE_INSTALLER_URL = (
-    "https://chatgpt.com/codex/install.sh"
-)
+OPENAI_CODEX_CLI_DOCUMENTATION_URL = "https://developers.openai.com/codex/cli/"
+OPENAI_CODEX_STANDALONE_INSTALLER_URL = "https://chatgpt.com/codex/install.sh"
 
 
 class CodexInstallStateKindV1(str, Enum):
@@ -237,9 +233,11 @@ def _validate_manifest(
         raise _inconsistent()
     _require_version(manifest.expected_version)
     _require_digest(manifest.expected_binary_sha256)
-    if type(manifest.expected_owner_uid) is not int or isinstance(
-        manifest.expected_owner_uid, bool
-    ) or manifest.expected_owner_uid < 0:
+    if (
+        type(manifest.expected_owner_uid) is not int
+        or isinstance(manifest.expected_owner_uid, bool)
+        or manifest.expected_owner_uid < 0
+    ):
         raise _inconsistent()
     install_path = _require_absolute_path(manifest.install_path)
     config_path = _require_absolute_path(manifest.config_path)
@@ -260,7 +258,10 @@ def _validate_manifest(
         r"sha256:[0-9a-f]{64}", manifest.manifest_digest
     ):
         raise _inconsistent()
-    if verify_digest and _digest(_manifest_payload(manifest)) != manifest.manifest_digest:
+    if (
+        verify_digest
+        and _digest(_manifest_payload(manifest)) != manifest.manifest_digest
+    ):
         raise _inconsistent()
 
 
@@ -452,13 +453,9 @@ class CodexRollbackResultV1:
 
 
 class RemoteQueenCodexOperations(Protocol):
-    def inspect(
-        self, manifest: RemoteQueenCodexManifestV1
-    ) -> CodexInstallFactV1: ...
+    def inspect(self, manifest: RemoteQueenCodexManifestV1) -> CodexInstallFactV1: ...
 
-    def install_attested(
-        self, plan: RemoteQueenCodexPlanV1
-    ) -> CodexApplyJournalV1: ...
+    def install_attested(self, plan: RemoteQueenCodexPlanV1) -> CodexApplyJournalV1: ...
 
     def rollback_installation(
         self,
@@ -648,7 +645,10 @@ def plan_remote_queen_codex(
         action = CodexPlanActionV1.INSTALL
     elif before.owner_uid != manifest.expected_owner_uid:
         raise _foreign()
-    elif before.install_path != manifest.install_path or before.config_path != manifest.config_path:
+    elif (
+        before.install_path != manifest.install_path
+        or before.config_path != manifest.config_path
+    ):
         raise _foreign()
     elif before.source_url != manifest.source.installer_url:
         raise _attestation()
@@ -790,7 +790,10 @@ def apply_remote_queen_codex(
     request: CodexApplyRequestV1,
     operations: RemoteQueenCodexOperations,
 ) -> CodexApplyResultV1:
-    if type(plan) is not RemoteQueenCodexPlanV1 or type(request) is not CodexApplyRequestV1:
+    if (
+        type(plan) is not RemoteQueenCodexPlanV1
+        or type(request) is not CodexApplyRequestV1
+    ):
         raise _inconsistent()
     _validate_plan(plan, verify_digest=True)
     _validate_apply_request(request)
@@ -844,7 +847,10 @@ def verify_remote_queen_codex(
     request: CodexVerifyRequestV1,
     operations: RemoteQueenCodexOperations,
 ) -> CodexVerifyResultV1:
-    if type(manifest) is not RemoteQueenCodexManifestV1 or type(request) is not CodexVerifyRequestV1:
+    if (
+        type(manifest) is not RemoteQueenCodexManifestV1
+        or type(request) is not CodexVerifyRequestV1
+    ):
         raise _inconsistent()
     _validate_manifest(manifest, verify_digest=True)
     _validate_verify_request(request)

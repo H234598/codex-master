@@ -29,7 +29,9 @@ class FakeService:
         return self.snapshot
 
     def account_gate(self, agent: str, **_kwargs: object) -> AccountGateDecision:
-        return AccountGateDecision(agent != "d1", "limit_active" if agent == "d1" else "ready", "project", 3)
+        return AccountGateDecision(
+            agent != "d1", "limit_active" if agent == "d1" else "ready", "project", 3
+        )
 
 
 def resource_operator_status() -> ResourceOperatorStatus:
@@ -50,7 +52,9 @@ def resource_operator_status() -> ResourceOperatorStatus:
     )
 
 
-def test_applet_status_v4_has_exact_resource_projection_and_one_generation(monkeypatch) -> None:
+def test_applet_status_v4_has_exact_resource_projection_and_one_generation(
+    monkeypatch,
+) -> None:
     base = {
         "schema_version": 2,
         "mode": "read_only",
@@ -102,7 +106,9 @@ def test_applet_status_v1_to_v3_remain_byte_contract_compatible(monkeypatch) -> 
         "identity_state": "stopped",
         "lease_state": "unclaimed",
     }
-    monkeypatch.setattr(server, "applet_agent_observation", lambda *_args, **_kwargs: dict(row))
+    monkeypatch.setattr(
+        server, "applet_agent_observation", lambda *_args, **_kwargs: dict(row)
+    )
     monkeypatch.setattr(
         server,
         "managed_applet_inventory",
@@ -142,7 +148,10 @@ def test_applet_status_v1_to_v3_remain_byte_contract_compatible(monkeypatch) -> 
         server.applet_status([], schema_version=3),
     ]
 
-    assert [json.dumps(payload, sort_keys=True, separators=(",", ":")) for payload in payloads] == [
+    assert [
+        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        for payload in payloads
+    ] == [
         (
             '{"activity_state":"sleeping","agents":[{"activity_state":"sleeping",'
             '"agent":"a1","auth_state":"ready","backend_state":"ok","control_state":"ready",'
@@ -164,22 +173,53 @@ def test_applet_status_v1_to_v3_remain_byte_contract_compatible(monkeypatch) -> 
     ]
 
 
-def test_applet_snapshot_v3_is_series_bounded_and_filters_limited_targets(monkeypatch, tmp_path: Path) -> None:
+def test_applet_snapshot_v3_is_series_bounded_and_filters_limited_targets(
+    monkeypatch, tmp_path: Path
+) -> None:
     snapshot = FleetSnapshot(
-        1, 3,
-        (FleetAccount("project", "Project", Provider.GEMINI_API, AuthKind.API_KEY,
-                      SecretState.CONFIGURED, LimitState.READY, True, None,
-                      "2026-08-05T12:00:00+00:00", None),),
-        tuple(FleetSeries(prefix, prefix.upper(), 1, RunnerKind.GEMINI_CLI,
-                          Provider.GEMINI_API, "model", "project", True)
-              for prefix in ("d", "e", "f")),
+        1,
+        3,
+        (
+            FleetAccount(
+                "project",
+                "Project",
+                Provider.GEMINI_API,
+                AuthKind.API_KEY,
+                SecretState.CONFIGURED,
+                LimitState.READY,
+                True,
+                None,
+                "2026-08-05T12:00:00+00:00",
+                None,
+            ),
+        ),
+        tuple(
+            FleetSeries(
+                prefix,
+                prefix.upper(),
+                1,
+                RunnerKind.GEMINI_CLI,
+                Provider.GEMINI_API,
+                "model",
+                "project",
+                True,
+            )
+            for prefix in ("d", "e", "f")
+        ),
     )
     inventory = build_inventory(snapshot, tmp_path)
     monkeypatch.setattr(server, "published_agent_inventory", lambda: (inventory, True))
-    monkeypatch.setattr(server, "_readonly_fleet_service", lambda: FakeService(snapshot))
-    monkeypatch.setattr(server, "status_agent", lambda agent, **_kwargs: {
-        "running": False, "limit_state": {"limited": agent == "d1"},
-    })
+    monkeypatch.setattr(
+        server, "_readonly_fleet_service", lambda: FakeService(snapshot)
+    )
+    monkeypatch.setattr(
+        server,
+        "status_agent",
+        lambda agent, **_kwargs: {
+            "running": False,
+            "limit_state": {"limited": agent == "d1"},
+        },
+    )
 
     payload = server.applet_status(["d1", "e1", "f1"], schema_version=3)
 
@@ -200,13 +240,28 @@ def test_applet_snapshot_v3_is_series_bounded_and_filters_limited_targets(monkey
     }
 
 
-def test_applet_snapshot_separates_legacy_native_agents(monkeypatch, tmp_path: Path) -> None:
+def test_applet_snapshot_separates_legacy_native_agents(
+    monkeypatch, tmp_path: Path
+) -> None:
     descriptor = AgentDescriptor(
-        "a1", "a", 1, "Native A", RunnerKind.CODEX_CLI, Provider.OPENAI_CHATGPT,
-        "primary", "legacy", tmp_path / "a1", "codex-a1", True,
+        "a1",
+        "a",
+        1,
+        "Native A",
+        RunnerKind.CODEX_CLI,
+        Provider.OPENAI_CHATGPT,
+        "primary",
+        "legacy",
+        tmp_path / "a1",
+        "codex-a1",
+        True,
     )
     inventory = InventorySnapshot(
-        ("a1",), {"a1": descriptor}, {"a-series": ("a1",)}, {"a1": 0}, ("a",),
+        ("a1",),
+        {"a1": descriptor},
+        {"a-series": ("a1",)},
+        {"a1": 0},
+        ("a",),
     )
     monkeypatch.setattr(server, "published_agent_inventory", lambda: (inventory, False))
     monkeypatch.setattr(
@@ -214,26 +269,49 @@ def test_applet_snapshot_separates_legacy_native_agents(monkeypatch, tmp_path: P
         "_readonly_fleet_service",
         lambda: (_ for _ in ()).throw(server.AgentError("fleet_registry_unavailable")),
     )
-    monkeypatch.setattr(server, "status_agent", lambda agent, **_kwargs: {
-        "running": False, "limit_state": {"state": "ready"},
-    })
+    monkeypatch.setattr(
+        server,
+        "status_agent",
+        lambda agent, **_kwargs: {
+            "running": False,
+            "limit_state": {"state": "ready"},
+        },
+    )
 
     payload = server.applet_status(["a1"], schema_version=3)
 
     assert payload["series"] == []
-    assert payload["native_agents"] == [{
-        "id": "a1", "label": "Native A", "running": False, "limit_state": "ready",
-    }]
+    assert payload["native_agents"] == [
+        {
+            "id": "a1",
+            "label": "Native A",
+            "running": False,
+            "limit_state": "ready",
+        }
+    ]
     assert payload["dispatch_targets"] == ["a1"]
 
 
 def test_applet_snapshot_exposes_degraded_sources(monkeypatch, tmp_path: Path) -> None:
     descriptor = AgentDescriptor(
-        "a1", "a", 1, "Native A", RunnerKind.CODEX_CLI, Provider.OPENAI_CHATGPT,
-        "primary", "legacy", tmp_path / "a1", "codex-a1", True,
+        "a1",
+        "a",
+        1,
+        "Native A",
+        RunnerKind.CODEX_CLI,
+        Provider.OPENAI_CHATGPT,
+        "primary",
+        "legacy",
+        tmp_path / "a1",
+        "codex-a1",
+        True,
     )
     inventory = InventorySnapshot(
-        ("a1",), {"a1": descriptor}, {"a-series": ("a1",)}, {"a1": 0}, ("a",),
+        ("a1",),
+        {"a1": descriptor},
+        {"a-series": ("a1",)},
+        {"a1": 0},
+        ("a",),
     )
     monkeypatch.setattr(server, "published_agent_inventory", lambda: (inventory, False))
     monkeypatch.setattr(
@@ -246,9 +324,14 @@ def test_applet_snapshot_exposes_degraded_sources(monkeypatch, tmp_path: Path) -
         "create_fleet_snapshot",
         lambda **_: (_ for _ in ()).throw(OSError("proc unavailable")),
     )
-    monkeypatch.setattr(server, "status_agent", lambda agent, **_kwargs: {
-        "running": False, "limit_state": {"state": "ready"},
-    })
+    monkeypatch.setattr(
+        server,
+        "status_agent",
+        lambda agent, **_kwargs: {
+            "running": False,
+            "limit_state": {"state": "ready"},
+        },
+    )
 
     payload = server.applet_status([], schema_version=3)
 
@@ -256,26 +339,60 @@ def test_applet_snapshot_exposes_degraded_sources(monkeypatch, tmp_path: Path) -
     assert payload["watchdog_snapshot_degraded"] is True
 
 
-def test_applet_snapshot_chooses_earliest_valid_reset_instant(monkeypatch, tmp_path: Path) -> None:
+def test_applet_snapshot_chooses_earliest_valid_reset_instant(
+    monkeypatch, tmp_path: Path
+) -> None:
     snapshot = FleetSnapshot(
-        1, 3,
-        (FleetAccount("project", "Project", Provider.GEMINI_API, AuthKind.API_KEY,
-                      SecretState.CONFIGURED, LimitState.READY, True, None,
-                      "2026-08-05T12:00:00+00:00", None),),
-        (FleetSeries("d", "D", 2, RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-                     "model", "project", True),),
+        1,
+        3,
+        (
+            FleetAccount(
+                "project",
+                "Project",
+                Provider.GEMINI_API,
+                AuthKind.API_KEY,
+                SecretState.CONFIGURED,
+                LimitState.READY,
+                True,
+                None,
+                "2026-08-05T12:00:00+00:00",
+                None,
+            ),
+        ),
+        (
+            FleetSeries(
+                "d",
+                "D",
+                2,
+                RunnerKind.GEMINI_CLI,
+                Provider.GEMINI_API,
+                "model",
+                "project",
+                True,
+            ),
+        ),
     )
     inventory = build_inventory(snapshot, tmp_path)
     monkeypatch.setattr(server, "published_agent_inventory", lambda: (inventory, True))
-    monkeypatch.setattr(server, "_readonly_fleet_service", lambda: FakeService(snapshot))
+    monkeypatch.setattr(
+        server, "_readonly_fleet_service", lambda: FakeService(snapshot)
+    )
     resets = {
         "d1": "2026-08-05T12:00:00+02:00",
         "d2": "2026-08-05T09:30:00Z",
     }
-    monkeypatch.setattr(server, "status_agent", lambda agent, **_kwargs: {
-        "running": False,
-        "limit_state": {"state": "limited", "limited": True, "blocked_until_utc": resets[agent]},
-    })
+    monkeypatch.setattr(
+        server,
+        "status_agent",
+        lambda agent, **_kwargs: {
+            "running": False,
+            "limit_state": {
+                "state": "limited",
+                "limited": True,
+                "blocked_until_utc": resets[agent],
+            },
+        },
+    )
 
     payload = server.applet_status(["d1", "d2"], schema_version=3)
 

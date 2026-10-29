@@ -34,7 +34,7 @@ PROBE_TIMEOUT_SECONDS = 2.0
 MAX_TAG_RESPONSE_BYTES = 64 * 1024
 _MAX_CGROUP_BYTES = 4096
 _MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
-_EXEC_HELPER_SOURCE = r'''
+_EXEC_HELPER_SOURCE = r"""
 import fcntl, hashlib, json, os, stat, sys
 MAX_BYTES = 512 * 1024 * 1024
 PATH_KEYS = {"path", "device", "inode", "mode", "owner_uid", "owner_gid", "link_count", "size", "mtime_ns", "ctime_ns", "sha256", "ancestors"}
@@ -184,7 +184,7 @@ try:
     os.execve(pinned_fd, (executable["path"], "serve"), {"OLLAMA_HOST": "127.0.0.1:" + str(port), "OLLAMA_MODELS": "/proc/self/fd/" + str(models_fd)})
 except BaseException:
     os._exit(125)
-'''.strip()
+""".strip()
 _UNIT_NAME = re.compile(r"^codex-master-ollama-[a-f0-9]{32}\.scope$")
 _CPU_PROPERTY = re.compile(
     r"^--property=AllowedCPUs=(?:0|[1-9][0-9]*)(?:-(?:[1-9][0-9]*))?"
@@ -210,10 +210,7 @@ _RUNNING_RECORDS: dict[
 _EXECUTABLE_IDENTITY_CACHE: dict[tuple[int, int, int, int, str], None] = {}
 _EXECUTABLE_IDENTITY_CACHE_MAX = 128
 _REQUIRED_EXECUTABLE_SEALS = (
-    fcntl.F_SEAL_SEAL
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_WRITE
+    fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
 )
 
 
@@ -271,7 +268,9 @@ class OllamaHostSnapshot:
             or type(self.effective_gid) is not int
             or self.effective_gid < 0
             or not isinstance(self.supplementary_gids, tuple)
-            or any(type(group) is not int or group < 0 for group in self.supplementary_gids)
+            or any(
+                type(group) is not int or group < 0 for group in self.supplementary_gids
+            )
             or tuple(sorted(set(self.supplementary_gids))) != self.supplementary_gids
         ):
             _fail("resource.host_probe_invalid")
@@ -348,7 +347,10 @@ class OllamaLocalPlan:
             or not isinstance(self.selected_provider_model_ids, tuple)
             or len(self.selected_provider_model_ids)
             != len(self.instance.selected_model_refs)
-            or any(not isinstance(model_id, str) or not model_id for model_id in self.selected_provider_model_ids)
+            or any(
+                not isinstance(model_id, str) or not model_id
+                for model_id in self.selected_provider_model_ids
+            )
         ):
             _fail("provider.plan_invalid")
 
@@ -532,7 +534,9 @@ class OllamaRuntime(Protocol):
         max_bytes: int,
     ) -> set[str] | None: ...
 
-    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> bool: ...
+    def cleanup_scope(
+        self, request: OllamaStartRequest, process: OllamaProcess
+    ) -> bool: ...
 
     def stop_scope(self, request: OllamaStopRequest) -> None: ...
 
@@ -698,7 +702,11 @@ class SystemOllamaRuntime:
                 timeout=timeout,
                 check=False,
             )
-            if result.returncode != 0 or result.stderr or len(result.stdout) > _MAX_CGROUP_BYTES:
+            if (
+                result.returncode != 0
+                or result.stderr
+                or len(result.stdout) > _MAX_CGROUP_BYTES
+            ):
                 return None
             lines = result.stdout.decode("ascii").splitlines()
             if len(lines) != 1 or any("=" not in line for line in lines):
@@ -718,7 +726,12 @@ class SystemOllamaRuntime:
             return None
 
     def listener_owned_by(self, pid: int, port: int) -> bool:
-        if type(pid) is not int or pid < 1 or type(port) is not int or not 1 <= port <= 65535:
+        if (
+            type(pid) is not int
+            or pid < 1
+            or type(port) is not int
+            or not 1 <= port <= 65535
+        ):
             return False
         try:
             listener_inodes = _loopback_listener_inodes(port)
@@ -818,7 +831,10 @@ class SystemOllamaRuntime:
             try:
                 inodes = _connected_server_inodes(server_port, client_port)
                 if inodes:
-                    if self._scope_observation(unit_name, deadline=deadline) != expected:
+                    if (
+                        self._scope_observation(unit_name, deadline=deadline)
+                        != expected
+                    ):
                         return False
                     if _pid_owns_socket_inodes(pid, inodes):
                         current_start_ticks = _process_start_ticks(pid)
@@ -833,7 +849,9 @@ class SystemOllamaRuntime:
                 return False
             time.sleep(min(0.005, remaining))
 
-    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> bool:
+    def cleanup_scope(
+        self, request: OllamaStartRequest, process: OllamaProcess
+    ) -> bool:
         if not _recorded_start_request(request):
             return False
         try:
@@ -955,11 +973,8 @@ def start_local_instance(
     unit_name: str | None = None,
     port: int | None = None,
 ) -> RunningOllamaInstance:
-    if (
-        not isinstance(plan, OllamaLocalPlan)
-        or not _consume_weak(
-            _PLAN_RECORDS, plan._provenance, plan, _plan_state(plan)
-        )
+    if not isinstance(plan, OllamaLocalPlan) or not _consume_weak(
+        _PLAN_RECORDS, plan._provenance, plan, _plan_state(plan)
     ):
         _fail("provider.plan_invalid")
     _revalidate_path(plan.executable, plan.host, kind="executable")
@@ -1016,9 +1031,7 @@ def start_local_instance(
             _provenance=provenance,
             _seal=_RUNNING_SEAL,
         )
-        _register_weak(
-            _RUNNING_RECORDS, provenance, running, _running_state(running)
-        )
+        _register_weak(_RUNNING_RECORDS, provenance, running, _running_state(running))
         return running
     except BaseException as error:
         cleanup_proven = False
@@ -1311,11 +1324,7 @@ def _canonical_path(value: str) -> Path:
         path = Path(value)
     except (TypeError, ValueError):
         _fail("resource.target_path_invalid")
-    if (
-        not path.is_absolute()
-        or path == Path("/")
-        or str(path) != value
-    ):
+    if not path.is_absolute() or path == Path("/") or str(path) != value:
         _fail("resource.target_path_invalid")
     return path
 
@@ -1331,9 +1340,17 @@ def _valid_systemd_properties(value: object) -> bool:
             and weight[0] == "CPUWeight"
             and _CPU_PROPERTY.fullmatch(f"--property=AllowedCPUs={allowed[1]}")
             is not None
-            and (quota_match := _QUOTA_PROPERTY.fullmatch(f"--property=CPUQuota={quota[1]}"))
+            and (
+                quota_match := _QUOTA_PROPERTY.fullmatch(
+                    f"--property=CPUQuota={quota[1]}"
+                )
+            )
             is not None
-            and (weight_match := _WEIGHT_PROPERTY.fullmatch(f"--property=CPUWeight={weight[1]}"))
+            and (
+                weight_match := _WEIGHT_PROPERTY.fullmatch(
+                    f"--property=CPUWeight={weight[1]}"
+                )
+            )
             is not None
             and int(quota_match.group(1)) <= 10000
             and int(weight_match.group(1)) <= 10000
@@ -1420,17 +1437,17 @@ def _path_evidence_document(evidence: OllamaPathEvidence) -> dict[str, object]:
 
 
 def _recorded_running(instance: object) -> bool:
-    if not isinstance(instance, RunningOllamaInstance) or instance._seal is not _RUNNING_SEAL:
+    if (
+        not isinstance(instance, RunningOllamaInstance)
+        or instance._seal is not _RUNNING_SEAL
+    ):
         return False
     with _RECORD_LOCK:
-        return (
-            instance._provenance not in _RUNNING_CLAIMS
-            and _matches_weak(
-                _RUNNING_RECORDS,
-                instance._provenance,
-                instance,
-                _running_state(instance),
-            )
+        return instance._provenance not in _RUNNING_CLAIMS and _matches_weak(
+            _RUNNING_RECORDS,
+            instance._provenance,
+            instance,
+            _running_state(instance),
         )
 
 
@@ -1527,26 +1544,24 @@ def _running_state(instance: RunningOllamaInstance) -> tuple[object, ...]:
 
 
 def _claim_running(instance: object) -> bool:
-    if not isinstance(instance, RunningOllamaInstance) or instance._seal is not _RUNNING_SEAL:
+    if (
+        not isinstance(instance, RunningOllamaInstance)
+        or instance._seal is not _RUNNING_SEAL
+    ):
         return False
     with _RECORD_LOCK:
-        if (
-            instance._provenance in _RUNNING_CLAIMS
-            or not _matches_weak(
-                _RUNNING_RECORDS,
-                instance._provenance,
-                instance,
-                _running_state(instance),
-            )
+        if instance._provenance in _RUNNING_CLAIMS or not _matches_weak(
+            _RUNNING_RECORDS,
+            instance._provenance,
+            instance,
+            _running_state(instance),
         ):
             return False
         _RUNNING_CLAIMS.add(instance._provenance)
         return True
 
 
-def _finish_running_claim(
-    instance: RunningOllamaInstance, *, stopped: bool
-) -> None:
+def _finish_running_claim(instance: RunningOllamaInstance, *, stopped: bool) -> None:
     with _RECORD_LOCK:
         _RUNNING_CLAIMS.discard(instance._provenance)
         if stopped:
@@ -1608,7 +1623,9 @@ def _stop_request_state(request: OllamaStopRequest) -> tuple[object, ...]:
     )
 
 
-def _inspect_path(value: str, *, host: OllamaHostSnapshot, kind: str) -> OllamaPathEvidence:
+def _inspect_path(
+    value: str, *, host: OllamaHostSnapshot, kind: str
+) -> OllamaPathEvidence:
     descriptor = -1
     try:
         descriptor, evidence = _open_validated_path(value, host=host, kind=kind)
@@ -1641,14 +1658,14 @@ def _open_validated_path(
                 and (metadata.st_uid == 0 or metadata.st_nlink == 1)
                 and 0 < metadata.st_size <= _MAX_EXECUTABLE_BYTES
             )
-            digest = _digest_descriptor(descriptor, expected=metadata) if valid else None
+            digest = (
+                _digest_descriptor(descriptor, expected=metadata) if valid else None
+            )
         else:
             private_user_directory = (
                 metadata.st_uid == host.effective_uid and mode == 0o700
             )
-            administrative_directory = (
-                metadata.st_uid == 0 and not bool(mode & 0o022)
-            )
+            administrative_directory = metadata.st_uid == 0 and not bool(mode & 0o022)
             valid = (
                 stat.S_ISDIR(metadata.st_mode)
                 and trusted_owner
@@ -1746,7 +1763,7 @@ def _effective_access(
     mode = stat.S_IMODE(metadata.st_mode)
     required = (0o4 if read else 0) | (0o1 if execute else 0)
     if host.effective_uid == 0:
-        return (not execute or bool(mode & 0o111))
+        return not execute or bool(mode & 0o111)
     if metadata.st_uid == host.effective_uid:
         granted = (mode >> 6) & 0o7
     elif metadata.st_gid in {host.effective_gid, *host.supplementary_gids}:
@@ -1756,9 +1773,7 @@ def _effective_access(
     return granted & required == required
 
 
-def _digest_descriptor(
-    descriptor: int, *, expected: os.stat_result
-) -> str:
+def _digest_descriptor(descriptor: int, *, expected: os.stat_result) -> str:
     before = os.fstat(descriptor)
     if _stable_file_identity(before) != _stable_file_identity(expected):
         _fail("resource.target_path_invalid")
@@ -1773,9 +1788,8 @@ def _digest_descriptor(
             _fail("resource.target_path_invalid")
         digest.update(chunk)
     after = os.fstat(descriptor)
-    if (
-        total != before.st_size
-        or _stable_file_identity(after) != _stable_file_identity(before)
+    if total != before.st_size or _stable_file_identity(after) != _stable_file_identity(
+        before
     ):
         _fail("resource.target_path_invalid")
     os.lseek(descriptor, 0, os.SEEK_SET)
@@ -1850,15 +1864,12 @@ def _exec_pinned(
     raise AssertionError("unreachable")
 
 
-def _copy_executable_to_memfd(
-    source_fd: int, *, expected: OllamaPathEvidence
-) -> int:
+def _copy_executable_to_memfd(source_fd: int, *, expected: OllamaPathEvidence) -> int:
     pinned_fd = -1
     try:
         before = os.fstat(source_fd)
         if (
-            _stable_file_identity(before)
-            != _evidence_file_identity(expected)
+            _stable_file_identity(before) != _evidence_file_identity(expected)
             or expected.sha256 is None
         ):
             _fail("resource.target_path_changed")
@@ -1997,7 +2008,9 @@ def _read_http_response(
             length = headers.get("content-length")
             if length is not None and length.isdigit() and body_size >= int(length):
                 break
-            if headers.get("transfer-encoding") == "chunked" and raw.endswith(b"0\r\n\r\n"):
+            if headers.get("transfer-encoding") == "chunked" and raw.endswith(
+                b"0\r\n\r\n"
+            ):
                 break
     if len(raw) > maximum:
         return None
@@ -2303,7 +2316,12 @@ def _path_evidence_from_document(value: object) -> OllamaPathEvidence:
     if (
         not isinstance(path, str)
         or not path.startswith("/")
-        or (sha256 is not None and (not isinstance(sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", sha256)))
+        or (
+            sha256 is not None
+            and (
+                not isinstance(sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", sha256)
+            )
+        )
     ):
         _fail("provider.operation_not_allowed")
     return OllamaPathEvidence(
@@ -2322,7 +2340,9 @@ def _path_evidence_from_document(value: object) -> OllamaPathEvidence:
     )
 
 
-def _document_int(value: object, *, minimum: int = 0, maximum: int = (1 << 63) - 1) -> int:
+def _document_int(
+    value: object, *, minimum: int = 0, maximum: int = (1 << 63) - 1
+) -> int:
     if type(value) is not int or not minimum <= value <= maximum:
         _fail("provider.operation_not_allowed")
     return value

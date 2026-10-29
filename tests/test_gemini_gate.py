@@ -50,7 +50,9 @@ def _series(prefix: str, account_id: str, model: str) -> FleetSeries:
     )
 
 
-def _service(tmp_path: Path, accounts: tuple[FleetAccount, ...], series: tuple[FleetSeries, ...]):
+def _service(
+    tmp_path: Path, accounts: tuple[FleetAccount, ...], series: tuple[FleetSeries, ...]
+):
     from the_hive.fleet_service import FleetPaths, FleetService
     from the_hive.server import build_fleet_private_io
 
@@ -60,11 +62,15 @@ def _service(tmp_path: Path, accounts: tuple[FleetAccount, ...], series: tuple[F
         replace(build_fleet_private_io(paths), utc_now=lambda: NOW),
         pool_root=tmp_path / "pool",
     )
-    service.commit_snapshot(FleetSnapshot(1, 2, accounts, series), expected_generation=1)
+    service.commit_snapshot(
+        FleetSnapshot(1, 2, accounts, series), expected_generation=1
+    )
     return service, paths
 
 
-def test_known_model_rpm_gate_rotates_to_ready_gemini_account_before_openai(tmp_path: Path) -> None:
+def test_known_model_rpm_gate_rotates_to_ready_gemini_account_before_openai(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(
         tmp_path,
         (_account("the-hive-4"), _account("the-hive-6")),
@@ -104,7 +110,9 @@ def test_known_local_reset_defers_headless_start_until_reset(tmp_path: Path) -> 
     assert decision.diagnostic_code == "gemini_local_rate_limited"
 
 
-def test_probe_reservation_blocks_following_work_request_in_same_local_minute(tmp_path: Path) -> None:
+def test_probe_reservation_blocks_following_work_request_in_same_local_minute(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(
         tmp_path,
         (_account("the-hive-4"),),
@@ -113,14 +121,18 @@ def test_probe_reservation_blocks_following_work_request_in_same_local_minute(tm
 
     service.probe_account(
         "the-hive-4",
-        lambda _account: ProbeResult(Provider.GEMINI_API, True, "gemini-3-flash", True, None),
+        lambda _account: ProbeResult(
+            Provider.GEMINI_API, True, "gemini-3-flash", True, None
+        ),
         expected_generation=2,
     )
 
     assert service.gemini_headless_gate("d1").action == "defer_until"
 
 
-def test_known_model_rpm_gate_rotates_to_equal_gemini_model_on_same_key(tmp_path: Path) -> None:
+def test_known_model_rpm_gate_rotates_to_equal_gemini_model_on_same_key(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(
         tmp_path,
         (_account("the-hive-4"), _account("the-hive-6")),
@@ -138,7 +150,9 @@ def test_known_model_rpm_gate_rotates_to_equal_gemini_model_on_same_key(tmp_path
     assert (decision.action, decision.target_agent_id) == ("rotate_model", "e1")
 
 
-def test_model_scope_limited_rotation_keeps_account_ready_and_rotates_model(tmp_path: Path) -> None:
+def test_model_scope_limited_rotation_keeps_account_ready_and_rotates_model(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(
         tmp_path,
         (_account("shared"), _account("the-hive-6")),
@@ -155,7 +169,9 @@ def test_model_scope_limited_rotation_keeps_account_ready_and_rotates_model(tmp_
         gate_action="defer_until",
         gate_code="gemini_model_limited",
         next_reset_at_utc="2026-08-03T12:02:00Z",
-        quota_observation=ProviderErrorQuotaObservation(scope="model", retry_after_seconds=120),
+        quota_observation=ProviderErrorQuotaObservation(
+            scope="model", retry_after_seconds=120
+        ),
     )
 
     decision = service.gemini_headless_gate("d1")
@@ -166,7 +182,9 @@ def test_model_scope_limited_rotation_keeps_account_ready_and_rotates_model(tmp_
     assert service.account_gate("d1").reason == "ready"
 
 
-def test_unknown_dashboard_limits_remain_explicitly_observed_only(tmp_path: Path) -> None:
+def test_unknown_dashboard_limits_remain_explicitly_observed_only(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(
         tmp_path,
         (_account("untracked"),),
@@ -175,34 +193,40 @@ def test_unknown_dashboard_limits_remain_explicitly_observed_only(tmp_path: Path
 
     decision = service.gemini_headless_gate("d1")
 
-    assert (decision.action, decision.diagnostic_code) == ("allow", "gemini_limits_unknown")
+    assert (decision.action, decision.diagnostic_code) == (
+        "allow",
+        "gemini_limits_unknown",
+    )
     assert decision.defer_until is None
     assert decision.public()["next_reset_at_utc"] is None
 
 
-@pytest.mark.parametrize(("event_time", "count", "input_tokens", "code", "reset_at"), [
-    (
-        NOW - timedelta(seconds=30),
-        5,
-        0,
-        "gemini_rpm_exhausted",
-        "2026-08-03T12:00:30Z",
-    ),
-    (
-        NOW - timedelta(seconds=20),
-        1,
-        250_000,
-        "gemini_tpm_exhausted",
-        "2026-08-03T12:00:40Z",
-    ),
-    (
-        NOW - timedelta(hours=1),
-        20,
-        0,
-        "gemini_rpd_exhausted",
-        "2026-08-04T11:00:00Z",
-    ),
-])
+@pytest.mark.parametrize(
+    ("event_time", "count", "input_tokens", "code", "reset_at"),
+    [
+        (
+            NOW - timedelta(seconds=30),
+            5,
+            0,
+            "gemini_rpm_exhausted",
+            "2026-08-03T12:00:30Z",
+        ),
+        (
+            NOW - timedelta(seconds=20),
+            1,
+            250_000,
+            "gemini_tpm_exhausted",
+            "2026-08-03T12:00:40Z",
+        ),
+        (
+            NOW - timedelta(hours=1),
+            20,
+            0,
+            "gemini_rpd_exhausted",
+            "2026-08-04T11:00:00Z",
+        ),
+    ],
+)
 def test_known_quota_windows_provide_metric_reset_to_gate(
     tmp_path: Path,
     event_time: datetime,
@@ -219,7 +243,9 @@ def test_known_quota_windows_provide_metric_reset_to_gate(
     service._io = replace(service._io, utc_now=lambda: event_time)
     for _ in range(count):
         service.record_gemini_usage(
-            "the-hive-4", model="gemini-3-flash", input_tokens=input_tokens,
+            "the-hive-4",
+            model="gemini-3-flash",
+            input_tokens=input_tokens,
         )
     service._io = replace(service._io, utc_now=lambda: NOW)
 
@@ -231,7 +257,9 @@ def test_known_quota_windows_provide_metric_reset_to_gate(
     assert decision.public()["next_reset_at_utc"] == reset_at
 
 
-def test_quota_reset_waits_until_observed_count_falls_below_limit(tmp_path: Path) -> None:
+def test_quota_reset_waits_until_observed_count_falls_below_limit(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(
         tmp_path,
         (_account("the-hive-4"),),
@@ -239,7 +267,9 @@ def test_quota_reset_waits_until_observed_count_falls_below_limit(tmp_path: Path
     )
     for seconds_ago in (50, 40, 30, 20, 10, 0):
         event_time = NOW - timedelta(seconds=seconds_ago)
-        service._io = replace(service._io, utc_now=lambda event_time=event_time: event_time)
+        service._io = replace(
+            service._io, utc_now=lambda event_time=event_time: event_time
+        )
         service.record_gemini_usage("the-hive-4", model="gemini-3-flash")
     service._io = replace(service._io, utc_now=lambda: NOW)
 
@@ -261,23 +291,43 @@ def test_known_reset_releases_gate_when_time_has_passed(tmp_path: Path) -> None:
         outcome="rate_limited",
         reset_at_utc="2026-08-03T12:10:00Z",
     )
-    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 10, tzinfo=timezone.utc))
+    service._io = replace(
+        service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 10, tzinfo=timezone.utc)
+    )
 
     assert service.gemini_headless_gate("d1").action == "allow"
 
 
-def test_openai_fallback_reason_is_exposed_only_after_gemini_rotation_is_exhausted(tmp_path: Path) -> None:
+def test_openai_fallback_reason_is_exposed_only_after_gemini_rotation_is_exhausted(
+    tmp_path: Path,
+) -> None:
     openai = FleetAccount(
-        "openai", "openai", Provider.OPENAI_API, AuthKind.API_KEY,
-        SecretState.CONFIGURED, LimitState.READY, True, None,
-        NOW.isoformat().replace("+00:00", "Z"), None,
+        "openai",
+        "openai",
+        Provider.OPENAI_API,
+        AuthKind.API_KEY,
+        SecretState.CONFIGURED,
+        LimitState.READY,
+        True,
+        None,
+        NOW.isoformat().replace("+00:00", "Z"),
+        None,
     )
     service, _ = _service(
         tmp_path,
         (_account("the-hive-4"), openai),
         (
             _series("d", "the-hive-4", "gemini-3-flash"),
-            FleetSeries("o", "o", 1, RunnerKind.CODEX_CLI, Provider.OPENAI_API, "gpt", "openai", True),
+            FleetSeries(
+                "o",
+                "o",
+                1,
+                RunnerKind.CODEX_CLI,
+                Provider.OPENAI_API,
+                "gpt",
+                "openai",
+                True,
+            ),
         ),
     )
     for _ in range(5):
@@ -287,10 +337,15 @@ def test_openai_fallback_reason_is_exposed_only_after_gemini_rotation_is_exhaust
 
     assert decision.action == "defer_until"
     assert decision.defer_until == "2026-08-03T12:01:00Z"
-    assert decision.openai_fallback_reason == "Gemini rotation exhausted; eligible OpenAI fallback may be selected."
+    assert (
+        decision.openai_fallback_reason
+        == "Gemini rotation exhausted; eligible OpenAI fallback may be selected."
+    )
 
 
-def test_usage_ledger_keeps_gate_usage_and_reset_but_never_prompt_or_secret(tmp_path: Path) -> None:
+def test_usage_ledger_keeps_gate_usage_and_reset_but_never_prompt_or_secret(
+    tmp_path: Path,
+) -> None:
     service, paths = _service(
         tmp_path,
         (_account("the-hive-4"),),
@@ -318,7 +373,9 @@ def test_usage_ledger_keeps_gate_usage_and_reset_but_never_prompt_or_secret(tmp_
     assert "105547" in ledger
 
 
-def test_event_ledger_replaces_unstructured_failure_reason_with_redacted_code(tmp_path: Path) -> None:
+def test_event_ledger_replaces_unstructured_failure_reason_with_redacted_code(
+    tmp_path: Path,
+) -> None:
     service, paths = _service(
         tmp_path,
         (_account("the-hive-4"),),
@@ -340,20 +397,24 @@ def test_event_ledger_replaces_unstructured_failure_reason_with_redacted_code(tm
     assert '"reason": "runner_failed"' in ledger
 
 
-@pytest.mark.parametrize(("legacy_code", "expected_code"), [
-    ("ready", "gemini_ready"),
-    ("limit_active", "gemini_account_limited"),
-    ("probe_stale", "gemini_probe_stale"),
-    ("gemini_local_rate_limit", "gemini_local_rate_limited"),
-    ("account_disabled", "gemini_account_disabled"),
-    ("secret_missing", "gemini_secret_missing"),
-    ("auth_invalid", "gemini_auth_invalid"),
-    ("provider_unavailable", "gemini_provider_unavailable"),
-    ("model_unavailable", "gemini_model_unavailable"),
-    ("limit_unknown", "gemini_account_limit_unknown"),
-])
+@pytest.mark.parametrize(
+    ("legacy_code", "expected_code"),
+    [
+        ("ready", "gemini_ready"),
+        ("limit_active", "gemini_account_limited"),
+        ("probe_stale", "gemini_probe_stale"),
+        ("gemini_local_rate_limit", "gemini_local_rate_limited"),
+        ("account_disabled", "gemini_account_disabled"),
+        ("secret_missing", "gemini_secret_missing"),
+        ("auth_invalid", "gemini_auth_invalid"),
+        ("provider_unavailable", "gemini_provider_unavailable"),
+        ("model_unavailable", "gemini_model_unavailable"),
+        ("limit_unknown", "gemini_account_limit_unknown"),
+    ],
+)
 def test_every_gate_diagnostic_is_redacted_and_legacy_codes_map_exactly(
-    legacy_code: str, expected_code: str,
+    legacy_code: str,
+    expected_code: str,
 ) -> None:
     from the_hive.fleet_service import GEMINI_GATE_DIAGNOSTICS, map_gemini_gate_code
 
@@ -363,7 +424,13 @@ def test_every_gate_diagnostic_is_redacted_and_legacy_codes_map_exactly(
 
     assert diagnostic["severity"] in {"info", "warning", "error"}
     assert isinstance(diagnostic["retryable"], bool)
-    assert diagnostic["action"] in {"allow", "defer_until", "rotate_account", "rotate_model", "reject"}
+    assert diagnostic["action"] in {
+        "allow",
+        "defer_until",
+        "rotate_account",
+        "rotate_model",
+        "reject",
+    }
     assert "secret" not in diagnostic["reason"].lower()
     assert "prompt" not in diagnostic["reason"].lower()
 
@@ -375,6 +442,12 @@ def test_all_gate_diagnostics_have_safe_complete_metadata() -> None:
         assert code.startswith("gemini_")
         assert diagnostic["severity"] in {"info", "warning", "error"}
         assert isinstance(diagnostic["retryable"], bool)
-        assert diagnostic["action"] in {"allow", "defer_until", "rotate_account", "rotate_model", "reject"}
+        assert diagnostic["action"] in {
+            "allow",
+            "defer_until",
+            "rotate_account",
+            "rotate_model",
+            "reject",
+        }
         assert "secret" not in diagnostic["reason"].lower()
         assert "prompt" not in diagnostic["reason"].lower()

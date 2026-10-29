@@ -56,11 +56,17 @@ class ReporterLeaderLease:
         timestamp = now or datetime.now(UTC)
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
-        payload = json.dumps(
-            {"pid": os.getpid(), "heartbeat": timestamp.astimezone(UTC).isoformat()},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("ascii") + b"\n"
+        payload = (
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "heartbeat": timestamp.astimezone(UTC).isoformat(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            + b"\n"
+        )
         os.lseek(self._fd, 0, os.SEEK_SET)
         os.ftruncate(self._fd, 0)
         os.write(self._fd, payload)
@@ -141,6 +147,10 @@ def active_reporter_required(
                 expires = datetime.fromisoformat(expires.replace("Z", "+00:00"))
             except ValueError:
                 expires = None
-        if isinstance(expires, datetime) and expires.tzinfo is not None and expires.astimezone(UTC) > now.astimezone(UTC):
+        if (
+            isinstance(expires, datetime)
+            and expires.tzinfo is not None
+            and expires.astimezone(UTC) > now.astimezone(UTC)
+        ):
             return True
     return False

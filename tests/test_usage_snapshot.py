@@ -99,7 +99,12 @@ def write_producer_golden(
     private_dir(data_home / "codex-usage")
 
     monkeypatch.syspath_prepend(str(source_root / "src"))
-    from codex_usage import integration_evidence, integration_pool_authority, integration_snapshot, private_io
+    from codex_usage import (
+        integration_evidence,
+        integration_pool_authority,
+        integration_snapshot,
+        private_io,
+    )
     from codex_usage.integration_attestation import verify_active_manifest_at
     from codex_usage.integration_installer import install_release
 
@@ -210,7 +215,9 @@ def test_d300_pinned_producer_06542_golden_generation_is_complete(
     assert result.status == "complete"
     assert type(result) is usage_snapshot.UsageEvidenceV2
     assert not hasattr(result, "_reader_attestation")
-    assert tuple(account.account_id for account in result.accounts) == ("synthetic-alpha",)
+    assert tuple(account.account_id for account in result.accounts) == (
+        "synthetic-alpha",
+    )
     integration = state_home / "codex-usage" / "integration"
     pointer = json.loads((integration / "current.json").read_text(encoding="utf-8"))
     active = json.loads((integration / "active.json").read_text(encoding="utf-8"))
@@ -407,9 +414,19 @@ def test_retired_producer_versions_have_no_consumer_fallback(
     (
         ("active", lambda value: value.update({"version": "0.6.537"})),
         ("pointer", lambda value: value.update({"pointer_schema_version": 2})),
-        ("binding", lambda value: value["usage_binding"].update({"producer_version": "0.6.537"})),
+        (
+            "binding",
+            lambda value: value["usage_binding"].update(
+                {"producer_version": "0.6.537"}
+            ),
+        ),
         ("binding", lambda value: value.update({"binding_schema_version": 1})),
-        ("binding", lambda value: value["usage_binding"].update({"usage_binding_schema_version": 1})),
+        (
+            "binding",
+            lambda value: value["usage_binding"].update(
+                {"usage_binding_schema_version": 1}
+            ),
+        ),
         ("payload", lambda value: value.update({"schema_version": 1})),
         ("authority", lambda value: value.update({"pool_authority_schema_version": 1})),
         ("authority", lambda value: value.update({"producer_version": "0.6.537"})),
@@ -437,14 +454,31 @@ def test_06538_versions_and_legacy_parallel_path_are_invalid(
 @pytest.mark.parametrize(
     ("target", "mutate"),
     (
-        ("binding", lambda value: value["usage_binding"].update({"payload_sha256": "0" * 64})),
-        ("binding", lambda value: value["usage_binding"].update({"payload_size_bytes": 1})),
+        (
+            "binding",
+            lambda value: value["usage_binding"].update({"payload_sha256": "0" * 64}),
+        ),
+        (
+            "binding",
+            lambda value: value["usage_binding"].update({"payload_size_bytes": 1}),
+        ),
         ("binding", lambda value: value.update({"pool_authority_sha256": "0" * 64})),
         ("binding", lambda value: value.update({"pool_authority_size_bytes": 1})),
-        ("binding", lambda value: value["usage_binding"].update({"generation_id": "0" * 32})),
-        ("binding", lambda value: value["usage_binding"].update({"release_id": "0.6.540-0000000000000000"})),
+        (
+            "binding",
+            lambda value: value["usage_binding"].update({"generation_id": "0" * 32}),
+        ),
+        (
+            "binding",
+            lambda value: value["usage_binding"].update(
+                {"release_id": "0.6.540-0000000000000000"}
+            ),
+        ),
         ("authority", lambda value: value.update({"generation_id": "0" * 32})),
-        ("authority", lambda value: value.update({"release_id": "0.6.540-0000000000000000"})),
+        (
+            "authority",
+            lambda value: value.update({"release_id": "0.6.540-0000000000000000"}),
+        ),
     ),
 )
 def test_06538_digest_size_generation_and_release_crossbindings_are_invalid(
@@ -588,7 +622,9 @@ def test_06538_hashed_shared_lock_contention_is_busy(
         usage_snapshot._evidence_lock_name(integration / "current.json"),
     }
     lock_root = next(
-        path for path in (tmp_path / "producer-lock-home").rglob("locks") if path.is_dir()
+        path
+        for path in (tmp_path / "producer-lock-home").rglob("locks")
+        if path.is_dir()
     )
     assert expected_names.issubset({path.name for path in lock_root.iterdir()})
 
@@ -617,7 +653,9 @@ def _rebind_after_active_record_change(paths: dict[str, Path]) -> None:
         if row.split(",", 1)[0] == "codex_usage/integration_entrypoint.py"
     ]
     assert len(removed) == 1
-    private_file(record, "".join(row for row in rows if row not in removed).encode("utf-8"))
+    private_file(
+        record, "".join(row for row in rows if row not in removed).encode("utf-8")
+    )
     active["record_sha256"] = digest(record.read_bytes())
     active["release_tree_sha256"] = _release_tree_sha256(
         release_dir=Path(active["release_dir"])
@@ -728,9 +766,7 @@ def _model_capability_entry(**overrides: object) -> dict[str, object]:
     return entry
 
 
-def _rebind_model_invocability(
-    paths: dict[str, Path], projection: object
-) -> None:
+def _rebind_model_invocability(paths: dict[str, Path], projection: object) -> None:
     """Bind a V3 model-capability projection through the real generation chain."""
     authority = json.loads(paths["authority"].read_text(encoding="utf-8"))
     authority["pool_authority_schema_version"] = 3
@@ -788,7 +824,9 @@ def test_d236_missing_v3_model_capabilities_preserve_valid_usage_but_fail_closed
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
     payload = _payload_with_complete_evidence(paths)
-    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))["authorities"]
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))[
+        "authorities"
+    ]
     _rebind_payload_and_authority(paths, payload, authorities)
     _rebind_without_model_invocability(paths)
 
@@ -801,7 +839,10 @@ def test_d236_missing_v3_model_capabilities_preserve_valid_usage_but_fail_closed
     assert evidence.model_invocability.status == "unattested"
     assert evidence.model_invocability.capabilities == ()
     assert display.source == "live"
-    assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
+    assert tuple(limit.pool for limit in display.accounts[0].limits) == (
+        "main",
+        "spark",
+    )
 
 
 def test_06538_bound_native_model_capability_preserves_usage_display(
@@ -809,7 +850,9 @@ def test_06538_bound_native_model_capability_preserves_usage_display(
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
     payload = _payload_with_complete_evidence(paths)
-    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))["authorities"]
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))[
+        "authorities"
+    ]
     _rebind_payload_and_authority(paths, payload, authorities)
     _rebind_model_invocability(
         paths, _model_invocability_projection(_model_capability_entry())
@@ -838,7 +881,10 @@ def test_06538_bound_native_model_capability_preserves_usage_display(
         True,
     )
     assert display.source == "live"
-    assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
+    assert tuple(limit.pool for limit in display.accounts[0].limits) == (
+        "main",
+        "spark",
+    )
 
 
 def test_usage_evidence_subclass_never_attests_model_invocability_or_display(
@@ -938,7 +984,9 @@ def test_06538_extreme_model_capability_timestamp_is_locally_fail_closed(
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
     payload = _payload_with_complete_evidence(paths)
-    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))["authorities"]
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))[
+        "authorities"
+    ]
     _rebind_payload_and_authority(paths, payload, authorities)
     _rebind_model_invocability(
         paths,
@@ -959,22 +1007,24 @@ def test_06538_extreme_model_capability_timestamp_is_locally_fail_closed(
     assert evidence.model_invocability.status == "invalid"
     assert evidence.model_invocability.capabilities == ()
     assert display.source == "live"
-    assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
+    assert tuple(limit.pool for limit in display.accounts[0].limits) == (
+        "main",
+        "spark",
+    )
 
 
 @pytest.mark.parametrize(
     "projection",
     (
-        {"capability_schema_version": 1, "entries": [{"account_id": "synthetic-alpha"}]},
+        {
+            "capability_schema_version": 1,
+            "entries": [{"account_id": "synthetic-alpha"}],
+        },
         _model_invocability_projection(
             _model_capability_entry(), _model_capability_entry()
         ),
-        _model_invocability_projection(
-            _model_capability_entry(catalog_visible=False)
-        ),
-        _model_invocability_projection(
-            _model_capability_entry(visibility="list")
-        ),
+        _model_invocability_projection(_model_capability_entry(catalog_visible=False)),
+        _model_invocability_projection(_model_capability_entry(visibility="list")),
     ),
 )
 def test_d236_malformed_model_capabilities_are_invalid_but_preserve_usage(
@@ -999,9 +1049,12 @@ def test_d236_malformed_model_capabilities_are_invalid_but_preserve_usage(
         )
         is None
     )
-    assert usage_snapshot.display_snapshot_from_evidence(
-        evidence, known_account_ids=frozenset({"synthetic-alpha"})
-    ).source == "live"
+    assert (
+        usage_snapshot.display_snapshot_from_evidence(
+            evidence, known_account_ids=frozenset({"synthetic-alpha"})
+        ).source
+        == "live"
+    )
 
 
 def test_d236_stale_model_capabilities_are_distinct_from_invalid_and_preserve_usage(
@@ -1023,9 +1076,12 @@ def test_d236_stale_model_capabilities_are_distinct_from_invalid_and_preserve_us
     assert evidence.status == "complete"
     assert evidence.model_invocability.status == "stale"
     assert evidence.model_invocability.capabilities == ()
-    assert usage_snapshot.display_snapshot_from_evidence(
-        evidence, known_account_ids=frozenset({"synthetic-alpha"})
-    ).source == "live"
+    assert (
+        usage_snapshot.display_snapshot_from_evidence(
+            evidence, known_account_ids=frozenset({"synthetic-alpha"})
+        ).source
+        == "live"
+    )
 
 
 def test_06538_missing_entrypoint_record_row_after_rebinding_is_invalid(
@@ -1169,7 +1225,9 @@ def test_06538_permissive_ancestor_in_hashed_lock_path_is_invalid(
     state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
     lock_root = usage_snapshot._lock_root()
     assert lock_root == next(
-        path for path in (tmp_path / "producer-lock-home").rglob("locks") if path.is_dir()
+        path
+        for path in (tmp_path / "producer-lock-home").rglob("locks")
+        if path.is_dir()
     )
     assert lock_root.parent.stat().st_mode & 0o777 == 0o700
     lock_root.parent.chmod(0o755)

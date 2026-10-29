@@ -11,35 +11,53 @@ from the_hive.hive.messages import validate_message
 NOW = datetime(2026, 8, 16, 10, 5, tzinfo=UTC)
 
 
-def hive_message(message_type: str, *, message_id: str, payload: dict[str, object]) -> object:
-    return validate_message({
-        "schema_version": 1,
-        "message_id": message_id,
-        "correlation_id": "request-one",
-        "causation_id": None,
-        "message_type": message_type,
-        "sender": {"principal_id": "specialist-one", "class_id": "spezialistin"},
-        "recipient": {"principal_id": "lead-one", "class_id": "teamleiterin"},
-        "repo_id": "codex-master",
-        "dispatch_id": "dispatch-one",
-        "workpackage_id": "workpackage-one",
-        "dispatch_priority": "DP1",
-        "created_at_utc": NOW.isoformat(),
-        "expires_at_utc": (NOW + timedelta(hours=1)).isoformat(),
-        "authorization": {"grant_id": "grant-one", "scope_digest": "sha256:scope", "principal_version": 1},
-        "payload": payload,
-        "raw_output": "not_returned",
-    })
+def hive_message(
+    message_type: str, *, message_id: str, payload: dict[str, object]
+) -> object:
+    return validate_message(
+        {
+            "schema_version": 1,
+            "message_id": message_id,
+            "correlation_id": "request-one",
+            "causation_id": None,
+            "message_type": message_type,
+            "sender": {"principal_id": "specialist-one", "class_id": "spezialistin"},
+            "recipient": {"principal_id": "lead-one", "class_id": "teamleiterin"},
+            "repo_id": "codex-master",
+            "dispatch_id": "dispatch-one",
+            "workpackage_id": "workpackage-one",
+            "dispatch_priority": "DP1",
+            "created_at_utc": NOW.isoformat(),
+            "expires_at_utc": (NOW + timedelta(hours=1)).isoformat(),
+            "authorization": {
+                "grant_id": "grant-one",
+                "scope_digest": "sha256:scope",
+                "principal_version": 1,
+            },
+            "payload": payload,
+            "raw_output": "not_returned",
+        }
+    )
 
 
-def test_hive_event_store_persists_assignment_and_completion_without_payload(tmp_path: Path) -> None:
+def test_hive_event_store_persists_assignment_and_completion_without_payload(
+    tmp_path: Path,
+) -> None:
     store = HiveEventStore(tmp_path / "hive")
-    store.append_message(hive_message("workpackage.assign", message_id="assign-one", payload={"secret": "TOKEN"}))
+    store.append_message(
+        hive_message(
+            "workpackage.assign", message_id="assign-one", payload={"secret": "TOKEN"}
+        )
+    )
     store.append_message(
         hive_message(
             "completion",
             message_id="complete-one",
-            payload={"status": "completed", "response": "PRIVATE_RESULT", "raw_output": "not_returned"},
+            payload={
+                "status": "completed",
+                "response": "PRIVATE_RESULT",
+                "raw_output": "not_returned",
+            },
         )
     )
 
@@ -91,7 +109,9 @@ def test_hive_event_store_records_queue_completion_for_reporter(tmp_path: Path) 
     assert [event["status"] for event in events] == ["queued", "completed"]
     records = [
         json.loads(line)
-        for line in (tmp_path / "hive" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (tmp_path / "hive" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     assert all(record["raw_output"] == "not_returned" for record in records)
 
@@ -100,16 +120,19 @@ def test_hive_event_store_rejects_tampered_record_schema(tmp_path: Path) -> None
     store = HiveEventStore(tmp_path / "hive")
     path = tmp_path / "hive" / "events.jsonl"
     path.write_text(
-        json.dumps({
-            "schema_version": 1,
-            "record_kind": "event",
-            "event_id": "event-one",
-            "at_utc": NOW.isoformat(),
-            "assignment_id": "workpackage-one",
-            "agent": "agent-one",
-            "status": "completed",
-            "raw_output": "PRIVATE_RESULT",
-        }) + "\n",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "record_kind": "event",
+                "event_id": "event-one",
+                "at_utc": NOW.isoformat(),
+                "assignment_id": "workpackage-one",
+                "agent": "agent-one",
+                "status": "completed",
+                "raw_output": "PRIVATE_RESULT",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 

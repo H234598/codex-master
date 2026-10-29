@@ -100,7 +100,11 @@ class CpuTopologyV1:
             _fail()
         normalized = tuple(_canonical_cpu_set(core) for core in self.physical_cores)
         all_cpus = tuple(cpu for core in normalized for cpu in core)
-        if not all_cpus or len(set(all_cpus)) != len(all_cpus) or tuple(sorted(all_cpus)) != all_cpus:
+        if (
+            not all_cpus
+            or len(set(all_cpus)) != len(all_cpus)
+            or tuple(sorted(all_cpus)) != all_cpus
+        ):
             _fail()
         efficiency = _canonical_cpu_set(self.efficiency_cpus, allow_empty=True)
         if not set(efficiency).issubset(all_cpus):
@@ -136,7 +140,12 @@ class CgroupProfileV1:
             _fail()
         if (self.cpu_quota_percent, self.cpu_weight, self.io_weight) != (750, 50, 50):
             _fail()
-        if not 0 < self.memory_high_bytes < self.memory_max_bytes <= MAX_MEMORY_TOTAL_BYTES:
+        if (
+            not 0
+            < self.memory_high_bytes
+            < self.memory_max_bytes
+            <= MAX_MEMORY_TOTAL_BYTES
+        ):
             _fail()
         if self.memory_swap_max_bytes != 8 * GIB:
             _fail()
@@ -206,7 +215,9 @@ class CgroupPreflightV1:
     def __post_init__(self) -> None:
         if self.unified_v2 is not True:
             _fail()
-        if not isinstance(self.controllers, frozenset) or not isinstance(self.subtree_controllers, frozenset):
+        if not isinstance(self.controllers, frozenset) or not isinstance(
+            self.subtree_controllers, frozenset
+        ):
             _fail()
         if not REQUIRED_CONTROLLERS.issubset(self.controllers):
             _fail()
@@ -214,7 +225,11 @@ class CgroupPreflightV1:
             _fail()
         if self.io_physical_isolation_proven is not False:
             _fail()
-        object.__setattr__(self, "parent_effective_cpuset", _canonical_cpu_set(self.parent_effective_cpuset))
+        object.__setattr__(
+            self,
+            "parent_effective_cpuset",
+            _canonical_cpu_set(self.parent_effective_cpuset),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,16 +242,22 @@ class PreparedAgentScope:
     challenge: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.unit_name, str) or not _UNIT_NAME.fullmatch(self.unit_name):
+        if not isinstance(self.unit_name, str) or not _UNIT_NAME.fullmatch(
+            self.unit_name
+        ):
             _fail()
         _validate_tmux_name(self.socket_name)
         _validate_tmux_name(self.session_name)
         if type(self.gate_pid) is not int or self.gate_pid <= 0:
             _fail()
-        if not isinstance(self.challenge, str) or not _CHALLENGE.fullmatch(self.challenge):
+        if not isinstance(self.challenge, str) or not _CHALLENGE.fullmatch(
+            self.challenge
+        ):
             _fail()
         control_group = _canonical_control_group(
-            self.control_group if self.control_group.startswith("/") else f"/{self.control_group}"
+            self.control_group
+            if self.control_group.startswith("/")
+            else f"/{self.control_group}"
         )
         if control_group.rsplit("/", 1)[-1] != self.unit_name:
             _fail()
@@ -265,7 +286,11 @@ class CommandResultV1:
     stderr: bytes
 
     def __post_init__(self) -> None:
-        if type(self.returncode) is not int or type(self.stdout) is not bytes or type(self.stderr) is not bytes:
+        if (
+            type(self.returncode) is not int
+            or type(self.stdout) is not bytes
+            or type(self.stderr) is not bytes
+        ):
             _fail()
 
 
@@ -300,7 +325,9 @@ class SystemdUserCommandRunner(Protocol):
 class CgroupSystemAdapter(Protocol):
     def read_bounded_cgroup_bytes(self, path: Path, *, max_bytes: int) -> bytes: ...
 
-    def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None: ...
+    def read_optional_cpu_topology_bytes(
+        self, path: Path, *, max_bytes: int
+    ) -> bytes | None: ...
 
     def capture_cpu_topology_snapshot(self, cpus: CpuSet) -> object: ...
 
@@ -315,13 +342,17 @@ class CgroupSystemAdapter(Protocol):
         runner_target: RunnerExecutionTargetV1 | None = None,
     ) -> PreparedAgentScope: ...
 
-    def verify_scope(self, scope: PreparedAgentScope, profile: CgroupProfileV1) -> None: ...
+    def verify_scope(
+        self, scope: PreparedAgentScope, profile: CgroupProfileV1
+    ) -> None: ...
 
     def release_scope(self, scope: PreparedAgentScope) -> None: ...
 
     def confirm_scope(self, scope: PreparedAgentScope) -> int: ...
 
-    def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None: ...
+    def verify_tmux_membership_and_inheritance(
+        self, scope: PreparedAgentScope, tmux_pid: int
+    ) -> None: ...
 
     def cleanup_new_scope(self, scope: PreparedAgentScope) -> None: ...
 
@@ -338,8 +369,10 @@ class CgroupIoPressureEvidenceV1:
 
     def __post_init__(self) -> None:
         for value in (self.some_avg10, self.full_avg10, self.full_avg60):
-            if type(value) is bool or not isinstance(value, (float, int)) or not math.isfinite(
-                value
+            if (
+                type(value) is bool
+                or not isinstance(value, (float, int))
+                or not math.isfinite(value)
             ):
                 _fail()
             if value < 0.0 or value > 100.0:
@@ -414,7 +447,12 @@ class _ScopeControl:
 
     def _read_exact(self, size: int, *, timeout_seconds: float) -> bytes:
         connection = self._connection
-        if connection is None or type(size) is not int or size <= 0 or timeout_seconds <= 0:
+        if (
+            connection is None
+            or type(size) is not int
+            or size <= 0
+            or timeout_seconds <= 0
+        ):
             _fail()
         deadline = time.monotonic() + timeout_seconds
         payload = bytearray()
@@ -487,7 +525,10 @@ class _ScopeControl:
         if not self._released:
             _fail()
         try:
-            if self._read_exact(len(_GATE_READY), timeout_seconds=timeout_seconds) != _GATE_READY:
+            if (
+                self._read_exact(len(_GATE_READY), timeout_seconds=timeout_seconds)
+                != _GATE_READY
+            ):
                 _fail()
         except CgroupPreflightError:
             self.close()
@@ -509,7 +550,11 @@ class _ScopeControl:
 
 
 def _canonical_control_group(value: object) -> str:
-    if not isinstance(value, str) or not 2 <= len(value) <= 512 or not value.startswith("/"):
+    if (
+        not isinstance(value, str)
+        or not 2 <= len(value) <= 512
+        or not value.startswith("/")
+    ):
         _fail()
     parts = value[1:].split("/")
     if not parts or any(not _CGROUP_COMPONENT.fullmatch(part) for part in parts):
@@ -527,7 +572,9 @@ def _bind_directory(path: Path) -> _BoundDirectory:
             metadata = os.fstat(descriptor)
             if not stat.S_ISDIR(metadata.st_mode):
                 _fail()
-            return _BoundDirectory(path=path, device=metadata.st_dev, inode=metadata.st_ino)
+            return _BoundDirectory(
+                path=path, device=metadata.st_dev, inode=metadata.st_ino
+            )
         finally:
             os.close(descriptor)
     except (OSError, ValueError) as exc:
@@ -574,7 +621,10 @@ def _read_bounded_under(
                 break
             payload.extend(chunk)
         after = os.fstat(descriptor)
-        if len(payload) > max_bytes or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        if len(payload) > max_bytes or (before.st_dev, before.st_ino) != (
+            after.st_dev,
+            after.st_ino,
+        ):
             _fail()
         root_after = os.fstat(root_descriptor)
         if (root_after.st_dev, root_after.st_ino) != (bound.device, bound.inode):
@@ -674,12 +724,20 @@ def _read_optional_core_type_under(
             for metadata in (root_before, cpu_before, topology_before)
         )
         try:
-            leaf_before = os.stat(parts[2], dir_fd=topology_descriptor, follow_symlinks=False)
+            leaf_before = os.stat(
+                parts[2], dir_fd=topology_descriptor, follow_symlinks=False
+            )
         except FileNotFoundError:
             try:
                 os.stat(parts[2], dir_fd=topology_descriptor, follow_symlinks=False)
             except FileNotFoundError:
-                if tuple((metadata.st_dev, metadata.st_ino) for metadata in map(os.fstat, parent_descriptors)) != parent_identities:
+                if (
+                    tuple(
+                        (metadata.st_dev, metadata.st_ino)
+                        for metadata in map(os.fstat, parent_descriptors)
+                    )
+                    != parent_identities
+                ):
                     _fail()
                 return None
             _fail()
@@ -691,7 +749,8 @@ def _read_optional_core_type_under(
         if (
             not stat.S_ISREG(leaf_opened.st_mode)
             or leaf_opened.st_nlink != 1
-            or (leaf_opened.st_dev, leaf_opened.st_ino) != (leaf_before.st_dev, leaf_before.st_ino)
+            or (leaf_opened.st_dev, leaf_opened.st_ino)
+            != (leaf_before.st_dev, leaf_before.st_ino)
         ):
             _fail()
         payload = bytearray()
@@ -706,7 +765,13 @@ def _read_optional_core_type_under(
             leaf_after.st_ino,
         ):
             _fail()
-        if tuple((metadata.st_dev, metadata.st_ino) for metadata in map(os.fstat, parent_descriptors)) != parent_identities:
+        if (
+            tuple(
+                (metadata.st_dev, metadata.st_ino)
+                for metadata in map(os.fstat, parent_descriptors)
+            )
+            != parent_identities
+        ):
             _fail()
         return bytes(payload)
     except (OSError, ValueError) as exc:
@@ -736,7 +801,9 @@ class _SubprocessHeldGate:
         self._stdout = bytearray()
         self._stderr = bytearray()
 
-    def _read_until(self, *, timeout_seconds: float, max_stdout_bytes: int, max_stderr_bytes: int) -> None:
+    def _read_until(
+        self, *, timeout_seconds: float, max_stdout_bytes: int, max_stderr_bytes: int
+    ) -> None:
         if self._process.stdout is None or self._process.stderr is None:
             _fail()
         deadline = time.monotonic() + timeout_seconds
@@ -757,7 +824,9 @@ class _SubprocessHeldGate:
                         selector.unregister(key.fileobj)
                         continue
                     destination = self._stdout if key.data == "stdout" else self._stderr
-                    limit = max_stdout_bytes if key.data == "stdout" else max_stderr_bytes
+                    limit = (
+                        max_stdout_bytes if key.data == "stdout" else max_stderr_bytes
+                    )
                     destination.extend(chunk)
                     if len(destination) > limit:
                         _fail()
@@ -776,7 +845,11 @@ class _SubprocessHeldGate:
             returncode = self._process.wait(timeout=max(0.01, timeout_seconds))
         except subprocess.TimeoutExpired as exc:
             raise CgroupPreflightError("cgroup_preflight_failed") from exc
-        return CommandResultV1(returncode=returncode, stdout=bytes(self._stdout), stderr=bytes(self._stderr))
+        return CommandResultV1(
+            returncode=returncode,
+            stdout=bytes(self._stdout),
+            stderr=bytes(self._stderr),
+        )
 
     def terminate(self) -> None:
         if self._process.poll() is None:
@@ -789,7 +862,9 @@ class _SubprocessHeldGate:
 
 class _SubprocessSystemdUserRunner:
     def _popen(self, argv: tuple[str, ...]) -> subprocess.Popen[bytes]:
-        if not argv or any(type(argument) is not str or not argument for argument in argv):
+        if not argv or any(
+            type(argument) is not str or not argument for argument in argv
+        ):
             _fail()
         return subprocess.Popen(
             argv,
@@ -837,7 +912,12 @@ class _SubprocessSystemdUserRunner:
 class SystemdUserCgroupAdapter:
     """Concrete, held-scope adapter; G5 alone may inject it into admission."""
 
-    __slots__ = ("_runner", "_cgroup_root", "_owned", "_target_slice_control_group_path")
+    __slots__ = (
+        "_runner",
+        "_cgroup_root",
+        "_owned",
+        "_target_slice_control_group_path",
+    )
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -849,7 +929,9 @@ class SystemdUserCgroupAdapter:
         object.__setattr__(self, "_runner", bound_runner)
         object.__setattr__(self, "_cgroup_root", bound_root)
         object.__setattr__(self, "_owned", {})
-        object.__setattr__(self, "_target_slice_control_group_path", _UNSET_TARGET_SLICE_CONTROL_GROUP)
+        object.__setattr__(
+            self, "_target_slice_control_group_path", _UNSET_TARGET_SLICE_CONTROL_GROUP
+        )
 
     def _run(self, argv: tuple[str, ...]) -> CommandResultV1:
         try:
@@ -899,12 +981,16 @@ class SystemdUserCgroupAdapter:
                 _bind_directory(CPU_TOPOLOGY_ROOT), candidate, max_bytes=max_bytes
             )
         else:
-            payload = _read_bounded_under(self._cgroup_root, candidate, max_bytes=max_bytes)
+            payload = _read_bounded_under(
+                self._cgroup_root, candidate, max_bytes=max_bytes
+            )
         if payload is None:
             _fail()
         return payload
 
-    def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None:
+    def read_optional_cpu_topology_bytes(
+        self, path: Path, *, max_bytes: int
+    ) -> bytes | None:
         candidate = Path(path)
         try:
             relative = candidate.relative_to(CPU_TOPOLOGY_ROOT)
@@ -981,15 +1067,25 @@ class SystemdUserCgroupAdapter:
         object.__setattr__(self, "_target_slice_control_group_path", control_group)
         return control_group
 
-    def _target_slice_evidence(self, *, allow_missing: bool = False) -> tuple[str, frozenset[str], frozenset[str], CpuSet] | None:
+    def _target_slice_evidence(
+        self, *, allow_missing: bool = False
+    ) -> tuple[str, frozenset[str], frozenset[str], CpuSet] | None:
         control_group = self._target_slice_control_group(allow_missing=allow_missing)
         if control_group is None:
             return None
         return (
             control_group,
-            _parse_controller_set(self._read_cgroup_file(control_group, "cgroup.controllers")),
-            _parse_controller_set(self._read_cgroup_file(control_group, "cgroup.subtree_control")),
-            _parse_cpu_set(_read_single_line(self._read_cgroup_file(control_group, "cpuset.cpus.effective"))),
+            _parse_controller_set(
+                self._read_cgroup_file(control_group, "cgroup.controllers")
+            ),
+            _parse_controller_set(
+                self._read_cgroup_file(control_group, "cgroup.subtree_control")
+            ),
+            _parse_cpu_set(
+                _read_single_line(
+                    self._read_cgroup_file(control_group, "cpuset.cpus.effective")
+                )
+            ),
         )
 
     def clear_target_slice_control_group_cache(self) -> None:
@@ -1008,7 +1104,10 @@ class SystemdUserCgroupAdapter:
     def bind_monitor_parent_slice_control_group(self) -> str:
         """Pin monitor's own exact v2 parent slice without a user-bus lookup."""
 
-        if self._target_slice_control_group_path is not _UNSET_TARGET_SLICE_CONTROL_GROUP:
+        if (
+            self._target_slice_control_group_path
+            is not _UNSET_TARGET_SLICE_CONTROL_GROUP
+        ):
             _fail()
         pid = _parse_positive_pid(str(os.getpid()))
         bound_proc = _bind_directory(PROC_ROOT)
@@ -1048,7 +1147,9 @@ class SystemdUserCgroupAdapter:
         evidence = self._target_slice_evidence()
         if evidence is None:
             _fail()
-        _control_group, controllers, subtree_controllers, parent_effective_cpuset = evidence
+        _control_group, controllers, subtree_controllers, parent_effective_cpuset = (
+            evidence
+        )
         return CgroupPreflightV1(
             unified_v2=True,
             controllers=controllers,
@@ -1077,10 +1178,12 @@ class SystemdUserCgroupAdapter:
         evidence = self._target_slice_evidence(allow_missing=True)
         if evidence is None:
             return "requires_target_slice"
-        _control_group, controllers, subtree_controllers, _parent_effective_cpuset = evidence
-        if not REQUIRED_CONTROLLERS.issubset(controllers) or not REQUIRED_CONTROLLERS.issubset(
-            subtree_controllers
-        ):
+        _control_group, controllers, subtree_controllers, _parent_effective_cpuset = (
+            evidence
+        )
+        if not REQUIRED_CONTROLLERS.issubset(
+            controllers
+        ) or not REQUIRED_CONTROLLERS.issubset(subtree_controllers):
             return "requires_delegated_controllers"
         return None
 
@@ -1111,10 +1214,14 @@ class SystemdUserCgroupAdapter:
         if len(lines) != 2 or any("=" not in line for line in lines):
             _fail()
         values = dict(line.split("=", 1) for line in lines)
-        if set(values) != {"ControlGroup", "DelegateControllers"} or len(values) != len(lines):
+        if set(values) != {"ControlGroup", "DelegateControllers"} or len(values) != len(
+            lines
+        ):
             _fail()
         control_group = _canonical_control_group(values["ControlGroup"])
-        delegated = _parse_controller_set(f"{values['DelegateControllers']}\n".encode("ascii"))
+        delegated = _parse_controller_set(
+            f"{values['DelegateControllers']}\n".encode("ascii")
+        )
         if control_group != f"{expected_slice_control_group}/{unit_name}":
             _fail()
         if delegated != REQUIRED_CONTROLLERS:
@@ -1137,20 +1244,29 @@ class SystemdUserCgroupAdapter:
         slice_evidence = self._target_slice_evidence()
         if slice_evidence is None:
             _fail()
-        slice_control_group, _controllers, _subtree_controllers, _parent_effective_cpuset = slice_evidence
+        (
+            slice_control_group,
+            _controllers,
+            _subtree_controllers,
+            _parent_effective_cpuset,
+        ) = slice_evidence
         unit_name = f"the-hive-resource-{secrets.token_hex(16)}.scope"
         if not _UNIT_NAME.fullmatch(unit_name) or unit_name in self._owned:
             _fail()
         collision = self._run(
-            (SYSTEMCTL_PATH, "--user", "--no-pager", "show", unit_name, "--property=LoadState")
-        )
-        if (
-            collision.returncode != 4
-            and (
-                collision.returncode != 0
-                or collision.stdout != b"LoadState=not-found\n"
-                or collision.stderr
+            (
+                SYSTEMCTL_PATH,
+                "--user",
+                "--no-pager",
+                "show",
+                unit_name,
+                "--property=LoadState",
             )
+        )
+        if collision.returncode != 4 and (
+            collision.returncode != 0
+            or collision.stdout != b"LoadState=not-found\n"
+            or collision.stderr
         ):
             _fail()
         control_name = f"the-hive-resource-{secrets.token_hex(16)}"
@@ -1158,7 +1274,10 @@ class SystemdUserCgroupAdapter:
             _fail()
         runner_arguments: tuple[str, ...] = ()
         if runner_target is not None:
-            if not isinstance(runner_target, RunnerExecutionTargetV1) or runner_target.owner_pid != os.getpid():
+            if (
+                not isinstance(runner_target, RunnerExecutionTargetV1)
+                or runner_target.owner_pid != os.getpid()
+            ):
                 _fail()
             try:
                 runner_metadata = os.fstat(runner_target.fd)
@@ -1269,15 +1388,23 @@ class SystemdUserCgroupAdapter:
         for name, payload in expected.items():
             if self._read_cgroup_file(scope.control_group, name) != payload:
                 _fail()
-        pids = _parse_pid_lines(self._read_cgroup_file(scope.control_group, "cgroup.procs"))
+        pids = _parse_pid_lines(
+            self._read_cgroup_file(scope.control_group, "cgroup.procs")
+        )
         if scope.gate_pid not in pids:
             _fail()
         parent = owned.slice_control_group
         if scope.control_group != f"{parent}/{scope.unit_name}":
             _fail()
-        controllers = _parse_controller_set(self._read_cgroup_file(parent, "cgroup.controllers"))
-        delegated = _parse_controller_set(self._read_cgroup_file(parent, "cgroup.subtree_control"))
-        parent_mask = _parse_cpu_set(_read_single_line(self._read_cgroup_file(parent, "cpuset.cpus.effective")))
+        controllers = _parse_controller_set(
+            self._read_cgroup_file(parent, "cgroup.controllers")
+        )
+        delegated = _parse_controller_set(
+            self._read_cgroup_file(parent, "cgroup.subtree_control")
+        )
+        parent_mask = _parse_cpu_set(
+            _read_single_line(self._read_cgroup_file(parent, "cpuset.cpus.effective"))
+        )
         if (
             not REQUIRED_CONTROLLERS.issubset(controllers)
             or not REQUIRED_CONTROLLERS.issubset(delegated)
@@ -1293,7 +1420,9 @@ class SystemdUserCgroupAdapter:
             scope.unit_name,
             expected_slice_control_group=owned.slice_control_group,
         )
-        pids = _parse_pid_lines(self._read_cgroup_file(scope.control_group, "cgroup.procs"))
+        pids = _parse_pid_lines(
+            self._read_cgroup_file(scope.control_group, "cgroup.procs")
+        )
         if (
             control_group != scope.control_group
             or owned.control.peer_pid() != scope.gate_pid
@@ -1302,7 +1431,10 @@ class SystemdUserCgroupAdapter:
             _fail()
         owned.released = True
         try:
-            owned.control.release_once(f"{scope.challenge}\n".encode("ascii"), timeout_seconds=COMMAND_TIMEOUT_SECONDS)
+            owned.control.release_once(
+                f"{scope.challenge}\n".encode("ascii"),
+                timeout_seconds=COMMAND_TIMEOUT_SECONDS,
+            )
             owned.control.read_ready(timeout_seconds=COMMAND_TIMEOUT_SECONDS)
         except Exception as exc:
             raise CgroupPreflightError("cgroup_preflight_failed") from exc
@@ -1366,16 +1498,22 @@ class SystemdUserCgroupAdapter:
         children_text = text[:-1]
         if not children_text:
             _fail()
-        children = tuple(_parse_positive_pid(value) for value in children_text.split(" "))
+        children = tuple(
+            _parse_positive_pid(value) for value in children_text.split(" ")
+        )
         if len(set(children)) != len(children):
             _fail()
         return children
 
-    def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None:
+    def verify_tmux_membership_and_inheritance(
+        self, scope: PreparedAgentScope, tmux_pid: int
+    ) -> None:
         owned = self._owned_scope(scope)
         if not owned.released or type(tmux_pid) is not int or tmux_pid <= 0:
             _fail()
-        members = _parse_pid_lines(self._read_cgroup_file(scope.control_group, "cgroup.procs"))
+        members = _parse_pid_lines(
+            self._read_cgroup_file(scope.control_group, "cgroup.procs")
+        )
         if tmux_pid not in members:
             _fail()
         children = self._read_tmux_children(tmux_pid)
@@ -1419,7 +1557,12 @@ def _parse_controller_set(raw: bytes) -> frozenset[str]:
 
 
 def _parse_positive_pid(value: str) -> int:
-    if not value or not value.isascii() or not value.isdecimal() or (len(value) > 1 and value[0] == "0"):
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdecimal()
+        or (len(value) > 1 and value[0] == "0")
+    ):
         _fail()
     parsed = int(value)
     if parsed <= 0 or parsed > (1 << 31) - 1:
@@ -1443,7 +1586,11 @@ def _parse_pid_lines(raw: bytes) -> frozenset[int]:
 
 
 def _parse_gate_challenge(raw: bytes) -> str:
-    if type(raw) is not bytes or len(raw) != _GATE_OUTPUT_BYTES or not raw.endswith(b"\n"):
+    if (
+        type(raw) is not bytes
+        or len(raw) != _GATE_OUTPUT_BYTES
+        or not raw.endswith(b"\n")
+    ):
         _fail()
     try:
         challenge = raw[:-1].decode("ascii")
@@ -1542,7 +1689,9 @@ def _parse_cgroup_pressure(raw: bytes) -> CgroupIoPressureEvidenceV1:
     )
 
 
-def read_hive_io_pressure(*, adapter: CgroupSystemAdapter) -> CgroupIoPressureEvidenceV1 | None:
+def read_hive_io_pressure(
+    *, adapter: CgroupSystemAdapter
+) -> CgroupIoPressureEvidenceV1 | None:
     try:
         return adapter.read_hive_io_pressure()
     except Exception:
@@ -1550,7 +1699,12 @@ def read_hive_io_pressure(*, adapter: CgroupSystemAdapter) -> CgroupIoPressureEv
 
 
 def _parse_decimal(value: str) -> int:
-    if not value or not value.isascii() or not value.isdecimal() or (len(value) > 1 and value[0] == "0"):
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdecimal()
+        or (len(value) > 1 and value[0] == "0")
+    ):
         _fail()
     parsed = int(value)
     if parsed > MAX_CPU_INDEX:
@@ -1692,7 +1846,9 @@ def build_approved_cgroup_runtime(
     else:
         adapter.bind_target_slice_control_group()
     topology = parse_cpu_topology(adapter)
-    memory_total = _read_host_memory_total_bytes() if mem_total_bytes is None else mem_total_bytes
+    memory_total = (
+        _read_host_memory_total_bytes() if mem_total_bytes is None else mem_total_bytes
+    )
     profile = derive_cgroup_profile(
         topology,
         approved_cpuset=approved,
@@ -1708,16 +1864,18 @@ def build_approved_cgroup_runtime(
     )
 
 
-def require_cgroup_preflight(adapter: CgroupSystemAdapter, profile: CgroupProfileV1) -> CgroupPreflightV1:
+def require_cgroup_preflight(
+    adapter: CgroupSystemAdapter, profile: CgroupProfileV1
+) -> CgroupPreflightV1:
     if not isinstance(profile, CgroupProfileV1):
         _fail()
     try:
         preflight = adapter.inspect_preflight()
     except Exception as exc:
         raise CgroupPreflightError("cgroup_preflight_failed") from exc
-    if not isinstance(preflight, CgroupPreflightV1) or not set(profile.cpuset_cpus).issubset(
-        preflight.parent_effective_cpuset
-    ):
+    if not isinstance(preflight, CgroupPreflightV1) or not set(
+        profile.cpuset_cpus
+    ).issubset(preflight.parent_effective_cpuset):
         _fail()
     return preflight
 
@@ -1765,7 +1923,9 @@ def start_released_scope(
         raise CgroupPreflightError("cgroup_preflight_failed") from exc
 
 
-def confirm_verified_scope(adapter: CgroupSystemAdapter, scope: PreparedAgentScope) -> PreparedAgentScope:
+def confirm_verified_scope(
+    adapter: CgroupSystemAdapter, scope: PreparedAgentScope
+) -> PreparedAgentScope:
     """Require Gate ELF attestation and tmux cgroup inheritance before publication."""
 
     if not isinstance(scope, PreparedAgentScope):

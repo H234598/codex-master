@@ -118,7 +118,9 @@ def test_decode_and_read_teamleader_registry_strict(tmp_path, monkeypatch) -> No
         json.dumps(
             {
                 "schema_version": server.TEAMLEADER_REGISTRY_SCHEMA_VERSION,
-                "principals": [{"digest": digest, "class": "koenigin", "agent_id": None}],
+                "principals": [
+                    {"digest": digest, "class": "koenigin", "agent_id": None}
+                ],
             }
         ),
         encoding="utf-8",
@@ -174,12 +176,15 @@ def test_native_subagent_parent_from_transcript_reads_only_active_home(
     monkeypatch.setattr(server, "active_codex_home_path", lambda: home)
 
     assert (
-            server._native_subagent_parent_from_transcript(
-                {"transcript_path": str(transcript)}, "child-456"
-            )
-            == "codex_agent_q1_mcp"
+        server._native_subagent_parent_from_transcript(
+            {"transcript_path": str(transcript)}, "child-456"
         )
-    assert server._native_subagent_parent_from_transcript({"transcript_path": "rel"}, "x") is None
+        == "codex_agent_q1_mcp"
+    )
+    assert (
+        server._native_subagent_parent_from_transcript({"transcript_path": "rel"}, "x")
+        is None
+    )
 
 
 def test_headless_process_start_ticks_parses_proc_stat(monkeypatch) -> None:
@@ -192,7 +197,9 @@ def test_headless_process_start_ticks_parses_proc_stat(monkeypatch) -> None:
     assert server._headless_process_start_ticks(123) == 19
 
 
-def test_headless_route_candidates_canonicalizes_single_requested_agent(monkeypatch) -> None:
+def test_headless_route_candidates_canonicalizes_single_requested_agent(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(server, "canonical_agent_id", lambda agent: f"canon-{agent}")
     assert server._headless_route_candidates("d1", "skill", ["a"]) == ["canon-d1"]
 
@@ -201,12 +208,20 @@ def test_private_text_peek_and_home_file_snapshot(tmp_path) -> None:
     private_file = tmp_path / "secret.txt"
     private_file.write_text("private text", encoding="utf-8")
     private_file.chmod(0o600)
-    assert server._fleet_peek_optional_private_text(private_file, 64, "boom") == "private text"
-    assert server._fleet_peek_optional_private_text(tmp_path / "missing", 64, "boom") is None
+    assert (
+        server._fleet_peek_optional_private_text(private_file, 64, "boom")
+        == "private text"
+    )
+    assert (
+        server._fleet_peek_optional_private_text(tmp_path / "missing", 64, "boom")
+        is None
+    )
 
     home_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        data, mode, stat_result = server._fleet_home_file_snapshot(home_fd, "secret.txt")
+        data, mode, stat_result = server._fleet_home_file_snapshot(
+            home_fd, "secret.txt"
+        )
     finally:
         os.close(home_fd)
     assert data == b"private text"
@@ -216,18 +231,30 @@ def test_private_text_peek_and_home_file_snapshot(tmp_path) -> None:
 
 def test_fleet_created_homes_match_verifies_identity(monkeypatch, tmp_path) -> None:
     expected = tmp_path.stat()
-    monkeypatch.setattr(server, "pool_root_lock", lambda _root: contextlib.nullcontext())
-    monkeypatch.setattr(server, "pool_root_operation", lambda *_a, **_k: contextlib.nullcontext(tmp_path))
+    monkeypatch.setattr(
+        server, "pool_root_lock", lambda _root: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        server,
+        "pool_root_operation",
+        lambda *_a, **_k: contextlib.nullcontext(tmp_path),
+    )
     monkeypatch.setattr(server, "_fleet_verify_home", lambda *_a, **_k: expected)
 
     assert server._fleet_created_homes_match([("a1", expected, {})]) is True
 
 
-def test_fleet_write_recovery_backup_restores_absent_home(monkeypatch, tmp_path) -> None:
+def test_fleet_write_recovery_backup_restores_absent_home(
+    monkeypatch, tmp_path
+) -> None:
     restored: dict[str, bytes] = {}
     monkeypatch.setattr(server, "path_present_no_follow", lambda _path: False)
-    monkeypatch.setattr(server, "_fleet_restore_home", lambda _home, backup: restored.update(backup))
-    monkeypatch.setattr(server, "_fleet_existing_home_ok", lambda _home, _artifacts: True)
+    monkeypatch.setattr(
+        server, "_fleet_restore_home", lambda _home, backup: restored.update(backup)
+    )
+    monkeypatch.setattr(
+        server, "_fleet_existing_home_ok", lambda _home, _artifacts: True
+    )
 
     server._fleet_write_recovery_backup(tmp_path / "a1", {"codex": b"runner"})
 
@@ -265,15 +292,23 @@ def test_fleet_plan_reports_counts_and_requires_confirmation() -> None:
 
 def test_fleet_require_removable_accepts_stopped_unleased_agent(monkeypatch) -> None:
     monkeypatch.setattr(server, "canonical_agent_id", lambda agent: agent)
-    monkeypatch.setattr(server, "agent_config", lambda _agent: {"session": "codex_agent_a1_mcp"})
+    monkeypatch.setattr(
+        server, "agent_config", lambda _agent: {"session": "codex_agent_a1_mcp"}
+    )
     monkeypatch.setattr(server, "tmux_alive", lambda _session: False)
-    monkeypatch.setattr(server, "agent_home_process_summary", lambda _agent: {"process_count": 0})
-    monkeypatch.setattr(server, "agent_lease_status", lambda *_a, **_k: {"state": "unclaimed"})
+    monkeypatch.setattr(
+        server, "agent_home_process_summary", lambda _agent: {"process_count": 0}
+    )
+    monkeypatch.setattr(
+        server, "agent_lease_status", lambda *_a, **_k: {"state": "unclaimed"}
+    )
 
     assert server._fleet_require_removable("a1") is None
 
 
-def test_fleet_series_recovery_entries_covers_create_update_and_remove(monkeypatch, tmp_path) -> None:
+def test_fleet_series_recovery_entries_covers_create_update_and_remove(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path)
     current = _snapshot(_series("a", 2, model="old"), generation=4)
     planned = _snapshot(_series("a", 2, model="new"), _series("b", 1), generation=5)
@@ -288,7 +323,9 @@ def test_fleet_series_recovery_entries_covers_create_update_and_remove(monkeypat
     assert all(entry.phase is EntryPhase.INTENT for entry in entries)
 
 
-def test_fleet_recovery_transaction_append_entry_persists_and_returns_index(tmp_path, monkeypatch) -> None:
+def test_fleet_recovery_transaction_append_entry_persists_and_returns_index(
+    tmp_path, monkeypatch
+) -> None:
     persisted: list[FleetRecoveryJournal] = []
     transaction = server._FleetRecoveryTransaction(
         server.FleetPaths.from_state_root(tmp_path),
@@ -307,10 +344,16 @@ def test_fleet_recovery_transaction_append_entry_persists_and_returns_index(tmp_
     assert persisted == [transaction.journal]
 
 
-def test_fleet_series_disable_locked_stops_series_and_commits(monkeypatch, tmp_path) -> None:
+def test_fleet_series_disable_locked_stops_series_and_commits(
+    monkeypatch, tmp_path
+) -> None:
     current = _snapshot(_series("a", 2), generation=4)
-    planned = replace(current, generation=5, series=(replace(current.series[0], enabled=False),))
-    service = SimpleNamespace(load=Mock(return_value=current), commit_snapshot=Mock(return_value=planned))
+    planned = replace(
+        current, generation=5, series=(replace(current.series[0], enabled=False),)
+    )
+    service = SimpleNamespace(
+        load=Mock(return_value=current), commit_snapshot=Mock(return_value=planned)
+    )
     transaction = SimpleNamespace(
         journal=_journal(),
         paths=server.FleetPaths.from_state_root(tmp_path),
@@ -319,13 +362,21 @@ def test_fleet_series_disable_locked_stops_series_and_commits(monkeypatch, tmp_p
     stopped: list[str] = []
     monkeypatch.setattr(server, "require_fleet_recovery_ready", lambda _operation: None)
     monkeypatch.setattr(server, "current_fleet_service", lambda: service)
-    monkeypatch.setattr(server._FleetRecoveryTransaction, "begin", Mock(return_value=transaction))
+    monkeypatch.setattr(
+        server._FleetRecoveryTransaction, "begin", Mock(return_value=transaction)
+    )
     monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path)
-    monkeypatch.setattr(server, "temporary_agent_inventory", lambda _inventory: contextlib.nullcontext())
-    monkeypatch.setattr(server, "stop_agent", lambda agent, **_kwargs: stopped.append(agent))
+    monkeypatch.setattr(
+        server, "temporary_agent_inventory", lambda _inventory: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        server, "stop_agent", lambda agent, **_kwargs: stopped.append(agent)
+    )
     monkeypatch.setattr(server, "update_watchdog_marker", lambda *_a: None)
     monkeypatch.setattr(server, "publish_agent_inventory", lambda _inventory: None)
-    monkeypatch.setattr(server, "_fleet_remove_complete_recovery_journal", lambda *_a: True)
+    monkeypatch.setattr(
+        server, "_fleet_remove_complete_recovery_journal", lambda *_a: True
+    )
 
     result = server._fleet_series_disable_locked(prefix="a", expected_generation=4)
 
@@ -339,7 +390,9 @@ def test_fleet_series_disable_locked_stops_series_and_commits(monkeypatch, tmp_p
     }
 
 
-def test_g_migration_mark_degraded_redacts_authoritative_generation(monkeypatch, tmp_path) -> None:
+def test_g_migration_mark_degraded_redacts_authoritative_generation(
+    monkeypatch, tmp_path
+) -> None:
     journal = GMigrationJournal(
         1,
         "m" * 32,
@@ -359,16 +412,22 @@ def test_g_migration_mark_degraded_redacts_authoritative_generation(monkeypatch,
         (),
     )
     stored: list[GMigrationJournal] = []
-    monkeypatch.setattr(server, "_g_migration_store_journal", lambda *_args: stored.append(_args[-1]))
+    monkeypatch.setattr(
+        server, "_g_migration_store_journal", lambda *_args: stored.append(_args[-1])
+    )
 
-    server._g_migration_mark_degraded(SimpleNamespace(), server.FleetPaths.from_state_root(tmp_path), journal, 99)
+    server._g_migration_mark_degraded(
+        SimpleNamespace(), server.FleetPaths.from_state_root(tmp_path), journal, 99
+    )
 
     assert stored[0].phase is GMigrationPhase.DEGRADED
     assert stored[0].authoritative_generation is None
     assert stored[0].blocking_error_codes == ("migration_recovery_degraded",)
 
 
-def test_goddess_helpers_parse_env_state_and_binding_status(monkeypatch, tmp_path) -> None:
+def test_goddess_helpers_parse_env_state_and_binding_status(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setenv("CODEX_PROGRAMMING_VAULT", str(tmp_path / "vault"))
     assert server._goddess_vault_root() == tmp_path / "vault"
     monkeypatch.setattr(server, "GODDESS_REPORT_STATE_FILE", tmp_path / "state.json")
@@ -382,32 +441,48 @@ def test_goddess_helpers_parse_env_state_and_binding_status(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(server, "build_current_hive_runtime", lambda **_kwargs: runtime)
     monkeypatch.setattr(server, "active_reporter_required", lambda *_a, **_k: True)
-    assert server._goddess_binding_status(datetime(2026, 8, 16, tzinfo=UTC)) == (True, None)
+    assert server._goddess_binding_status(datetime(2026, 8, 16, tzinfo=UTC)) == (
+        True,
+        None,
+    )
 
 
 def test_parse_report_timestamp_normalizes_to_utc_and_rejects_naive() -> None:
-    assert server._parse_report_timestamp("2026-08-16T12:30:00+02:00", "from") == datetime(
-        2026, 8, 16, 10, 30, tzinfo=UTC
-    )
+    assert server._parse_report_timestamp(
+        "2026-08-16T12:30:00+02:00", "from"
+    ) == datetime(2026, 8, 16, 10, 30, tzinfo=UTC)
     with pytest.raises(server.AgentError, match="from must be RFC3339"):
         server._parse_report_timestamp("2026-08-16T12:30:00", "from")
 
 
-def test_assignment_report_output_meaningful_filters_empty_and_accepts_content() -> None:
+def test_assignment_report_output_meaningful_filters_empty_and_accepts_content() -> (
+    None
+):
     assert server._is_assignment_report_output_meaningful("", running=False) is False
-    assert server._is_assignment_report_output_meaningful("finished useful work", running=True) is True
+    assert (
+        server._is_assignment_report_output_meaningful(
+            "finished useful work", running=True
+        )
+        is True
+    )
 
 
 def test_usage_watchdog_agent_unlocked_clear_path(monkeypatch) -> None:
     monkeypatch.setattr(server, "canonical_agent_id", lambda agent: agent)
-    monkeypatch.setattr(server, "agent_config", lambda _agent: {"session": "codex_agent_a1_mcp"})
+    monkeypatch.setattr(
+        server, "agent_config", lambda _agent: {"session": "codex_agent_a1_mcp"}
+    )
     monkeypatch.setattr(server, "tmux_alive", lambda _session: False)
     monkeypatch.setattr(
         server,
         "agent_lease_status",
         lambda *_a, **_k: {"state": "unclaimed", "held_by_this_server": False},
     )
-    monkeypatch.setattr(server, "codex_usage_watchdog_status", lambda _agent, **_kwargs: {"blocked": False})
+    monkeypatch.setattr(
+        server,
+        "codex_usage_watchdog_status",
+        lambda _agent, **_kwargs: {"blocked": False},
+    )
 
     result = server._usage_watchdog_agent_unlocked("a1", dry_run=True)
 

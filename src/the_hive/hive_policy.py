@@ -223,7 +223,9 @@ def load_common_policy(path: str | Path = COMMON_POLICY_PATH) -> CommonPolicyCon
     except UnicodeDecodeError:
         raise CommonPolicyError("common_policy_encoding_invalid") from None
     try:
-        is_canonical_common_policy = policy_path.resolve() == COMMON_POLICY_PATH.resolve()
+        is_canonical_common_policy = (
+            policy_path.resolve() == COMMON_POLICY_PATH.resolve()
+        )
     except OSError as exc:
         raise CommonPolicyError("common_policy_unavailable") from exc
     if is_canonical_common_policy:

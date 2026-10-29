@@ -286,7 +286,11 @@ def _validate_choices(
     if type(fallback_applied) is not bool:
         _invalid()
     if requested_choice is None or effective_choice is None:
-        if requested_choice is not None or effective_choice is not None or fallback_applied:
+        if (
+            requested_choice is not None
+            or effective_choice is not None
+            or fallback_applied
+        ):
             _invalid()
         return
     requested = _validate_token(requested_choice)

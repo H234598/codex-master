@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable as _Callable, Collection as _Collection, Mapping as _Mapping
+from collections.abc import (
+    Callable as _Callable,
+    Collection as _Collection,
+    Mapping as _Mapping,
+)
 from dataclasses import dataclass as _dataclass
 from uuid import UUID as _UUID
 
@@ -73,7 +77,11 @@ def _valid_provider_runner(provider: object, runner: object) -> bool:
         _Provider.OLLAMA_LOCAL: _RunnerKind.CODEX_CLI,
         _Provider.HUGGINGFACE_INFERENCE: _RunnerKind.CODEX_CLI,
     }
-    return type(provider) is _Provider and type(runner) is _RunnerKind and expected.get(provider) is runner
+    return (
+        type(provider) is _Provider
+        and type(runner) is _RunnerKind
+        and expected.get(provider) is runner
+    )
 
 
 def _valid_account(account: object) -> bool:
@@ -87,10 +95,22 @@ def _valid_account(account: object) -> bool:
         and type(account.secret_state) is _SecretState
         and type(account.limit_state) is _LimitState
         and type(account.enabled) is bool
-        and (account.reset_at_utc is None or _valid_text(account.reset_at_utc, maximum=64))
-        and (account.last_probe_at_utc is None or _valid_text(account.last_probe_at_utc, maximum=64))
-        and (account.limit_reason is None or _valid_text(account.limit_reason, maximum=64))
-        and (account.billing_group is None or _valid_text(account.billing_group, maximum=64))
+        and (
+            account.reset_at_utc is None
+            or _valid_text(account.reset_at_utc, maximum=64)
+        )
+        and (
+            account.last_probe_at_utc is None
+            or _valid_text(account.last_probe_at_utc, maximum=64)
+        )
+        and (
+            account.limit_reason is None
+            or _valid_text(account.limit_reason, maximum=64)
+        )
+        and (
+            account.billing_group is None
+            or _valid_text(account.billing_group, maximum=64)
+        )
     )
 
 
@@ -103,13 +123,18 @@ def _valid_member(member: object) -> bool:
         and type(member.source_ordinal) is int
         and member.source_ordinal > 0
         and _valid_text(member.account_id, maximum=64)
-        and (member.target_ordinal is None or (type(member.target_ordinal) is int and member.target_ordinal > 0))
+        and (
+            member.target_ordinal is None
+            or (type(member.target_ordinal) is int and member.target_ordinal > 0)
+        )
         and _valid_text(member.disposition, maximum=64)
         and _valid_text(member.reason_code, maximum=64)
     )
 
 
-def _validate_snapshot_shape(snapshot: object) -> tuple[dict[str, _FleetAccount], dict[str, tuple[_FleetMigrationSeries, object]]]:
+def _validate_snapshot_shape(
+    snapshot: object,
+) -> tuple[dict[str, _FleetAccount], dict[str, tuple[_FleetMigrationSeries, object]]]:
     if type(snapshot) is not _FleetMigrationSnapshot:
         _fail("invalid_migration_materialization")
     if (
@@ -154,8 +179,12 @@ def _validate_snapshot_shape(snapshot: object) -> tuple[dict[str, _FleetAccount]
                 and not _valid_text(legacy_member.account_id, maximum=64)
                 or type(legacy_member.enabled) is not bool
                 or not _valid_optional_text(legacy_member.model_override)
-                or not _valid_optional_text(legacy_member.skill_profile_override, maximum=64)
-                or not _valid_optional_text(legacy_member.task_profile_override, maximum=64)
+                or not _valid_optional_text(
+                    legacy_member.skill_profile_override, maximum=64
+                )
+                or not _valid_optional_text(
+                    legacy_member.task_profile_override, maximum=64
+                )
                 or legacy_member.migration_identity in members
             ):
                 _fail("invalid_migration_materialization")
@@ -168,9 +197,15 @@ def _validate_provider_references(
     members: _Mapping[str, tuple[_FleetMigrationSeries, object]],
 ) -> None:
     for series, legacy_member in members.values():
-        account = accounts.get(legacy_member.account_id) if legacy_member.account_id is not None else None
+        account = (
+            accounts.get(legacy_member.account_id)
+            if legacy_member.account_id is not None
+            else None
+        )
         requires_account = series.provider is not _Provider.OLLAMA_LOCAL
-        if (requires_account and account is None) or (not requires_account and account is not None):
+        if (requires_account and account is None) or (
+            not requires_account and account is not None
+        ):
             _fail("invalid_migration_materialization")
         if account is not None and account.provider is not series.provider:
             _fail("invalid_migration_materialization")
@@ -178,7 +213,9 @@ def _validate_provider_references(
 
 def _expected_relocation(snapshot: _FleetMigrationSnapshot) -> str | None:
     prefixes = {series.prefix for series in snapshot.series}
-    g_series = next((series for series in snapshot.series if series.prefix == "g"), None)
+    g_series = next(
+        (series for series in snapshot.series if series.prefix == "g"), None
+    )
     if g_series is None or g_series.provider is _Provider.GEMINI_API:
         return None
     gemini_prefixes = sorted(
@@ -209,7 +246,10 @@ def _validate_plan(
         type(plan.source_generation) is not int
         or plan.source_generation != snapshot.generation
         or plan.target_prefix != "g"
-        or (plan.g_relocation_target is not None and not _valid_text(plan.g_relocation_target, maximum=16))
+        or (
+            plan.g_relocation_target is not None
+            and not _valid_text(plan.g_relocation_target, maximum=16)
+        )
         or type(plan.members) is not tuple
     ):
         _fail("invalid_migration_plan")
@@ -242,7 +282,10 @@ def _validate_plan(
                 _fail("invalid_migration_plan")
             target_ordinals.add(item.target_ordinal)
         elif item.disposition == "retired_duplicate_credential":
-            if item.target_ordinal is not None or item.reason_code != "duplicate_credential":
+            if (
+                item.target_ordinal is not None
+                or item.reason_code != "duplicate_credential"
+            ):
                 _fail("invalid_migration_plan")
         else:
             _fail("invalid_migration_plan")
@@ -282,7 +325,9 @@ def _allocation_entries(value: object, *, code: str) -> tuple[tuple[str, str], .
             _fail(code)
         entries.append((record.migration_identity, record.member_id))
     identities = tuple(identity for identity, _member_id in entries)
-    if identities != tuple(sorted(identities)) or len(set(identities)) != len(identities):
+    if identities != tuple(sorted(identities)) or len(set(identities)) != len(
+        identities
+    ):
         _fail(code)
     return tuple(entries)
 
@@ -338,23 +383,32 @@ def allocate_final_member_ids(
     except GMigrationMaterializationError:
         raise
     except Exception:
-        raise GMigrationMaterializationError("invalid_migration_materialization") from None
+        raise GMigrationMaterializationError(
+            "invalid_migration_materialization"
+        ) from None
 
 
 def _binding_by_account(
     snapshot: _FleetMigrationSnapshot,
     credential_bindings: object,
 ) -> dict[str, str]:
-    if not isinstance(credential_bindings, _Mapping) or isinstance(credential_bindings, (str, bytes)):
+    if not isinstance(credential_bindings, _Mapping) or isinstance(
+        credential_bindings, (str, bytes)
+    ):
         _fail("credential_binding_unknown")
     gemini_ids = {
-        account.account_id for account in snapshot.accounts if account.provider is _Provider.GEMINI_API
+        account.account_id
+        for account in snapshot.accounts
+        if account.provider is _Provider.GEMINI_API
     }
     try:
         entries = tuple(credential_bindings.items())
     except Exception:
         _fail("credential_binding_unknown")
-    if len(entries) != len(gemini_ids) or {key for key, _value in entries} != gemini_ids:
+    if (
+        len(entries) != len(gemini_ids)
+        or {key for key, _value in entries} != gemini_ids
+    ):
         _fail("credential_binding_unknown")
     result: dict[str, str] = {}
     for key, value in entries:
@@ -363,7 +417,9 @@ def _binding_by_account(
             or type(value) is not str
             or len(value) != len("hmac-sha256:") + 64
             or not value.startswith("hmac-sha256:")
-            or any(char not in "0123456789abcdef" for char in value[len("hmac-sha256:") :])
+            or any(
+                char not in "0123456789abcdef" for char in value[len("hmac-sha256:") :]
+            )
         ):
             _fail("credential_binding_unknown")
         result[key] = value
@@ -382,7 +438,8 @@ def _duplicate_loser_accounts(
     non_gemini_references = {
         legacy_member.account_id
         for series, legacy_member in members.values()
-        if series.provider is not _Provider.GEMINI_API and legacy_member.account_id is not None
+        if series.provider is not _Provider.GEMINI_API
+        and legacy_member.account_id is not None
     }
     losers: set[str] = set()
     for binding, account_ids in grouped.items():
@@ -391,7 +448,8 @@ def _duplicate_loser_accounts(
         winners = {
             item.account_id
             for identity, item in plan.items()
-            if item.disposition == "g_member" and bindings.get(item.account_id) == binding
+            if item.disposition == "g_member"
+            and bindings.get(item.account_id) == binding
         }
         if len(winners) != 1:
             _fail("migration_duplicate_account_conflict")
@@ -400,11 +458,15 @@ def _duplicate_loser_accounts(
             account_members = [
                 identity
                 for identity, (series, legacy_member) in members.items()
-                if series.provider is _Provider.GEMINI_API and legacy_member.account_id == account_id
+                if series.provider is _Provider.GEMINI_API
+                and legacy_member.account_id == account_id
             ]
             if (
                 not account_members
-                or any(plan[identity].disposition != "retired_duplicate_credential" for identity in account_members)
+                or any(
+                    plan[identity].disposition != "retired_duplicate_credential"
+                    for identity in account_members
+                )
                 or account_id in non_gemini_references
             ):
                 _fail("migration_duplicate_account_conflict")
@@ -430,13 +492,17 @@ def _materialize_accounts(
             account.last_probe_at_utc,
             account.limit_reason,
             account.billing_group,
-            bindings.get(account.account_id) if account.provider is _Provider.GEMINI_API else None,
+            bindings.get(account.account_id)
+            if account.provider is _Provider.GEMINI_API
+            else None,
         )
         for account in snapshot.accounts
     )
 
 
-def _override(value: str | None, source_default: str, target_default: str) -> str | None:
+def _override(
+    value: str | None, source_default: str, target_default: str
+) -> str | None:
     effective = source_default if value is None else value
     return None if effective == target_default else effective
 
@@ -458,12 +524,22 @@ def _materialize_series(
             if prefix is None:
                 _fail("invalid_migration_plan")
         output_members = []
-        for legacy_member in sorted(source_series.members, key=lambda item: item.ordinal):
+        for legacy_member in sorted(
+            source_series.members, key=lambda item: item.ordinal
+        ):
             member_id = allocations.get(legacy_member.migration_identity)
             if member_id is None:
                 _fail("invalid_member_id_allocation")
-            account = accounts.get(legacy_member.account_id) if legacy_member.account_id is not None else None
-            enabled = source_series.enabled and legacy_member.enabled and (account is None or account.enabled)
+            account = (
+                accounts.get(legacy_member.account_id)
+                if legacy_member.account_id is not None
+                else None
+            )
+            enabled = (
+                source_series.enabled
+                and legacy_member.enabled
+                and (account is None or account.enabled)
+            )
             output_members.append(
                 _FleetSeriesMember(
                     member_id,
@@ -492,7 +568,11 @@ def _materialize_series(
     winners = [item for item in plan.values() if item.disposition == "g_member"]
     winner_sources = [members[item.migration_identity][0] for item in winners]
     base = next(
-        (item for item in snapshot.series if item.prefix == "g" and item.provider is _Provider.GEMINI_API),
+        (
+            item
+            for item in snapshot.series
+            if item.prefix == "g" and item.provider is _Provider.GEMINI_API
+        ),
         min(winner_sources, key=lambda item: item.prefix),
     )
     g_members: list[_FleetSeriesMember] = []
@@ -510,9 +590,19 @@ def _materialize_series(
                 item.target_ordinal,
                 item.account_id,
                 source_series.enabled and legacy_member.enabled and account.enabled,
-                _override(legacy_member.model_override, source_series.model, base.model),
-                _override(legacy_member.skill_profile_override, source_series.skill_profile, base.skill_profile),
-                _override(legacy_member.task_profile_override, source_series.task_profile, base.task_profile),
+                _override(
+                    legacy_member.model_override, source_series.model, base.model
+                ),
+                _override(
+                    legacy_member.skill_profile_override,
+                    source_series.skill_profile,
+                    base.skill_profile,
+                ),
+                _override(
+                    legacy_member.task_profile_override,
+                    source_series.task_profile,
+                    base.task_profile,
+                ),
             )
         )
     output.append(
@@ -537,7 +627,10 @@ def _allocation_by_identity(
 ) -> dict[str, str]:
     entries = _allocation_entries(allocations, code="invalid_member_id_allocation")
     expected = set(final_identities)
-    if len(entries) != len(expected) or {identity for identity, _member_id in entries} != expected:
+    if (
+        len(entries) != len(expected)
+        or {identity for identity, _member_id in entries} != expected
+    ):
         _fail("invalid_member_id_allocation")
     result: dict[str, str] = {}
     used: set[str] = set()
@@ -563,12 +656,18 @@ def materialize_g_series_v2(
         accounts, members = _validate_snapshot_shape(snapshot)
         validated_plan = _validate_plan(snapshot, plan, members)
         bindings = _binding_by_account(snapshot, credential_bindings)
-        duplicate_losers = _duplicate_loser_accounts(snapshot, members, validated_plan, bindings)
+        duplicate_losers = _duplicate_loser_accounts(
+            snapshot, members, validated_plan, bindings
+        )
         _validate_provider_references(accounts, members)
         final_identities = _final_identities(members, validated_plan)
         allocation_by_identity = _allocation_by_identity(allocations, final_identities)
-        materialized_accounts = _materialize_accounts(snapshot, bindings, duplicate_losers)
-        accounts_by_id = {account.account_id: account for account in materialized_accounts}
+        materialized_accounts = _materialize_accounts(
+            snapshot, bindings, duplicate_losers
+        )
+        accounts_by_id = {
+            account.account_id: account for account in materialized_accounts
+        }
         materialized_series = _materialize_series(
             snapshot,
             members,
@@ -576,7 +675,9 @@ def materialize_g_series_v2(
             allocation_by_identity,
             accounts_by_id,
         )
-        candidate = _FleetSnapshotV2(2, snapshot.generation + 1, materialized_accounts, materialized_series, ())
+        candidate = _FleetSnapshotV2(
+            2, snapshot.generation + 1, materialized_accounts, materialized_series, ()
+        )
         normalized = _normalize_fleet_document(_fleet_document(candidate))
         if type(normalized) is not _FleetSnapshotV2:
             _fail("invalid_migration_materialization")
@@ -584,4 +685,6 @@ def materialize_g_series_v2(
     except GMigrationMaterializationError:
         raise
     except Exception:
-        raise GMigrationMaterializationError("invalid_migration_materialization") from None
+        raise GMigrationMaterializationError(
+            "invalid_migration_materialization"
+        ) from None

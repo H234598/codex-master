@@ -90,7 +90,9 @@ class FileCompletionJournal(CompletionJournal):
                 return
             if len(records) >= MAX_JOURNAL_RECORDS:
                 raise CompletionJournalError("completion_journal_full")
-            records[admission.admission_id] = self._started_payload(admission, operation)
+            records[admission.admission_id] = self._started_payload(
+                admission, operation
+            )
             self._write_locked(records)
         self._record_event(admission, "executing")
 
@@ -169,12 +171,16 @@ class FileCompletionJournal(CompletionJournal):
 
     def _load_locked(self) -> dict[str, dict[str, object]]:
         try:
-            payload = self._state.read_json_locked(_JOURNAL_RELATIVE_PATH, max_bytes=4 * 1024 * 1024)
+            payload = self._state.read_json_locked(
+                _JOURNAL_RELATIVE_PATH, max_bytes=4 * 1024 * 1024
+            )
         except HiveStateError as exc:
             if str(exc) == "state_not_found":
                 return {}
             raise CompletionJournalError("completion_journal_invalid") from exc
-        if payload.get("schema_version") != 1 or not isinstance(payload.get("records"), list):
+        if payload.get("schema_version") != 1 or not isinstance(
+            payload.get("records"), list
+        ):
             raise CompletionJournalError("completion_journal_invalid")
         raw_records = payload["records"]
         if len(raw_records) > MAX_JOURNAL_RECORDS:
@@ -224,7 +230,9 @@ class FileCompletionJournal(CompletionJournal):
         except HiveStateError as exc:
             raise CompletionJournalError("completion_journal_write_failed") from exc
 
-    def _started_payload(self, admission: AdmissionRecord, operation: str) -> dict[str, object]:
+    def _started_payload(
+        self, admission: AdmissionRecord, operation: str
+    ) -> dict[str, object]:
         return {
             "admission_id": admission.admission_id,
             "revision": admission.revision,
@@ -252,7 +260,8 @@ class FileCompletionJournal(CompletionJournal):
                 dispatch_id=admission.dispatch_id,
                 repo_id=admission.repo_id,
                 agent_id=admission.resource.agent_id,
-                event_id="admission-" + hashlib.sha256(
+                event_id="admission-"
+                + hashlib.sha256(
                     f"{admission.admission_id}\0{status}".encode("utf-8")
                 ).hexdigest()[:24],
             )
@@ -261,8 +270,11 @@ class FileCompletionJournal(CompletionJournal):
 
 
 def _is_digest(value: object) -> bool:
-    return isinstance(value, str) and value.startswith("sha256:") and len(value) == 71 and all(
-        char in "0123456789abcdef" for char in value[7:]
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(char in "0123456789abcdef" for char in value[7:])
     )
 
 
@@ -286,7 +298,10 @@ def _admission_binding_digest(admission: AdmissionRecord) -> str:
         "grant_id": admission.grant_id,
         "grant_digest": admission.grant_digest,
         "work_item_version": admission.work_item_version,
-        "scope": {"mode": admission.scope.mode, "digest": admission.scope.canonical_digest},
+        "scope": {
+            "mode": admission.scope.mode,
+            "digest": admission.scope.canonical_digest,
+        },
         "resource": {
             "agent_id": admission.resource.agent_id,
             "account_digest": _digest(admission.resource.account_key),
@@ -298,7 +313,8 @@ def _admission_binding_digest(admission: AdmissionRecord) -> str:
             "expected_state": admission.lease_context.expected_state,
             "lease_digest": (
                 _digest(admission.lease_context.lease_id)
-                if admission.lease_context.lease_id is not None else None
+                if admission.lease_context.lease_id is not None
+                else None
             ),
         },
         "priority": {
@@ -306,7 +322,9 @@ def _admission_binding_digest(admission: AdmissionRecord) -> str:
             "selection_reason": admission.priority.selection_reason,
         },
     }
-    canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
     return _digest(canonical)
 
 

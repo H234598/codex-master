@@ -53,12 +53,19 @@ def create_assignment_admission(
     claim a lease, start a provider, or mutate a repository.
     """
 
-    if not all(isinstance(value, expected) for value, expected in (
-        (plan, QueenAssignmentPlan), (workpackage, WorkPackage),
-        (intent, AssignmentIntent), (grant, DelegationGrant),
-        (authority, AuthorityEngine), (repositories, RepositoryRegistry),
-        (lease_context, LeaseBinding), (priority, AdmissionPriority),
-    )):
+    if not all(
+        isinstance(value, expected)
+        for value, expected in (
+            (plan, QueenAssignmentPlan),
+            (workpackage, WorkPackage),
+            (intent, AssignmentIntent),
+            (grant, DelegationGrant),
+            (authority, AuthorityEngine),
+            (repositories, RepositoryRegistry),
+            (lease_context, LeaseBinding),
+            (priority, AdmissionPriority),
+        )
+    ):
         raise HiveAdmissionError("invalid_assignment_admission_input")
     if plan.mode != "enforced":
         raise HiveAdmissionError("assignment_shadow_only")
@@ -104,8 +111,14 @@ def create_assignment_admission(
             capability=capability,
         )
         scope_mode = "write" if workpackage.write_paths else "read"
-        binding_paths = tuple(workpackage.write_paths) if scope_mode == "write" else tuple(workpackage.scope)
-        scope_digest = repositories.scope_digest(plan.repo_id, scope_mode, binding_paths)
+        binding_paths = (
+            tuple(workpackage.write_paths)
+            if scope_mode == "write"
+            else tuple(workpackage.scope)
+        )
+        scope_digest = repositories.scope_digest(
+            plan.repo_id, scope_mode, binding_paths
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         raise HiveAdmissionError("authoritative_admission_unavailable") from exc
     if current_grant != grant:
@@ -138,6 +151,7 @@ def create_assignment_admission(
         now=now,
         ttl_seconds=ttl_seconds,
     )
+
 
 ExecutionAdmission = AdmissionRecord
 

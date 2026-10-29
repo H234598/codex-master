@@ -56,17 +56,13 @@ class WalRecovery:
 
 
 class WalOperations(Protocol):
-    def read_all(self) -> tuple[bytes, ...]:
-        ...
+    def read_all(self) -> tuple[bytes, ...]: ...
 
-    def append(self, record: bytes) -> None:
-        ...
+    def append(self, record: bytes) -> None: ...
 
-    def fsync_wal(self) -> None:
-        ...
+    def fsync_wal(self) -> None: ...
 
-    def fsync_parent(self) -> None:
-        ...
+    def fsync_parent(self) -> None: ...
 
 
 def _invalid(message: str) -> None:
@@ -74,7 +70,11 @@ def _invalid(message: str) -> None:
 
 
 def _digest_text(value: object, field: str) -> str:
-    if type(value) is not str or len(value) != _DIGEST_BYTES or any(character not in "0123456789abcdef" for character in value):
+    if (
+        type(value) is not str
+        or len(value) != _DIGEST_BYTES
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
         _invalid(f"{field} is not a lowercase SHA-256 digest")
     return value
 
@@ -96,8 +96,19 @@ def encode_status_payload(status: TransactionStatus) -> bytes:
     if type(status) is not TransactionStatus:
         _invalid("status type is invalid")
     try:
-        result = status.terminal_result if status.terminal_result is not None else BrokerResultCode.PENDING
-        message = BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, status.binding.transaction_id, result, status, None)
+        result = (
+            status.terminal_result
+            if status.terminal_result is not None
+            else BrokerResultCode.PENDING
+        )
+        message = BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            status.binding.transaction_id,
+            result,
+            status,
+            None,
+        )
         return encode_chpb_message(message)
     except Exception as exc:
         raise WalValidationError("status payload is invalid") from exc
@@ -110,14 +121,22 @@ def decode_status_payload(raw: bytes) -> TransactionStatus:
         message = decode_chpb_message(raw)
     except Exception as exc:
         raise WalValidationError("status payload is invalid") from exc
-    if type(message) is not BrokerReply or message.protocol != CHPB_PROTOCOL or message.kind is not ChpbMessageKind.REPLY:
+    if (
+        type(message) is not BrokerReply
+        or message.protocol != CHPB_PROTOCOL
+        or message.kind is not ChpbMessageKind.REPLY
+    ):
         _invalid("status payload is not a CHPB/2 reply")
     if message.attestation is not None or message.transaction is None:
         _invalid("status payload has an attestation or no transaction")
     status = message.transaction
     if message.request_id != status.binding.transaction_id:
         _invalid("status payload request binding is invalid")
-    expected_result = status.terminal_result if status.terminal_result is not None else BrokerResultCode.PENDING
+    expected_result = (
+        status.terminal_result
+        if status.terminal_result is not None
+        else BrokerResultCode.PENDING
+    )
     if message.result is not expected_result:
         _invalid("status payload result is invalid")
     if encode_status_payload(status) != raw:
@@ -128,10 +147,18 @@ def decode_status_payload(raw: bytes) -> TransactionStatus:
 def _preimage(sequence: int, previous_digest: str, payload: bytes) -> bytes:
     if type(payload) is not bytes:
         _invalid("record payload type is invalid")
-    return _MAGIC + sequence.to_bytes(8, "big") + previous_digest.encode("ascii") + len(payload).to_bytes(4, "big") + payload
+    return (
+        _MAGIC
+        + sequence.to_bytes(8, "big")
+        + previous_digest.encode("ascii")
+        + len(payload).to_bytes(4, "big")
+        + payload
+    )
 
 
-def _record_from_status(sequence: int, previous_digest: str, status: TransactionStatus, payload: bytes) -> WalRecord:
+def _record_from_status(
+    sequence: int, previous_digest: str, status: TransactionStatus, payload: bytes
+) -> WalRecord:
     preimage = _preimage(sequence, previous_digest, payload)
     return WalRecord(sequence, previous_digest, sha256(preimage).hexdigest(), status)
 
@@ -182,8 +209,13 @@ def _validate_initial(status: TransactionStatus) -> None:
         _invalid("record one is not an initial mutation checkpoint")
 
 
-def _validate_following(previous: TransactionStatus, current: TransactionStatus) -> None:
-    if previous.binding != current.binding or previous.population_total != current.population_total:
+def _validate_following(
+    previous: TransactionStatus, current: TransactionStatus
+) -> None:
+    if (
+        previous.binding != current.binding
+        or previous.population_total != current.population_total
+    ):
         _invalid("WAL status binding or population total changed")
     if not is_checkpoint_transition_allowed(previous.checkpoint, current.checkpoint):
         _invalid("WAL checkpoint transition is not allowed")
@@ -201,7 +233,10 @@ def _validated_chain(raw_records: tuple[bytes, ...]) -> tuple[WalRecord, ...]:
     expected_previous = _GENESIS
     for raw in raw_records:
         record = decode_wal_record(raw)
-        if record.sequence != expected_sequence or record.previous_digest != expected_previous:
+        if (
+            record.sequence != expected_sequence
+            or record.previous_digest != expected_previous
+        ):
             _invalid("WAL sequence or hash chain is broken")
         if not records:
             _validate_initial(record.status)
@@ -247,7 +282,9 @@ def append_status(operations: WalOperations, status: TransactionStatus) -> WalRe
         if previous.sequence == _MAX_SEQUENCE:
             _invalid("WAL sequence cannot advance")
         _validate_following(previous.status, status)
-        record = _record_from_status(previous.sequence + 1, previous.digest, status, payload)
+        record = _record_from_status(
+            previous.sequence + 1, previous.digest, status, payload
+        )
     else:
         _validate_initial(status)
         record = _record_from_status(1, _GENESIS, status, payload)
@@ -267,7 +304,9 @@ def _blocked_decision() -> RecoveryDecision:
     )
 
 
-def recover_status(operations: WalOperations, observation: BrokerObservation) -> WalRecovery:
+def recover_status(
+    operations: WalOperations, observation: BrokerObservation
+) -> WalRecovery:
     try:
         records = _validated_chain(operations.read_all())
     except Exception:

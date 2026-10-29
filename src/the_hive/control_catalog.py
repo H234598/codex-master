@@ -189,7 +189,9 @@ RISK_BY_TOOL = MappingProxyType(
 
 _ROOT_KEYWORDS = frozenset({"type", "required", "properties", "additionalProperties"})
 _STRING_KEYWORDS = frozenset({"type", "description", "default", "enum", "maxLength"})
-_INTEGER_KEYWORDS = frozenset({"type", "description", "default", "enum", "minimum", "maximum"})
+_INTEGER_KEYWORDS = frozenset(
+    {"type", "description", "default", "enum", "minimum", "maximum"}
+)
 _BOOLEAN_KEYWORDS = frozenset({"type", "description", "default"})
 _ARRAY_KEYWORDS = frozenset(
     {"type", "description", "default", "items", "minItems", "maxItems", "uniqueItems"}
@@ -226,13 +228,17 @@ def _schema_mapping(value: Any, label: str) -> Mapping[str, Any]:
     return value
 
 
-def _reject_unknown_keywords(schema: Mapping[str, Any], allowed: frozenset[str], label: str) -> None:
+def _reject_unknown_keywords(
+    schema: Mapping[str, Any], allowed: frozenset[str], label: str
+) -> None:
     unknown = sorted(set(schema) - allowed)
     if unknown:
         raise SchemaError(f"{label} uses unsupported keyword")
 
 
-def _optional_non_negative_int(schema: Mapping[str, Any], key: str, label: str) -> int | None:
+def _optional_non_negative_int(
+    schema: Mapping[str, Any], key: str, label: str
+) -> int | None:
     if key not in schema:
         return None
     value = schema[key]
@@ -307,7 +313,11 @@ def _normalize_value(
             raise error_type(f"{label} must be <= {field.maximum}")
         return value
     if field.kind is FieldKind.NUMBER:
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
             raise error_type(f"{label} must be a number")
         if field.minimum is not None and value < field.minimum:
             raise error_type(f"{label} must be >= {field.minimum}")
@@ -402,7 +412,11 @@ def _compile_field(name: str, raw_schema: Any, required: bool) -> FieldDescripto
             maximum=maximum,
         )
     elif value_type == "number":
-        _reject_unknown_keywords(schema, frozenset({"type", "description", "default", "minimum", "maximum"}), label)
+        _reject_unknown_keywords(
+            schema,
+            frozenset({"type", "description", "default", "minimum", "maximum"}),
+            label,
+        )
         minimum = schema.get("minimum")
         maximum = schema.get("maximum")
         for bound_name, bound in (("minimum", minimum), ("maximum", maximum)):
@@ -436,7 +450,9 @@ def _compile_field(name: str, raw_schema: Any, required: bool) -> FieldDescripto
         _reject_unknown_keywords(items, _ARRAY_ITEM_KEYWORDS, f"{label} items")
         if items.get("type") != "string":
             raise SchemaError(f"{label} only supports string-array items")
-        item_max_length = _optional_non_negative_int(items, "maxLength", f"{label} items")
+        item_max_length = _optional_non_negative_int(
+            items, "maxLength", f"{label} items"
+        )
         if item_max_length is None or item_max_length > MAX_SUPPORTED_STRING_CHARS:
             raise SchemaError(f"{label} item maxLength is missing or unsupported")
         min_items = _optional_non_negative_int(schema, "minItems", label)
@@ -475,7 +491,9 @@ def compile_input_schema(raw_schema: Any) -> tuple[FieldDescriptor, ...]:
     if len(properties) > MAX_FIELDS_PER_TOOL:
         raise SchemaError("input schema has too many fields")
     raw_required = schema.get("required", [])
-    if not isinstance(raw_required, list) or any(not isinstance(value, str) for value in raw_required):
+    if not isinstance(raw_required, list) or any(
+        not isinstance(value, str) for value in raw_required
+    ):
         raise SchemaError("input schema required must be an array of field names")
     if len(raw_required) != len(set(raw_required)):
         raise SchemaError("input schema required must not contain duplicates")
@@ -497,7 +515,9 @@ def compile_catalog(raw_tools: Iterable[Any]) -> tuple[ToolDescriptor, ...]:
             raise CatalogError("too many tools in catalog")
         tools.append(tool)
 
-    exact_names = [tool.get("name") if isinstance(tool, Mapping) else None for tool in tools]
+    exact_names = [
+        tool.get("name") if isinstance(tool, Mapping) else None for tool in tools
+    ]
     counts = Counter(name for name in exact_names if isinstance(name, str))
     descriptors: list[ToolDescriptor] = []
     for index, raw_tool in enumerate(tools):
@@ -519,9 +539,17 @@ def compile_catalog(raw_tools: Iterable[Any]) -> tuple[ToolDescriptor, ...]:
             and bool(exact_name)
             and len(exact_name) <= MAX_DESCRIPTOR_NAME_CHARS
         )
-        name = exact_name if valid_name else _bounded_display_text(exact_name) or f"<invalid-tool-{index + 1}>"
+        name = (
+            exact_name
+            if valid_name
+            else _bounded_display_text(exact_name) or f"<invalid-tool-{index + 1}>"
+        )
         description = _bounded_display_text(raw_tool.get("description"))
-        risk = RISK_BY_TOOL.get(exact_name, Risk.UNCLASSIFIED) if valid_name else Risk.UNCLASSIFIED
+        risk = (
+            RISK_BY_TOOL.get(exact_name, Risk.UNCLASSIFIED)
+            if valid_name
+            else Risk.UNCLASSIFIED
+        )
         fields: tuple[FieldDescriptor, ...] = ()
         schema_error: SchemaError | None = None
         try:
@@ -554,12 +582,18 @@ def effective_risk(tool: ToolDescriptor, arguments: Mapping[str, Any]) -> Risk:
         return Risk.UNCLASSIFIED
     if any(arguments.get(name) is True for name in _DANGEROUS_TRUE_ARGUMENTS):
         return Risk.DESTRUCTIVE
-    if any(arguments.get(name) is False for name in _DANGEROUS_FALSE_ARGUMENTS if name in arguments):
+    if any(
+        arguments.get(name) is False
+        for name in _DANGEROUS_FALSE_ARGUMENTS
+        if name in arguments
+    ):
         return Risk.DESTRUCTIVE
     return tool.risk
 
 
-def serialize_arguments(tool: ToolDescriptor, values: Mapping[str, Any]) -> dict[str, Any]:
+def serialize_arguments(
+    tool: ToolDescriptor, values: Mapping[str, Any]
+) -> dict[str, Any]:
     if not tool.enabled:
         raise CatalogError("tool is disabled")
     if not isinstance(values, Mapping):
@@ -568,7 +602,11 @@ def serialize_arguments(tool: ToolDescriptor, values: Mapping[str, Any]) -> dict
     unknown = sorted(set(values) - set(fields))
     if unknown:
         raise CatalogError("unknown argument")
-    missing = [field.name for field in tool.fields if field.required and field.name not in values]
+    missing = [
+        field.name
+        for field in tool.fields
+        if field.required and field.name not in values
+    ]
     if missing:
         raise CatalogError("missing required argument")
 
@@ -577,5 +615,7 @@ def serialize_arguments(tool: ToolDescriptor, values: Mapping[str, Any]) -> dict
         if field.name not in values:
             continue
         normalized = _normalize_value(field, values[field.name])
-        serialized[field.name] = list(normalized) if field.kind is FieldKind.STRING_ARRAY else normalized
+        serialized[field.name] = (
+            list(normalized) if field.kind is FieldKind.STRING_ARRAY else normalized
+        )
     return serialized

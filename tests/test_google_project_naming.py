@@ -14,7 +14,9 @@ from the_hive.google_project_naming import (
 )
 
 
-def test_generated_names_and_ids_obey_google_rules_and_avoid_internal_identity() -> None:
+def test_generated_names_and_ids_obey_google_rules_and_avoid_internal_identity() -> (
+    None
+):
     seen_names: set[str] = set()
     seen_ids: set[str] = set()
 
@@ -22,7 +24,9 @@ def test_generated_names_and_ids_obey_google_rules_and_avoid_internal_identity()
         identity = generate_pretty_project_identity(
             visible_names=seen_names, reserved_project_ids=seen_ids
         )
-        assert re.fullmatch(r"[A-Za-z][A-Za-z' !-]{2,28}[A-Za-z]", identity.project_name)
+        assert re.fullmatch(
+            r"[A-Za-z][A-Za-z' !-]{2,28}[A-Za-z]", identity.project_name
+        )
         assert re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", identity.project_id)
         assert "the-hive" not in identity.project_name.casefold()
         assert "the-hive" not in identity.project_id
@@ -38,8 +42,12 @@ def test_generated_names_and_ids_obey_google_rules_and_avoid_internal_identity()
 def test_generator_retries_visible_name_and_project_id_collisions(monkeypatch) -> None:
     choices = iter(("Quietglow", "Aurorabay", "Brightbloom", "Meadowglen"))
     suffixes = iter(("a1b2c3", "d4e5f6"))
-    monkeypatch.setattr("the_hive.google_project_naming.secrets.choice", lambda _: next(choices))
-    monkeypatch.setattr("the_hive.google_project_naming.secrets.token_hex", lambda _: next(suffixes))
+    monkeypatch.setattr(
+        "the_hive.google_project_naming.secrets.choice", lambda _: next(choices)
+    )
+    monkeypatch.setattr(
+        "the_hive.google_project_naming.secrets.token_hex", lambda _: next(suffixes)
+    )
 
     identity = generate_pretty_project_identity(
         visible_names={"Quietglow Aurorabay"},

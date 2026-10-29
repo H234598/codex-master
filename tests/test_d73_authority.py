@@ -22,6 +22,7 @@ BUS_NAME = "org.example.D73Policy"
 SELINUX_CONTEXT = "synthetic_u:synthetic_r:synthetic_t:s0"
 POLKIT_ACTION = "org.example.d73.publish"
 
+
 def _manifest() -> bytes:
     value: dict[str, object] = {
         "schema_version": 2,
@@ -281,7 +282,7 @@ def test_s5a_direct_peer_requires_exact_builtin_types_and_bounds(
     ),
 )
 def test_s5a_direct_peer_rejects_missing_or_augmented_required_bits(
-    changes: dict[str, int]
+    changes: dict[str, int],
 ) -> None:
     with pytest.raises(authority.D73AuthorityRejected):
         _peer(**changes)
@@ -322,9 +323,7 @@ def test_s5a_pure_continuity_requires_same_peer_and_fresh_policy_owner(
 def test_s5a_pure_continuity_accepts_equal_peer_and_owner() -> None:
     policy = _policy()
     assert (
-        authority._verify_peer_continuity_v1(
-            _peer(), _peer(), _owner(policy), policy
-        )
+        authority._verify_peer_continuity_v1(_peer(), _peer(), _owner(policy), policy)
         is None
     )
 
@@ -742,9 +741,7 @@ def test_s5a_decoder_exception_aborts_after_the_q1_decoder_closed_the_fd(
 
 @pytest.mark.parametrize("stage", ("b", "c"))
 @pytest.mark.parametrize("kind", ("owner_sender", "owner_bus"))
-def test_s5a_b_and_c_reject_owner_drift(
-    stage: str, kind: str
-) -> None:
+def test_s5a_b_and_c_reject_owner_drift(stage: str, kind: str) -> None:
     transaction, policy, _attestation_value = _decoded_transaction()
     if stage == "c":
         transaction.verify_b(_peer(), _owner(policy))

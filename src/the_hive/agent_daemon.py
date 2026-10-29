@@ -263,7 +263,14 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
                 return
             length_status, length = _parse_content_length(headers.get("content-length"))
             if length_status != 200:
-                self._reply(length_status, {"error": "agent.request_too_large" if length_status == 413 else "agent.request_invalid"})
+                self._reply(
+                    length_status,
+                    {
+                        "error": "agent.request_too_large"
+                        if length_status == 413
+                        else "agent.request_invalid"
+                    },
+                )
                 return
             body_deadline = time.monotonic() + HTTP_BODY_TIMEOUT_SECONDS
             body = self._read_body(length, body_deadline)
@@ -323,12 +330,25 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
         self._send(
             AgentHttpResponse(
                 status,
-                json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii"),
+                json.dumps(value, sort_keys=True, separators=(",", ":")).encode(
+                    "ascii"
+                ),
             )
         )
 
     def _send(self, response: AgentHttpResponse) -> None:
-        reasons = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 413: "Content Too Large", 415: "Unsupported Media Type", 431: "Request Header Fields Too Large", 503: "Service Unavailable"}
+        reasons = {
+            200: "OK",
+            400: "Bad Request",
+            403: "Forbidden",
+            404: "Not Found",
+            405: "Method Not Allowed",
+            409: "Conflict",
+            413: "Content Too Large",
+            415: "Unsupported Media Type",
+            431: "Request Header Fields Too Large",
+            503: "Service Unavailable",
+        }
         headers = [
             f"HTTP/1.1 {response.status} {reasons.get(response.status, 'Error')}\r\n",
             *[f"{name}: {value}\r\n" for name, value in response.headers],
@@ -416,7 +436,11 @@ class AgentApiServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             self._shutdown_worker.start()
 
     def drain(self, timeout: float) -> bool:
-        if type(timeout) not in {int, float} or not math.isfinite(timeout) or timeout < 0:
+        if (
+            type(timeout) not in {int, float}
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
             raise ValueError("agent.drain_timeout_invalid")
         deadline = time.monotonic() + float(timeout)
         worker = self._shutdown_worker
@@ -477,7 +501,9 @@ def assemble_server(
     shared_gid: int | None = None,
 ) -> AgentApiServer:
     registry = cast(HostRegistry, _state_owner(HostRegistry, state_root, shared_gid))
-    store = cast(AgentOperationStore, _state_owner(AgentOperationStore, state_root, shared_gid))
+    store = cast(
+        AgentOperationStore, _state_owner(AgentOperationStore, state_root, shared_gid)
+    )
     host_probe_owner = RemoteHostProbeCompletionOwner(
         operation_store=cast(
             AdminOperationStore,
@@ -489,7 +515,9 @@ def assemble_server(
     ollama = (
         _ollama_completion_fleet(state_root, store, registry)
         if shared_gid is None
-        else _ollama_completion_fleet(state_root, store, registry, shared_gid=shared_gid)
+        else _ollama_completion_fleet(
+            state_root, store, registry, shared_gid=shared_gid
+        )
     )
     return AgentApiServer(
         (address, port),

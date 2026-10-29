@@ -97,7 +97,9 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
 
     assert contract.version == 1
     assert contract.source_bytes == source_bytes
-    assert contract.source_digest == "sha256:" + hashlib.sha256(source_bytes).hexdigest()
+    assert (
+        contract.source_digest == "sha256:" + hashlib.sha256(source_bytes).hexdigest()
+    )
     assert [group.identifier for group in contract.rule_groups] == [
         "delivery-and-preflight",
         "versioning-and-deterministic-execution",
@@ -110,11 +112,11 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
     assert {
         rule.enforcement for group in contract.rule_groups for rule in group.rules
     } == {"machine", "governance"}
-    contracts = {group.identifier: group.machine_contract for group in contract.rule_groups}
+    contracts = {
+        group.identifier: group.machine_contract for group in contract.rule_groups
+    }
     assert contracts["delivery-and-preflight"]["feature_delivery"] == "separate"
-    compatibility = contracts["versioning-and-deterministic-execution"][
-        "compatibility"
-    ]
+    compatibility = contracts["versioning-and-deterministic-execution"]["compatibility"]
     journal = contracts["transaction-publication-and-recovery"]["journal"]
     telemetry = contracts["evidence-contracts-and-telemetry"]["telemetry"]
     diagnostic = contracts["diagnostic-evidence-and-remediation-gates"]
@@ -209,10 +211,10 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
 def test_machine_contracts_are_deeply_immutable_and_render_original_json() -> None:
     source_bytes = RUNTIME_MIGRATION_POLICY_PATH.read_bytes()
     contract = load_runtime_migration_policy()
-    contracts = {group.identifier: group.machine_contract for group in contract.rule_groups}
-    compatibility = contracts["versioning-and-deterministic-execution"][
-        "compatibility"
-    ]
+    contracts = {
+        group.identifier: group.machine_contract for group in contract.rule_groups
+    }
+    compatibility = contracts["versioning-and-deterministic-execution"]["compatibility"]
     canary = contracts["diagnostic-evidence-and-remediation-gates"]["canary"]
     assert isinstance(compatibility, dict) is False
     assert isinstance(canary, dict) is False
@@ -227,13 +229,16 @@ def test_machine_contracts_are_deeply_immutable_and_render_original_json() -> No
     rendered_after = render_runtime_migration_policy_block(contract)
     machine_contracts = [
         json.loads(
-            line.removeprefix("Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `")
-            .removesuffix("`")
+            line.removeprefix(
+                "Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `"
+            ).removesuffix("`")
         )
         for line in rendered_after.decode("utf-8").splitlines()
         if line.startswith("Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `")
     ]
-    assert contract.source_digest == "sha256:" + hashlib.sha256(source_bytes).hexdigest()
+    assert (
+        contract.source_digest == "sha256:" + hashlib.sha256(source_bytes).hexdigest()
+    )
     assert f'source_digest":"{contract.source_digest}"'.encode() in rendered_after
     assert rendered_after == rendered_before
     assert len(machine_contracts) == len(contract.rule_groups)
@@ -255,7 +260,10 @@ def test_rendered_block_is_exactly_materialized_in_common_policy() -> None:
     assert common_bytes.count(rendered) == 1
     assert f'source_digest":"{contract.source_digest}"'.encode() in rendered
     assert b"normierten Maschinenvertr\xc3\xa4ge" in rendered
-    assert b"Policy-Executor f\xc3\xbcr die operative Durchsetzung dieser Vertr\xc3\xa4ge ist unbekannt" in rendered
+    assert (
+        b"Policy-Executor f\xc3\xbcr die operative Durchsetzung dieser Vertr\xc3\xa4ge ist unbekannt"
+        in rendered
+    )
     assert b"keine Aussage \xc3\xbcber vorhandene Runtime-Mechanismen" in rendered
     assert b'"rollback_guard":"cas_fencing"' in rendered
 
@@ -264,9 +272,9 @@ def test_rendered_block_is_exactly_materialized_in_common_policy() -> None:
     ("mutate", "error"),
     [
         (
-            lambda payload: _rule(
-                payload, "explicit-versioned-stepwise-migrators"
-            ).pop("enforcement"),
+            lambda payload: _rule(payload, "explicit-versioned-stepwise-migrators").pop(
+                "enforcement"
+            ),
             "runtime_migration_policy_rule_invalid",
         ),
         (
@@ -276,29 +284,27 @@ def test_rendered_block_is_exactly_materialized_in_common_policy() -> None:
             "runtime_migration_policy_rule_catalog_invalid",
         ),
         (
-            lambda payload: _rule(
-                payload, "bounded-compatibility-window"
-            ).__setitem__("requirement", "Legacy fallback ist erlaubt."),
+            lambda payload: _rule(payload, "bounded-compatibility-window").__setitem__(
+                "requirement", "Legacy fallback ist erlaubt."
+            ),
             "runtime_migration_policy_compatibility_invalid",
         ),
         (
-            lambda payload: _group(
-                payload, "transaction-publication-and-recovery"
-            ).pop("machine_contract"),
+            lambda payload: _group(payload, "transaction-publication-and-recovery").pop(
+                "machine_contract"
+            ),
             "runtime_migration_policy_rule_group_invalid",
         ),
         (
-            lambda payload: _group(
-                payload, "versioning-and-deterministic-execution"
-            )["machine_contract"]["compatibility"].__setitem__(
-                "unbounded_legacy", "allow"
-            ),
+            lambda payload: _group(payload, "versioning-and-deterministic-execution")[
+                "machine_contract"
+            ]["compatibility"].__setitem__("unbounded_legacy", "allow"),
             "runtime_migration_policy_machine_contract_invalid",
         ),
         (
-            lambda payload: _group(
-                payload, "failure-observation-and-retention"
-            )["machine_contract"].__setitem__("observation_timeout_seconds", 0),
+            lambda payload: _group(payload, "failure-observation-and-retention")[
+                "machine_contract"
+            ].__setitem__("observation_timeout_seconds", 0),
             "runtime_migration_policy_machine_contract_value_invalid",
         ),
     ],
@@ -328,15 +334,15 @@ def test_rejects_incomplete_or_unsafe_runtime_migration_policy_source(
         (
             lambda payload: _group(
                 payload, "diagnostic-evidence-and-remediation-gates"
-            )["machine_contract"]["diagnostic_gates"].pop("root_cause_for_product_activation"),
+            )["machine_contract"]["diagnostic_gates"].pop(
+                "root_cause_for_product_activation"
+            ),
             "runtime_migration_policy_machine_contract_invalid",
         ),
         (
             lambda payload: _group(
                 payload, "diagnostic-evidence-and-remediation-gates"
-            )["machine_contract"]["telemetry"].__setitem__(
-                "second_authority", "allow"
-            ),
+            )["machine_contract"]["telemetry"].__setitem__("second_authority", "allow"),
             "runtime_migration_policy_machine_contract_invalid",
         ),
         (
@@ -363,12 +369,13 @@ def test_rejects_incomplete_or_unsafe_runtime_migration_policy_source(
             lambda payload: _group(
                 payload, "diagnostic-evidence-and-remediation-gates"
             )["machine_contract"]["canary"].__setitem__(
-                "layers", [
+                "layers",
+                [
                     "namespace_sandbox",
                     "manager_syntax_transport",
                     "helper",
                     "product_logic",
-                ]
+                ],
             ),
             "runtime_migration_policy_machine_contract_invalid",
         ),
@@ -407,20 +414,19 @@ def test_rejects_incomplete_or_unsafe_runtime_migration_policy_source(
         (
             lambda payload: _group(
                 payload, "diagnostic-evidence-and-remediation-gates"
-            )["machine_contract"]["evidence_freshness"].__setitem__(
-                "stale", "allow"
-            ),
+            )["machine_contract"]["evidence_freshness"].__setitem__("stale", "allow"),
             "runtime_migration_policy_machine_contract_invalid",
         ),
         (
             lambda payload: _group(
                 payload, "diagnostic-evidence-and-remediation-gates"
             )["machine_contract"]["harness_scope"].__setitem__(
-                "bound_declarations", [
+                "bound_declarations",
+                [
                     "files",
                     "production_loc",
                     "error_families",
-                ]
+                ],
             ),
             "runtime_migration_policy_machine_contract_invalid",
         ),
@@ -503,7 +509,9 @@ def test_rejects_stale_digest_and_drifted_rendered_block() -> None:
         contract.source_digest.encode("ascii"), stale_digest, 1
     )
     drifted_block = common_bytes.replace(
-        b"Install, Migrate, Activate und Rollback", b"Install, Update, Activate und Rollback", 1
+        b"Install, Migrate, Activate und Rollback",
+        b"Install, Update, Activate und Rollback",
+        1,
     )
 
     with pytest.raises(
@@ -566,6 +574,9 @@ def test_runtime_migration_block_projects_to_every_provider_home() -> None:
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
 
         assert primary.startswith(common_bytes)
-        assert validate_runtime_migration_policy_materialization(
-            primary[: len(common_bytes)]
-        ).source_digest == load_runtime_migration_policy().source_digest
+        assert (
+            validate_runtime_migration_policy_materialization(
+                primary[: len(common_bytes)]
+            ).source_digest
+            == load_runtime_migration_policy().source_digest
+        )

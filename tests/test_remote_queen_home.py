@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 
 from the_hive import remote_queen_home
-from the_hive.remote_queen_bootstrap import ManifestGenerationV1, RemoteQueenBootstrapError
+from the_hive.remote_queen_bootstrap import (
+    ManifestGenerationV1,
+    RemoteQueenBootstrapError,
+)
 from the_hive.remote_queen_home import (
     GENERIC_RULES_PATH,
     QUEEN_BRANCH,
@@ -118,7 +121,9 @@ def test_valid_class_id_accepts_only_remote_queen_material_classes():
 
 def test_digest_without_own_field_matches_public_canonical_digest():
     topic = build_queen_topic_binding(WRITE_PATHS)
-    assert remote_queen_home._digest_payload_without_field(topic) == canonical_digest(topic)
+    assert remote_queen_home._digest_payload_without_field(topic) == canonical_digest(
+        topic
+    )
 
 
 def _manifest():
@@ -225,7 +230,9 @@ def _owned_snapshot(manifest, **overrides):
 
 
 class FakeOperations:
-    def __init__(self, inspect_results, journal=None, materialize_error=None, rollback_error=None):
+    def __init__(
+        self, inspect_results, journal=None, materialize_error=None, rollback_error=None
+    ):
         self.inspect_results = list(inspect_results)
         self.journal = journal
         self.materialize_error = materialize_error
@@ -265,7 +272,11 @@ def test_closed_constants_and_exact_immutable_public_shapes():
     assert QUEEN_HOME_PREFIX == "G18-"
     assert GENERIC_RULES_PATH == "instructions/generic.md"
     assert TOPIC_ASSIGNMENT_PATH == "assignments/g18.md"
-    assert [item.value for item in QueenHomeStateKindV1] == ["absent", "owned", "foreign"]
+    assert [item.value for item in QueenHomeStateKindV1] == [
+        "absent",
+        "owned",
+        "foreign",
+    ]
     assert [item.value for item in QueenHomeActionV1] == ["create-home"]
     assert [item.value for item in QueenMaterialKindV1] == [
         "generic-rules",
@@ -306,17 +317,41 @@ def test_closed_constants_and_exact_immutable_public_shapes():
 
 def test_canonicalization_and_fixed_seven_digest_vector():
     manifest = _manifest()
-    assert manifest.topic_binding.binding_digest == "sha256:9ce316a8878da7aeff21b3752f3f7c50da2690e9ca508fcf149248882ffd510b"
-    assert manifest.lease_binding.binding_digest == "sha256:5a3ce7f18c287b775d34fa8267bff7ee06eb5c99c7b8504181b21de44d68a7c1"
-    assert manifest.resume_capsule.capsule_digest == "sha256:693967d176afdab8ab8de04351075330b5f3513d01f7e8456033f7f89d115fb4"
-    assert material_tree_digest(manifest.materials) == "sha256:cefe490e933d4265d4d228db7f49d39ffaffe2903728aff8ca0b5d821ea70437"
-    assert manifest.manifest_digest == "sha256:b167cb957392d5cab2472f25d969ea16cb20b1eaa4d81b1b528bee0923eae61e"
+    assert (
+        manifest.topic_binding.binding_digest
+        == "sha256:9ce316a8878da7aeff21b3752f3f7c50da2690e9ca508fcf149248882ffd510b"
+    )
+    assert (
+        manifest.lease_binding.binding_digest
+        == "sha256:5a3ce7f18c287b775d34fa8267bff7ee06eb5c99c7b8504181b21de44d68a7c1"
+    )
+    assert (
+        manifest.resume_capsule.capsule_digest
+        == "sha256:693967d176afdab8ab8de04351075330b5f3513d01f7e8456033f7f89d115fb4"
+    )
+    assert (
+        material_tree_digest(manifest.materials)
+        == "sha256:cefe490e933d4265d4d228db7f49d39ffaffe2903728aff8ca0b5d821ea70437"
+    )
+    assert (
+        manifest.manifest_digest
+        == "sha256:b167cb957392d5cab2472f25d969ea16cb20b1eaa4d81b1b528bee0923eae61e"
+    )
     before = _absent_snapshot(manifest)
-    assert queen_home_snapshot_digest(before) == "sha256:2a05a0484bb5d9395fd6db984b6d4128c80cbf182274a4c9db03b1295e0cc1e3"
+    assert (
+        queen_home_snapshot_digest(before)
+        == "sha256:2a05a0484bb5d9395fd6db984b6d4128c80cbf182274a4c9db03b1295e0cc1e3"
+    )
     plan = plan_remote_queen_home(manifest, FakeOperations([before]))
-    assert plan.plan_digest == "sha256:1a3543ca3fb610cfff48811b1ee37ee17c7c0462428ee231138abc0e9f78c9fa"
+    assert (
+        plan.plan_digest
+        == "sha256:1a3543ca3fb610cfff48811b1ee37ee17c7c0462428ee231138abc0e9f78c9fa"
+    )
     assert canonical_json_bytes(("b", "ä")) == '["b","ä"]'.encode("utf-8")
-    assert canonical_digest({"z": 1, "a": True}) == "sha256:903596123ef8596d132eb70fae4c171f0133ed7cdbe9e3e6a67d01c08c5c6992"
+    assert (
+        canonical_digest({"z": 1, "a": True})
+        == "sha256:903596123ef8596d132eb70fae4c171f0133ed7cdbe9e3e6a67d01c08c5c6992"
+    )
     _expect_code("RQ_E_PLAN_INCONSISTENT", canonical_json_bytes, ["list-is-not-domain"])
     _expect_code("RQ_E_PLAN_INCONSISTENT", canonical_json_bytes, {1: "non-string-key"})
     _expect_code("RQ_E_PLAN_INCONSISTENT", canonical_json_bytes, float("nan"))
@@ -338,7 +373,15 @@ def test_path_material_and_class_gates_are_fail_closed():
         ("G18/bootstrapplan/**",),
     ):
         _expect_code("RQ_E_PLAN_INCONSISTENT", build_queen_topic_binding, write_paths)
-    for remote_home in ("/", "/home/queen/", "/home/./queen", "/home//queen", "home/queen", "/home/../queen", "/home/que\u0000n"):
+    for remote_home in (
+        "/",
+        "/home/queen/",
+        "/home/./queen",
+        "/home//queen",
+        "home/queen",
+        "/home/../queen",
+        "/home/que\u0000n",
+    ):
         _expect_code(
             "RQ_E_PLAN_INCONSISTENT",
             build_remote_queen_home_manifest,
@@ -350,9 +393,24 @@ def test_path_material_and_class_gates_are_fail_closed():
             capsule,
         )
     for material_values in (
-        ("instructions/generic.md", QueenMaterialKindV1.QUEEN_RULES, "generic", "sha256:" + "4" * 64),
-        ("skills/Worker/SKILL.md", QueenMaterialKindV1.SKILL, "queen", "sha256:" + "7" * 64),
-        ("skills/teamlead/SKILL.md", QueenMaterialKindV1.SKILL, "queen", "sha256:" + "7" * 64),
+        (
+            "instructions/generic.md",
+            QueenMaterialKindV1.QUEEN_RULES,
+            "generic",
+            "sha256:" + "4" * 64,
+        ),
+        (
+            "skills/Worker/SKILL.md",
+            QueenMaterialKindV1.SKILL,
+            "queen",
+            "sha256:" + "7" * 64,
+        ),
+        (
+            "skills/teamlead/SKILL.md",
+            QueenMaterialKindV1.SKILL,
+            "queen",
+            "sha256:" + "7" * 64,
+        ),
     ):
         _expect_code(
             "RQ_E_PLAN_INCONSISTENT",
@@ -414,7 +472,21 @@ def test_resume_capsule_binds_authority_and_rejects_secret_schema_names():
     with pytest.raises(RemoteQueenBootstrapError) as caught:
         canonical_json_bytes({"token": "redacted-value"})
     assert "redacted-value" not in str(caught.value)
-    assert all(field.name not in {"token", "secret", "password", "cookie", "credential", "stdout", "stderr", "command", "content"} for field in fields(RemoteQueenHomeApplyJournalV1))
+    assert all(
+        field.name
+        not in {
+            "token",
+            "secret",
+            "password",
+            "cookie",
+            "credential",
+            "stdout",
+            "stderr",
+            "command",
+            "content",
+        }
+        for field in fields(RemoteQueenHomeApplyJournalV1)
+    )
     # Any valid authority digest is accepted; account age/classification is outside this slice.
     accepted_account = build_resume_capsule(
         CAPSULE_GENERATION,
@@ -504,7 +576,12 @@ def test_plan_matrix_and_port_exception_redaction():
         True,
         manifest.resume_capsule.account_binding_sha256,
     )
-    _expect_code("RQ_E_FOREIGN_STATE", plan_remote_queen_home, manifest, FakeOperations([foreign]))
+    _expect_code(
+        "RQ_E_FOREIGN_STATE",
+        plan_remote_queen_home,
+        manifest,
+        FakeOperations([foreign]),
+    )
     _expect_code(
         "RQ_E_BUS_TOPIC_CONFLICT",
         plan_remote_queen_home,
@@ -515,37 +592,74 @@ def test_plan_matrix_and_port_exception_redaction():
         "RQ_E_BUS_TOPIC_CONFLICT",
         plan_remote_queen_home,
         manifest,
-        FakeOperations([_absent_snapshot(manifest, conflicting_write_paths=("G18/plan/**",))]),
+        FakeOperations(
+            [_absent_snapshot(manifest, conflicting_write_paths=("G18/plan/**",))]
+        ),
     )
     _expect_code(
         "RQ_E_BUS_UNAVAILABLE",
         plan_remote_queen_home,
         manifest,
-        FakeOperations([_absent_snapshot(manifest, bus_available=False, observed_bus_cursor_sha256=None)]),
+        FakeOperations(
+            [
+                _absent_snapshot(
+                    manifest, bus_available=False, observed_bus_cursor_sha256=None
+                )
+            ]
+        ),
     )
     _expect_code(
         "RQ_E_RESUME_STALE",
         plan_remote_queen_home,
         manifest,
-        FakeOperations([_absent_snapshot(manifest, lease_active=False, observed_lease_binding_digest=None)]),
+        FakeOperations(
+            [
+                _absent_snapshot(
+                    manifest, lease_active=False, observed_lease_binding_digest=None
+                )
+            ]
+        ),
     )
     _expect_code(
         "RQ_E_RESUME_STALE",
         plan_remote_queen_home,
         manifest,
-        FakeOperations([_absent_snapshot(manifest, observed_bus_cursor_sha256="sha256:" + "e" * 64)]),
+        FakeOperations(
+            [
+                _absent_snapshot(
+                    manifest, observed_bus_cursor_sha256="sha256:" + "e" * 64
+                )
+            ]
+        ),
     )
     _expect_code(
         "RQ_E_ACCOUNT_UNAVAILABLE",
         plan_remote_queen_home,
         manifest,
-        FakeOperations([_absent_snapshot(manifest, account_available=False, observed_account_binding_sha256=None)]),
+        FakeOperations(
+            [
+                _absent_snapshot(
+                    manifest,
+                    account_available=False,
+                    observed_account_binding_sha256=None,
+                )
+            ]
+        ),
     )
     _expect_code(
         "RQ_E_RESUME_STALE",
         plan_remote_queen_home,
         manifest,
-        FakeOperations([_owned_snapshot(manifest, home=replace(_owned_snapshot(manifest).home, baseline_commit="f" * 40))]),
+        FakeOperations(
+            [
+                _owned_snapshot(
+                    manifest,
+                    home=replace(
+                        _owned_snapshot(manifest).home, baseline_commit="f" * 40
+                    ),
+                )
+            ]
+        ),
     )
     _expect_code(
         "RQ_E_RESUME_STALE",
@@ -602,33 +716,45 @@ def test_apply_verify_rollback_call_contract_and_drift_gates():
         queen_home_snapshot_digest(owned),
     )
     apply_fake = FakeOperations([before, owned], journal)
-    applied = apply_remote_queen_home(ApplyRemoteQueenHomeRequestV1(create_plan, create_plan.plan_digest), apply_fake)
+    applied = apply_remote_queen_home(
+        ApplyRemoteQueenHomeRequestV1(create_plan, create_plan.plan_digest), apply_fake
+    )
     assert applied.changed
     assert applied.snapshot == owned
     assert applied.journal == journal
-    assert [call[0] for call in apply_fake.calls] == ["inspect", "materialize_home", "inspect"]
+    assert [call[0] for call in apply_fake.calls] == [
+        "inspect",
+        "materialize_home",
+        "inspect",
+    ]
 
     no_op_plan = plan_remote_queen_home(manifest, FakeOperations([owned]))
     no_op_fake = FakeOperations([])
-    no_op_result = apply_remote_queen_home(ApplyRemoteQueenHomeRequestV1(no_op_plan, no_op_plan.plan_digest), no_op_fake)
+    no_op_result = apply_remote_queen_home(
+        ApplyRemoteQueenHomeRequestV1(no_op_plan, no_op_plan.plan_digest), no_op_fake
+    )
     assert not no_op_result.changed
     assert no_op_result.snapshot == owned
     assert no_op_result.journal is None
     assert no_op_fake.calls == []
 
-    drift_fake = FakeOperations([QueenHomeSnapshotV1(
-        before.home,
-        before.active_topic_principal_id,
-        before.active_topic_home_path,
-        before.active_topic_lease_id,
-        before.conflicting_write_paths,
-        before.lease_active,
-        before.observed_lease_binding_digest,
-        before.bus_available,
-        before.observed_bus_cursor_sha256,
-        before.account_available,
-        before.observed_account_binding_sha256,
-    )])
+    drift_fake = FakeOperations(
+        [
+            QueenHomeSnapshotV1(
+                before.home,
+                before.active_topic_principal_id,
+                before.active_topic_home_path,
+                before.active_topic_lease_id,
+                before.conflicting_write_paths,
+                before.lease_active,
+                before.observed_lease_binding_digest,
+                before.bus_available,
+                before.observed_bus_cursor_sha256,
+                before.account_available,
+                before.observed_account_binding_sha256,
+            )
+        ]
+    )
     # A request digest mutation is rejected before any port call.
     _expect_code(
         "RQ_E_PLAN_INCONSISTENT",
@@ -639,7 +765,9 @@ def test_apply_verify_rollback_call_contract_and_drift_gates():
     assert drift_fake.calls == []
 
     verify_fake = FakeOperations([owned])
-    verified = verify_remote_queen_home(VerifyRemoteQueenHomeRequestV1(no_op_plan, no_op_plan.plan_digest), verify_fake)
+    verified = verify_remote_queen_home(
+        VerifyRemoteQueenHomeRequestV1(no_op_plan, no_op_plan.plan_digest), verify_fake
+    )
     assert verified.verified and verified.snapshot == owned
     assert [call[0] for call in verify_fake.calls] == ["inspect"]
     _expect_code(
@@ -655,7 +783,11 @@ def test_apply_verify_rollback_call_contract_and_drift_gates():
         rollback_fake,
     )
     assert rollback_result.changed and rollback_result.snapshot == before
-    assert [call[0] for call in rollback_fake.calls] == ["inspect", "rollback_home", "inspect"]
+    assert [call[0] for call in rollback_fake.calls] == [
+        "inspect",
+        "rollback_home",
+        "inspect",
+    ]
 
     rollback_noop_fake = FakeOperations([])
     rollback_noop_result = rollback_remote_queen_home(
@@ -674,7 +806,9 @@ def test_apply_verify_rollback_call_contract_and_drift_gates():
     _expect_code(
         "RQ_E_ROLLBACK_DRIFT",
         rollback_remote_queen_home,
-        RollbackRemoteQueenHomeRequestV1(create_plan, create_plan.plan_digest, bad_journal),
+        RollbackRemoteQueenHomeRequestV1(
+            create_plan, create_plan.plan_digest, bad_journal
+        ),
         FakeOperations([owned]),
     )
 
@@ -694,7 +828,10 @@ def _assert_allowed_imports(source):
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            assert all(alias.name in allowed_imports and alias.asname is None for alias in node.names)
+            assert all(
+                alias.name in allowed_imports and alias.asname is None
+                for alias in node.names
+            )
         if isinstance(node, ast.ImportFrom):
             assert node.level == 0
             assert node.module in allowed_import_from
@@ -711,7 +848,9 @@ def test_ast_import_gate_rejects_qualified_unapproved_project_importfrom():
 
 
 def test_production_ast_has_only_allowed_dependencies_and_no_effect_calls():
-    source_path = Path(__file__).parents[1] / "src" / "the_hive" / "remote_queen_home.py"
+    source_path = (
+        Path(__file__).parents[1] / "src" / "the_hive" / "remote_queen_home.py"
+    )
     source = source_path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     forbidden = {

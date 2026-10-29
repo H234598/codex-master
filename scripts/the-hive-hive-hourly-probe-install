@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -182,6 +184,11 @@ _RUNTIME_IMAGE_FILES = (
     (
         "bin/the-hive-resource-scope-gate",
         "bin/the-hive-resource-scope-gate",
+        0o755,
+    ),
+    (
+        "scripts/the-hive-hook-abi-v1-install",
+        "bin/the-hive-hook-abi-v1-install",
         0o755,
     ),
     ("bin/the-hive-hive-hourly-probe", "bin/the-hive-hive-hourly-probe", 0o755),
@@ -618,6 +625,7 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
         layout = RuntimeLayout.from_runtime_root(stage)
         layout.read_attested_file("src/the_hive/server.py")
         layout.read_attested_file("bin/the-hive-resource-scope-gate")
+        layout.read_attested_file("bin/the-hive-hook-abi-v1-install")
     except ValueError as exc:
         raise InstallError("install_stage_validation_failed") from exc
     stage_server = (
@@ -2307,23 +2315,371 @@ def _ensure_probe_lock(state: Path) -> None:
             os.close(descriptor)
 
 
-def _install_attested_runtime(*, home: Path) -> dict[str, object]:
+def _rename_noreplace(
+    directory: Path,
+    source: str,
+    target: str,
+    *,
+    expected_parent: tuple[int, int],
+    expected_source: tuple[int, int],
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise InstallError("install_path_untrusted")
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint
+    ]
+    renameat2.restype = ctypes.c_int
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        parent_info = os.fstat(descriptor)
+        source_info = os.stat(source, dir_fd=descriptor, follow_symlinks=False)
+        if (
+            (parent_info.st_dev, parent_info.st_ino) != expected_parent
+            or (source_info.st_dev, source_info.st_ino) != expected_source
+        ):
+            raise InstallError("install_path_untrusted")
+        result = renameat2(
+            descriptor, os.fsencode(source), descriptor, os.fsencode(target), 1
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+        os.fsync(descriptor)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("install_path_untrusted") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _setup_temporary_name(path: Path, stage_name: str) -> str:
+    transaction = stage_name.rsplit(".", 1)[-1]
+    selected = hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
+    return f".{path.name}.hive-v2-setup-{transaction}-{selected}"
+
+
+def _setup_directory(
+    path: Path,
+    *,
+    mode: int,
+    stage_name: str,
+    reserve_setup: Callable[[Path, Path, str], None],
+) -> Path:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        temporary_name = _setup_temporary_name(path, stage_name)
+        temporary = path.parent / temporary_name
+        try:
+            temporary.mkdir(mode=mode)
+            item = temporary.lstat()
+            if (
+                not stat.S_ISDIR(item.st_mode)
+                or item.st_uid != os.geteuid()
+                or stat.S_IMODE(item.st_mode) != mode
+            ):
+                raise InstallError("install_path_untrusted")
+            identity = {
+                "type": "directory",
+                "dev": item.st_dev,
+                "ino": item.st_ino,
+                "uid": item.st_uid,
+                "gid": item.st_gid,
+                "mode": stat.S_IMODE(item.st_mode),
+                "nlink": item.st_nlink,
+            }
+            stable_identity = {
+                key: identity[key]
+                for key in ("type", "dev", "ino", "uid", "gid", "mode")
+            }
+            parent = path.parent.lstat()
+            expected_parent = (parent.st_dev, parent.st_ino)
+            stable_identity.update(
+                parent_dev=parent.st_dev,
+                parent_ino=parent.st_ino,
+                target=os.fspath(path),
+            )
+            digest = hashlib.sha256(
+                json.dumps(stable_identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            reserve_setup(path, temporary, digest)
+            _rename_noreplace(
+                path.parent,
+                temporary_name,
+                path.name,
+                expected_parent=expected_parent,
+                expected_source=(item.st_dev, item.st_ino),
+            )
+        except (OSError, InstallError) as exc:
+            raise InstallError("install_path_untrusted") from exc
+    _directory(path, mode=mode, create=False)
+    return path
+
+
+def _setup_child_directory(
+    home: Path,
+    parts: tuple[str, ...],
+    *,
+    mode: int,
+    stage_name: str,
+    reserve_setup: Callable[[Path, Path, str], None],
+) -> Path:
+    current = home
+    for part in parts:
+        current /= part
+        _setup_directory(
+            current,
+            mode=mode,
+            stage_name=stage_name,
+            reserve_setup=reserve_setup,
+        )
+    return current
+
+
+def _setup_probe_lock(
+    state: Path,
+    *,
+    stage_name: str,
+    reserve_setup: Callable[[Path, Path, str], None],
+) -> None:
+    lock = state / ".hive-hourly-probe.lock"
+    try:
+        lock.lstat()
+    except FileNotFoundError:
+        temporary_name = _setup_temporary_name(lock, stage_name)
+        temporary = state / temporary_name
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.fsync(descriptor)
+                item = os.fstat(descriptor)
+                identity = {
+                    "type": "file",
+                    "dev": item.st_dev,
+                    "ino": item.st_ino,
+                    "uid": item.st_uid,
+                    "gid": item.st_gid,
+                    "mode": stat.S_IMODE(item.st_mode),
+                    "nlink": item.st_nlink,
+                }
+                stable_identity = {
+                    key: identity[key]
+                    for key in (
+                        "type", "dev", "ino", "uid", "gid", "mode", "nlink"
+                    )
+                }
+                parent_descriptor = os.open(
+                    state,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    parent = os.fstat(parent_descriptor)
+                finally:
+                    os.close(parent_descriptor)
+                expected_parent = (parent.st_dev, parent.st_ino)
+                stable_identity.update(
+                    parent_dev=parent.st_dev,
+                    parent_ino=parent.st_ino,
+                    target=os.fspath(lock),
+                )
+            finally:
+                os.close(descriptor)
+            digest = hashlib.sha256(
+                json.dumps(stable_identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            reserve_setup(lock, temporary, digest)
+            _rename_noreplace(
+                state,
+                temporary_name,
+                lock.name,
+                expected_parent=expected_parent,
+                expected_source=(item.st_dev, item.st_ino),
+            )
+        except (OSError, InstallError) as exc:
+            raise InstallError("install_target_untrusted") from exc
+    _ensure_probe_lock(state)
+
+
+def _setup_object_digest(path: Path, target: Path) -> str:
+    item = path.lstat()
+    parent = path.parent.lstat()
+    if stat.S_ISDIR(item.st_mode):
+        identity = {
+            "type": "directory",
+            "dev": item.st_dev,
+            "ino": item.st_ino,
+            "uid": item.st_uid,
+            "gid": item.st_gid,
+            "mode": stat.S_IMODE(item.st_mode),
+        }
+    elif stat.S_ISREG(item.st_mode) and item.st_nlink == 1:
+        identity = {
+            "type": "file",
+            "dev": item.st_dev,
+            "ino": item.st_ino,
+            "uid": item.st_uid,
+            "gid": item.st_gid,
+            "mode": stat.S_IMODE(item.st_mode),
+            "nlink": item.st_nlink,
+        }
+    else:
+        raise InstallError("install_path_untrusted")
+    identity.update(
+        parent_dev=parent.st_dev,
+        parent_ino=parent.st_ino,
+        target=os.fspath(target),
+    )
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _provision_hook_session_pin_authority(
+    home: Path,
+    *,
+    stage_name: str,
+    reserve_setup: Callable[[Path, Path, str], None],
+) -> None:
+    parent = _setup_child_directory(
+        home,
+        (".local", "state", "the-hive"),
+        mode=0o700,
+        stage_name=stage_name,
+        reserve_setup=reserve_setup,
+    )
+    state_root = parent / "hook-session-pins-v1"
+    try:
+        state_root.lstat()
+    except FileNotFoundError:
+        temporary_name = _setup_temporary_name(state_root, stage_name)
+        temporary = parent / temporary_name
+        try:
+            temporary.mkdir(mode=0o700)
+            store = HookSessionPinStoreV1.create_at(temporary)
+            lock_path = temporary / ".hook-session-pins-v1.lock"
+            root_digest = _setup_object_digest(temporary, state_root)
+            lock_digest = _setup_object_digest(
+                lock_path, state_root / lock_path.name
+            )
+            reserve_setup(
+                state_root,
+                temporary,
+                root_digest,
+            )
+            reserve_setup(
+                state_root / lock_path.name,
+                lock_path,
+                lock_digest,
+            )
+            parent_info = parent.lstat()
+            source_info = temporary.lstat()
+            _rename_noreplace(
+                parent,
+                temporary_name,
+                state_root.name,
+                expected_parent=(parent_info.st_dev, parent_info.st_ino),
+                expected_source=(source_info.st_dev, source_info.st_ino),
+            )
+            if _setup_object_digest(state_root, state_root) != root_digest:
+                raise InstallError("install_path_untrusted")
+            if (
+                _setup_object_digest(
+                    state_root / lock_path.name, state_root / lock_path.name
+                )
+                != lock_digest
+            ):
+                raise InstallError("install_path_untrusted")
+            store = HookSessionPinStoreV1.open_at(state_root)
+        except (OSError, HookSessionPinStoreError, InstallError) as exc:
+            raise InstallError("install_path_untrusted") from exc
+    else:
+        try:
+            store = HookSessionPinStoreV1.open_at(state_root)
+        except HookSessionPinStoreError as exc:
+            raise InstallError("install_path_untrusted") from exc
+    try:
+        store.retained_bindings(now_unix_ns=time.time_ns())
+    except HookSessionPinStoreError as exc:
+        raise InstallError("install_path_untrusted") from exc
+
+
+def _install_attested_runtime(
+    *,
+    home: Path,
+    stage_name: str,
+    record_setup: Callable[[Path], None],
+    reserve_setup: Callable[[Path, Path, str], None],
+    before_publish: Callable[[Path, RuntimeLayout, dict[str, str]], None],
+) -> dict[str, object]:
     """Internal lifecycle API; never a second public operator transaction."""
-    if not home.is_absolute():
+    if (
+        not home.is_absolute()
+        or not isinstance(stage_name, str)
+        or re.fullmatch(
+            rf"\.{re.escape(_RUNTIME_ROOT_NAME)}\.stage\.[A-Za-z0-9-]{{1,64}}",
+            stage_name,
+        )
+        is None
+        or not callable(record_setup)
+        or not callable(reserve_setup)
+        or not callable(before_publish)
+    ):
         raise InstallError("home_unavailable")
     _directory(home, mode=0o700, create=False)
     repository = Path(__file__).resolve().parents[1]
     commit = _verified_release_commit(repository)
-    library = _child_directory(home, (".local", "lib"), mode=0o700)
     local = home / ".local"
     _directory(local, mode=0o700, create=False)
-    bindir = local / "bin"
-    _directory(bindir, mode=0o700, create=True)
-    libexec = _child_directory(home, (".local", "libexec"), mode=0o700)
-    state = _child_directory(home, (".local", "state", "codex-master-mcp"), mode=0o700)
-    units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
-    _ensure_probe_lock(state)
-    stage = Path(tempfile.mkdtemp(prefix=f".{_RUNTIME_ROOT_NAME}.stage.", dir=library))
+    library = _setup_child_directory(
+        home, (".local", "lib"), mode=0o700, stage_name=stage_name,
+        reserve_setup=reserve_setup,
+    )
+    _setup_child_directory(
+        home,
+        (".local", "lib", _RUNTIME_ROOT_NAME, _RELEASE_GENERATIONS_NAME),
+        mode=0o700,
+        stage_name=stage_name,
+        reserve_setup=reserve_setup,
+    )
+    bindir = _setup_child_directory(
+        home, (".local", "bin"), mode=0o700, stage_name=stage_name,
+        reserve_setup=reserve_setup,
+    )
+    libexec = _setup_child_directory(
+        home, (".local", "libexec"), mode=0o700, stage_name=stage_name,
+        reserve_setup=reserve_setup,
+    )
+    state = _setup_child_directory(
+        home, (".local", "state", "codex-master-mcp"), mode=0o700,
+        stage_name=stage_name, reserve_setup=reserve_setup,
+    )
+    units = _setup_child_directory(
+        home, (".config", "systemd", "user"), mode=0o700,
+        stage_name=stage_name, reserve_setup=reserve_setup,
+    )
+    _provision_hook_session_pin_authority(
+        home, stage_name=stage_name, reserve_setup=reserve_setup
+    )
+    _setup_probe_lock(
+        state, stage_name=stage_name, reserve_setup=reserve_setup
+    )
+    stage = library / stage_name
+    _setup_directory(
+        stage, mode=0o700, stage_name=stage_name, reserve_setup=reserve_setup
+    )
+    record_setup(stage)
     _build_runtime_image(
         repository=repository, stage=stage, generation=commit, commit=commit
     )
@@ -2333,6 +2689,29 @@ def _install_attested_runtime(*, home: Path) -> dict[str, object]:
     if _verified_release_commit(repository) != commit:
         raise InstallError("install_release_checkout_changed")
     _validate_runtime_image_stage(stage=stage, home=home)
+    layout = RuntimeLayout.from_runtime_root(stage)
+    hourly_service, hourly_timer = _staged_hourly_probe_unit_bytes(
+        layout=layout, generation=commit
+    )
+    pricing_service, pricing_timer = _staged_pricing_inventory_unit_bytes(
+        layout=layout
+    )
+    output_digests = {
+        "mcp_launcher": hashlib.sha256(
+            _attested_stable_mcp_launcher_bytes(layout)
+        ).hexdigest(),
+        "hourly_service": hashlib.sha256(hourly_service).hexdigest(),
+        "hourly_timer": hashlib.sha256(hourly_timer).hexdigest(),
+        "pricing_launcher": hashlib.sha256(
+            _attested_pricing_inventory_launcher_bytes(layout)
+        ).hexdigest(),
+        "pricing_service": hashlib.sha256(pricing_service).hexdigest(),
+        "pricing_timer": hashlib.sha256(pricing_timer).hexdigest(),
+        "legacy_launcher": hashlib.sha256(
+            _attested_legacy_probe_launcher_bytes(layout)
+        ).hexdigest(),
+    }
+    before_publish(stage, layout, output_digests)
     layout = _publish_runtime_generation(
         stage=stage,
         release_root=library / _RUNTIME_ROOT_NAME,

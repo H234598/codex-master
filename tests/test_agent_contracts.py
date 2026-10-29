@@ -301,7 +301,10 @@ def test_receipt_binds_all_fences_and_bounded_result() -> None:
     assert receipt.reason_codes == ("resource_ready",)
     assert receipt.result.kind == "host.probe"
     assert receipt.result.action == "collect"
-    assert receipt.result.payload["metrics"] == {"cpu_percent": 12, "memory_bytes": 4096}
+    assert receipt.result.payload["metrics"] == {
+        "cpu_percent": 12,
+        "memory_bytes": 4096,
+    }
 
 
 @pytest.mark.parametrize(
@@ -326,12 +329,16 @@ def test_receipt_binds_all_fences_and_bounded_result() -> None:
             result_digest="sha256:0f4bfca18d84a2e8dddf8f5cfe7d6af5a20c92cb1ff5db90ee75f7a15f9a96c8",
         ),
         valid_receipt_wire(result_digest=DIGEST_A),
-        valid_receipt_wire(result={"kind": "unknown.kind", "action": "collect", "payload": {}}),
-        valid_receipt_wire(result={"kind": "host.probe", "action": "plan", "payload": {}}),
+        valid_receipt_wire(
+            result={"kind": "unknown.kind", "action": "collect", "payload": {}}
+        ),
+        valid_receipt_wire(
+            result={"kind": "host.probe", "action": "plan", "payload": {}}
+        ),
     ),
 )
 def test_receipt_parser_rejects_noncanonical_or_unbounded_values(
-    wire: dict[str, object]
+    wire: dict[str, object],
 ) -> None:
     with pytest.raises(AgentContractError, match="agent.request_invalid"):
         parse_agent_receipt(wire)

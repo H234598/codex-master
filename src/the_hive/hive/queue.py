@@ -14,7 +14,12 @@ class QueueError(ValueError):
     """Raised when a work queue request is invalid."""
 
 
-_PRIORITY_RANK = {DispatchPriority.DP0: 0, DispatchPriority.DP1: 1, DispatchPriority.DP2: 2, DispatchPriority.DP3: 3}
+_PRIORITY_RANK = {
+    DispatchPriority.DP0: 0,
+    DispatchPriority.DP1: 1,
+    DispatchPriority.DP2: 2,
+    DispatchPriority.DP3: 3,
+}
 _RUNNABLE = frozenset({"ready", "queued"})
 MAX_QUEUE_ITEMS = 4096
 MAX_COST_MICRO = 10**18
@@ -41,7 +46,9 @@ class QueueDecision:
         return {
             "workpackage_id": self.workpackage.workpackage_id,
             "repo_id": self._repo_id(),
-            "priority": self.workpackage.resource_profile.get("dispatch_priority", "not_returned"),
+            "priority": self.workpackage.resource_profile.get(
+                "dispatch_priority", "not_returned"
+            ),
             "reason_codes": list(self.reason_codes),
         }
 
@@ -63,7 +70,9 @@ class WorkQueue:
         queen_deficit: Callable[[WorkPackage], int] | None = None,
     ) -> None:
         values = tuple(items)
-        if len(values) > MAX_QUEUE_ITEMS or any(not isinstance(item, WorkPackage) for item in values):
+        if len(values) > MAX_QUEUE_ITEMS or any(
+            not isinstance(item, WorkPackage) for item in values
+        ):
             raise QueueError("invalid_queue_items")
         ids = [item.workpackage_id for item in values]
         if len(set(ids)) != len(ids):
@@ -81,7 +90,10 @@ class WorkQueue:
             if item.state not in _RUNNABLE:
                 continue
             try:
-                dependencies_ready = all(self._dependency_done(dependency) for dependency in item.depends_on_workpackage_ids)
+                dependencies_ready = all(
+                    self._dependency_done(dependency)
+                    for dependency in item.depends_on_workpackage_ids
+                )
             except Exception:
                 dependencies_ready = False
             if dependencies_ready:
@@ -92,7 +104,11 @@ class WorkQueue:
         if isinstance(limit, bool) or not 1 <= limit <= MAX_QUEUE_ITEMS:
             raise QueueError("invalid_queue_limit")
         return tuple(
-            QueueDecision(item, self._key(item, now), ("dispatch_priority", "deadline", "queen_fairness", "age"))
+            QueueDecision(
+                item,
+                self._key(item, now),
+                ("dispatch_priority", "deadline", "queen_fairness", "age"),
+            )
             for item in self.runnable_items(now=now)[:limit]
         )
 
@@ -103,9 +119,15 @@ class WorkQueue:
         return decisions[0]
 
     def reserve_cost(self, workpackage_id: str, cost_micro: int) -> None:
-        if not isinstance(workpackage_id, str) or workpackage_id not in {item.workpackage_id for item in self._items}:
+        if not isinstance(workpackage_id, str) or workpackage_id not in {
+            item.workpackage_id for item in self._items
+        }:
             raise QueueError("unknown_workpackage")
-        if isinstance(cost_micro, bool) or not isinstance(cost_micro, int) or not 0 <= cost_micro <= MAX_COST_MICRO:
+        if (
+            isinstance(cost_micro, bool)
+            or not isinstance(cost_micro, int)
+            or not 0 <= cost_micro <= MAX_COST_MICRO
+        ):
             raise QueueError("invalid_queue_cost")
         if workpackage_id in self._reserved or workpackage_id in self._finalized:
             raise QueueError("queue_cost_already_recorded")
@@ -115,7 +137,9 @@ class WorkQueue:
         if workpackage_id not in self._reserved:
             raise QueueError("queue_cost_not_reserved")
         if actual_cost_micro is not None and (
-            isinstance(actual_cost_micro, bool) or not isinstance(actual_cost_micro, int) or not 0 <= actual_cost_micro <= MAX_COST_MICRO
+            isinstance(actual_cost_micro, bool)
+            or not isinstance(actual_cost_micro, int)
+            or not 0 <= actual_cost_micro <= MAX_COST_MICRO
         ):
             raise QueueError("invalid_queue_cost")
         self._finalized[workpackage_id] = actual_cost_micro
@@ -127,15 +151,25 @@ class WorkQueue:
         del self._reserved[workpackage_id]
 
     def _key(self, item: WorkPackage, now: datetime) -> WorkPriorityKey:
-        raw_priority = item.resource_profile.get("dispatch_priority", DispatchPriority.DP3.value)
+        raw_priority = item.resource_profile.get(
+            "dispatch_priority", DispatchPriority.DP3.value
+        )
         try:
-            priority = raw_priority if isinstance(raw_priority, DispatchPriority) else DispatchPriority(raw_priority)
+            priority = (
+                raw_priority
+                if isinstance(raw_priority, DispatchPriority)
+                else DispatchPriority(raw_priority)
+            )
         except ValueError:
             priority = DispatchPriority.DP3
         deadline = item.resource_profile.get("deadline_epoch_ms", 2**63 - 1)
         ready = item.ready_since_utc or now
         try:
-            deadline_ms = int(deadline) if isinstance(deadline, int) and deadline >= 0 else 2**63 - 1
+            deadline_ms = (
+                int(deadline)
+                if isinstance(deadline, int) and deadline >= 0
+                else 2**63 - 1
+            )
             ready_ms = int(validate_utc_datetime(ready).timestamp() * 1000)
         except (OverflowError, TypeError, ValueError):
             deadline_ms = 2**63 - 1
@@ -145,7 +179,15 @@ class WorkQueue:
         except (TypeError, ValueError, OverflowError):
             deficit = 0
         deficit = max(-MAX_COST_MICRO, min(MAX_COST_MICRO, deficit))
-        return WorkPriorityKey(_PRIORITY_RANK[priority], deadline_ms, -deficit, ready_ms, ready_ms, str(item.resource_profile.get("repo_id", "")), item.workpackage_id)
+        return WorkPriorityKey(
+            _PRIORITY_RANK[priority],
+            deadline_ms,
+            -deficit,
+            ready_ms,
+            ready_ms,
+            str(item.resource_profile.get("repo_id", "")),
+            item.workpackage_id,
+        )
 
 
 def _now(value: datetime) -> datetime:
