@@ -9881,8 +9881,11 @@ def _materialize_managed_codex_runtime_class(
     runtime_profile = _runtime_class_skill_profile(agent_class)
     projected = dataclass_replace(descriptor, skill_profile=runtime_profile)
     desired = fleet_markdown_artifacts(projected)
-    if runtime_profile != "generic":
-        desired.update(portable_gemini_skill_artifacts(runtime_profile))
+    desired.update(
+        portable_gemini_skill_artifacts(
+            runtime_profile, include_required_codex_skills=True
+        )
+    )
     if (
         not desired
         or len(desired) > MAX_PORTABLE_SKILLS + 2
@@ -12990,7 +12993,10 @@ def _g5_start_scope(
     return runtime, scope
 
 
-def _g5_direct_child_scope_owner() -> tuple[ResourceGateRuntime, SystemdDirectChildScopeOwner]:
+def _g5_direct_child_scope_owner() -> tuple[
+    ResourceGateRuntime,
+    SystemdDirectChildScopeOwner,
+]:
     """Proposed internal G5 handoff, never a dispatch or grant issuer."""
     runtime = _RESOURCE_GATE_RUNTIME.get()
     approved = _typed_g5_cgroup_runtime()
@@ -28548,12 +28554,18 @@ def _build_fleet_home_target(
             )
         )
         files[".gemini/policies/codex-master.toml"] = (policy.encode("utf-8"), 0o600)
-    if include_portable_skills and effective_skill_profile != "generic":
+    if include_portable_skills and (
+        effective_skill_profile != "generic"
+        or descriptor.runner is RunnerKind.CODEX_CLI
+    ):
         files.update(
             {
                 name: (data, 0o600)
                 for name, data in portable_gemini_skill_artifacts(
-                    effective_skill_profile
+                    effective_skill_profile,
+                    include_required_codex_skills=(
+                        descriptor.runner is RunnerKind.CODEX_CLI
+                    ),
                 ).items()
             }
         )
@@ -43833,6 +43845,21 @@ _VISUAL_COMPANION_PORTABLE_GUIDE = (
     f"{_VISUAL_COMPANION_PORTABLE_ROOT}/visual-companion.md"
 )
 
+_REQUIRED_CODEX_SKILL_FILES = {
+    "code-review": (
+        "SKILL.md",
+        "references/auth-recovery.md",
+        "references/cli-workflows.md",
+    ),
+    "autofix": ("SKILL.md", "github.md"),
+    "find-skills": ("SKILL.md",),
+}
+_REQUIRED_CODEX_SKILL_TARGETS = frozenset(
+    f".agents/skills/{skill}/{relative}"
+    for skill, relatives in _REQUIRED_CODEX_SKILL_FILES.items()
+    for relative in relatives
+)
+
 
 def _skill_allowed_for_profile(skill_name: str, profile: str) -> bool:
     normalized = skill_name.strip().lower()
@@ -43844,6 +43871,7 @@ def _portable_skill_projection_name(name: object) -> bool:
     return type(name) is str and (
         (name.startswith("skills/.portable/") and name.endswith("/SKILL.md"))
         or name == _VISUAL_COMPANION_PORTABLE_GUIDE
+        or name in _REQUIRED_CODEX_SKILL_TARGETS
     )
 
 
@@ -43874,16 +43902,36 @@ def _portable_visual_companion_artifacts(profile: str, home: Path) -> dict[str, 
     }
 
 
-def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes]:
+def portable_gemini_skill_artifacts(
+    profile: str = "generic", *, include_required_codex_skills: bool = False
+) -> dict[str, bytes]:
     """Materialize vetted Markdown skills without copying executable plugins."""
 
     home = Path.home()
+    required: dict[str, bytes] = {}
+    if include_required_codex_skills:
+        for skill, relatives in _REQUIRED_CODEX_SKILL_FILES.items():
+            for relative in relatives:
+                content = _fleet_peek_optional_private_text(
+                    home / ".agents" / "skills" / skill / relative,
+                    MAX_FLEET_ARTIFACT_BYTES,
+                    "portable_skill_source_invalid",
+                )
+                if content is None:
+                    raise AgentError("portable_skill_source_missing")
+                target = f".agents/skills/{skill}/{relative}"
+                required[target] = content.encode("utf-8")
     visual_companion = _portable_visual_companion_artifacts(profile, home)
-    if len(visual_companion) > MAX_PORTABLE_SKILLS:
+    reserved = {**visual_companion, **required}
+    if len(reserved) > MAX_PORTABLE_SKILLS:
+        if include_required_codex_skills:
+            raise AgentError("portable_skill_capacity_exceeded")
         return {}
-    other_capacity = MAX_PORTABLE_SKILLS - len(visual_companion)
+    if include_required_codex_skills and profile == "generic":
+        return reserved
+    other_capacity = MAX_PORTABLE_SKILLS - len(reserved)
     if other_capacity == 0:
-        return visual_companion
+        return reserved
     roots = [
         (home / ".codex-agents" / "b1" / "skills" / ".system", "system"),
         (home / ".codex-agents" / "b1" / "skills", "agents"),
@@ -43895,6 +43943,11 @@ def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes
             continue
         for skill_file in sorted(root.glob("*/SKILL.md")):
             if namespace == "agents" and skill_file.parent.name == ".system":
+                continue
+            if (
+                include_required_codex_skills
+                and skill_file.parent.name in _REQUIRED_CODEX_SKILL_FILES
+            ):
                 continue
             if not _skill_allowed_for_profile(skill_file.parent.name, profile):
                 continue
@@ -43913,7 +43966,7 @@ def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes
             target = f"skills/.portable/{namespace}/{skill_file.parent.name}/SKILL.md"
             artifacts.setdefault(target, data)
             if len(artifacts) >= other_capacity:
-                artifacts.update(visual_companion)
+                artifacts.update(reserved)
                 return artifacts
 
     plugin_root = home / ".codex-agents" / "b1" / "plugins" / "cache"
@@ -43950,7 +44003,7 @@ def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes
             artifacts.setdefault(target, data)
             if len(artifacts) >= other_capacity:
                 break
-    artifacts.update(visual_companion)
+    artifacts.update(reserved)
     return artifacts
 
 

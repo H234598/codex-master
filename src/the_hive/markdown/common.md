@@ -473,92 +473,66 @@ PR-Pfad mit Qltychecks verwenden. Fehlende CLIprüfung ist kein grüner Check.
 Der gemeinsame lokale Qualitätsowner ist der geprüfte Runner
 `<UID-Home>/the_hive/scripts/the-hive-qlty-maintenance`, auf diesem Host also
 `python3 /home/teladi/the_hive/scripts/the-hive-qlty-maintenance`. Er verwendet
-das Betriebssystem-Benutzerhome der tatsächlichen UID für CLI und Zustand;
-ein privates Bienen-`HOME` eröffnet keinen zweiten Tagesledger. Produktive
-Aufrufe dürfen `--state-root` oder `--qlty` nicht auf einen frischen Ersatzpfad
-umlenken, um eine Sperre oder den Tagesclaim zu umgehen. Abweichende Pfade
-sind ausschließlich in ausdrücklich privaten Tests zulässig.
+das Betriebssystem-Benutzerhome für CLI und Zustand. Produktive Aufrufe dürfen
+`--state-root` oder `--qlty` nicht auf Ersatzpfade umlenken, um gemeinsame
+Guards zu umgehen. Abweichende Pfade sind nur in privaten Tests zulässig.
 
-Vor tatsächlicher Coding- oder Reviewarbeit am bestätigten Git-Repository
+Vor Coding- oder Reviewarbeit am bestätigten Git-Repository
 `begin --repo <absoluter Repositorypfad> --owner <tatsächliche Assignmentkennung>
---phase work` aufrufen und die zurückgegebene `guard_id` dauerhaft beim
-Assignment sichern. Dieser lokale Owner erhebt seine Zeit selbst und bindet
-das Ereignis an Git-TopLevel, Git-CommonDir sowie Dateisystemidentität. Die
-Quelle heißt ausdrücklich `declared_local_work`; sie ist keine native
-CWD-Attestierung, kein Historybeleg und keine zusätzliche Hive-Autorität.
-Die vorhandene Task-, Scope- und Schreibkoordination bleibt verbindlich.
+--phase work` aufrufen und die echte `guard_id` dauerhaft sichern. Der Guard
+bindet Git-TopLevel, Git-CommonDir und Dateisystemidentität. Seine Abdeckung
+heißt `declared_local_work_only`; sie attestiert weder universelle Ruhe noch
+native CWD-, Account- oder Hive-Autorität. Bestehende Taskkoordination gilt.
 
-Vor Sourcefreeze oder Tests den eigenen Arbeitsguard tatsächlich beenden
-und einen Guard mit `--phase freeze` beziehungsweise `--phase test` beginnen.
-Ein Freeze-/Testguard verhindert neue erklärte Schreiber; ein noch aktiver
-Schreiber verhindert den Beginn dieses Freeze-/Testguards. Solche Guards
-schreiben keine neue Arbeitsaktivität. Vorhandene fremde oder unklare Guards
-bleiben geschützt. Alter, Prozessschweigen und ein abgelaufener selbst
-gewählter Beobachtungszeitraum sind keine Freigabe und beenden keinen Guard.
-Bei einem Crash oder einer unbekannten Formatierungsphase die zuständige
-Leitung mit dem konkreten Zustand befassen; keinen Zustand blind löschen.
-
-Ein tatsächliches Arbeits- oder Testende wird mit
+Vor Tests oder Sourcefreeze den eigenen Arbeitsguard mit
 `end --repo <Repositorypfad> --owner <dieselbe Assignmentkennung>
---guard-id <tatsächlich erhaltene guard_id>` gespeichert. Nur an einer mit der
-zuständigen Schreib-/Taskleitung bestätigten sicheren Grenze zusätzlich
-`--approve-format` setzen. Dies erlaubt genau einen an die aktuelle lokale
-Bindung, Revision und den erfassten Sourcezustand gebundenen Qualitätslauf.
-Die Freigabe ersetzt weder einen vollständigen Testnachweis noch einen
-Nachweis universeller Ruhe. Nicht beteiligte oder unbekannte Schreiber sind
-durch den erklärten lokalen Owner nicht automatisch abgedeckt.
+--guard-id <tatsächliche guard_id>` regulär beenden. Danach einen eigenen
+Guard mit `--phase test` beziehungsweise `--phase freeze` beginnen und am
+wirklichen Ende ebenfalls regulär beenden. Arbeitsguards und Test-/Freezeguards
+sperren sich gegenseitig. Fremde oder unklare Guards bleiben geschützt.
+Alter, Schweigen oder ein Beobachtungstimeout beendet keinen Guard.
+Ungeklärte frühere Formatguards werden der Leitung gemeldet und nicht gelöscht.
 
-Sind andere Guards noch aktiv, speichert `end --approve-format` trotzdem das
-eigene Ende und meldet `approval: deferred`. Das ist keine Freigabe. Die
-verbrauchte eigene Guardkennung nicht in einer Schleife erneut beenden.
-Der letzte tatsächlich zuständige, freigebende Owner kann sein eigenes Ende
-mit der einmaligen Freigabe verbinden. Jede neue Arbeit sowie jeder neue
-Freeze-/Testguard verwirft eine ältere Freigabe.
+Jede Code schreibende Biene prüft ihren tatsächlichen fertigen Code mit
+lokalem Qlty. Kleine relevante Checks dürfen dafür ausdrücklich benannte echte
+Dateien und passende Plugins verwenden, beispielsweise
+`qlty check --filter=ruff --no-fix <Dateipfade>`. Vollständige Befehle, echte
+Exits, geprüfte Dateien und Findings werden sourcegebunden übergeben.
+Versionsausgaben oder Null-Dateien-Ergebnisse gelten nicht als Fertigprüfung.
 
-Ein Repository ist für diese Automatik nur nach einem tatsächlich erklärten
-Arbeitsereignis innerhalb der letzten 24 Stunden aktiv. Schedulerlauf,
-Upgrade, Scan, Formatierung, Ingestion, Dateizeitstempel und Selfchecks
-reaktivieren es nicht. Unbekannte oder nicht angeschlossene Repositorys nicht
-als inaktiv oder vollständig geprüft ausgeben. Der Benutzer-Timer prüft
-stündlich mit `daily` nur die Fälligkeit. Die tatsächlichen teuren Aktionen
-bleiben durch ihre persistenten rollenden Tagesclaims begrenzt; eine bloße
-stündliche Prüfung ist keine neue Qlty-Kette. Der gesonderte Upgradeclaim führt
-bei Fälligkeit tatsächlich
-`qlty upgrade --verify-attestations` aus; ein fehlender Repositoryguard
-blockiert nicht diese unabhängige Upgradephase.
+Vor JEDEM Commit veranlasst die Königin einen frischen vollständigen
+`precommit --repo <Repositorypfad> --owner <Assignmentkennung>`-Lauf dieses
+Owners. Jeder erlaubte mutierende Commitpfad wird einzeln als
+`--format-path <vaultunabhängiger relativer Repositorypfad>` angegeben.
+Diese Pfade müssen durch den tatsächlichen Auftrag freigegeben sein. Die
+Formatphase verwendet die vorhandenen Rollen Ruff, Prettier und shfmt nur
+auf diesen Dateien. Geschlossene Authority-, Client- oder Corepfade werden
+dadurch nicht geöffnet. Ein nötiger weiterer Formatpfad wird vorab konkret
+mit der zuständigen Leitung geklärt. Der Owner prüft unveränderte Außenbytes.
 
-Die vollständige Kette `qlty metrics --all`, `qlty smells --all`,
-`qlty check --all` und `qlty fmt --all` ausschließlich über `run --repo ...`
-beziehungsweise `daily` dieses Owners ausführen. Der persistente,
-parallel sichere Tagesclaim gilt gemeinsam für alle Worktrees desselben
-Git-CommonDir und höchstens einmal pro rollenden 24 Stunden, auch nach einem
-Fehler oder Crash. Ein übersprungener erneuter Aufruf beweist keine neue
-Prüfung. Die exklusive Formatierungsphase braucht zusätzlich die tatsächliche
-einmalige Freigabe und schützt nur die ausdrücklich erklärte Writerabdeckung.
-Eine unabhängige zweite vollständige Kette, ein neuer Ledger oder ein
-Formatierungslauf über aktive Sourcefreezes hinweg ist nicht erlaubt.
+Der Lauf erhält ausschließlich bei beendeten anderen Guards einen exklusiven
+Precommitguard. Zuerst erfolgt diese begrenzte Formatierung. Danach folgen
+`metrics --all`, `smells --all --no-snippets` und ein ungefiltertes
+`check --all --no-fix --no-cache --sarif --print-errors`. Sämtliche tatsächlich
+unterstützten Plugins müssen aktiviert sein. Der aktuelle Katalog enthält
+68 sichtbare Plugins und zusätzlich die versteckte Definition `tsc`.
+Anwendbarkeit, konkurrierende Formatter als Validatoren und echte fehlende
+Sprach-/Paketkontexte werden anhand des vollständigen Katalogs beurteilt.
+Es werden weder Plugins wegen ihrer Menge weggelassen noch Versionen erfunden.
 
-Kleine relevante Prüfungen wie
-`qlty check --all --filter=shellcheck --no-fix` an sinnvollen Arbeitsgrenzen
-häufig ausführen; sie sind keine zweite vollständige Tageskette. Benötigte
-Sprachplugins anhand des tatsächlichen Katalogs und der Repositorydateien
-auswählen. Duplikate und ungültige Namen klären; pro Dateibereich keine
-konkurrierenden Formatter unbesehen aktivieren. Relevante Findings beheben
-und risikoarme Quickfixes im freigegebenen Scope umsetzen. Änderungen müssen
-an einer sicheren Schreibgrenze erfolgen und anschließend passend geprüft
-werden. Findings mit Sourcebindung, Befehlsstatus und vollständigem Log über
-den vorhandenen Assignment-/Dispatchowner an die zuständige Leitung geben;
-der Qualitätsrunner startet keine Ersatzbienen und schafft keinen Broker.
+Der Owner sichert frische vollständige stdout-/stderr-Dateien, SARIF, echte
+Exitcodes, CLI-/Plugin-/Konfigurationsbindungen und die Endbytes nach der
+Formatierung. Fehlende oder ungültige Nachweise, Source- oder Plugindrift und
+Toolfehler halten den Abschluss geschlossen. Es gibt keine Filter-, No-Fail-,
+No-Error- oder Cacheabkürzung im vollständigen Check. Alte Befunde oder
+Fingerprints ersetzen keinen neuen Lauf. Findings werden gezielt im
+freigegebenen Scope behoben; eine notwendige Reparatur braucht passende Tests
+und getrennte unabhängige Review. Der Runner startet keine Ersatzbienen.
 
-Wenn die vorhandene Tageskette nach genau `metrics`, `smells` und `check` mit
-`source_changed` endete und `fmt` nachweislich nicht gestartet wurde, darf
-ausschließlich `finish-fmt --repo <Repository> --attempted-at <ursprünglicher Wert>`
-die fehlende Formatphase nachholen. Dafür müssen alle beteiligten Owner ihre
-Arbeit regulär beenden und eine neue einmalige Formatfreigabe erteilen. Der
-Runner bindet die Fortsetzung ausdrücklich an den neuen Sourcezustand; der
-ursprüngliche Tageszeitpunkt und die bisherigen drei Prüfbefunde bleiben
-erhalten. Ein erfolgreiches `finish-fmt` bestätigt nur die Formatphase. Frühere
-Checkfehler und die historische Sourceabweichung bleiben dokumentiert. Eine
-bereits gestartete oder unklar abgebrochene Formatfortsetzung wird nicht
-automatisch wiederholt. Weder die gesamte Kette noch frühere Prüfschritte
-werden dadurch erneut freigegeben.
+Eine tägliche oder rollende 24-Stunden-Repositoryprüfkette existiert nicht
+mehr und darf auch nicht als Migrationstest ausgeführt werden. Die früheren
+Operationen `daily`, `run`, `finish-fmt` und `--approve-format` sind entfernt.
+Der bestehende Benutzer-Timer ruft ausschließlich `upgrade` auf. Nur dieses
+separate CLI-Upgrade besitzt weiterhin einen persistenten parallelen Tagesclaim
+und verwendet `qlty upgrade --verify-attestations`. Fehlende Repositoryguards
+blockieren das Upgrade nicht. Historische Berichte bleiben unverändert.

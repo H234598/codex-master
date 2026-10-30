@@ -1,0 +1,12 @@
+---
+rules:
+  - id: hive-no-eval-python
+    languages: [python]
+    severity: ERROR
+    message: Parse a restricted data format instead of executing eval.
+    pattern: eval(...)
+  - id: hive-no-eval-javascript
+    languages: [javascript]
+    severity: ERROR
+    message: Parse a restricted data format instead of executing eval.
+    pattern: eval(...)

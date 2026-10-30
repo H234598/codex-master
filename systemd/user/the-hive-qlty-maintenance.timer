@@ -1,5 +1,5 @@
 [Unit]
-Description=Check whether daily Qlty maintenance is due
+Description=Schedule the daily attested Qlty CLI upgrade
 
 [Timer]
 OnCalendar=hourly
