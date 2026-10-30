@@ -29,6 +29,8 @@ from unittest.mock import Mock, patch
 import pytest
 import yaml
 
+from conftest import _write_required_codex_skill_fixture, regular_home_files_for_test
+
 import the_hive.server as server_module
 import the_hive.resource_cgroup as resource_cgroup
 from the_hive import __version__
@@ -1528,22 +1530,7 @@ def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
     )
 
 
-def _write_required_codex_skill_fixture(home: Path) -> dict[str, bytes]:
-    expected = {
-        ".agents/skills/code-review/SKILL.md": b"# Code review\n",
-        ".agents/skills/code-review/references/auth-recovery.md": b"# Recovery\n",
-        ".agents/skills/code-review/references/cli-workflows.md": b"# CLI workflow\n",
-        ".agents/skills/autofix/SKILL.md": b"# Autofix\n",
-        ".agents/skills/autofix/github.md": b"# GitHub reference\n",
-        ".agents/skills/find-skills/SKILL.md": b"# Find skills\n",
-    }
-    for name, content in expected.items():
-        path = home / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-    return expected
-
-
+@pytest.mark.usefixtures("hermetic_codex_skill_home")
 class ServerHelpersTest(unittest.TestCase):
     def test_tracked_worktree_use_propagates_lifecycle_store_errors(self) -> None:
         failure = AgentError("worktree_lifecycle_unavailable")
@@ -9588,6 +9575,12 @@ class ServerHelpersTest(unittest.TestCase):
                         "codex",
                         "config.toml",
                         "model.json",
+                        ".agents/skills/code-review/SKILL.md",
+                        ".agents/skills/code-review/references/auth-recovery.md",
+                        ".agents/skills/code-review/references/cli-workflows.md",
+                        ".agents/skills/autofix/SKILL.md",
+                        ".agents/skills/autofix/github.md",
+                        ".agents/skills/find-skills/SKILL.md",
                     },
                 )
                 self.assertTrue(
@@ -9639,9 +9632,9 @@ class ServerHelpersTest(unittest.TestCase):
             ) -> dict[str, tuple[int, int, str]]:
                 result: dict[str, tuple[int, int, str]] = {}
                 for agent_id in agent_ids:
-                    for path in sorted((pool / agent_id).iterdir()):
-                        current = path.stat()
-                        result[f"{agent_id}/{path.name}"] = (
+                    for path in regular_home_files_for_test(pool / agent_id):
+                        current = path.lstat()
+                        result[f"{agent_id}/{path.relative_to(pool / agent_id)}"] = (
                             current.st_ino,
                             current.st_mtime_ns,
                             hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -10650,7 +10643,7 @@ google_accounts:
                         hashlib.sha256(path.read_bytes()).hexdigest(),
                     )
                     for ordinal in range(1, 4)
-                    for path in (pool / f"d{ordinal}").iterdir()
+                    for path in regular_home_files_for_test(pool / f"d{ordinal}")
                 }
                 service = server_module.current_fleet_service()
                 with (
@@ -10736,7 +10729,7 @@ google_accounts:
                         hashlib.sha256(path.read_bytes()).hexdigest(),
                     )
                     for ordinal in range(1, 4)
-                    for path in (pool / f"d{ordinal}").iterdir()
+                    for path in regular_home_files_for_test(pool / f"d{ordinal}")
                 }
             self.assertEqual(result["removed_count"], 2)
             self.assertEqual(untouched, current)
@@ -10900,8 +10893,11 @@ google_accounts:
                     )
                 server_module.fleet_series_disable(prefix="d", expected_generation=2)
                 before = {
-                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                    for path in (pool / "d1").iterdir()
+                    str(path.relative_to(pool / "d1")): (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.lstat().st_mode),
+                    )
+                    for path in regular_home_files_for_test(pool / "d1")
                 }
                 service = server_module.current_fleet_service()
                 with (
@@ -10934,8 +10930,11 @@ google_accounts:
                             codex_executable=executable,
                         )
                 restored = {
-                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                    for path in (pool / "d1").iterdir()
+                    str(path.relative_to(pool / "d1")): (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.lstat().st_mode),
+                    )
+                    for path in regular_home_files_for_test(pool / "d1")
                 }
                 self.assertEqual(restored, before)
 
@@ -12013,8 +12012,11 @@ google_accounts:
                     expected_generation=3,
                 )
                 before = {
-                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                    for path in (pool / "d1").iterdir()
+                    str(path.relative_to(pool / "d1")): (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.lstat().st_mode),
+                    )
+                    for path in regular_home_files_for_test(pool / "d1")
                 }
                 real_write = server_module.write_private_new_bytes
 
@@ -12052,8 +12054,11 @@ google_accounts:
                             gemini_executable=executable,
                         )
                 after = {
-                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                    for path in (pool / "d1").iterdir()
+                    str(path.relative_to(pool / "d1")): (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.lstat().st_mode),
+                    )
+                    for path in regular_home_files_for_test(pool / "d1")
                 }
                 self.assertEqual(after, before)
                 with (
@@ -14592,7 +14597,7 @@ google_accounts:
                         stat.S_IMODE(path.stat().st_mode),
                     )
                     for ordinal in (1, 2)
-                    for path in (pool / f"d{ordinal}").iterdir()
+                    for path in regular_home_files_for_test(pool / f"d{ordinal}")
                 }
                 service = server_module.current_fleet_service()
                 with (
@@ -14623,7 +14628,7 @@ google_accounts:
                         stat.S_IMODE(path.stat().st_mode),
                     )
                     for ordinal in (1, 2)
-                    for path in (pool / f"d{ordinal}").iterdir()
+                    for path in regular_home_files_for_test(pool / f"d{ordinal}")
                 }
                 self.assertEqual(after, before)
                 self.assertFalse((pool / "d3").exists())
@@ -14679,7 +14684,7 @@ google_accounts:
                         str(path.relative_to(pool)): path.read_bytes()
                         for home in pool.iterdir()
                         if home.is_dir()
-                        for path in home.iterdir()
+                        for path in regular_home_files_for_test(home)
                     }
                     with self.assertRaisesRegex(
                         AgentError, "fleet_pool_marker_required"
@@ -14719,7 +14724,7 @@ google_accounts:
                         str(path.relative_to(pool)): path.read_bytes()
                         for home in pool.iterdir()
                         if home.is_dir()
-                        for path in home.iterdir()
+                        for path in regular_home_files_for_test(home)
                     }
                     self.assertEqual(after, before)
 
@@ -15133,9 +15138,9 @@ google_accounts:
                     stat.S_IMODE(home_stat.st_mode),
                     b"",
                 )
-                for path in home.iterdir():
-                    current = path.stat()
-                    result[f"{agent_id}/{path.name}"] = (
+                for path in regular_home_files_for_test(home):
+                    current = path.lstat()
+                    result[f"{agent_id}/{path.relative_to(home)}"] = (
                         current.st_ino,
                         current.st_mtime_ns,
                         stat.S_IMODE(current.st_mode),
@@ -32006,7 +32011,9 @@ google_accounts:
             self.assertNotIn(
                 "skills/.portable/agents/teamleiterin/SKILL.md", marker["managed_files"]
             )
-            projected_skills.assert_called_once_with("worker")
+            projected_skills.assert_called_once_with(
+                "worker", include_required_codex_skills=True
+            )
 
     def test_legacy_home_refresh_rejects_active_codex_roots_without_mutation(
         self,

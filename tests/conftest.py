@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import runpy
+import stat
 from pathlib import Path
 import subprocess
 
@@ -9,6 +11,55 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 _TEST_MANIFEST_COMMIT = "a" * 40
+
+
+def _write_required_codex_skill_fixture(home: Path) -> dict[str, bytes]:
+    expected = {
+        ".agents/skills/code-review/SKILL.md": b"# Code review\n",
+        ".agents/skills/code-review/references/auth-recovery.md": b"# Recovery\n",
+        ".agents/skills/code-review/references/cli-workflows.md": b"# CLI workflow\n",
+        ".agents/skills/autofix/SKILL.md": b"# Autofix\n",
+        ".agents/skills/autofix/github.md": b"# GitHub reference\n",
+        ".agents/skills/find-skills/SKILL.md": b"# Find skills\n",
+    }
+    for name, content in expected.items():
+        path = home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return expected
+
+
+def regular_home_files_for_test(home: Path) -> list[Path]:
+    """List every regular file without following or silently skipping symlinks."""
+    if not stat.S_ISDIR(home.lstat().st_mode):
+        raise AssertionError(f"untrusted test home: {home}")
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    files: list[Path] = []
+    for directory, names, leaves in os.walk(
+        home, followlinks=False, onerror=raise_walk_error
+    ):
+        for name in (*names, *leaves):
+            path = Path(directory) / name
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise AssertionError(f"unexpected symlink in test home: {path}")
+            if stat.S_ISREG(mode):
+                files.append(path)
+            elif not stat.S_ISDIR(mode):
+                raise AssertionError(f"unexpected entry in test home: {path}")
+    return sorted(files)
+
+
+@pytest.fixture
+def hermetic_codex_skill_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "codex-skill-source"
+    home.mkdir(mode=0o700)
+    _write_required_codex_skill_fixture(home)
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> None:
