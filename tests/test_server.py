@@ -1528,6 +1528,22 @@ def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
     )
 
 
+def _write_required_codex_skill_fixture(home: Path) -> dict[str, bytes]:
+    expected = {
+        ".agents/skills/code-review/SKILL.md": b"# Code review\n",
+        ".agents/skills/code-review/references/auth-recovery.md": b"# Recovery\n",
+        ".agents/skills/code-review/references/cli-workflows.md": b"# CLI workflow\n",
+        ".agents/skills/autofix/SKILL.md": b"# Autofix\n",
+        ".agents/skills/autofix/github.md": b"# GitHub reference\n",
+        ".agents/skills/find-skills/SKILL.md": b"# Find skills\n",
+    }
+    for name, content in expected.items():
+        path = home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return expected
+
+
 class ServerHelpersTest(unittest.TestCase):
     def test_tracked_worktree_use_propagates_lifecycle_store_errors(self) -> None:
         failure = AgentError("worktree_lifecycle_unavailable")
@@ -1554,6 +1570,114 @@ class ServerHelpersTest(unittest.TestCase):
                 "superpowers:brainstorming", "teamleiterin"
             )
         )
+
+    def test_codex_required_skill_bundles_are_complete_for_generic_and_worker(
+        self,
+    ) -> None:
+        for profile in ("generic", "worker", "teamleiterin"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                expected = _write_required_codex_skill_fixture(home)
+                extra = home / ".agents/skills/autofix/notes.md"
+                extra.write_bytes(b"not an authorized reference\n")
+                with patch.object(server_module.Path, "home", return_value=home):
+                    artifacts = server_module.portable_gemini_skill_artifacts(
+                        profile, include_required_codex_skills=True
+                    )
+                self.assertEqual(artifacts, expected)
+
+    def test_codex_required_skill_references_fail_closed_without_partial_bundle(
+        self,
+    ) -> None:
+        for mutation in (
+            "missing",
+            "symlink",
+            "parent-symlink",
+            "hardlink",
+            "utf8",
+            "size",
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                _write_required_codex_skill_fixture(home)
+                reference = (
+                    home / ".agents/skills/code-review/references/auth-recovery.md"
+                )
+                if mutation == "missing":
+                    reference.unlink()
+                elif mutation == "symlink":
+                    reference.unlink()
+                    reference.symlink_to(home / ".agents/skills/find-skills/SKILL.md")
+                elif mutation == "parent-symlink":
+                    source = reference.parent.with_name("held-references")
+                    reference.parent.rename(source)
+                    reference.parent.symlink_to(source, target_is_directory=True)
+                elif mutation == "hardlink":
+                    reference.with_name("other.md").hardlink_to(reference)
+                elif mutation == "utf8":
+                    reference.write_bytes(b"\xff")
+                else:
+                    reference.write_bytes(
+                        b"x" * (server_module.MAX_FLEET_ARTIFACT_BYTES + 1)
+                    )
+                with patch.object(server_module.Path, "home", return_value=home):
+                    with self.assertRaises(server_module.AgentError):
+                        server_module.portable_gemini_skill_artifacts(
+                            "worker", include_required_codex_skills=True
+                        )
+
+    def test_codex_skill_capacity_reserves_complete_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            expected = _write_required_codex_skill_fixture(home)
+            with patch.object(server_module.Path, "home", return_value=home):
+                artifacts = server_module.portable_gemini_skill_artifacts(
+                    "worker", include_required_codex_skills=True
+                )
+                self.assertEqual(artifacts, expected)
+                with patch.object(server_module, "MAX_PORTABLE_SKILLS", 5):
+                    with self.assertRaises(server_module.AgentError):
+                        server_module.portable_gemini_skill_artifacts(
+                            "generic", include_required_codex_skills=True
+                        )
+
+    def test_codex_home_composer_manages_complete_skill_bytes_without_creating_home(
+        self,
+    ) -> None:
+        for profile in ("generic", "worker"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source"
+                expected = _write_required_codex_skill_fixture(source)
+                home = root / "pool/a1"
+                descriptor = server_module.AgentDescriptor(
+                    agent_id="a1",
+                    series_prefix="a",
+                    ordinal=1,
+                    label="Agentin A1",
+                    runner=server_module.RunnerKind.CODEX_CLI,
+                    provider=server_module.Provider.OPENAI_CHATGPT,
+                    model="test-model",
+                    account_id=None,
+                    home=home,
+                    session="session-a1",
+                    enabled=True,
+                    runner_path=home / "codex",
+                    skill_profile=profile,
+                )
+                with patch.object(server_module.Path, "home", return_value=source):
+                    target = server_module._build_fleet_home_target(
+                        descriptor, root / "codex-native"
+                    )
+                files = {name: (content, mode) for name, content, mode in target.files}
+                marker = json.loads(target.marker_bytes)
+                for name, content in expected.items():
+                    self.assertEqual(files[name], (content, 0o600))
+                    self.assertIn(name, marker["managed_files"])
+                    self.assertEqual(
+                        marker["files"][name], hashlib.sha256(content).hexdigest()
+                    )
+                self.assertFalse(home.exists())
 
     def test_portable_teamlead_projection_includes_only_required_visual_companion_markdown(
         self,
@@ -12385,7 +12509,10 @@ google_accounts:
                     executable,
                     include_portable_skills=False,
                 )
-                flat = server_module._fleet_artifacts(descriptor, executable)
+                with patch.object(
+                    server_module, "portable_gemini_skill_artifacts", return_value={}
+                ):
+                    flat = server_module._fleet_artifacts(descriptor, executable)
 
                 self.assertEqual(
                     {
@@ -31835,7 +31962,7 @@ google_accounts:
                 patch.object(
                     server_module,
                     "portable_gemini_skill_artifacts",
-                    side_effect=lambda profile: {
+                    side_effect=lambda profile, **_kwargs: {
                         f"skills/.portable/agents/{profile}/SKILL.md": profile.encode(
                             "utf-8"
                         )
@@ -32425,7 +32552,7 @@ google_accounts:
                 patch.object(
                     server_module,
                     "portable_gemini_skill_artifacts",
-                    side_effect=lambda profile: {
+                    side_effect=lambda profile, **_kwargs: {
                         f"skills/.portable/agents/{profile}/SKILL.md": profile.encode(
                             "utf-8"
                         )
@@ -33333,7 +33460,7 @@ google_accounts:
             def idle_agent(*_args: Any, **_kwargs: Any):
                 yield {descriptor.agent_id: home.lstat()}
 
-            def projected(profile: str) -> dict[str, bytes]:
+            def projected(profile: str, **_kwargs: Any) -> dict[str, bytes]:
                 return {
                     f"skills/.portable/agents/{profile}/SKILL.md": profile.encode(
                         "utf-8"
@@ -33751,7 +33878,7 @@ google_accounts:
                 patch.object(
                     server_module,
                     "portable_gemini_skill_artifacts",
-                    side_effect=lambda profile: {
+                    side_effect=lambda profile, **_kwargs: {
                         f"skills/.portable/agents/{profile}/SKILL.md": profile.encode(
                             "utf-8"
                         )
@@ -33927,7 +34054,7 @@ google_accounts:
                     patch.object(
                         server_module,
                         "portable_gemini_skill_artifacts",
-                        side_effect=lambda profile: {
+                        side_effect=lambda profile, **_kwargs: {
                             f"skills/.portable/agents/{profile}/SKILL.md": profile.encode(
                                 "utf-8"
                             )

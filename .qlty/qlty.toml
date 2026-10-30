@@ -12,6 +12,8 @@
 # For a guide to configuration, visit https://qlty.sh/d/config
 # Or for a full reference, visit https://qlty.sh/d/qlty-toml
 config_version = "0"
+# Include the existing extensionless Python owner without replacing Python globs.
+file_types.python.globs = ["*.py", "*.pyw", "**/DEPS", "**/Snakefile", "**/SConscript", "**/wscript", "**/SConstruct", "**/.gclient", "scripts/the-hive-qlty-maintenance"]
 
 exclude_patterns = [
   "*_min.*",
@@ -69,11 +71,9 @@ name = "bandit"
 
 [[plugin]]
 name = "radarlint-python"
-mode = "comment"
 
 [[plugin]]
 name = "ripgrep"
-mode = "comment"
 
 [[plugin]]
 name = "ruff"
@@ -107,6 +107,180 @@ drivers = ["lint"]
 [[plugin]]
 name = "prettier"
 
+
+[[plugin]]
+name = "ast-grep"
+
+[[plugin]]
+name = "biome"
+
+[[plugin]]
+name = "black"
+
+[[plugin]]
+name = "brakeman"
+
+[[plugin]]
+name = "checkov"
+
+[[plugin]]
+name = "checkstyle"
+
+[[plugin]]
+name = "clippy"
+
+[[plugin]]
+name = "coffeelint"
+
+[[plugin]]
+name = "dockerfmt"
+
+[[plugin]]
+name = "dotenv-linter"
+
+[[plugin]]
+name = "editorconfig-checker"
+
+[[plugin]]
+name = "flake8"
+
+[[plugin]]
+name = "gitleaks"
+
+[[plugin]]
+name = "gofmt"
+
+[[plugin]]
+name = "golangci-lint"
+
+[[plugin]]
+name = "google-java-format"
+
+[[plugin]]
+name = "hadolint"
+
+[[plugin]]
+name = "haml-lint"
+
+[[plugin]]
+name = "knip"
+
+[[plugin]]
+name = "ktlint"
+
+[[plugin]]
+name = "kube-linter"
+
+[[plugin]]
+name = "mypy"
+
+[[plugin]]
+name = "osv-scanner"
+
+[[plugin]]
+name = "oxc"
+
+[[plugin]]
+name = "php-codesniffer"
+
+[[plugin]]
+name = "php-cs-fixer"
+
+[[plugin]]
+name = "phpstan"
+
+[[plugin]]
+name = "pmd"
+
+[[plugin]]
+name = "prisma"
+
+[[plugin]]
+name = "radarlint"
+
+[[plugin]]
+name = "radarlint-go"
+
+[[plugin]]
+name = "radarlint-iac"
+
+[[plugin]]
+name = "radarlint-java"
+
+[[plugin]]
+name = "radarlint-js"
+
+[[plugin]]
+name = "radarlint-kotlin"
+
+[[plugin]]
+name = "radarlint-php"
+
+[[plugin]]
+name = "radarlint-ruby"
+
+[[plugin]]
+name = "radarlint-scala"
+
+[[plugin]]
+name = "redocly"
+
+[[plugin]]
+name = "reek"
+
+[[plugin]]
+name = "rubocop"
+
+[[plugin]]
+name = "ruby-stree"
+
+[[plugin]]
+name = "rustfmt"
+
+[[plugin]]
+name = "semgrep"
+
+[[plugin]]
+name = "spectral"
+
+[[plugin]]
+name = "sqlfluff"
+
+[[plugin]]
+name = "standardrb"
+
+[[plugin]]
+name = "stringslint"
+
+[[plugin]]
+name = "stylelint"
+
+[[plugin]]
+name = "swiftformat"
+
+[[plugin]]
+name = "swiftlint"
+
+[[plugin]]
+name = "terraform"
+
+[[plugin]]
+name = "tflint"
+
+[[plugin]]
+name = "trivy"
+
+[[plugin]]
+name = "tsc"
+version = "7.0.2"
+
+[[plugin]]
+name = "vale"
+
+# All 69 merged definitions are enabled, including hidden tsc.
+# tsc uses a real package.json/TypeScript context; no version is invented.
+# The owner restricts mutating formatter targets before final analysis.
+
 # Full repository formatting remains enabled. Only these authority files have
 # the user-imposed production-line budget; Ruff lint still checks both files.
 [plugins.definitions.ruff.drivers.format]
@@ -116,3 +290,38 @@ script = "ruff format --force-exclude --exclude src/the_hive/hive/authority.py -
 # rules do not assume browser/Node globals or change existing application code.
 [plugins.definitions.eslint.drivers.lint]
 script = "eslint --no-config-lookup --parser-options '{\"ecmaVersion\":2022,\"sourceType\":\"module\"}' --rule 'no-eval:error' --rule 'no-debugger:error' --rule 'no-unreachable:error' --rule 'valid-typeof:error' --rule 'no-dupe-args:error' --rule 'no-duplicate-case:error' --rule 'use-isnan:error' --format json --output-file ${tmpfile} ${target}"
+
+[[exclude]]
+plugins = ["mypy"]
+file_patterns = ["src/the_hive/selection.py"]
+
+[[exclude]]
+plugins = ["kube-linter"]
+file_patterns = [".github/workflows/ci.yml", "sgconfig.yml", ".qlty/ast-grep/no-eval.yml", ".semgrep.yaml"]
+
+[plugins.definitions.mypy]
+extra_packages = ["types-PyYAML@6.0.12.20260906"]
+
+[plugins.definitions.mypy.drivers.legacy_selection]
+script = "mypy --ignore-missing-imports --output json --follow-imports=silent --show-error-codes --show-column-numbers ${target}"
+output = "stdout"
+output_format = "mypy"
+driver_type = "linter"
+success_codes = [0, 1]
+target = { type = "literal", path = "src/the_hive/selection.py" }
+runs_from = { type = "root" }
+
+[plugins.definitions.flake8.drivers.lint]
+script = "flake8 --max-line-length=88 ${target} --output-file ${tmpfile} --exit-zero"
+
+[plugins.definitions.vale]
+file_types = ["markdown"]
+
+[plugins.definitions.ast-grep]
+file_types = ["python", "javascript"]
+
+[plugins.definitions.semgrep]
+file_types = ["python", "javascript"]
+
+[plugins.definitions.semgrep.drivers.lint]
+script = "EIO_BACKEND=posix semgrep --metrics=off --disable-version-check --config .semgrep.yaml --sarif --output=${tmpfile} ${target}"
