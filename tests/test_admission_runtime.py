@@ -51,13 +51,13 @@ def materialize_probe_record(
     runtime = {
         "schema_version": 1,
         "mode": "enforced",
-        "counts": {"principals": 0, "repositories": 0},
-        "checks": {"authority": "ready", "repository": "ready", "state": "ready"},
+        "counts": {"principals": 1, "repositories": 1},
+        "checks": {"authority": "fail_closed", "repository": "ready", "state": "ready"},
         "config_digest": "sha256:" + "a" * 64,
         "catalog_digest": "sha256:" + "b" * 64,
         "repository": "ready",
         "principal": "ready",
-        "authority": "ready",
+        "authority": "fail_closed",
         "state": "ready",
         "pilot": "ready",
         "reason_codes": [],
@@ -81,12 +81,9 @@ def materialize_probe_record(
         "hive status": (runtime, True),
         "hive doctor": (
             {
-                "healthy": True,
-                "checks": {
-                    "authority": "ready",
-                    "repository": "ready",
-                    "state": "ready",
-                },
+                **{key: value for key, value in runtime.items()
+                   if key not in {"schema_version", "counts", "authority"}},
+                "healthy": False,
             },
             True,
         ),

@@ -30,13 +30,13 @@ def runtime_probe_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     runtime = {
         "schema_version": 1,
         "mode": "enforced",
-        "counts": {"principals": 0, "repositories": 0},
-        "checks": {"authority": "ready", "repository": "ready", "state": "ready"},
+        "counts": {"principals": 1, "repositories": 1},
+        "checks": {"authority": "fail_closed", "repository": "ready", "state": "ready"},
         "config_digest": "sha256:" + "a" * 64,
         "catalog_digest": "sha256:" + "b" * 64,
         "repository": "ready",
         "principal": "ready",
-        "authority": "ready",
+        "authority": "fail_closed",
         "state": "ready",
         "pilot": "ready",
         "reason_codes": [],
@@ -56,12 +56,9 @@ def runtime_probe_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
         "hive status": (runtime, True),
         "hive doctor": (
             {
-                "healthy": True,
-                "checks": {
-                    "authority": "ready",
-                    "repository": "ready",
-                    "state": "ready",
-                },
+                **{key: value for key, value in runtime.items()
+                   if key not in {"schema_version", "counts", "authority"}},
+                "healthy": False,
             },
             True,
         ),
@@ -632,10 +629,10 @@ state_root = root / "state"
 pool_root = root / "pool"
 probe_state = root / "probe-state"
 runtime = {
-    "schema_version": 1, "mode": "enforced", "counts": {"principals": 0, "repositories": 0},
-    "checks": {"authority": "ready", "repository": "ready", "state": "ready"},
+    "schema_version": 1, "mode": "enforced", "counts": {"principals": 1, "repositories": 1},
+    "checks": {"authority": "fail_closed", "repository": "ready", "state": "ready"},
     "config_digest": "sha256:" + "a" * 64, "catalog_digest": "sha256:" + "b" * 64,
-    "repository": "ready", "principal": "ready", "authority": "ready", "state": "ready", "pilot": "ready",
+    "repository": "ready", "principal": "ready", "authority": "fail_closed", "state": "ready", "pilot": "ready",
     "reason_codes": [], "mutation_performed": False, "raw_output": "not_returned",
     "global_pilot_readiness": {
         "schema_version": 1, "pilot": "ready", "generation_id": "c" * 32,
@@ -645,7 +642,14 @@ runtime = {
 }
 healthy = {
     "hive status": (runtime, True),
-    "hive doctor": ({"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}}, True),
+    "hive doctor": (
+        {
+            **{key: value for key, value in runtime.items()
+               if key not in {"schema_version", "counts", "authority"}},
+            "healthy": False,
+        },
+        True,
+    ),
 }
 layout = Mock(spec=RuntimeLayout)
 layout.mcp_entrypoint = executable
