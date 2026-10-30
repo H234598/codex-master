@@ -516,8 +516,11 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
         import json
         import os
         from pathlib import Path
+        from unittest.mock import Mock, patch
 
         from the_hive import server
+        from the_hive.hive import hourly_probe as probe_module
+        from the_hive.runtime_layout import RuntimeLayout
         from the_hive.admission import AdmissionPriority, LeaseBinding
         from the_hive.admission_runtime import AdmissionRuntimeError
         from the_hive.dynamic_pool import DynamicPoolInventoryEntryV1, DynamicPoolInventoryV1
@@ -570,8 +573,8 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
         runner.write_text("#!/bin/sh\\nexit 0\\n", encoding="utf-8")
         runner.chmod(0o700)
 
-        # The real capacity guard reads this complete v3 record and its shared
-        # lock.  The runner above is not called by this test.
+        # Legacy v3 remains a negative oracle before the real v4 producer runs.
+        # The runner above is not called by this test.
         probe_root = Path.home() / ".local" / "state" / "codex-master-mcp"
         probe_root.mkdir(parents=True, mode=0o700)
         probe_record = {
@@ -606,6 +609,10 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
         probe_lock.touch(mode=0o600)
         probe_lock.chmod(0o600)
 
+        legacy_gate = probe_module.read_probe_gate(state_file=probe_file, now=moment)
+        assert legacy_gate["reason_code"] == "probe_schema_legacy"
+        assert legacy_gate["allowed"] is False
+
         hive_state = HiveStateStore(root / "hive")
         principals = PrincipalRegistry(hive_state)
         for principal in (
@@ -623,6 +630,42 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
             state=hive_state,
             now=lambda: moment,
         )
+        # Publish through the actual service producer with the existing real owner.
+        runtime = {
+            "schema_version": 1, "mode": "enforced", "counts": {"principals": 4, "repositories": 1},
+            "checks": {"authority": "fail_closed", "repository": "ready", "state": "ready"},
+            "config_digest": digest, "catalog_digest": digest,
+            "repository": "ready", "principal": "ready", "authority": "fail_closed", "state": "ready", "pilot": "ready",
+            "reason_codes": [], "mutation_performed": False, "raw_output": "not_returned",
+            "global_pilot_readiness": {
+                "schema_version": 1, "pilot": "ready", "generation_id": "c" * 32,
+                "freshness": "fresh", "candidate_count": 1, "reason_codes": [], "raw_output": "not_returned",
+            },
+        }
+        doctor = {key: value for key, value in runtime.items()
+                  if key not in {"schema_version", "counts", "authority"}}
+        doctor["healthy"] = False
+        direct_runtime = {
+            "ok": True, "metadata": {"ok": True, "reason_code": "ok"},
+            "mcp_surface": {"ok": True, "initialize": True, "tools_list": True, "tool_count": 1, "reason_code": "ok"},
+            "raw_output": "not_returned",
+        }
+        diagnostic = {"code": "ok", "exit_code": 0,
+                      "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False}}
+        layout = Mock(spec=RuntimeLayout)
+        layout.mcp_entrypoint = runner
+        owner = principals.get("queen-codex-master")
+        layout.read_attested_file.return_value = json.dumps({"principals": [{
+            "principal_id": owner.principal_id, "class_id": owner.class_id, "repo_id": owner.repo_id,
+        }]}).encode()
+        with patch.object(probe_module, "_runtime_status_json", return_value=(direct_runtime, True, diagnostic)):
+            produced = probe_module.run_probe(
+                layout=layout, state_directory=probe_root, now=lambda: moment,
+                runner=lambda _command, *arguments: ({"hive status": runtime, "hive doctor": doctor}[" ".join(arguments)], True),
+            )
+        assert all(value is True for value in produced["service_checks"].values())
+        assert produced["checks"]["hive_runtime"] is False and produced["checks"]["hive_doctor"] is False
+
         control = HiveControlPlaneStore(HiveStateStore(root / "control"))
         control.initialize_task9(now=moment)
 
