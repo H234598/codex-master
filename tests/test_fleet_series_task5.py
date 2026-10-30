@@ -11,6 +11,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from conftest import regular_home_files_for_test
+
 from the_hive import server
 from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from the_hive.fleet_service import FleetConflictError
@@ -20,7 +22,9 @@ from the_hive.runtime_layout import RuntimeLayout
 
 
 @pytest.fixture(autouse=True)
-def runtime_probe_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def runtime_probe_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, hermetic_codex_skill_home: Path
+) -> None:
     """Materialize the canonical green record; never replace the gate or lock."""
 
     state_directory = tmp_path / "probe-state"
@@ -56,8 +60,11 @@ def runtime_probe_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
         "hive status": (runtime, True),
         "hive doctor": (
             {
-                **{key: value for key, value in runtime.items()
-                   if key not in {"schema_version", "counts", "authority"}},
+                **{
+                    key: value
+                    for key, value in runtime.items()
+                    if key not in {"schema_version", "counts", "authority"}
+                },
                 "healthy": False,
             },
             True,
@@ -104,6 +111,35 @@ def runtime_probe_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     )
     monkeypatch.setenv("CODEX_MASTER_MCP_STATE", str(state_directory))
     monkeypatch.delenv("CODEX_AGENT_MCP_STATE", raising=False)
+
+
+def test_home_snapshot_rejects_symlinks(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "link").symlink_to(tmp_path / "outside")
+    with pytest.raises(AssertionError, match="unexpected symlink"):
+        regular_home_files_for_test(home)
+
+
+def test_home_snapshot_rejects_symlink_root(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    with pytest.raises(AssertionError, match="untrusted test home"):
+        regular_home_files_for_test(alias)
+
+
+def test_home_snapshot_propagates_unreadable_directory(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    inaccessible = home / "private"
+    inaccessible.mkdir(parents=True)
+    inaccessible.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            regular_home_files_for_test(home)
+    finally:
+        inaccessible.chmod(0o700)
 
 
 def test_v1_series_apply_remains_compatible_with_dual_schema_reader() -> None:
@@ -182,12 +218,12 @@ def test_series_apply_grows_only_the_tail_and_publishes_inventory() -> None:
                 codex_executable=executable,
             )
             before = {
-                path.name: (
-                    path.stat().st_ino,
-                    path.stat().st_mtime_ns,
+                str(path.relative_to(root / "pool" / "d1")): (
+                    path.lstat().st_ino,
+                    path.lstat().st_mtime_ns,
                     path.read_bytes(),
                 )
-                for path in (root / "pool" / "d1").iterdir()
+                for path in regular_home_files_for_test(root / "pool" / "d1")
             }
             second = server.fleet_series_apply(
                 prefix="d",
@@ -200,12 +236,12 @@ def test_series_apply_grows_only_the_tail_and_publishes_inventory() -> None:
                 codex_executable=executable,
             )
             after = {
-                path.name: (
-                    path.stat().st_ino,
-                    path.stat().st_mtime_ns,
+                str(path.relative_to(root / "pool" / "d1")): (
+                    path.lstat().st_ino,
+                    path.lstat().st_mtime_ns,
                     path.read_bytes(),
                 )
-                for path in (root / "pool" / "d1").iterdir()
+                for path in regular_home_files_for_test(root / "pool" / "d1")
             }
             inventory = server.current_agent_inventory()
         assert first["created_count"] == 3
