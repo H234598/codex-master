@@ -1,0 +1,11 @@
+{
+  "overrides": [
+    {
+      "includes": ["codegraph.json", "biome.json"],
+      "formatter": {
+        "indentStyle": "space",
+        "indentWidth": 2
+      }
+    }
+  ]
+}

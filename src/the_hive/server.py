@@ -2672,6 +2672,76 @@ def codex_config_path() -> Path:
     return root / "config.toml"
 
 
+def _project_codegraph_stdio(
+    config_path: Path, binding: WorktreeBinding | None
+) -> tuple[str, str]:
+    """Project only the operator's public stdio fields into a bound home."""
+    stats = _fleet_optional_stats(config_path, "codegraph_config_invalid")
+    if stats is None:
+        return "unconfigured", ""
+    parent_stat, config_stat = stats
+    if (
+        not stat_module.S_ISREG(config_stat.st_mode)
+        or config_stat.st_uid != os.geteuid()
+        or config_stat.st_mode & 0o022
+        or getattr(config_stat, "st_nlink", 1) != 1
+    ):
+        raise AgentError("codegraph_config_invalid")
+    text = read_private_regular_text(
+        config_path,
+        MAX_CODEX_CONFIG_BYTES,
+        "codegraph_config_invalid",
+        expected_parent_stat=parent_stat,
+        expected_target_stat=config_stat,
+    )
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise AgentError("codegraph_config_invalid") from exc
+    servers = document.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        raise AgentError("codegraph_config_invalid")
+    if "codegraph" not in servers:
+        return "unconfigured", ""
+    entry = servers["codegraph"]
+    if not isinstance(entry, dict) or set(entry) - {"command", "args", "cwd"}:
+        raise AgentError("codegraph_config_invalid")
+    command = entry.get("command")
+    args = entry.get("args", [])
+    cwd = entry.get("cwd")
+    if (
+        not isinstance(command, str)
+        or not command
+        or not Path(command).is_absolute()
+        or not isinstance(args, list)
+        or not all(isinstance(arg, str) for arg in args)
+        or not all(args)
+        or "serve" not in args
+        or "--mcp" not in args
+        or any(re.fullmatch(r"(?:--path(?:=[\s\S]*)?|-p)", arg) for arg in args)
+        or (cwd is not None and not (isinstance(cwd, str) and Path(cwd).is_absolute()))
+    ):
+        raise AgentError("codegraph_config_invalid")
+    if binding is None:
+        return "root_pending", ""
+    if not isinstance(binding, WorktreeBinding) or cwd not in (
+        None,
+        str(binding.canonical_source_path),
+    ):
+        raise AgentError("codegraph_binding_invalid")
+    root = str(binding.canonical_source_path)
+    projected_args = [*args, "--path", root]
+    return "configured", "\n".join(
+        (
+            "[mcp_servers.codegraph]",
+            f"command = {json.dumps(command)}",
+            f"args = {json.dumps(projected_args)}",
+            f"cwd = {json.dumps(root)}",
+            "",
+        )
+    )
+
+
 def _updated_mcp_startup_timeout_config(
     text: str,
 ) -> tuple[str, bool, int | float | None]:
@@ -9689,6 +9759,9 @@ def _home_refresh_config(
     *,
     model: Any,
     reasoning_effort: Any,
+    codegraph_section: str | None = None,
+    allow_owned_codegraph: bool = False,
+    expected_hive_mcp: Mapping[str, Any] | None = None,
 ) -> bytes:
     """Keep narrow user trust state while restoring Fleet-owned Codex settings."""
 
@@ -9707,8 +9780,28 @@ def _home_refresh_config(
         "tui",
         "projects",
         "hooks",
+        "mcp_servers",
     }:
         raise AgentError("agent_class_materialization_invalid")
+    servers = document.get("mcp_servers", {})
+    if not isinstance(servers, dict) or set(servers) - {"codegraph", MCP_SERVER_NAME}:
+        raise AgentError("agent_class_materialization_invalid")
+    if MCP_SERVER_NAME in servers:
+        if expected_hive_mcp is None or servers[MCP_SERVER_NAME] != expected_hive_mcp:
+            raise AgentError("agent_class_materialization_invalid")
+    if "codegraph" in servers:
+        if not allow_owned_codegraph:
+            raise AgentError("agent_class_materialization_invalid")
+        previous = servers["codegraph"]
+        if (
+            not isinstance(previous, dict)
+            or set(previous) != {"command", "args", "cwd"}
+            or not isinstance(previous["command"], str)
+            or not isinstance(previous["cwd"], str)
+            or not isinstance(previous["args"], list)
+            or any(not isinstance(arg, str) for arg in previous["args"])
+        ):
+            raise AgentError("agent_class_materialization_invalid")
     features = document.get("features", {})
     if (
         not isinstance(features, dict)
@@ -9857,18 +9950,62 @@ def _home_refresh_config(
                     f"trusted_hash = {json.dumps(value['trusted_hash'])}",
                 ]
             )
+    if MCP_SERVER_NAME in servers:
+        own_mcp = servers[MCP_SERVER_NAME]
+        lines.extend(
+            [
+                "",
+                f"[mcp_servers.{MCP_SERVER_NAME}]",
+                f"command = {json.dumps(own_mcp['command'])}",
+                f"startup_timeout_sec = {own_mcp['startup_timeout_sec']}",
+                "default_tools_approval_mode = "
+                f"{json.dumps(own_mcp['default_tools_approval_mode'])}",
+            ]
+        )
+    if codegraph_section is not None:
+        try:
+            projected = tomllib.loads(codegraph_section)
+        except tomllib.TOMLDecodeError as exc:
+            raise AgentError("agent_class_materialization_invalid") from exc
+        projected_servers = projected.get("mcp_servers")
+        if (
+            set(projected) != {"mcp_servers"}
+            or not isinstance(projected_servers, dict)
+            or set(projected_servers) != {"codegraph"}
+            or not isinstance(projected_servers["codegraph"], dict)
+            or set(projected_servers["codegraph"]) != {"command", "args", "cwd"}
+        ):
+            raise AgentError("agent_class_materialization_invalid")
+        entry = projected_servers["codegraph"]
+        projected_command = entry["command"]
+        projected_cwd = entry["cwd"]
+        projected_args = entry["args"]
+        if (
+            not isinstance(projected_command, str)
+            or not Path(projected_command).is_absolute()
+            or not isinstance(projected_cwd, str)
+            or not Path(projected_cwd).is_absolute()
+            or not isinstance(projected_args, list)
+            or any(not isinstance(arg, str) for arg in projected_args)
+            or projected_args[-2:] != ["--path", projected_cwd]
+        ):
+            raise AgentError("agent_class_materialization_invalid")
+        lines.extend(["", codegraph_section.rstrip("\n")])
     return ("\n".join((*lines, ""))).encode("utf-8")
 
 
 def _materialize_managed_codex_runtime_class(
     descriptor: AgentDescriptor,
-    agent_class: str,
+    agent_class: str | None,
     *,
     expected_pool_parent_stat: os.stat_result,
     expected_pool_root_stat: os.stat_result,
     expected_home_stat: os.stat_result,
     confirm_home_refresh: bool = False,
     model_reasoning_effort: str | None = None,
+    refresh_codegraph: bool = False,
+    codegraph_section: str | None = None,
+    existing_runtime_profile: str | None = None,
 ) -> bool:
     """Project resolver-selected class context into one stopped, pinned Fleet home."""
 
@@ -9876,9 +10013,14 @@ def _materialize_managed_codex_runtime_class(
         descriptor.runner is not RunnerKind.CODEX_CLI
         or descriptor.home != AGENT_POOL_ROOT / descriptor.agent_id
         or type(confirm_home_refresh) is not bool
+        or type(refresh_codegraph) is not bool
     ):
         raise AgentError("agent_class_materialization_invalid")
-    runtime_profile = _runtime_class_skill_profile(agent_class)
+    runtime_profile = (
+        _runtime_class_skill_profile(agent_class)
+        if agent_class is not None
+        else existing_runtime_profile or descriptor.skill_profile
+    )
     projected = dataclass_replace(descriptor, skill_profile=runtime_profile)
     desired = fleet_markdown_artifacts(projected)
     desired.update(
@@ -10374,6 +10516,38 @@ def _materialize_managed_codex_runtime_class(
                     if not confirm_home_refresh:
                         raise AgentError("agent_home_refresh_confirmation_required")
 
+            if refresh_codegraph:
+                if digest_drift or "config.toml" not in managed_projection:
+                    raise AgentError("agent_class_materialization_invalid")
+                existing_config = managed_projection["config.toml"][0]
+                try:
+                    current_config = tomllib.loads(existing_config.decode("utf-8"))
+                except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+                    raise AgentError("agent_class_materialization_invalid") from exc
+                current_servers = current_config.get("mcp_servers", {})
+                if not isinstance(current_servers, dict):
+                    raise AgentError("agent_class_materialization_invalid")
+                if codegraph_section is not None or "codegraph" in current_servers:
+                    expected_hive_mcp = None
+                    if MCP_SERVER_NAME in current_servers:
+                        _name, generated_config = fleet_minimal_config(descriptor)
+                        generated_servers = tomllib.loads(generated_config).get(
+                            "mcp_servers", {}
+                        )
+                        if isinstance(generated_servers, dict):
+                            expected_hive_mcp = generated_servers.get(MCP_SERVER_NAME)
+                    refreshed_config = _home_refresh_config(
+                        descriptor.home,
+                        existing_config,
+                        model=descriptor.model,
+                        reasoning_effort=(
+                            model_reasoning_effort or DEFAULT_AGENT_MODEL_EFFORT
+                        ),
+                        codegraph_section=codegraph_section,
+                        allow_owned_codegraph=True,
+                        expected_hive_mcp=expected_hive_mcp,
+                    )
+
             next_digests = {
                 name: digest
                 for name, digest in marker_files.items()
@@ -10387,6 +10561,10 @@ def _materialize_managed_codex_runtime_class(
                     refreshed_config
                     if refreshed_config is not None
                     else managed_projection["config.toml"][0]
+                ).hexdigest()
+            if refresh_codegraph and refreshed_config is not None:
+                next_digests["config.toml"] = hashlib.sha256(
+                    refreshed_config
                 ).hexdigest()
             next_digests.update(
                 {
@@ -10419,6 +10597,10 @@ def _materialize_managed_codex_runtime_class(
             if (
                 not stale
                 and marker_bytes == next_marker_bytes
+                and (
+                    refreshed_config is None
+                    or managed_projection["config.toml"][0] == refreshed_config
+                )
                 and all(
                     projection.get(name, (None, None))[0] == content
                     for name, content in desired.items()
@@ -13239,7 +13421,7 @@ def _start_agent_unlocked(
         _managed_codex_configured_binary(
             agent, managed_home, runner, managed_wrapper_snapshot
         )
-        if agent_class is not None and managed_fleet_home:
+        if managed_fleet_home and descriptor is not None:
             try:
                 managed_pool_parent_stat = AGENT_POOL_ROOT.parent.lstat()
                 managed_pool_root_stat = AGENT_POOL_ROOT.lstat()
@@ -13322,7 +13504,27 @@ def _start_agent_unlocked(
                 "through codex-master-mcp"
             )
 
-        if managed_fleet_home and agent_class is not None:
+        expected_codegraph_binding: WorktreeBinding | None = None
+        codegraph_section: str | None = None
+        if managed_fleet_home and descriptor is not None:
+            codegraph_state, _ = _project_codegraph_stdio(codex_config_path(), None)
+            if codegraph_state == "root_pending":
+                if cwd is None:
+                    raise AgentError("codegraph_binding_invalid")
+                source = Path(cwd).expanduser().resolve()
+                expected_codegraph_binding = (
+                    _worktree_lifecycle_store().binding_for_source(source)
+                )
+                if expected_codegraph_binding is None:
+                    raise AgentError("codegraph_binding_invalid")
+                codegraph_state, codegraph_section = _project_codegraph_stdio(
+                    codex_config_path(), expected_codegraph_binding
+                )
+                if codegraph_state != "configured":
+                    raise AgentError("codegraph_config_invalid")
+            _home_stat, existing_runtime_profile = _fleet_managed_home_details(
+                AGENT_POOL_ROOT, descriptor, strict_contents=agent_class is None
+            )
             refresh_reasoning_effort = (
                 model_reasoning_effort or DEFAULT_AGENT_MODEL_EFFORT
             )
@@ -13334,15 +13536,12 @@ def _start_agent_unlocked(
                 expected_home_stat=managed_home_stat,
                 confirm_home_refresh=confirm_home_refresh,
                 model_reasoning_effort=refresh_reasoning_effort,
+                refresh_codegraph=True,
+                codegraph_section=codegraph_section,
+                existing_runtime_profile=existing_runtime_profile,
             )
             if refreshed:
                 managed_wrapper_snapshot = _managed_codex_wrapper_snapshot(runner)
-        elif managed_fleet_home:
-            _fleet_managed_home_state(
-                AGENT_POOL_ROOT,
-                descriptor,
-                strict_contents=True,
-            )
 
         close_runner_execution_fd(agent)
         cwd = (
@@ -13426,12 +13625,24 @@ def _start_agent_unlocked(
         if prompt:
             argv.append(prompt)
 
-        tracked_worktree_use = _begin_tracked_worktree_use(
-            start_cwd,
-            principal_id=agent,
-            session_id=session,
-            assignment_id=run_id,
-        )
+        try:
+            tracked_worktree_use = _begin_tracked_worktree_use(
+                start_cwd,
+                principal_id=agent,
+                session_id=session,
+                assignment_id=run_id,
+                **(
+                    {"expected_binding": expected_codegraph_binding}
+                    if expected_codegraph_binding is not None
+                    else {}
+                ),
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                cleanup_failed_start(session, raw_log, kill_session=False)
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise
         producer_tmpdir = None
         if tracked_worktree_use is not None:
             lifecycle_store, lifecycle_lease = tracked_worktree_use
@@ -13583,7 +13794,7 @@ def _start_agent_unlocked(
             close_runner_execution_fd(agent)
             release_start_lease_if_safe(agent, lease, release_lease_on_failure)
             raise
-        return {
+        result = {
             "agent": agent,
             "status": "started",
             "backend": "tmux",
@@ -13598,6 +13809,9 @@ def _start_agent_unlocked(
             "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
             "raw_output": "not_returned",
         }
+        if managed_fleet_home:
+            result["codegraph_status"] = codegraph_state
+        return result
 
 
 def _headless_descriptor(
@@ -14760,18 +14974,31 @@ def _begin_tracked_worktree_use(
     principal_id: str,
     session_id: str,
     assignment_id: str,
+    expected_binding: WorktreeBinding | None = None,
 ) -> tuple[WorktreeLifecycleStore, object] | None:
     lifecycle = _worktree_lifecycle_store()
     binding = lifecycle.binding_for_source(source)
+    if expected_binding is not None and binding != expected_binding:
+        raise AgentError("codegraph_binding_changed")
     if binding is None:
         return None
-    return lifecycle, lifecycle.begin_use(
+    lease = lifecycle.begin_use(
         binding,
         principal_id=principal_id,
         session_id=session_id,
         assignment_id=assignment_id,
         now=int(time.time()),
     )
+    if expected_binding is not None and lease.binding != expected_binding:
+        try:
+            producer = lifecycle.create_temporary_producer(lease, now=int(time.time()))
+            lifecycle.abort_temporary_producer_before_spawn(
+                lease, producer, now=int(time.time())
+            )
+        except (WorktreeLifecycleError, OSError, TypeError, ValueError) as exc:
+            raise AgentError("codegraph_binding_cleanup_unverified") from exc
+        raise AgentError("codegraph_binding_changed")
+    return lifecycle, lease
 
 
 def _g5_runner_env_prefix(
@@ -17672,7 +17899,7 @@ def status_agent(
         response_state = {**response_state, "state": "tmux_routing_unavailable"}
     elif running and not identity_guard["ok"]:
         response_state = {**response_state, "state": "identity_unverified"}
-    return {
+    result = {
         "agent": agent,
         "label": cfg["label"],
         "backend": "tmux",
@@ -17733,6 +17960,17 @@ def status_agent(
         ),
         "raw_output": "not_returned",
     }
+    descriptor = current_agent_inventory().agents.get(agent)
+    if descriptor is not None and descriptor.runner is RunnerKind.CODEX_CLI:
+        try:
+            codegraph_state, _ = _project_codegraph_stdio(codex_config_path(), None)
+            result["codegraph"] = {"state": codegraph_state}
+        except AgentError:
+            result["codegraph"] = {
+                "state": "hold",
+                "reason": "codegraph_config_invalid",
+            }
+    return result
 
 
 def require_invocation_status(

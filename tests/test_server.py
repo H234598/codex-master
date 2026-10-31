@@ -1531,6 +1531,506 @@ def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
 
 
 @pytest.mark.usefixtures("hermetic_codex_skill_home")
+class CodegraphProjectionTest(unittest.TestCase):
+    def test_owned_hive_mcp_survives_queen_and_teamleader_refresh(self) -> None:
+        for agent_class in ("koenigin", "teamleiterin"):
+            with (
+                self.subTest(agent_class=agent_class),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                entrypoint = root / "private-hive-entrypoint"
+                with patch.object(
+                    server_module, "_runtime_mcp_entrypoint", return_value=entrypoint
+                ):
+                    pool, descriptor, _inventory = write_managed_class_home_for_test(
+                        root, agent="q1", skill_profile="teamleiterin"
+                    )
+                    config_path = descriptor.home / "config.toml"
+                    original = tomllib.loads(config_path.read_text())
+                    expected_hive = original["mcp_servers"][
+                        server_module.MCP_SERVER_NAME
+                    ]
+                    binding = server_module.WorktreeBinding(
+                        "repo:1:2", root, root / ".git", 1, 2, 3
+                    )
+                    operator = root / "operator.toml"
+                    operator.write_text(
+                        '[mcp_servers.codegraph]\ncommand = "/usr/bin/node"\n'
+                        'args = ["/opt/graph.js", "serve", "--mcp"]\n'
+                    )
+                    _state, section = server_module._project_codegraph_stdio(
+                        operator, binding
+                    )
+                    with (
+                        patch.object(server_module, "AGENT_POOL_ROOT", pool),
+                        patch.object(
+                            server_module,
+                            "portable_gemini_skill_artifacts",
+                            return_value={},
+                        ),
+                    ):
+
+                        def refresh(projected: str | None) -> bool:
+                            return (
+                                server_module._materialize_managed_codex_runtime_class(
+                                    descriptor,
+                                    agent_class,
+                                    expected_pool_parent_stat=pool.parent.lstat(),
+                                    expected_pool_root_stat=pool.lstat(),
+                                    expected_home_stat=descriptor.home.lstat(),
+                                    model_reasoning_effort="low",
+                                    refresh_codegraph=True,
+                                    codegraph_section=projected,
+                                )
+                            )
+
+                        refresh(section)
+                        current = tomllib.loads(config_path.read_text())["mcp_servers"]
+                        self.assertEqual(
+                            current[server_module.MCP_SERVER_NAME], expected_hive
+                        )
+                        self.assertIn("codegraph", current)
+                        refresh(None)
+                        current = tomllib.loads(config_path.read_text())["mcp_servers"]
+                        self.assertEqual(
+                            current, {server_module.MCP_SERVER_NAME: expected_hive}
+                        )
+                        marker_path = (
+                            descriptor.home / server_module.FLEET_AGENT_MARKER_FILE
+                        )
+                        clean_config = config_path.read_bytes()
+                        clean_marker = marker_path.read_bytes()
+                        for bad_config in (
+                            clean_config.replace(
+                                str(entrypoint).encode(), b"/foreign/hive"
+                            ),
+                            clean_config
+                            + b'\n[mcp_servers.foreign]\ncommand = "/foreign"\n',
+                        ):
+                            config_path.write_bytes(bad_config)
+                            rewrite_fleet_marker_for_test(
+                                descriptor.home,
+                                lambda marker: marker["files"].__setitem__(
+                                    "config.toml",
+                                    hashlib.sha256(bad_config).hexdigest(),
+                                ),
+                            )
+                            before = (
+                                config_path.read_bytes(),
+                                marker_path.read_bytes(),
+                            )
+                            with self.assertRaisesRegex(
+                                server_module.AgentError,
+                                "agent_class_materialization_invalid",
+                            ):
+                                refresh(section)
+                            self.assertEqual(
+                                (config_path.read_bytes(), marker_path.read_bytes()),
+                                before,
+                            )
+                            config_path.write_bytes(clean_config)
+                            marker_path.write_bytes(clean_marker)
+
+    def test_public_status_projects_codegraph_without_home_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _pool, descriptor, inventory = write_managed_class_home_for_test(root)
+            operator = root / "operator.toml"
+            config = descriptor.home / "config.toml"
+            marker = descriptor.home / server_module.FLEET_AGENT_MARKER_FILE
+            before = (config.read_bytes(), marker.read_bytes())
+            summary = {
+                "process_count": 1,
+                "managed_process_count": 1,
+                "managed_process_ids": [123],
+                "managed_root_process_ids": [123],
+                "external_process_count": 0,
+                "external_processes_truncated": False,
+            }
+            cases = (
+                (None, {"state": "unconfigured"}),
+                (
+                    '[mcp_servers.codegraph]\ncommand = "/usr/bin/node"\n'
+                    'args = ["/opt/graph.js", "serve", "--mcp"]\n',
+                    {"state": "root_pending"},
+                ),
+                (
+                    '[mcp_servers.codegraph]\ncommand = "relative"\n',
+                    {"state": "hold", "reason": "codegraph_config_invalid"},
+                ),
+            )
+            with (
+                server_module.temporary_agent_inventory(inventory),
+                patch.object(server_module, "agent_ids", return_value=["a"]),
+                patch.object(server_module, "codex_config_path", return_value=operator),
+                patch.object(server_module, "_ollama_descriptor", return_value=None),
+                patch.object(
+                    server_module, "_observational_tmux_alive", return_value=True
+                ),
+                patch.object(
+                    server_module, "agent_home_process_summary", return_value=summary
+                ),
+                patch.object(server_module, "pane_pid", return_value=123),
+                patch.object(server_module, "pane_tail", return_value=""),
+                patch.object(server_module, "read_meta", return_value={}),
+                patch.object(
+                    server_module, "latest_assignment_summary", return_value=None
+                ),
+                patch.object(server_module, "agent_auth_status", return_value={}),
+                patch.object(server_module, "agent_lease_status", return_value={}),
+                patch.object(
+                    server_module, "codex_usage_watchdog_status", return_value={}
+                ),
+            ):
+                for contents, expected in cases:
+                    with self.subTest(state=expected["state"]):
+                        if contents is None:
+                            operator.unlink(missing_ok=True)
+                        else:
+                            operator.write_text(contents)
+                        result = server_module.call_tool("agent_status", {"agent": "a"})
+                        row = result["results"][0]
+                        self.assertEqual(row["codegraph"], expected)
+                        self.assertTrue(row["running"])
+                        self.assertEqual(
+                            (config.read_bytes(), marker.read_bytes()), before
+                        )
+
+    def test_tmux_projects_registered_root_before_lease(self) -> None:
+        from test_worktree_lifecycle import _binding, _register_origin
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool, descriptor, inventory = write_managed_class_home_for_test(root)
+            descriptor = dataclass_replace(descriptor, account_id="d254-a")
+            inventory = dataclass_replace(inventory, agents={"a": descriptor})
+            raw = root / "state" / "raw"
+            raw.mkdir(parents=True)
+            operator = root / "operator.toml"
+            operator.write_text(
+                '[mcp_servers.codegraph]\ncommand = "/usr/bin/node"\n'
+                'args = ["/opt/graph.js", "serve", "--mcp"]\n'
+            )
+            binding = _binding(root)
+            lifecycle = WorktreeLifecycleStore(HiveStateStore(root / "lifecycle"))
+            _register_origin(lifecycle, binding, root)
+            source = binding.canonical_source_path
+            process_summary = {
+                "process_count": 0,
+                "managed_process_count": 0,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
+
+            def before_spawn(_session: str, *_args: Any) -> None:
+                active = lifecycle.snapshot().active_uses
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0].binding, binding)
+                config = tomllib.loads((descriptor.home / "config.toml").read_text())
+                projected = config["mcp_servers"]["codegraph"]
+                self.assertEqual(projected["cwd"], str(source))
+                self.assertEqual(projected["args"][-2:], ["--path", str(source)])
+                raise server_module._G5StartNotStarted("stop_before_spawn", {})
+
+            with (
+                attested_codex_model_reader_for_test("d254-a"),
+                patch.object(server_module, "AGENT_POOL_ROOT", pool),
+                patch.object(server_module, "STATE_ROOT", root / "state"),
+                patch.object(server_module, "LOCK_DIR", root / "state" / "locks"),
+                patch.object(server_module, "RAW_DIR", raw),
+                patch.object(server_module, "META_DIR", root / "state" / "meta"),
+                patch.object(server_module, "codex_config_path", return_value=operator),
+                patch.object(
+                    server_module, "_worktree_lifecycle_store", return_value=lifecycle
+                ),
+                patch.object(
+                    server_module,
+                    "_g5_start_scope",
+                    side_effect=before_spawn,
+                ),
+                patch.dict(
+                    server_module.AGENTS,
+                    {
+                        "a": {
+                            "label": "A",
+                            "runner": descriptor.home / "codex",
+                            "home": descriptor.home,
+                            "session": descriptor.session,
+                        }
+                    },
+                ),
+                server_module.temporary_agent_inventory(inventory),
+                patch.object(server_module, "require_fleet_recovery_ready"),
+                patch.object(server_module, "ensure_state"),
+                patch.object(server_module, "tmux_alive", return_value=False),
+                patch.object(
+                    server_module,
+                    "require_spawn_capacity",
+                    return_value=ADMITTED_SPAWN_DECISION,
+                ),
+                patch.object(
+                    server_module,
+                    "agent_home_process_summary",
+                    return_value=process_summary,
+                ),
+                patch.object(
+                    server_module, "portable_gemini_skill_artifacts", return_value={}
+                ),
+                patch.object(server_module, "prune_raw_logs"),
+                patch.object(server_module, "run_tmux") as run_tmux_mock,
+            ):
+                with self.assertRaisesRegex(AgentError, "stop_before_spawn"):
+                    start_agent(
+                        "a",
+                        cwd=str(source),
+                        lease={"state": "held"},
+                        model="gpt-6-sol",
+                        model_reasoning_effort="low",
+                        agent_class=None,
+                    )
+                run_tmux_mock.assert_not_called()
+                self.assertEqual(lifecycle.snapshot().active_uses, ())
+
+    def test_maintenance_claim_stops_lease(self) -> None:
+        root = Path("/tmp/project")
+        binding = server_module.WorktreeBinding(
+            "repo:1:2", root, root / ".git", 1, 2, 3
+        )
+        lifecycle = Mock()
+        lifecycle.binding_for_source.return_value = binding
+        lifecycle.begin_use.side_effect = WorktreeLifecycleError(
+            "maintenance_claim_active"
+        )
+        with patch.object(
+            server_module, "_worktree_lifecycle_store", return_value=lifecycle
+        ):
+            with self.assertRaisesRegex(
+                WorktreeLifecycleError, "maintenance_claim_active"
+            ):
+                server_module._begin_tracked_worktree_use(
+                    root,
+                    principal_id="agent",
+                    session_id="session",
+                    assignment_id="assignment",
+                    expected_binding=binding,
+                )
+        lifecycle.create_temporary_producer.assert_not_called()
+
+    def test_journal_projects_and_removes_owned_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool, descriptor, _inventory = write_managed_class_home_for_test(root)
+            config = root / "operator.toml"
+            config.write_text(
+                '[mcp_servers.codegraph]\ncommand = "/usr/bin/node"\n'
+                'args = ["/opt/graph.js", "serve", "--mcp"]\n'
+            )
+            binding = server_module.WorktreeBinding(
+                "repo:1:2", root, root / ".git", 1, 2, 3
+            )
+            _state, section = server_module._project_codegraph_stdio(config, binding)
+            with (
+                patch.object(server_module, "AGENT_POOL_ROOT", pool),
+                patch.object(
+                    server_module, "portable_gemini_skill_artifacts", return_value={}
+                ),
+            ):
+
+                def materialize(projected: str | None) -> bool:
+                    return server_module._materialize_managed_codex_runtime_class(
+                        descriptor,
+                        "arbeitsbiene",
+                        expected_pool_parent_stat=pool.parent.lstat(),
+                        expected_pool_root_stat=pool.lstat(),
+                        expected_home_stat=descriptor.home.lstat(),
+                        model_reasoning_effort="low",
+                        refresh_codegraph=True,
+                        codegraph_section=projected,
+                    )
+
+                materialize(section)
+                path = descriptor.home / "config.toml"
+                self.assertEqual(
+                    tomllib.loads(path.read_text())["mcp_servers"]["codegraph"]["cwd"],
+                    str(root),
+                )
+                marker = json.loads(
+                    (
+                        descriptor.home / server_module.FLEET_AGENT_MARKER_FILE
+                    ).read_text()
+                )
+                self.assertEqual(
+                    marker["files"]["config.toml"],
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+                before_inventory = path.read_bytes()
+                server_module._fleet_managed_home_details(
+                    pool, descriptor, strict_contents=True
+                )
+                self.assertEqual(path.read_bytes(), before_inventory)
+                self.assertEqual(
+                    server_module._project_codegraph_stdio(config, None)[0],
+                    "root_pending",
+                )
+                materialize(None)
+                self.assertNotIn("mcp_servers", tomllib.loads(path.read_text()))
+
+    def test_post_lease_binding_mismatch_is_aborted(self) -> None:
+        root = Path("/tmp/project")
+        expected = server_module.WorktreeBinding(
+            "repo:1:2", root, root / ".git", 1, 2, 3
+        )
+        lifecycle = Mock()
+        lifecycle.binding_for_source.return_value = expected
+        lease = SimpleNamespace(binding=dataclass_replace(expected, inode=9))
+        lifecycle.begin_use.return_value = lease
+        producer = Path("/tmp/private-producer")
+        lifecycle.create_temporary_producer.return_value = producer
+        with patch.object(
+            server_module, "_worktree_lifecycle_store", return_value=lifecycle
+        ):
+            with self.assertRaisesRegex(
+                server_module.AgentError, "codegraph_binding_changed"
+            ):
+                server_module._begin_tracked_worktree_use(
+                    root,
+                    principal_id="agent",
+                    session_id="session",
+                    assignment_id="assignment",
+                    expected_binding=expected,
+                )
+        lifecycle.abort_temporary_producer_before_spawn.assert_called_once()
+        self.assertEqual(
+            lifecycle.abort_temporary_producer_before_spawn.call_args.args,
+            (lease, producer),
+        )
+        lifecycle.abort_temporary_producer_before_spawn.side_effect = OSError("failed")
+        with patch.object(
+            server_module, "_worktree_lifecycle_store", return_value=lifecycle
+        ):
+            with self.assertRaisesRegex(
+                server_module.AgentError, "codegraph_binding_cleanup_unverified"
+            ):
+                server_module._begin_tracked_worktree_use(
+                    root,
+                    principal_id="agent",
+                    session_id="session",
+                    assignment_id="assignment",
+                    expected_binding=expected,
+                )
+
+    def test_binding_change_stops_before_lease(self) -> None:
+        root = Path("/tmp/project")
+        expected = server_module.WorktreeBinding(
+            "repo:1:2", root, root / ".git", 1, 2, 3
+        )
+        changed = dataclass_replace(expected, inode=9)
+        lifecycle = Mock()
+        lifecycle.binding_for_source.return_value = changed
+        with patch.object(
+            server_module, "_worktree_lifecycle_store", return_value=lifecycle
+        ):
+            with self.assertRaisesRegex(
+                server_module.AgentError, "codegraph_binding_changed"
+            ):
+                server_module._begin_tracked_worktree_use(
+                    root,
+                    principal_id="agent",
+                    session_id="session",
+                    assignment_id="assignment",
+                    expected_binding=expected,
+                )
+        lifecycle.begin_use.assert_not_called()
+
+    def test_optional_public_projection_and_invalid_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.toml"
+            self.assertEqual(
+                server_module._project_codegraph_stdio(config, None),
+                ("unconfigured", ""),
+            )
+            config.write_text(
+                '[mcp_servers.codegraph]\ncommand = "/usr/bin/node"\n'
+                'args = ["/opt/graph.js", "serve", "--mcp"]\n'
+            )
+            self.assertEqual(
+                server_module._project_codegraph_stdio(config, None),
+                ("root_pending", ""),
+            )
+            binding = server_module.WorktreeBinding(
+                "repo:1:2", root, root / ".git", 1, 2, 3
+            )
+            state, section = server_module._project_codegraph_stdio(config, binding)
+            self.assertEqual(state, "configured")
+            result = tomllib.loads(section)["mcp_servers"]["codegraph"]
+            self.assertEqual(result["cwd"], str(root))
+            self.assertEqual(result["args"][-2:], ["--path", str(root)])
+            original = config.read_text()
+            for suffix in (
+                'cwd = "relative"\n',
+                "cwd = 7\n",
+                'args = ["serve", "--mcp", "--path=/foreign"]\n',
+                'args = ["serve", "--mcp", 7]\n',
+            ):
+                candidate = original + suffix
+                if suffix.startswith("args"):
+                    candidate = original.replace(
+                        'args = ["/opt/graph.js", "serve", "--mcp"]\n', suffix
+                    )
+                config.write_text(candidate)
+                with self.assertRaisesRegex(
+                    server_module.AgentError, "codegraph_config_invalid"
+                ):
+                    server_module._project_codegraph_stdio(config, binding)
+            config.write_text(original)
+            config.write_text(config.read_text() + 'env = { TOKEN = "secret" }\n')
+            with self.assertRaisesRegex(
+                server_module.AgentError, "codegraph_config_invalid"
+            ):
+                server_module._project_codegraph_stdio(config, binding)
+            target = root / "other.toml"
+            target.write_text(original)
+            config.unlink()
+            config.symlink_to(target)
+            with self.assertRaisesRegex(
+                server_module.AgentError, "codegraph_config_invalid"
+            ):
+                server_module._project_codegraph_stdio(config, binding)
+
+    def test_refresh_removes_only_owned_codegraph(self) -> None:
+        config = (
+            b'model = "old"\n[mcp_servers.codegraph]\n'
+            b'command = "/usr/bin/node"\nargs = ["serve", "--mcp"]\n'
+            b'cwd = "/tmp/project"\n'
+        )
+        with self.assertRaises(server_module.AgentError):
+            server_module._home_refresh_config(
+                Path("/tmp/home"), config, model="new", reasoning_effort="low"
+            )
+        updated = server_module._home_refresh_config(
+            Path("/tmp/home"),
+            config,
+            model="new",
+            reasoning_effort="low",
+            allow_owned_codegraph=True,
+        )
+        self.assertNotIn("mcp_servers", tomllib.loads(updated.decode()))
+        foreign = config.replace(b"mcp_servers.codegraph", b"mcp_servers.foreign")
+        with self.assertRaises(server_module.AgentError):
+            server_module._home_refresh_config(
+                Path("/tmp/home"),
+                foreign,
+                model="new",
+                reasoning_effort="low",
+                allow_owned_codegraph=True,
+            )
+
+
+@pytest.mark.usefixtures("hermetic_codex_skill_home")
 class ServerHelpersTest(unittest.TestCase):
     def test_tracked_worktree_use_propagates_lifecycle_store_errors(self) -> None:
         failure = AgentError("worktree_lifecycle_unavailable")
@@ -31901,6 +32401,13 @@ google_accounts:
     def test_start_agent_materializes_resolved_worker_before_g5_and_preserves_unmanaged_file(
         self,
     ) -> None:
+        self.enterContext(
+            patch.object(
+                server_module,
+                "_project_codegraph_stdio",
+                return_value=("unconfigured", ""),
+            )
+        )
         process_summary = {
             "process_count": 0,
             "managed_process_count": 0,
@@ -32112,6 +32619,13 @@ google_accounts:
     def test_current_home_with_active_root_fails_before_runner_without_class_refresh(
         self,
     ) -> None:
+        self.enterContext(
+            patch.object(
+                server_module,
+                "_project_codegraph_stdio",
+                return_value=("unconfigured", ""),
+            )
+        )
         process_summary = {
             "process_count": 0,
             "managed_process_count": 0,
@@ -34190,6 +34704,13 @@ google_accounts:
             )
 
     def test_runtime_class_materialization_failure_prevents_g5_start(self) -> None:
+        self.enterContext(
+            patch.object(
+                server_module,
+                "_project_codegraph_stdio",
+                return_value=("unconfigured", ""),
+            )
+        )
         process_summary = {
             "process_count": 0,
             "managed_process_count": 0,
