@@ -357,6 +357,78 @@ def _file_state(root_fd, relative, uid, gid, mode, *, allow_empty=False):
         os.close(directory)
 
 
+def _legacy_backups(parent, uid, gid):
+    result = {}
+    for name in sorted(os.listdir(parent)):
+        if re.fullmatch(r"\.v1\.backup-[0-9a-f]{40}", name) is None:
+            continue
+        backup = _directory(parent, name, uid, gid, 0o755)
+        try:
+            backup_state = _directory_state(backup)
+            backup_names = set(os.listdir(backup))
+            _need(
+                backup_names
+                == {
+                    "launcher",
+                    "hook_session_pin_store.py",
+                    "hook_abi_v1_core.py",
+                    "allowlists",
+                },
+                "hook_abi_gate_snapshot_untrusted",
+            )
+            allow = _directory(backup, "allowlists", uid, gid, 0o755)
+            try:
+                names = sorted(os.listdir(allow))
+                _need(
+                    bool(names)
+                    and all(
+                        re.fullmatch(r"[0-9a-f]{64}\.json", item) for item in names
+                    ),
+                    "hook_abi_gate_snapshot_untrusted",
+                )
+                allow_state = _directory_state(allow)
+            finally:
+                os.close(allow)
+            files = []
+            for path, mode in [
+                ("launcher", 0o755),
+                ("hook_session_pin_store.py", 0o644),
+                ("hook_abi_v1_core.py", 0o644),
+                *(("allowlists/" + item, 0o644) for item in names),
+            ]:
+                _raw, state = _file_state(backup, path, uid, gid, mode)
+                files.append({"path": path, **state})
+            for parent_fd, child_name, expected, children in (
+                (parent, name, backup_state, backup_names),
+                (backup, "allowlists", allow_state, set(names)),
+            ):
+                current = _directory(parent_fd, child_name, uid, gid, 0o755)
+                try:
+                    _need(
+                        _directory_state(current) == expected
+                        and set(os.listdir(current)) == children,
+                        "hook_abi_gate_snapshot_changed",
+                    )
+                finally:
+                    os.close(current)
+            result[name] = {
+                "directory": backup_state,
+                "allowlists": allow_state,
+                "files": files,
+            }
+        finally:
+            os.close(backup)
+    return result
+
+
+def _check_legacy_backup_pin(parent, state, uid, gid):
+    _need(
+        state.get("legacy_backups_sha256", _sha(_canonical({})))
+        == _sha(_canonical(_legacy_backups(parent, uid, gid))),
+        "hook_abi_gate_snapshot_changed",
+    )
+
+
 def _optional_file_state(parent_fd, name, uid, gid, mode, *, allow_empty=False):
     try:
         return _file_state(parent_fd, name, uid, gid, mode, allow_empty=allow_empty)[1]
@@ -385,8 +457,10 @@ def _inspect_root_state_once(parent_path, root_uid, root_gid, *, lock_held=False
             for name in names
             if re.fullmatch(r"\.v1\.(?:stage|previous)-[0-9a-f]{32}", name)
         }
+        legacy_backups = _legacy_backups(parent, root_uid, root_gid)
         _need(
-            len(transaction_names) <= 1 and names <= allowed | transaction_names,
+            len(transaction_names) <= 1
+            and names <= allowed | transaction_names | set(legacy_backups),
             "hook_abi_gate_snapshot_untrusted",
         )
 
@@ -431,6 +505,8 @@ def _inspect_root_state_once(parent_path, root_uid, root_gid, *, lock_held=False
                 "receipt": receipt_state,
                 "upgrade_state": upgrade_state,
             }
+            if legacy_backups:
+                result["legacy_backups"] = legacy_backups
             if upgrade_state.get("present"):
                 raw, _info = _file_state(
                     parent, ".root-hook-abi-upgrade-v1.json", root_uid, root_gid, 0o644
@@ -551,6 +627,8 @@ def _inspect_root_state_once(parent_path, root_uid, root_gid, *, lock_held=False
                 "descriptor_sha256": allowlist["descriptor_sha256"],
             },
         }
+        if legacy_backups:
+            root_state["legacy_backups"] = legacy_backups
         if transaction_names:
             upgrade_raw, _upgrade_info = _file_state(
                 parent, ".root-hook-abi-upgrade-v1.json", root_uid, root_gid, 0o644
@@ -715,7 +793,8 @@ def _root_install_baseline(parent, root_uid, root_gid):
         ROOT_EFFECT_RECEIPT,
         ".root-hook-abi-upgrade-v1.json",
     }
-    _need(names <= allowed, "hook_abi_gate_snapshot_untrusted")
+    legacy_backups = _legacy_backups(parent, root_uid, root_gid)
+    _need(names <= allowed | set(legacy_backups), "hook_abi_gate_snapshot_untrusted")
     _need(
         "v1" not in names
         and ROOT_EFFECT_RECEIPT not in names
@@ -728,16 +807,21 @@ def _root_install_baseline(parent, root_uid, root_gid):
         )
     except GateError as exc:
         raise GateError("hook_abi_gate_owner_lock_untrusted") from exc
-    return {
+    result = {
         "parent": _directory_state(parent),
         "owner_lock": lock_state,
         "target": {"present": False},
         "receipt": {"present": False},
         "upgrade_state": {"present": False},
     }
+    if legacy_backups:
+        result["legacy_backups"] = legacy_backups
+    return result
 
 
 def _write_upgrade_state(parent, state, root_uid, root_gid, *, expected_info=None):
+    if state["status"] == "pending":
+        _check_legacy_backup_pin(parent, state, root_uid, root_gid)
     encoded = _canonical(state)
     stage = ".root-hook-abi-upgrade-v1.stage-" + state["transaction_id"]
     descriptor = -1
@@ -840,6 +924,7 @@ def _pending_upgrade_state(
     return {
         "backup_name": None,
         "expected_root_state_sha256": expected_root_state_sha256,
+        "legacy_backups_sha256": _sha(_canonical(baseline.get("legacy_backups", {}))),
         "generation": values["generation"],
         "manifest_digest": values["runtime_manifest_digest"],
         "old_receipt": baseline["receipt"],
@@ -899,6 +984,7 @@ def _root_lock_object(parent, lock_info, root_uid, root_gid):
 
 
 def _committed_upgrade_state(parent, lock_info, pending, root_uid, root_gid):
+    _check_legacy_backup_pin(parent, pending, root_uid, root_gid)
     target_fd = os.open(
         "v1", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
     )
@@ -921,7 +1007,11 @@ def _committed_upgrade_state(parent, lock_info, pending, root_uid, root_gid):
     else:
         backup_name = None
     return {
-        **pending,
+        **{
+            key: value
+            for key, value in pending.items()
+            if key != "legacy_backups_sha256"
+        },
         "backup_name": backup_name,
         "owner_lock": _root_lock_object(parent, lock_info, root_uid, root_gid),
         "receipt": {
@@ -1379,6 +1469,7 @@ def install(
                 isinstance(candidate_state, dict)
                 and candidate_state.get("status") == "pending"
             ):
+                _check_legacy_backup_pin(parent, candidate_state, root_uid, root_gid)
                 _need(
                     candidate_state.get("expected_root_state_sha256")
                     == expected_root_state_sha256,
@@ -1501,6 +1592,9 @@ def install(
                     pending_state = {
                         **committed,
                         "expected_root_state_sha256": expected_root_state_sha256,
+                        "legacy_backups_sha256": _sha(
+                            _canonical(baseline.get("legacy_backups", {}))
+                        ),
                         "old_receipt": baseline["receipt"],
                         "stage_name": None,
                         "status": "pending",

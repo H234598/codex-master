@@ -251,6 +251,251 @@ def test_root_owner_upgrades_from_an_exact_read_only_snapshot_pin(safe_tmp_path)
     assert current["root_state"]["upgrade_state"]["present"] is True
 
 
+def _legacy_backup_fixture(tmp_path):
+    home, parent, generation, pin = _fixture(tmp_path)
+    assert _install(home, parent, pin) == "installed"
+    for label in ("b", "d"):
+        shutil.copytree(parent / "v1", parent / (".v1.backup-" + label * 40))
+    return home, parent, generation, pin
+
+
+@pytest.mark.parametrize("target_present", [False, True])
+def test_legacy_root_backups_are_bound_and_preserved(safe_tmp_path, target_present):
+    _, parent, _, _ = _legacy_backup_fixture(safe_tmp_path)
+    if not target_present:
+        shutil.rmtree(parent / "v1")
+        (parent / GATE["ROOT_EFFECT_RECEIPT"]).unlink()
+        (parent / ".root-hook-abi-upgrade-v1.json").unlink()
+    before = {
+        str(p.relative_to(parent)): (p.stat().st_ino, p.read_bytes())
+        for directory in parent.glob(".v1.backup-*")
+        for p in directory.rglob("*")
+        if p.is_file()
+    }
+    snapshot = GATE["_inspect_root_state"](
+        parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+    )
+    assert len(snapshot["root_state"]["legacy_backups"]) == 2
+    next_generation = "c" * 40
+    next_home, _, _, next_pin = _fixture(safe_tmp_path / "next", next_generation)
+    assert _install(next_home, parent, next_pin, next_generation) == (
+        "upgraded" if target_present else "installed"
+    )
+    after = {
+        str(p.relative_to(parent)): (p.stat().st_ino, p.read_bytes())
+        for directory in parent.glob(".v1.backup-*")
+        for p in directory.rglob("*")
+        if p.is_file()
+    }
+    assert before == after
+    current = GATE["_inspect_root_state"](
+        parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+    )
+    assert (
+        current["root_state"]["legacy_backups"]
+        == snapshot["root_state"]["legacy_backups"]
+    )
+    committed = json.loads((parent / ".root-hook-abi-upgrade-v1.json").read_bytes())
+    assert "legacy_backups_sha256" not in committed
+
+
+@pytest.mark.parametrize("drift", ["content", "replacement", "removal"])
+def test_legacy_root_backup_drift_invalidates_snapshot(safe_tmp_path, drift):
+    home, parent, _, pin = _legacy_backup_fixture(safe_tmp_path)
+    snapshot = GATE["_inspect_root_state"](
+        parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+    )
+    backup = parent / (".v1.backup-" + "b" * 40)
+    if drift == "content":
+        (backup / "hook_abi_v1_core.py").write_bytes(b"CHANGED = 1\n")
+    else:
+        backup.rename(safe_tmp_path / "held-backup")
+        if drift == "replacement":
+            shutil.copytree(safe_tmp_path / "held-backup", backup)
+    marker = (parent / ".root-hook-abi-upgrade-v1.json").read_bytes()
+    with pytest.raises(GATE["GateError"], match="hook_abi_gate_snapshot_changed"):
+        _install(
+            home, parent, pin, expected_root_state_sha256=snapshot["root_state_sha256"]
+        )
+    assert (parent / ".root-hook-abi-upgrade-v1.json").read_bytes() == marker
+
+
+@pytest.mark.parametrize(
+    "invalid", ["symlink", "mode", "owner", "name", "hardlink", "extra", "allowlist"]
+)
+def test_legacy_root_backups_reject_untrusted_objects(
+    safe_tmp_path, monkeypatch, invalid
+):
+    _, parent, _, _ = _legacy_backup_fixture(safe_tmp_path)
+    backup = parent / (".v1.backup-" + "b" * 40)
+    if invalid == "symlink":
+        backup.rename(safe_tmp_path / "held-backup")
+        backup.symlink_to(safe_tmp_path / "held-backup", target_is_directory=True)
+    elif invalid == "mode":
+        backup.chmod(0o777)
+    elif invalid == "owner":
+        info = backup.stat()
+        original = os.fstat
+
+        def foreign_owner(fd):
+            result = original(fd)
+            if (result.st_dev, result.st_ino) == (info.st_dev, info.st_ino):
+                values = list(result)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return result
+
+        monkeypatch.setattr(os, "fstat", foreign_owner)
+    elif invalid == "name":
+        backup.rename(parent / ".v1.backup-not-a-generation")
+    elif invalid == "hardlink":
+        os.link(backup / "hook_abi_v1_core.py", safe_tmp_path / "extra-link")
+    elif invalid == "extra":
+        (backup / "unexpected").write_bytes(b"untrusted\n")
+    else:
+        next((backup / "allowlists").iterdir()).rename(backup / "allowlists/bad.json")
+    with pytest.raises((GATE["GateError"], OSError)):
+        GATE["_inspect_root_state"](
+            parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+        )
+
+
+@pytest.mark.parametrize("during_commit", [False, True])
+def test_legacy_root_backup_pin_survives_pending_resume(
+    safe_tmp_path, monkeypatch, during_commit
+):
+    _, parent, _, _ = _legacy_backup_fixture(safe_tmp_path)
+    snapshot = GATE["_inspect_root_state"](
+        parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+    )
+    next_generation = "c" * 40
+    next_home, _, _, next_pin = _fixture(safe_tmp_path / "next", next_generation)
+    backup_file = parent / (".v1.backup-" + "b" * 40) / "hook_abi_v1_core.py"
+    globals_ = GATE["install"].__globals__
+    write_receipt = globals_["_write_effect_receipt"]
+
+    def interrupt(*args, **kwargs):
+        if during_commit:
+            result = write_receipt(*args, **kwargs)
+            backup_file.write_bytes(b"CHANGED = 1\n")
+            return result
+        raise GATE["GateError"]("injected_legacy_backup_interrupt")
+
+    expected_error = (
+        "hook_abi_gate_snapshot_changed"
+        if during_commit
+        else "injected_legacy_backup_interrupt"
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setitem(globals_, "_write_effect_receipt", interrupt)
+        with pytest.raises(
+            GATE["GateError"],
+            match=expected_error,
+        ):
+            _install(
+                next_home,
+                parent,
+                next_pin,
+                next_generation,
+                snapshot["root_state_sha256"],
+            )
+    pending = json.loads((parent / ".root-hook-abi-upgrade-v1.json").read_bytes())
+    assert pending["status"] == "pending"
+    assert pending["legacy_backups_sha256"]
+    backup_file.write_bytes(b"CHANGED = 2\n")
+    marker = (parent / ".root-hook-abi-upgrade-v1.json").read_bytes()
+    with pytest.raises(GATE["GateError"], match="hook_abi_gate_snapshot_changed"):
+        _install(
+            next_home, parent, next_pin, next_generation, snapshot["root_state_sha256"]
+        )
+    assert (parent / ".root-hook-abi-upgrade-v1.json").read_bytes() == marker
+
+
+def test_legacy_root_backup_pin_covers_receipt_refresh(safe_tmp_path, monkeypatch):
+    home, parent, _, pin = _legacy_backup_fixture(safe_tmp_path)
+    snapshot = GATE["_inspect_root_state"](
+        parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+    )
+    globals_ = GATE["install"].__globals__
+
+    def interrupt(*_args, **_kwargs):
+        raise GATE["GateError"]("injected_receipt_refresh_interrupt")
+
+    with monkeypatch.context() as scoped:
+        scoped.setitem(globals_, "_receipt_needs_refresh", lambda *_args: True)
+        scoped.setitem(globals_, "_write_effect_receipt", interrupt)
+        with pytest.raises(
+            GATE["GateError"], match="injected_receipt_refresh_interrupt"
+        ):
+            _install(
+                home,
+                parent,
+                pin,
+                expected_root_state_sha256=snapshot["root_state_sha256"],
+            )
+    marker = (parent / ".root-hook-abi-upgrade-v1.json").read_bytes()
+    pending = json.loads(marker)
+    assert pending["status"] == "pending"
+    assert pending["stage_name"] is None
+    assert pending["legacy_backups_sha256"]
+    (parent / (".v1.backup-" + "b" * 40) / "hook_abi_v1_core.py").write_bytes(
+        b"CHANGED = 1\n"
+    )
+    with pytest.raises(GATE["GateError"], match="hook_abi_gate_snapshot_changed"):
+        _install(
+            home, parent, pin, expected_root_state_sha256=snapshot["root_state_sha256"]
+        )
+    assert (parent / ".root-hook-abi-upgrade-v1.json").read_bytes() == marker
+
+
+@pytest.mark.parametrize(
+    "race", ["backup_swap", "allowlist_swap", "extra_file", "extra_allowlist"]
+)
+def test_legacy_root_backup_pin_rechecks_named_objects(
+    safe_tmp_path, monkeypatch, race
+):
+    _, parent, _, _ = _legacy_backup_fixture(safe_tmp_path)
+    backup = parent / (".v1.backup-" + "b" * 40)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    globals_ = GATE["_legacy_backups"].__globals__
+    original = globals_["_file_state"]
+    fired = False
+
+    def concurrent_change(*args, **kwargs):
+        nonlocal fired
+        if not fired:
+            fired = True
+            if race == "backup_swap":
+                backup.rename(safe_tmp_path / "held-backup")
+                shutil.copytree(safe_tmp_path / "held-backup", backup)
+            elif race == "allowlist_swap":
+                allow = backup / "allowlists"
+                allow.rename(safe_tmp_path / "held-allowlist")
+                allow.mkdir(mode=0o755)
+                for path in (safe_tmp_path / "held-allowlist").iterdir():
+                    path.rename(allow / path.name)
+            elif race == "extra_file":
+                (backup / "unexpected").write_bytes(b"untrusted\n")
+            else:
+                _put(backup / "allowlists" / ("e" * 64 + ".json"), b"{}\n")
+        return original(*args, **kwargs)
+
+    try:
+        pin = _sha(
+            GATE["_canonical"](
+                GATE["_legacy_backups"](parent_fd, os.getuid(), os.getgid())
+            )
+        )
+        monkeypatch.setitem(globals_, "_file_state", concurrent_change)
+        with pytest.raises(GATE["GateError"], match="hook_abi_gate_snapshot_changed"):
+            GATE["_check_legacy_backup_pin"](
+                parent_fd, {"legacy_backups_sha256": pin}, os.getuid(), os.getgid()
+            )
+        assert fired
+    finally:
+        os.close(parent_fd)
+
+
 def test_root_owner_upgrade_rejects_stale_snapshot_without_effect(safe_tmp_path):
     home, parent, _generation, old_pin = _fixture(safe_tmp_path)
     assert _install(home, parent, old_pin) == "installed"
