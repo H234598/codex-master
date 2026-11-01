@@ -324,7 +324,9 @@ def test_concurrent_target_creation_is_not_clobbered(
     assert not list(plugin.glob(".release-binding.json.*"))
 
 
-@pytest.mark.parametrize("race", ["source", "marketplace", "parent", "removed_target"])
+@pytest.mark.parametrize(
+    "race", ["source", "marketplace", "parent", "removed_target", "foreign_stage"]
+)
 def test_post_link_races_hold_and_remove_only_own_descriptor(
     release: tuple[Path, Path, str, str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -333,8 +335,10 @@ def test_post_link_races_hold_and_remove_only_own_descriptor(
     home, plugin, generation, manifest_digest, descriptor_digest = release
     namespace = runpy.run_path(str(OPERATOR), run_name="plugin_publish_test")
     link = os.link
+    foreign_bytes = b""
 
     def raced_link(source: str, destination: str, **kwargs: object) -> None:
+        nonlocal foreign_bytes
         link(source, destination, **kwargs)
         if race == "source":
             (plugin / "hooks" / "native_bee_event.py").write_bytes(b"changed\n")
@@ -345,6 +349,12 @@ def test_post_link_races_hold_and_remove_only_own_descriptor(
             (home / "plugins").symlink_to(
                 home / "plugins-moved", target_is_directory=True
             )
+        elif race == "foreign_stage":
+            foreign_bytes = (plugin / source).read_bytes()
+            (plugin / destination).unlink()
+            replacement = home.parent / "foreign-stage-after-link"
+            replacement.write_bytes(foreign_bytes)
+            os.replace(replacement, plugin / source)
         else:
             (plugin / destination).unlink()
 
@@ -359,7 +369,12 @@ def test_post_link_races_hold_and_remove_only_own_descriptor(
         (home / "plugins-moved").rename(home / "plugins")
     else:
         assert not (plugin / "release-binding.json").exists()
-    assert not list(plugin.glob(".release-binding.json.*"))
+    stages = list(plugin.glob(".release-binding.json.*"))
+    if race == "foreign_stage":
+        assert len(stages) == 1
+        assert stages[0].read_bytes() == foreign_bytes
+    else:
+        assert not stages
 
 
 @pytest.fixture
