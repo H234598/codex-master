@@ -632,10 +632,14 @@ def publish(
                         named = os.stat(
                             stage_name, dir_fd=parent_fd, follow_symlinks=False
                         )
+                        # Our publication link can legitimately change ctime.
                         if (
                             cleanup_info[:7] != stage_info[:7]
                             or cleanup_info.st_mtime_ns != stage_info.st_mtime_ns
-                            or cleanup_info.st_ctime_ns != stage_info.st_ctime_ns
+                            or (
+                                not linked
+                                and cleanup_info.st_ctime_ns != stage_info.st_ctime_ns
+                            )
                             or raw != descriptor
                             or named[:7] != cleanup_info[:7]
                             or named.st_mtime_ns != cleanup_info.st_mtime_ns
