@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import time
@@ -21,9 +22,11 @@ from the_hive.runtime_layout import (  # noqa: E402
     RuntimeLayout,
     _read_regular_bytes,
 )
+from the_hive.fleet_home_v2_cutover import LocalFleetHomeV2Filesystem  # noqa: E402
 from the_hive.runtime_lifecycle import (  # noqa: E402
     _bound_path_from_home,
     _lifecycle_lock,
+    _read_regular_at,
     _regular_bytes,
 )
 
@@ -80,6 +83,52 @@ def _canonical(value: object) -> bytes:
     ).encode("ascii")
 
 
+def _check_upgrade_archives(plugin: Path, identity: tuple[int, int]) -> None:
+    prefix = f".{_DESCRIPTOR}."
+    names = {
+        path.name
+        for path in plugin.iterdir()
+        if path.name.startswith((prefix + "upgrade", prefix + "previous"))
+    }
+    parent_fd = os.open(plugin, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(parent_fd)
+        if (parent.st_dev, parent.st_ino) != identity:
+            _fail("plugin_source_raced")
+        for name in sorted(names):
+            match = re.fullmatch(
+                re.escape(prefix + "previous-")
+                + r"([0-9a-f]{64})-([0-9]+)-([0-9]+)-([0-9]+)-([0-9a-f]{32})",
+                name,
+            )
+            if match is None:
+                raise PublishError("plugin_descriptor_raced")
+            path = plugin / name
+            before = path.lstat()
+            raw = _regular_bytes(path, maximum=65536, mode=0o644)
+            after = path.lstat()
+            if (
+                raw is None
+                or before[:7] != after[:7]
+                or before.st_mtime_ns != after.st_mtime_ns
+                or (after.st_dev, after.st_ino, after.st_gid)
+                != tuple(int(value) for value in match.groups()[1:4])
+                or hashlib.sha256(raw).hexdigest() != match[1]
+            ):
+                _fail("plugin_descriptor_raced")
+        current_names = {
+            path.name
+            for path in plugin.iterdir()
+            if path.name.startswith((prefix + "upgrade", prefix + "previous"))
+        }
+        if current_names != names or _directory(plugin) != identity:
+            _fail("plugin_source_raced")
+        if names:
+            os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _validate_effect_receipt(value: object) -> dict[str, object]:
     expected = {
         "descriptor_sha256",
@@ -131,11 +180,7 @@ def _validate_effect_receipt(value: object) -> dict[str, object]:
         ):
             _fail("plugin_receipt_untrusted")
     target = value["target_identity"]
-    if (
-        target["mode"] != 0o644
-        or target["nlink"] != 1
-        or target["size"] <= 0
-    ):
+    if target["mode"] != 0o644 or target["nlink"] != 1 or target["size"] <= 0:
         _fail("plugin_receipt_untrusted")
     return value
 
@@ -252,6 +297,7 @@ def _write_effect_receipt(
                 or old_info.st_ctime_ns != after.st_ctime_ns
             ):
                 _fail("plugin_receipt_untrusted")
+
             def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
                 result = dict(pairs)
                 if len(result) != len(pairs):
@@ -275,7 +321,8 @@ def _write_effect_receipt(
         os.fchmod(temporary_fd, 0o600)
         view = memoryview(encoded)
         while view:
-            view = view[os.write(temporary_fd, view):]
+            written = os.write(temporary_fd, view)
+            view = view[written:]
         os.fsync(temporary_fd)
         os.close(temporary_fd)
         temporary_fd = -1
@@ -291,9 +338,7 @@ def _write_effect_receipt(
                 error = ctypes.get_errno()
                 raise OSError(error, os.strerror(error))
         else:
-            current = os.stat(
-                _EFFECT_RECEIPT, dir_fd=state_fd, follow_symlinks=False
-            )
+            current = os.stat(_EFFECT_RECEIPT, dir_fd=state_fd, follow_symlinks=False)
             if (current.st_dev, current.st_ino) != old_identity:
                 _fail("plugin_receipt_raced")
             os.replace(
@@ -327,7 +372,12 @@ def _write_effect_receipt(
 
 
 def publish(
-    home: Path, generation: str, manifest_digest: str, descriptor_digest: str
+    home: Path,
+    generation: str,
+    manifest_digest: str,
+    descriptor_digest: str,
+    *,
+    expected_previous_descriptor_sha256: str | None = None,
 ) -> dict[str, str]:
     if (
         not home.is_absolute()
@@ -341,6 +391,13 @@ def publish(
         or any(
             c not in "0123456789abcdef"
             for c in manifest_digest[7:] + descriptor_digest[7:]
+        )
+        or (
+            expected_previous_descriptor_sha256 is not None
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}", expected_previous_descriptor_sha256
+            )
+            is None
         )
     ):
         _fail("plugin_publish_arguments_invalid")
@@ -390,10 +447,32 @@ def publish(
                     _fail("plugin_source_drift")
 
         validate_source()
+        _check_upgrade_archives(plugin, plugin_identity)
         present = _regular_bytes(target, maximum=65536, mode=0o644)
-        if present is not None:
-            if present != descriptor:
+        if present is None and expected_previous_descriptor_sha256 is not None:
+            _fail("plugin_descriptor_conflict")
+        if present is not None and present != descriptor:
+            previous_digest = hashlib.sha256(present).hexdigest()
+            if expected_previous_descriptor_sha256 != "sha256:" + previous_digest:
                 _fail("plugin_descriptor_conflict")
+            try:
+                previous = json.loads(present)
+                previous_layout = RuntimeLayout.from_previous_release(
+                    release_root,
+                    previous["generation"],
+                    previous["runtime_manifest_digest"],
+                )
+                attested = _read_regular_bytes(
+                    previous_layout.root, f"{_BUNDLE}/{_DESCRIPTOR}", max_bytes=65536
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise PublishError("plugin_descriptor_conflict") from exc
+            if attested != present:
+                _fail("plugin_descriptor_conflict")
+            previous_info = target.lstat()
+            if _regular_bytes(target, maximum=65536, mode=0o644) != present:
+                _fail("plugin_descriptor_raced")
+        elif present is not None:
             validate_source()
             receipt_sha256 = _write_effect_receipt(
                 home=home,
@@ -414,10 +493,14 @@ def publish(
 
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         parent_fd = os.open(plugin, flags)
-        stage_name = f".{_DESCRIPTOR}.{uuid.uuid4().hex}"
+        token = uuid.uuid4().hex
+        stage_name = (
+            f".{_DESCRIPTOR}.{'upgrade-' if present is not None else ''}{token}"
+        )
         stage_fd = -1
         linked = False
         stage_identity = plugin_identity
+        stage_info = None
         stage_present = False
         try:
             parent = os.fstat(parent_fd)
@@ -434,31 +517,67 @@ def publish(
             with os.fdopen(stage_fd, "wb", closefd=False) as stage:
                 stage.write(descriptor)
                 stage.flush()
-            os.fsync(stage_fd)
             stage_info = os.fstat(stage_fd)
             stage_identity = (stage_info.st_dev, stage_info.st_ino)
+            os.fsync(stage_fd)
             os.close(stage_fd)
             stage_fd = -1
             validate_source()
-            # Hard-link publication is atomic and refuses a concurrent target.
-            os.link(
-                stage_name,
-                _DESCRIPTOR,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            linked = True
-            linked_info = os.stat(_DESCRIPTOR, dir_fd=parent_fd, follow_symlinks=False)
-            if stage_identity != (linked_info.st_dev, linked_info.st_ino):
-                _fail("plugin_stage_raced")
-            os.unlink(stage_name, dir_fd=parent_fd)
-            stage_present = False
+            if present is not None:
+                current = os.stat(_DESCRIPTOR, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    current[:7] != previous_info[:7]
+                    or _regular_bytes(target, maximum=65536, mode=0o644) != present
+                ):
+                    _fail("plugin_descriptor_raced")
+                os.fsync(parent_fd)
+                # An exchange attempt may have displaced an object even if it raises.
+                stage_present = False
+                filesystem = LocalFleetHomeV2Filesystem()
+                filesystem.exchange_at(parent_fd, stage_name, _DESCRIPTOR)
+                os.fsync(parent_fd)
+                displaced = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+                published_info = os.stat(
+                    _DESCRIPTOR, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    displaced[:7] != previous_info[:7]
+                    or _regular_bytes(plugin / stage_name, maximum=65536, mode=0o644)
+                    != present
+                    or (published_info.st_dev, published_info.st_ino) != stage_identity
+                    or _regular_bytes(target, maximum=65536, mode=0o644) != descriptor
+                ):
+                    _fail("plugin_descriptor_raced")
+                validate_source()
+                archive = (
+                    f".{_DESCRIPTOR}.previous-{previous_digest}-"
+                    f"{previous_info.st_dev}-{previous_info.st_ino}-"
+                    f"{previous_info.st_gid}-{token}"
+                )
+                filesystem.rename_noreplace_at(parent_fd, stage_name, archive)
+            else:
+                # Hard-link publication is atomic and refuses a concurrent target.
+                os.link(
+                    stage_name,
+                    _DESCRIPTOR,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                linked = True
+                linked_info = os.stat(
+                    _DESCRIPTOR, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if stage_identity != (linked_info.st_dev, linked_info.st_ino):
+                    _fail("plugin_stage_raced")
+                os.unlink(stage_name, dir_fd=parent_fd)
+                stage_present = False
             os.fsync(parent_fd)
             published = _regular_bytes(target, maximum=65536, mode=0o644)
             if published != descriptor:
                 _fail("plugin_publish_postcheck_failed")
             validate_source()
+            _check_upgrade_archives(plugin, plugin_identity)
             # The descriptor is now a verified durable effect. A later receipt
             # failure must leave it available for an idempotent owner retry.
             linked = False
@@ -496,15 +615,39 @@ def publish(
                     os.fsync(parent_fd)
             raise
         finally:
-            if stage_fd >= 0:
-                os.close(stage_fd)
-            if stage_present:
-                try:
-                    os.unlink(stage_name, dir_fd=parent_fd)
-                    os.fsync(parent_fd)
-                except FileNotFoundError:
-                    pass
-            os.close(parent_fd)
+            try:
+                if stage_fd >= 0:
+                    os.close(stage_fd)
+                if stage_present:
+                    try:
+                        if stage_info is None:
+                            raise PublishError("plugin_stage_raced")
+                        raw, cleanup_info = _read_regular_at(
+                            parent_fd,
+                            stage_name,
+                            owner_uid=os.geteuid(),
+                            owner_gid=stage_info.st_gid,
+                            mode=0o644,
+                        )
+                        named = os.stat(
+                            stage_name, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                        if (
+                            cleanup_info[:7] != stage_info[:7]
+                            or cleanup_info.st_mtime_ns != stage_info.st_mtime_ns
+                            or cleanup_info.st_ctime_ns != stage_info.st_ctime_ns
+                            or raw != descriptor
+                            or named[:7] != cleanup_info[:7]
+                            or named.st_mtime_ns != cleanup_info.st_mtime_ns
+                            or named.st_ctime_ns != cleanup_info.st_ctime_ns
+                        ):
+                            _fail("plugin_stage_raced")
+                        os.unlink(stage_name, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(parent_fd)
 
 
 def main() -> int:
@@ -513,10 +656,16 @@ def main() -> int:
     parser.add_argument("--generation", required=True)
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--descriptor-sha256", required=True)
+    parser.add_argument("--expected-previous-descriptor-sha256")
     args = parser.parse_args()
+    previous_digest = args.expected_previous_descriptor_sha256
     try:
         result = publish(
-            args.home, args.generation, args.manifest_sha256, args.descriptor_sha256
+            args.home,
+            args.generation,
+            args.manifest_sha256,
+            args.descriptor_sha256,
+            expected_previous_descriptor_sha256=previous_digest,
         )
     except Exception as exc:
         code = str(exc) if isinstance(exc, PublishError) else "plugin_publish_failed"
