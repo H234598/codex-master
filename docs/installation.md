@@ -213,10 +213,29 @@ descriptor into the configured local `the-hive@personal` source:
 
 This source-only operator attests the current release pointer and image,
 checks the local marketplace mapping, registration files, hooks and Fleet skill
-against the attested bundle, and publishes only an absent descriptor. An
-already matching descriptor is a no-op; any different target or input holds.
+against the attested bundle, and publishes an absent descriptor. An
+already matching descriptor is a no-op. To replace an existing descriptor,
+add `--expected-previous-descriptor-sha256 sha256:<approved-previous-digest>`.
+The existing bytes must match that explicit digest and the descriptor of the
+attested `previous` release. Other targets or inputs hold.
 It does not install a Runtime Image, write the root ABI, edit hook trust or
 settings, or update a Codex plugin cache.
+
+Replacement uses an atomic exchange and retains the verified predecessor in
+an archive whose name binds its original digest and filesystem identity.
+Every invocation verifies these archives before accepting an already matching
+target. An interrupted exchange leaves an unresolved upgrade stage and holds;
+do not remove stages or archives to bypass that condition. After verified
+archival, an interrupted receipt write can use the normal matching readback.
+This operator does not collect old archives.
+
+Update the local Git plugin source within the rollout's quiescence boundary
+before publishing its descriptor. Preserve any expected tracked deployment
+change in a path-specific stash and record its commit OID. Keep the old
+untracked descriptor in place, detach only the explicitly reviewed and pushed
+source commit, and compare all plugin inputs with the installed attested
+bundle. Unexpected local changes hold. Consumers may resume only after source,
+descriptor, Root ABI and Runtime bindings agree.
 
 Codex 0.161 refreshes an installed local plugin of the same version with
 `codex --no-daemon plugin add the-hive@personal`. Run that native command once
