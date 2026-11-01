@@ -51,3 +51,4 @@ not copy documentation into a separate Wiki as an operational step.
 - [Recovery](recovery.md)
 - [Agent pool](../agent-pool.md)
 - [Hive operations](hive-operations.md)
+- [Qlty-Konfigurationspflege](qlty-configuration-maintenance.md)

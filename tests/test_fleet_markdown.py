@@ -404,7 +404,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 12
+    assert metadata.generation == 13
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -430,7 +430,7 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":12,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":13,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -458,7 +458,7 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
         assert required_inline_link in primary
         assert obsolete_line not in primary
         assert projection.metadata.common_digest == contract.common_digest
-        assert projection.metadata.generation == contract.generation == 12
+        assert projection.metadata.generation == contract.generation == 13
 
 
 def test_both_provider_projections_keep_annotation_marker_sidecars_read_only() -> None:
@@ -479,7 +479,7 @@ def test_both_provider_projections_keep_annotation_marker_sidecars_read_only() -
         assert primary.startswith(contract.common_bytes)
         for fragment in required_fragments:
             assert fragment in normalized_primary
-        assert projection.metadata.generation == contract.generation == 12
+        assert projection.metadata.generation == contract.generation == 13
 
 
 def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> (
@@ -562,14 +562,14 @@ def test_both_provider_projections_carry_identical_inline_and_multi_source_guard
         assert projection.metadata.common_digest == contract.common_digest
 
 
-def test_both_provider_projections_carry_same_generation_twelve_policy_bytes() -> None:
+def test_provider_projections_carry_generation_thirteen_policy_bytes() -> None:
     contract = load_common_policy()
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
         projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary[: len(contract.common_bytes)] == contract.common_bytes
-        assert projection.metadata.generation == contract.generation == 12
+        assert projection.metadata.generation == contract.generation == 13
 
 
 def test_review_reporting_policy_projects_to_core_profiles_for_both_providers() -> None:
@@ -659,7 +659,7 @@ def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> N
         assert primary.startswith(contract.common_bytes)
         for fragment in required_fragments:
             assert fragment in primary
-        assert projection.metadata.generation == contract.generation == 12
+        assert projection.metadata.generation == contract.generation == 13
 
 
 def test_both_provider_projections_carry_side_effect_free_external_plan_handoff():
@@ -687,7 +687,7 @@ def test_both_provider_projections_carry_side_effect_free_external_plan_handoff(
             assert fragment in normalized_primary
         for backend in (b"wl-copy", b"xclip", b"xsel"):
             assert backend not in primary
-        assert projection.metadata.generation == contract.generation == 12
+        assert projection.metadata.generation == contract.generation == 13
 
 
 def test_both_provider_projections_carry_unencoded_local_file_link_contract() -> None:
@@ -861,7 +861,7 @@ def test_document_policies_materialize_all_profiles_without_changing_question_hi
         marker = json.loads((home / server_module.FLEET_AGENT_MARKER_FILE).read_bytes())
         assert marker["common_policy"] == {
             "schema_version": 1,
-            "generation": 12,
+            "generation": 13,
             "digest": hashlib.sha256(contract.common_bytes).hexdigest(),
         }
         assert (

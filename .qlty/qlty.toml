@@ -12,8 +12,54 @@
 # For a guide to configuration, visit https://qlty.sh/d/config
 # Or for a full reference, visit https://qlty.sh/d/qlty-toml
 config_version = "0"
-# Include the existing extensionless Python owner without replacing Python globs.
-file_types.python.globs = ["*.py", "*.pyw", "**/DEPS", "**/Snakefile", "**/SConscript", "**/wscript", "**/SConstruct", "**/.gclient", "scripts/the-hive-qlty-maintenance"]
+# Preserve standard globs and classify the repository's extensionless scripts.
+# The current CLI does not select these paths from interpreters metadata alone.
+# Generic security scanners must also select filenames without an extension.
+file_types.ALL.globs = ["*.*", "*"]
+file_types.python.globs = [
+  "*.py", "*.pyw", "**/DEPS", "**/Snakefile", "**/SConscript", "**/wscript",
+  "**/SConstruct", "**/.gclient",
+  "bin/codex-master-hive-hourly-probe",
+  "bin/the-hive-home-broker",
+  "bin/the-hive-limit-tracker",
+  "bin/the-hive-publish-plan-path",
+  "bin/the-hive-resource-scope-gate",
+  "scripts/google-account-manager",
+  "scripts/google-account-subject-id",
+  "scripts/install-host-agent",
+  "scripts/install-the-hive-resource-scope-gate",
+  "scripts/the-hive-cinnamon-applet",
+  "scripts/the-hive-fleet-watchdog",
+  "scripts/the-hive-hive-hourly-probe-install",
+  "scripts/the-hive-hook-abi-v1-install",
+  "scripts/the-hive-manpage",
+  "scripts/the-hive-plugin-release-publish",
+  "scripts/the-hive-qlty-maintenance",
+  "scripts/the-hive-runtime-service",
+  "systemd/libexec/the-hive-agent-launcher",
+  "systemd/libexec/the-hive-broker-verify",
+  "systemd/libexec/the-hive-home-broker",
+]
+file_types.shell.globs = [
+  "*.sh", "*.bash", "**/man", "**/PKGBUILD", "**/.zshrc", "**/.profile",
+  "**/.zlogout", "**/zlogout", "**/bash_logout", "**/bash_aliases", "**/.bashrc",
+  "**/bashrc", "**/.zlogin", "**/9fs", "**/zlogin", "**/cshrc",
+  "**/.bash_aliases", "**/.cshrc", "**/.bash_logout", "**/zshrc", "**/zprofile",
+  "**/login", "**/.bash_profile", "**/.login", "**/.zprofile", "**/profile",
+  "**/.bash_history", "**/bash_profile", "**/.zshenv", "**/zshenv",
+  "**/.bash_functions", "**/.bash_completion",
+  "bin/codex-agent-mcp",
+  "bin/the-hive-hive-hourly-probe",
+  "bin/the-hive-mcp",
+  "bin/the-hive-mcp-stable",
+  "bin/the-hive-openai-pricing-inventory",
+  "bin/the-hive-openai-pricing-inventory-stable",
+  "bin/the-hive-plugin-hook-stable",
+  "bin/the-hive-resource-monitor",
+  "scripts/install-agent-pool",
+  "scripts/install-gemini-cli",
+  "scripts/the-hive-hive-pilot-provisioner",
+]
 
 exclude_patterns = [
   "*_min.*",
@@ -25,7 +71,6 @@ exclude_patterns = [
   "**/bower_components/**",
   "**/build/**",
   "**/cache/**",
-  "**/config/**",
   "**/db/**",
   "**/deps/**",
   "**/dist/**",
@@ -118,28 +163,7 @@ name = "biome"
 name = "black"
 
 [[plugin]]
-name = "brakeman"
-
-[[plugin]]
 name = "checkov"
-
-[[plugin]]
-name = "checkstyle"
-
-[[plugin]]
-name = "clippy"
-
-[[plugin]]
-name = "coffeelint"
-
-[[plugin]]
-name = "dockerfmt"
-
-[[plugin]]
-name = "dotenv-linter"
-
-[[plugin]]
-name = "editorconfig-checker"
 
 [[plugin]]
 name = "flake8"
@@ -148,138 +172,30 @@ name = "flake8"
 name = "gitleaks"
 
 [[plugin]]
-name = "gofmt"
-
-[[plugin]]
-name = "golangci-lint"
-
-[[plugin]]
-name = "google-java-format"
-
-[[plugin]]
-name = "hadolint"
-
-[[plugin]]
-name = "haml-lint"
-
-[[plugin]]
-name = "knip"
-
-[[plugin]]
-name = "ktlint"
-
-[[plugin]]
-name = "kube-linter"
-
-[[plugin]]
 name = "mypy"
-
-[[plugin]]
-name = "osv-scanner"
 
 [[plugin]]
 name = "oxc"
 
 [[plugin]]
-name = "php-codesniffer"
-
-[[plugin]]
-name = "php-cs-fixer"
-
-[[plugin]]
-name = "phpstan"
-
-[[plugin]]
-name = "pmd"
-
-[[plugin]]
-name = "prisma"
-
-[[plugin]]
-name = "radarlint"
-
-[[plugin]]
-name = "radarlint-go"
-
-[[plugin]]
-name = "radarlint-iac"
-
-[[plugin]]
-name = "radarlint-java"
-
-[[plugin]]
 name = "radarlint-js"
-
-[[plugin]]
-name = "radarlint-kotlin"
-
-[[plugin]]
-name = "radarlint-php"
-
-[[plugin]]
-name = "radarlint-ruby"
-
-[[plugin]]
-name = "radarlint-scala"
-
-[[plugin]]
-name = "redocly"
-
-[[plugin]]
-name = "reek"
-
-[[plugin]]
-name = "rubocop"
-
-[[plugin]]
-name = "ruby-stree"
-
-[[plugin]]
-name = "rustfmt"
 
 [[plugin]]
 name = "semgrep"
 
 [[plugin]]
-name = "spectral"
-
-[[plugin]]
-name = "sqlfluff"
-
-[[plugin]]
-name = "standardrb"
-
-[[plugin]]
-name = "stringslint"
-
-[[plugin]]
-name = "stylelint"
-
-[[plugin]]
-name = "swiftformat"
-
-[[plugin]]
-name = "swiftlint"
-
-[[plugin]]
-name = "terraform"
-
-[[plugin]]
-name = "tflint"
-
-[[plugin]]
 name = "trivy"
-
-[[plugin]]
-name = "tsc"
-version = "7.0.2"
 
 [[plugin]]
 name = "vale"
 
-# All 69 merged definitions are enabled, including hidden tsc.
-# tsc uses a real package.json/TypeScript context; no version is invented.
-# The owner restricts mutating formatter targets before final analysis.
+# This repository uses Python, GJS/JavaScript, shell, Markdown, YAML and JSON.
+# Keep the applicable language, security and CI validators enabled. The native
+# C helpers retain generic security scans and their compile/consumer tests.
+# Plugin relevance and absent project contexts are documented in
+# docs/operations/qlty-configuration-maintenance.md. Findings never decide this set.
+# The owner mutates only active Ruff/Prettier/shfmt targets; the full check also
+# validates the other active formatters.
 
 # Full repository formatting remains enabled. Only these authority files have
 # the user-imposed production-line budget; Ruff lint still checks both files.
@@ -291,25 +207,27 @@ script = "ruff format --force-exclude --exclude src/the_hive/hive/authority.py -
 [plugins.definitions.eslint.drivers.lint]
 script = "eslint --no-config-lookup --parser-options '{\"ecmaVersion\":2022,\"sourceType\":\"module\"}' --rule 'no-eval:error' --rule 'no-debugger:error' --rule 'no-unreachable:error' --rule 'valid-typeof:error' --rule 'no-dupe-args:error' --rule 'no-duplicate-case:error' --rule 'use-isnan:error' --format json --output-file ${tmpfile} ${target}"
 
-[[exclude]]
-plugins = ["mypy"]
-file_patterns = ["src/the_hive/selection.py"]
-
-[[exclude]]
-plugins = ["kube-linter"]
-file_patterns = [".github/workflows/ci.yml", "sgconfig.yml", ".qlty/ast-grep/no-eval.yml", ".semgrep.yaml"]
-
 [plugins.definitions.mypy]
 extra_packages = ["types-PyYAML@6.0.12.20260906"]
 
-[plugins.definitions.mypy.drivers.legacy_selection]
-script = "mypy --ignore-missing-imports --output json --follow-imports=silent --show-error-codes --show-column-numbers ${target}"
-output = "stdout"
-output_format = "mypy"
-driver_type = "linter"
-success_codes = [0, 1]
-target = { type = "literal", path = "src/the_hive/selection.py" }
+# Extensionless entrypoints are separate __main__ modules; even
+# --scripts-are-modules collides on the two the-hive-home-broker basenames.
+# Keep application imports typed when checking each entrypoint on its own.
+[plugins.definitions.mypy.drivers.format]
+batch = false
+script = "MYPYPATH=src mypy --ignore-missing-imports --output json --follow-imports=silent --no-incremental --show-error-codes --show-column-numbers ${target}"
 runs_from = { type = "root" }
+
+[plugins.definitions.bandit]
+config_files = [".bandit", ".bandit.yaml"]
+
+[plugins.definitions.bandit.drivers.lint]
+script = "bandit --exit-zero --ini .bandit --configfile .bandit.yaml --format json --output ${tmpfile} ${target}"
+
+# This root-target driver walks beyond Qlty's selected files. MyPy writes
+# temporary cache files concurrently; they are generated, ignored inputs.
+[plugins.definitions.trivy.drivers.config]
+script = "trivy config ${target} --format sarif --skip-dirs .mypy_cache"
 
 [plugins.definitions.flake8.drivers.lint]
 script = "flake8 --max-line-length=88 ${target} --output-file ${tmpfile} --exit-zero"
