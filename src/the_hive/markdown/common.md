@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":12,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":13,"schema_version":1} -->
 
 # Common Hive context
 
@@ -452,6 +452,64 @@ Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `{"baselines":{"claim_with
 
 ## Verbindliche lokale Qlty-Arbeits- und Prüfkette
 
+Jede zuständige Königin pflegt nachvollziehbare, eng begrenzte Ausnahmen für
+den Scan in der tatsächlichen Qlty-Konfiguration des jeweiligen Repositorys
+und bei Bedarf in dessen `.gitignore`. Im Hive ist die Qlty-Konfiguration
+`.qlty/qlty.toml`. Geeignete Ausnahmen können generierte, temporäre, Cache-,
+Archiv- oder ausgelagerte Artefakte betreffen. Relevante Quelldateien, Tests
+und tatsächliche Findings dürfen nicht pauschal ausgeblendet werden.
+`.gitignore` und reine Qlty-Ausnahmen sind nach ihrer jeweiligen Wirkung zu
+wählen; eine Ausnahme entfernt keine bereits verfolgte Datei aus Git.
+Flüchtige CLI-Flags oder lokales `.git/info/exclude` sind keine alleinige
+hiveweite Regel.
+
+Jede Königin prüft bei ihrer ersten aktiven Arbeit oder Übernahme eines
+Repositorys dessen `.qlty/qlty.toml` und zugehörige Plugin-Konfigurationen.
+Ein vollständiger, aktuell gültiger Nachweis darf nach Abgleich mit dem
+tatsächlichen Repository- und Konfigurationsstand übernommen werden. Ein
+Sessionwechsel allein löst keine neue Erstprüfung aus. Bei aktiver Arbeit
+wird die Prüfung spätestens 30 Kalendertage nach dem letzten vollständigen
+Abschluss erneut fällig. Ein inaktives Repository wird dafür nicht geweckt;
+bei Wiederaufnahme wird eine fällige Prüfung nachgeholt. Änderungen an
+Sprachen, Frameworks, Build, CI, Qlty-Format oder Plugins sowie konkrete
+Konfigurationsfehler erfordern eine vorgezogene Sichtung. Geändert wird nur,
+was tatsächlich nötig ist.
+
+Die Königin prüft TOML, Plugin-Konfigurationen, Dateiglobs, Pfade,
+Abhängigkeiten, Formatter und Ausnahmen gemeinsam und respektiert bestehende
+Projektstandards. Das aktive Pluginset richtet sich nach dem Repository.
+Unpassende Plugins dürfen begründet deaktiviert werden; Sicherheits-, CI-,
+Container- und IaC-Prüfungen werden jeweils gesondert auf Relevanz geprüft.
+Viele Findings sind kein Abschaltgrund. Ein falscher MyPy-Pfad wird korrigiert,
+statt MyPy pauschal abzuschalten. Es gibt weder eine feste Katalogzahl noch
+eine globale Allowlist-Registry.
+
+Nur tatsächlich geänderte Qlty-, Plugin- oder Ignore-Konfigurationen benötigen
+eine zusätzliche unabhängige Prüfung durch eine Nichtautorin mit dem höchsten
+freigegebenen verfügbaren Reviewmodell und der höchsten zulässigen,
+unterstützten Reasoning-Stufe. Ein zusammenhängender Konfigurationsdiff wird
+gemeinsam geprüft; Einzelreviews je Plugin sind nicht erforderlich. Eingaben
+sind der Konfigurationsdiff, die Repositorystruktur, die Begründungen und die
+QA-Ergebnisse. Die Reviewerin prüft insbesondere Abdeckungsverlust, verdeckte
+Findings, falsche Pfade und Formatterkonflikte. Auftrag, Bestätigung und
+Ergebnis binden die konkrete Modellkennung und das tatsächlich verwendete
+Reasoning wahrheitsgemäß. Ist die erforderliche Kombination nicht verfügbar,
+bleibt das Review offen; es gibt keine stille Herabstufung. Unabhängig mögliche
+Arbeit geht weiter. Eine gezielte Nachprüfung betrifft nur konkrete
+Korrekturen. Ohne Konfigurationsänderung ist dieses Zusatzreview nicht nötig.
+
+Der fortlaufende vollständige Nachweis liegt im Default-Vault unter
+`Projekte/<repo>/Berichte/Qlty-Konfigurationspflege.md`. Er enthält Datum,
+nächsten Termin, gebundenen Konfigurationsstand, Pluginentscheidungen mit
+Begründungen, Änderungen und Checks. Nur ein vollständiger Abschluss setzt
+den nächsten Termin fort; eine vollständige Prüfung ohne Änderung zählt
+ebenfalls. Bei Konfigurationsänderungen bleibt die Prüfung bis zur Bestätigung
+des unabhängigen Reviews offen. Dies ist ein Ablauf der Königin mit
+Dokumentnachweis, keine automatische Zeit- oder Startsperre und keine
+Zustandsmaschine für die Periodik. Dafür werden weder ein Hintergrunddienst
+noch ein neuer Timer oder eine tägliche Repositoryprüfkette eingeführt.
+Der bestehende CLI-Upgrade-Timer bleibt unverändert.
+
 Jede lokale Coding- und Reviewbiene verwendet die Qlty-CLI tatsächlich. Vor
 der ersten Arbeit `qlty --version` prüfen. Das Benutzerhome dafür ist immer
 `pwd.getpwuid(os.getuid()).pw_dir`, nicht ein privates Bienen-`HOME`. Die
@@ -505,20 +563,24 @@ Vor JEDEM Commit veranlasst die Königin einen frischen vollständigen
 Owners. Jeder erlaubte mutierende Commitpfad wird einzeln als
 `--format-path <vaultunabhängiger relativer Repositorypfad>` angegeben.
 Diese Pfade müssen durch den tatsächlichen Auftrag freigegeben sein. Die
-Formatphase verwendet die vorhandenen Rollen Ruff, Prettier und shfmt nur
-auf diesen Dateien. Geschlossene Authority-, Client- oder Corepfade werden
+Formatphase verwendet nur die aktiven Formatter aus der Schnittmenge des
+Repository-Pluginsets mit Ruff, Prettier und shfmt und nur auf diesen Dateien.
+Ist diese Schnittmenge leer, wird die Formatphase ausdrücklich als nicht
+anwendbar dokumentiert; ein Formatlauf wird nicht vorgetäuscht. Geschlossene
+Authority-, Client- oder Corepfade werden
 dadurch nicht geöffnet. Ein nötiger weiterer Formatpfad wird vorab konkret
 mit der zuständigen Leitung geklärt. Der Owner prüft unveränderte Außenbytes.
 
 Der Lauf erhält ausschließlich bei beendeten anderen Guards einen exklusiven
 Precommitguard. Zuerst erfolgt diese begrenzte Formatierung. Danach folgen
 `metrics --all`, `smells --all --no-snippets` und ein ungefiltertes
-`check --all --no-fix --no-cache --sarif --print-errors`. Sämtliche tatsächlich
-unterstützten Plugins müssen aktiviert sein. Der aktuelle Katalog enthält
-68 sichtbare Plugins und zusätzlich die versteckte Definition `tsc`.
-Anwendbarkeit, konkurrierende Formatter als Validatoren und echte fehlende
-Sprach-/Paketkontexte werden anhand des vollständigen Katalogs beurteilt.
-Es werden weder Plugins wegen ihrer Menge weggelassen noch Versionen erfunden.
+`check --all --no-fix --no-cache --sarif --print-errors`. Der vollständige
+Check verwendet alle für das Repository benötigten aktivierten Plugins.
+Der vollständige unterstützte Katalog einschließlich versteckter Definitionen
+bleibt gebunden; das effektive aktive Set ist eine gültige nichtleere
+Teilmenge davon. Andere aktive Formatter werden weiterhin im ungefilterten
+Check als Validatoren geprüft. Anwendbarkeit und echte fehlende Sprach- oder
+Paketkontexte werden begründet; Versionen werden nicht erfunden.
 
 Der Owner sichert frische vollständige stdout-/stderr-Dateien, SARIF, echte
 Exitcodes, CLI-/Plugin-/Konfigurationsbindungen und die Endbytes nach der

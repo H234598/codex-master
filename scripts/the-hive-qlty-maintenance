@@ -437,42 +437,50 @@ def plugin_snapshots_equal(before: dict, after: dict) -> bool:
 
 def plugin_evidence(config: str, catalog: str, version: str) -> dict:
     """Validate the CLI's merged definitions, including hidden supported plugins."""
-    definitions_text = config.split("  definitions:\n", 1)[1].split("\nlanguage:", 1)[0]
-    definitions = re.split(r"(?m)^    ([a-z0-9-]+):\n", definitions_text)
-    supported = dict(zip(definitions[1::2], definitions[2::2]))
-    enabled_text = config.split("\nplugin:\n", 1)[1].split("\nsmells:", 1)[0]
-    enabled = re.findall(r"(?m)^- name: ([a-z0-9-]+)$", enabled_text)
-    visible = set(re.findall(r"(?m)^  (?:✔ )?([a-z0-9-]+)$", catalog))
+    document = yaml.safe_load(config)
+    supported = document["plugins"]["definitions"]
+    entries = document.get("plugin")
+    if (
+        not isinstance(entries, list)
+        or not entries
+        or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
+            for entry in entries
+        )
+    ):
+        raise ValueError("qlty_plugin_set_invalid")
+    enabled = [entry["name"] for entry in entries]
+    visible = set(re.findall(r"(?m)^  (?:✔ |  )?([a-z0-9-]+)$", catalog))
     hidden = {
         name
-        for name, body in supported.items()
-        if re.search(r"(?m)^      hidden: true$", body)
+        for name, definition in supported.items()
+        if definition.get("hidden") is True
     }
     if (
         not supported
         or len(enabled) != len(set(enabled))
-        or set(enabled) != set(supported)
+        or not set(enabled).issubset(supported)
         or visible != set(supported) - hidden
     ):
-        raise ValueError("qlty_all_plugins_required")
-    for block in re.split(r"(?m)^- name: ", enabled_text)[1:]:
-        if any(
-            not re.search(rf"(?m)^  {field}: {expected}$", block)
-            for field, expected in [
-                ("mode", "null"),
-                ("triggers", r"\[\]"),
-                ("skip_upstream", "null"),
-            ]
+        raise ValueError("qlty_plugin_set_invalid")
+    for entry in entries:
+        if (
+            not {"mode", "triggers", "skip_upstream"}.issubset(entry)
+            or entry["mode"] is not None
+            or entry["triggers"] != []
+            or entry["skip_upstream"] is not None
         ):
             raise ValueError("qlty_plugin_restriction")
     if not version.startswith("qlty "):
         raise ValueError("qlty_version_missing")
-    definitions = yaml.safe_load(config)["plugins"]["definitions"]
+    active_drivers = {entry["name"]: entry.get("drivers", ["ALL"]) for entry in entries}
     formatters = sorted(
         [name, driver_name]
-        for name, definition in definitions.items()
+        for name, definition in supported.items()
+        if name in enabled
         for driver_name, driver in (definition.get("drivers") or {}).items()
         if driver.get("driver_type") == "formatter"
+        and ("ALL" in active_drivers[name] or driver_name in active_drivers[name])
     )
     return {
         "formatters": formatters,
@@ -711,23 +719,35 @@ def precommit(
         atomic_json(record, value)
         before_plugins = plugins("before")
         value["plugins_before"] = before_plugins
-        outside = source_state(repository, exclude=tuple(format_paths))
-        formatted = capture(
-            [
-                "fmt",
-                "--filter=ruff,prettier,shfmt",
-                "--no-progress",
-                "--skip-source-fetch",
-                "--no-upgrade-check",
-                "--",
-                *format_paths,
-            ],
-            "fmt",
+        formatters = sorted(
+            {name for name, _ in before_plugins["formatters"]}
+            & {"ruff", "prettier", "shfmt"}
         )
+        formatting = {
+            "plugins": formatters,
+            "status": "pending" if formatters else "not_applicable",
+        }
+        value["formatting"] = formatting
+        outside = source_state(repository, exclude=tuple(format_paths))
+        if formatters:
+            formatted = capture(
+                [
+                    "fmt",
+                    "--filter=" + ",".join(formatters),
+                    "--no-progress",
+                    "--skip-source-fetch",
+                    "--no-upgrade-check",
+                    "--",
+                    *format_paths,
+                ],
+                "fmt",
+            )
         if source_state(repository, exclude=tuple(format_paths)) != outside:
             raise ValueError("qlty_format_scope_changed")
-        if formatted["exit_code"]:
-            raise ValueError("qlty_format_failed")
+        if formatters:
+            if formatted["exit_code"]:
+                raise ValueError("qlty_format_failed")
+            formatting["status"] = "complete"
         value["formatted_source"] = source_state(repository)
         value["candidate_sha256"] = {
             name: hashlib.sha256((repository / name).read_bytes()).hexdigest()

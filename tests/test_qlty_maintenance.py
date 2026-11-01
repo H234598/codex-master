@@ -6,6 +6,7 @@ import importlib.util
 import json
 import hashlib
 import copy
+import fnmatch
 import tomllib
 from pathlib import Path
 import subprocess
@@ -335,6 +336,179 @@ class MaintenanceTests(unittest.TestCase):
             json.loads(path.read_text())
             for path in (self.state / "logs").glob("*/precommit.json")
         ]
+
+    def test_plugin_subset_keeps_complete_supported_and_hidden_evidence(self):
+        self.precommit_fixture()
+        document = yaml.safe_load(self.config)
+        for names in (["ruff"], ["tsc"], ["ruff", "markdownlint"]):
+            with self.subTest(names=names):
+                document["plugin"] = [
+                    {"name": name, "mode": None, "triggers": [], "skip_upstream": None}
+                    for name in names
+                ]
+                config = yaml.safe_dump(document)
+                catalog = "2 available plugins:\n" + "".join(
+                    ("  ✔ " if name in names else "    ") + name + "\n"
+                    for name in ("ruff", "markdownlint")
+                )
+                evidence = maintenance.plugin_evidence(config, catalog, "qlty 1")
+                self.assertEqual(evidence["enabled"], sorted(names))
+                self.assertEqual(evidence["supported"], ["markdownlint", "ruff", "tsc"])
+                self.assertEqual(evidence["hidden"], ["tsc"])
+                self.assertEqual(
+                    evidence["formatters"],
+                    [["ruff", "format"]] if "ruff" in names else [],
+                )
+                self.assertEqual(
+                    evidence["config_sha256"],
+                    hashlib.sha256(config.encode()).hexdigest(),
+                )
+                for catalog in (
+                    "1 available plugins:\n  ✔ ruff\n",
+                    self.catalog + "  tsc\n",
+                ):
+                    with self.assertRaisesRegex(ValueError, "qlty_plugin_set_invalid"):
+                        maintenance.plugin_evidence(config, catalog, "qlty 1")
+
+    def test_plugin_subset_rejects_empty_unknown_and_duplicate_entries(self):
+        self.precommit_fixture()
+        document = yaml.safe_load(self.config)
+        for names in ([], ["unknown"], ["ruff", "ruff"]):
+            with self.subTest(names=names):
+                document["plugin"] = [
+                    {"name": name, "mode": None, "triggers": [], "skip_upstream": None}
+                    for name in names
+                ]
+                with self.assertRaisesRegex(ValueError, "qlty_plugin_set_invalid"):
+                    maintenance.plugin_evidence(
+                        yaml.safe_dump(document), self.catalog, "qlty 1"
+                    )
+
+    def test_plugin_subset_preserves_restriction_checks(self):
+        self.precommit_fixture()
+        document = yaml.safe_load(self.config)
+        document["plugin"] = [document["plugin"][0]]
+        original = copy.deepcopy(document["plugin"][0])
+        for field, value in (
+            ("mode", "comment"),
+            ("triggers", ["manual"]),
+            ("skip_upstream", True),
+        ):
+            for missing in (False, True):
+                with self.subTest(field=field, missing=missing):
+                    entry = document["plugin"][0] = {**original, field: value}
+                    if missing:
+                        del entry[field]
+                    with self.assertRaisesRegex(ValueError, "qlty_plugin_restriction"):
+                        maintenance.plugin_evidence(
+                            yaml.safe_dump(document), self.catalog, "qlty 1"
+                        )
+
+    def test_precommit_formats_only_active_mutating_roles(self):
+        for ruff_drivers, extra, expected in (
+            (["ALL"], ["prettier"], ["prettier", "ruff"]),
+            (["lint"], ["shfmt"], ["shfmt"]),
+            (["lint"], [], []),
+        ):
+            with self.subTest(expected=expected):
+                self.state = self.root / ("format-" + "-".join(expected))
+                repo, spy = self.precommit_fixture()
+                document = yaml.safe_load(self.config)
+                for name in ("prettier", "shfmt", "black"):
+                    document["plugins"]["definitions"][name] = {
+                        "hidden": False,
+                        "drivers": {"format": {"driver_type": "formatter"}},
+                    }
+                    self.catalog += f"  {name}\n"
+                document["plugin"] = [
+                    {**document["plugin"][0], "name": name} for name in ["ruff", *extra]
+                ]
+                document["plugin"][0]["drivers"] = ruff_drivers
+                self.config = yaml.safe_dump(document)
+                outside = repo / "outside.py"
+                outside.write_text("untouched\n")
+                with spy:
+                    self.assertEqual(self.invoke_precommit(repo), 0)
+                formatted = [
+                    command for command in self.commands if command[0] == "fmt"
+                ]
+                self.assertEqual(len(formatted), 1 if expected else 0)
+                if expected:
+                    self.assertIn("--filter=" + ",".join(expected), formatted[0])
+                    self.assertEqual(formatted[0][-1], "candidate.py")
+                    self.assertNotIn("--all", formatted[0])
+                receipt = self.receipts()[-1]
+                self.assertEqual(
+                    receipt["formatting"],
+                    {
+                        "plugins": expected,
+                        "status": "complete" if expected else "not_applicable",
+                    },
+                )
+                self.assertEqual(outside.read_text(), "untouched\n")
+                self.assertEqual(receipt["formatted_source"], receipt["final_source"])
+                check = next(
+                    command for command in self.commands if command[0] == "check"
+                )
+                self.assertIn("--all", check)
+                self.assertIn("--no-cache", check)
+                self.assertIn("--no-fix", check)
+                self.assertFalse(
+                    any(argument.startswith("--filter") for argument in check)
+                )
+                self.assertEqual(receipt["invocation_evidence"]["file_targets"], 1)
+
+    def test_other_active_formatter_still_runs_in_unfiltered_check(self):
+        repo, spy = self.precommit_fixture()
+        document = yaml.safe_load(self.config)
+        document["plugins"]["definitions"]["black"] = {
+            "hidden": False,
+            "drivers": {"format": {"driver_type": "formatter"}},
+        }
+        document["plugin"] = [{**document["plugin"][0], "name": "black"}]
+        self.catalog += "  black\n"
+        self.config = yaml.safe_dump(document)
+        self.records[0].update(pluginName="black", driverName="format")
+
+        def stage(arguments, keywords):
+            if arguments[0] == "check":
+                path = Path(keywords["env"]["TMPDIR"]) / "qlty/Ab123456-rw"
+                path.mkdir(parents=True)
+                self.records[0]["cwd"] = str(path)
+            return 0
+
+        self.effect = stage
+        with spy:
+            self.assertEqual(self.invoke_precommit(repo), 0)
+        receipt = self.receipts()[-1]
+        self.assertEqual(receipt["plugins_before"]["formatters"], [["black", "format"]])
+        self.assertEqual(receipt["formatting"]["status"], "not_applicable")
+        self.assertFalse(any(command[0] == "fmt" for command in self.commands))
+        self.assertEqual(receipt["invocation_evidence"]["completed"], 1)
+        check = next(command for command in self.commands if command[0] == "check")
+        self.assertIn("--all", check)
+        self.assertFalse(any(argument.startswith("--filter") for argument in check))
+
+    def test_enabled_subset_drift_holds_after_successful_native_check(self):
+        repo, spy = self.precommit_fixture()
+        config_calls = 0
+
+        def drift(arguments, keywords):
+            nonlocal config_calls
+            if arguments[0] == "config":
+                config_calls += 1
+                if config_calls == 2:
+                    document = yaml.safe_load(self.config)
+                    document["plugin"] = [document["plugin"][0]]
+                    self.config = yaml.safe_dump(document)
+            return 0
+
+        self.effect = drift
+        with spy:
+            self.assertEqual(self.invoke_precommit(repo), 2)
+        receipt = self.receipts()[-1]
+        self.assertEqual(receipt["reason"], "qlty_plugins_changed")
+        self.assertEqual(receipt["invocation_evidence"]["completed"], 1)
 
     def test_precommit_is_fresh_each_time_and_binds_formatted_endbytes(self):
         repo, spy = self.precommit_fixture()
@@ -872,7 +1046,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertGreaterEqual(record["attempted_at"] - first_started, maintenance.DAY)
         self.assertLess(record["attempted_at"] - first_started, maintenance.DAY + 3600)
 
-    def test_scheduler_is_upgrade_only_and_all_69_definitions_are_enabled(self):
+    def test_scheduler_is_upgrade_only_and_repository_plugins_are_unrestricted(self):
         root = SCRIPT.parents[1]
         service = (root / "systemd/user/the-hive-qlty-maintenance.service").read_text()
         self.assertIn(
@@ -887,7 +1061,32 @@ class MaintenanceTests(unittest.TestCase):
         )
         config = tomllib.loads((root / ".qlty/qlty.toml").read_text())
         names = [entry["name"] for entry in config["plugin"]]
-        self.assertEqual(len(names), 69)
-        self.assertEqual(len(set(names)), 69)
-        self.assertIn("tsc", names)
+        self.assertTrue(names)
+        self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all("mode" not in entry for entry in config["plugin"]))
+
+    def test_repository_extensionless_scripts_have_language_globs(self):
+        root = SCRIPT.parents[1]
+        config = tomllib.loads((root / ".qlty/qlty.toml").read_text())
+        files = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).split(
+            b"\0"
+        )
+        for encoded in files:
+            if not encoded:
+                continue
+            name = encoded.decode()
+            path = root / name
+            if path.suffix or not path.is_file():
+                continue
+            shebang = path.read_text().partition("\n")[0]
+            if not shebang.startswith("#!"):
+                continue
+            language = "python" if "python" in shebang else "shell"
+            for file_type in (language, "ALL"):
+                with self.subTest(path=name, file_type=file_type):
+                    self.assertTrue(
+                        any(
+                            fnmatch.fnmatchcase(name, pattern)
+                            for pattern in config["file_types"][file_type]["globs"]
+                        )
+                    )

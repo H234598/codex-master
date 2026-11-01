@@ -1,0 +1,8 @@
+---
+# These assertions express pytest expectations, not production access controls.
+# Skip only B101 in this exact test module; all other Bandit checks
+# remain active.
+assert_used:
+  skips:
+    - tests/test_runtime_lifecycle_service.py
+    - ./tests/test_runtime_lifecycle_service.py
