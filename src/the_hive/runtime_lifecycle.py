@@ -1746,7 +1746,11 @@ def _v2_validate_identity(
         identity["nlink"] != 1 or identity["mode"] != 0o600
     ):
         _d320_fail("d320_v2_identity_file_invalid")
-    if expected_type == "directory" and identity["mode"] != 0o700:
+    if expected_type == "directory" and not (
+        identity["mode"] == 0o700
+        or kind in {"config", "config_systemd"}
+        and identity["mode"] == 0o755
+    ):
         _d320_fail("d320_v2_identity_directory_invalid")
     children = identity["children"]
     if (
