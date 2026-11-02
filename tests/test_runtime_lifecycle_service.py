@@ -10604,7 +10604,7 @@ def test_public_recover_published_generation_requires_stage_inode_binding(
 
 
 def _sealed_v2_recovery_fixture(
-    root: Path, *, published: bool
+    root: Path, *, published: bool, prepare_payload=None
 ) -> tuple[Path, dict[str, object], object, Path, Path, dict[str, object]]:
     home = root / "home"
     root.mkdir(mode=0o700)
@@ -10616,6 +10616,8 @@ def _sealed_v2_recovery_fixture(
     library.mkdir(mode=0o700, parents=True)
     release.mkdir(mode=0o700)
     generations.mkdir(mode=0o700)
+    if prepare_payload is not None:
+        prepare_payload(home, payload)
     stage = library / payload["stage_name"]
     temporary = runtime_lifecycle._v2_setup_temp_path(payload, stage)
     temporary.mkdir(mode=0o700)
@@ -10751,6 +10753,492 @@ def _recovery_systemctl(payload: dict[str, object]):
         return {}
 
     return systemctl
+
+
+@pytest.mark.parametrize("journaled", [True, False])
+def test_recovery_checks_native_same_bytes_replacement_before_original_inode(
+    tmp_path: Path, journaled: bool
+) -> None:
+    payload = _runtime_v2_payload(tmp_path / "home")
+    path = Path(payload["files"][1]["path"])
+    path.parent.mkdir(mode=0o700, parents=True)
+    path.write_bytes(b"unchanged stable launcher\n")
+    path.chmod(0o755)
+    payload["files"][1] = runtime_lifecycle._v2_capture_managed_file(path, 0o755)
+    _replace_file_with_live_inode(path, path.read_bytes(), 0o755)
+    installed = runtime_lifecycle._v2_capture_managed_file(path, 0o755)
+    digest = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(installed)
+    ).hexdigest()
+    payload["steps"].append(
+        {
+            "action": "effect_installed",
+            "phase": "INSTALLED",
+            "effect": str(path),
+            "sha256": digest if journaled else "f" * 64,
+        }
+    )
+
+    assert (
+        runtime_lifecycle._v2_recovery_files_are_bound(
+            tmp_path / "home", payload, "INSTALLED"
+        )
+        is journaled
+    )
+
+
+def _recovery_handoff_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    sources = []
+    for name in ("original", "owner"):
+        source = tmp_path / name
+        source.mkdir(mode=0o700)
+        for relative in (
+            "scripts/the-hive-hive-hourly-probe-install",
+            "src/the_hive/usage_snapshot.py",
+            "src/the_hive/limit_tracker.py",
+            "src/the_hive/runtime_lifecycle.py",
+            "src/the_hive/markdown/runtime-release-compatibility-v1.json",
+        ):
+            target = source / relative
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
+        (source / "source-marker").write_text(name + "\n", encoding="utf-8")
+        for args in (("init", "-q"), ("add", "."), ("commit", "-qm", name)):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "-c",
+                    "user.name=Recovery Fixture",
+                    "-c",
+                    "user.email=recovery@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    *args,
+                ],
+                check=True,
+                capture_output=True,
+            )
+        sources.append(source)
+    original, owner = sources
+    original_pin = runtime_lifecycle._source_tree_binding(original)
+    assert runtime_lifecycle._source_tree_binding(owner) != original_pin
+    make_payload = _runtime_v2_payload
+
+    def source_payload(home: Path):
+        value = make_payload(home)
+        previous_commit = value["source"]["commit"]
+        value["source"] = {"commit": original_pin[0], "tree_sha256": original_pin[1]}
+        value["plan"]["source"] = dict(value["source"])
+        value["plan"]["extra_effects"] = runtime_lifecycle._v2_plan_effects(
+            home, original_pin[0]
+        )
+        for effect in value["extra_effects"]:
+            effect["path"] = effect["path"].replace(previous_commit, original_pin[0])
+        for unit, state in value["manager_pre"].items():
+            state["Result"] = "success"
+            if unit.endswith(".service"):
+                state.update(UnitFileState="static", ExecMainStatus="0")
+        value["manager_pre"][runtime_lifecycle._NEW_SERVICE].update(
+            ActiveState="failed", Result="exit-code", ExecMainStatus="1"
+        )
+        value["plan_sha256"] = hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(value["plan"])
+        ).hexdigest()
+        value["steps"][0]["sha256"] = value["plan_sha256"]
+        return value
+
+    monkeypatch.setattr(sys.modules[__name__], "_runtime_v2_payload", source_payload)
+
+    def existing_directories(home: Path, value):
+        value["extra_effects"] = runtime_lifecycle._v2_capture_effects(
+            home, value["source"]["commit"], value["stage_name"]
+        )
+
+    home, payload, journal, stage, generation, installer = _sealed_v2_recovery_fixture(
+        tmp_path / "installed", published=True, prepare_payload=existing_directories
+    )
+    _patch_recovery_runtime_validation(monkeypatch, installer)
+    monkeypatch.setattr(
+        runtime_lifecycle, "__file__", str(owner / "src/the_hive/runtime_lifecycle.py")
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_runtime_identity",
+        lambda _root: {
+            "generation": payload["source"]["commit"],
+            "manifest_digest": payload["sealed"]["manifest_digest"],
+        },
+    )
+    states = copy.deepcopy(payload["manager_pre"])
+    states[runtime_lifecycle._NEW_SERVICE]["ExecMainStatus"] = "64"
+    actions = []
+
+    def systemctl(arguments):
+        if arguments[0] == "show":
+            return dict(states[arguments[1]])
+        durable = runtime_lifecycle._v2_load_journal(home).payload
+        assert durable["phase"] == "RECOVERING"
+        assert any(x["action"] == "recovery_started" for x in durable["steps"])
+        actions.append(arguments)
+        if arguments == ("daemon-reload",):
+            return {}
+        operation, *flags, unit = arguments
+        if operation in {"enable", "disable"}:
+            assert flags == ["--now"]
+            states[unit]["UnitFileState"] = (
+                "enabled" if operation == "enable" else "disabled"
+            )
+            states[unit]["ActiveState"] = (
+                "active" if operation == "enable" else "inactive"
+            )
+        elif operation in {"start", "stop"}:
+            assert flags == []
+            if states[unit]["ActiveState"] != "failed":
+                states[unit]["ActiveState"] = (
+                    "active" if operation == "start" else "inactive"
+                )
+        elif operation == "reset-failed":
+            assert flags == []
+            states[unit].update(
+                ActiveState="inactive", Result="success", ExecMainStatus="0"
+            )
+        else:
+            raise AssertionError(arguments)
+        return {}
+
+    kwargs = {
+        "home": home,
+        "plan_sha256": payload["plan_sha256"],
+        "phase": "recover",
+        "systemctl": systemctl,
+        "recovery_source": original,
+        "recovery_exec_main_status": 64,
+    }
+    return kwargs, payload, journal, generation, original, owner, states, actions
+
+
+def test_public_recover_explicitly_binds_original_source_owner_and_probe_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kwargs, payload, _journal, generation, original, owner, states, actions = (
+        _recovery_handoff_fixture(tmp_path, monkeypatch)
+    )
+    before = [runtime_lifecycle._source_tree_binding(p) for p in (original, owner)]
+
+    result = runtime_lifecycle.cutover(**kwargs)
+
+    assert result["status"] == "runtime_lifecycle_recovery_complete", result
+    assert (
+        runtime_lifecycle._v2_load_journal(kwargs["home"]).payload["phase"]
+        == "ROLLED_BACK"
+    )
+    assert not generation.exists()
+    assert ("daemon-reload",) in actions
+    assert ("reset-failed", runtime_lifecycle._NEW_SERVICE) in actions
+    assert states[runtime_lifecycle._NEW_SERVICE]["ActiveState"] == "inactive"
+    assert [
+        runtime_lifecycle._source_tree_binding(p) for p in (original, owner)
+    ] == before
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "wrong_status",
+        "missing_status",
+        "missing_source",
+        "bool_status",
+        "zero_status",
+        "large_status",
+        "active_service",
+        "other_unit",
+        "wrong_source",
+        "dirty_source",
+        "unsafe_source",
+        "symlink_source",
+        "other_phase",
+    ),
+)
+def test_public_recover_handoff_rejects_unbound_inputs_before_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    kwargs, _payload, journal, generation, original, owner, states, actions = (
+        _recovery_handoff_fixture(tmp_path, monkeypatch)
+    )
+    if drift in {"wrong_status", "bool_status", "zero_status", "large_status"}:
+        kwargs["recovery_exec_main_status"] = {
+            "wrong_status": 65,
+            "bool_status": True,
+            "zero_status": 0,
+            "large_status": 256,
+        }[drift]
+    elif drift == "missing_status":
+        kwargs["recovery_exec_main_status"] = None
+    elif drift == "missing_source":
+        kwargs["recovery_source"] = None
+    elif drift == "active_service":
+        states[runtime_lifecycle._NEW_SERVICE]["ActiveState"] = "active"
+    elif drift == "other_unit":
+        states[runtime_lifecycle._PRICING_UNITS[0]]["ExecMainStatus"] = "64"
+    elif drift == "wrong_source":
+        kwargs["recovery_source"] = owner
+    elif drift == "dirty_source":
+        (original / "unexpected").write_text("untracked\n", encoding="utf-8")
+    elif drift == "unsafe_source":
+        original.chmod(0o775)
+    elif drift == "symlink_source":
+        link = tmp_path / "source-link"
+        link.symlink_to(original, target_is_directory=True)
+        kwargs["recovery_source"] = link
+    else:
+        kwargs["phase"] = "install"
+
+    result = runtime_lifecycle.cutover(**kwargs)
+
+    assert result["status"] not in {
+        "runtime_lifecycle_recovery_complete",
+        "runtime_lifecycle_install_complete",
+    }, result
+    assert actions == []
+    assert generation.exists()
+    assert (
+        runtime_lifecycle._v2_journal_path(kwargs["home"]).read_bytes()
+        == journal.to_bytes()
+    )
+
+
+@pytest.mark.parametrize(
+    "resume_drift",
+    (
+        "none",
+        "owner",
+        "manager",
+        "pin",
+        "source",
+        "intent",
+        "omit_pins",
+        "default",
+        "image",
+        "owner_committed",
+        "prefix",
+    ),
+)
+def test_public_recover_handoff_resumes_only_its_durable_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resume_drift: str
+) -> None:
+    kwargs, _payload, _journal, generation, original, owner, states, actions = (
+        _recovery_handoff_fixture(tmp_path, monkeypatch)
+    )
+    if resume_drift in {"omit_pins", "default"}:
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "__file__",
+            str(original / "src/the_hive/runtime_lifecycle.py"),
+        )
+    if resume_drift == "default":
+        kwargs.pop("recovery_source")
+        kwargs.pop("recovery_exec_main_status")
+        states[runtime_lifecycle._NEW_SERVICE]["ExecMainStatus"] = "1"
+    remove_stage = runtime_lifecycle._v2_remove_owned_stage
+
+    def interrupt_before_inverse(*_args, **_kwargs):
+        raise RuntimeError("simulated interruption before inverse effects")
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_v2_remove_owned_stage", interrupt_before_inverse
+    )
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        runtime_lifecycle.cutover(**kwargs)
+    durable = runtime_lifecycle._v2_journal_path(kwargs["home"]).read_bytes()
+    assert (
+        runtime_lifecycle._v2_load_journal(kwargs["home"]).payload["phase"]
+        == "RECOVERING"
+    )
+    assert actions == []
+    monkeypatch.setattr(runtime_lifecycle, "_v2_remove_owned_stage", remove_stage)
+    if resume_drift == "owner":
+        (owner / "unexpected").write_text("changed owner\n", encoding="utf-8")
+    elif resume_drift == "manager":
+        states[runtime_lifecycle._NEW_SERVICE]["Result"] = "timeout"
+    elif resume_drift == "pin":
+        kwargs["recovery_exec_main_status"] = 65
+    elif resume_drift == "source":
+        (original / "unexpected").write_text("changed source\n", encoding="utf-8")
+    elif resume_drift == "image":
+        (generation / "src/the_hive/runtime_lifecycle.py").write_text(
+            "corrupt installed image\n", encoding="utf-8"
+        )
+    elif resume_drift == "owner_committed":
+        (owner / "source-marker").write_text("new owner commit\n", encoding="utf-8")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(owner),
+                "-c",
+                "user.name=Recovery Fixture",
+                "-c",
+                "user.email=recovery@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qam",
+                "new owner",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    elif resume_drift == "prefix":
+        changed = runtime_lifecycle._v2_load_journal(kwargs["home"]).payload
+        index = next(
+            i
+            for i, step in enumerate(changed["steps"])
+            if step["action"] == "recovery_started"
+        )
+        changed["steps"].insert(
+            index,
+            {
+                "sequence": 0,
+                "phase": "ACTIVATED",
+                "action": "manager_mutation",
+                "effect": "manager:" + runtime_lifecycle._NEW_TIMER,
+                "sha256": "f" * 64,
+            },
+        )
+        for sequence, step in enumerate(changed["steps"], 1):
+            step["sequence"] = sequence
+        changed["sequence"] = len(changed["steps"])
+        durable = runtime_lifecycle.D320CutoverJournalV2.from_payload(
+            changed
+        ).to_bytes()
+        runtime_lifecycle._v2_journal_path(kwargs["home"]).write_bytes(durable)
+    elif resume_drift == "intent":
+        changed = runtime_lifecycle._v2_load_journal(kwargs["home"]).payload
+        next(x for x in changed["steps"] if x["action"] == "recovery_started")[
+            "sha256"
+        ] = "0" * 64
+        durable = runtime_lifecycle._d320_journal_envelope(
+            runtime_lifecycle._d320_canonical_json(changed)
+        )
+        runtime_lifecycle._v2_journal_path(kwargs["home"]).write_bytes(durable)
+    elif resume_drift == "omit_pins":
+        kwargs.pop("recovery_source")
+        kwargs.pop("recovery_exec_main_status")
+        states[runtime_lifecycle._NEW_SERVICE]["ExecMainStatus"] = "1"
+
+    result = runtime_lifecycle.cutover(**kwargs)
+
+    if resume_drift in {"none", "default"}:
+        assert result["status"] == "runtime_lifecycle_recovery_complete", result
+        assert not generation.exists()
+    else:
+        assert result["status"] != "runtime_lifecycle_recovery_complete", result
+        assert (
+            runtime_lifecycle._v2_journal_path(kwargs["home"]).read_bytes() == durable
+        )
+        assert actions == []
+        assert generation.exists()
+
+
+@pytest.mark.parametrize("changed_source", ("owner", "original"))
+def test_public_recover_handoff_revalidates_sources_after_durable_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_source: str
+) -> None:
+    kwargs, _payload, _journal, generation, original, owner, _states, actions = (
+        _recovery_handoff_fixture(tmp_path, monkeypatch)
+    )
+    transition = runtime_lifecycle._v2_transition
+
+    def change_owner_after_intent(*args, **options):
+        result = transition(*args, **options)
+        if options["action"] == "recovery_started":
+            source = owner if changed_source == "owner" else original
+            (source / "source-marker").write_text(
+                "clean source drift\n", encoding="utf-8"
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "-c",
+                    "user.name=Recovery Fixture",
+                    "-c",
+                    "user.email=recovery@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "-qam",
+                    "source drift",
+                ],
+                check=True,
+                capture_output=True,
+            )
+        return result
+
+    monkeypatch.setattr(runtime_lifecycle, "_v2_transition", change_owner_after_intent)
+    result = runtime_lifecycle.cutover(**kwargs)
+
+    assert result["status"] != "runtime_lifecycle_recovery_complete", result
+    assert (
+        runtime_lifecycle._v2_load_journal(kwargs["home"]).payload["phase"]
+        == "RECOVERING"
+    )
+    assert actions == []
+    assert generation.exists()
+
+
+def test_public_recover_handoff_requires_persisted_admission_before_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kwargs, _payload, journal, generation, _original, _owner, _states, actions = (
+        _recovery_handoff_fixture(tmp_path, monkeypatch)
+    )
+
+    def reject_store(*_args, **_kwargs):
+        raise runtime_lifecycle._error("runtime_lifecycle_journal_raced")
+
+    monkeypatch.setattr(runtime_lifecycle, "_v2_store_journal", reject_store)
+    result = runtime_lifecycle.cutover(**kwargs)
+
+    assert result["status"] == "runtime_lifecycle_journal_raced", result
+    assert (
+        runtime_lifecycle._v2_journal_path(kwargs["home"]).read_bytes()
+        == journal.to_bytes()
+    )
+    assert actions == []
+    assert generation.exists()
+
+
+def test_public_recover_handoff_holds_if_persisted_admission_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kwargs, _payload, _journal, generation, _original, _owner, _states, actions = (
+        _recovery_handoff_fixture(tmp_path, monkeypatch)
+    )
+    transition = runtime_lifecycle._v2_transition
+
+    def remove_admission(*args, **options):
+        result = transition(*args, **options)
+        if options["action"] == "recovery_started":
+            runtime_lifecycle._v2_journal_path(kwargs["home"]).unlink()
+        return result
+
+    monkeypatch.setattr(runtime_lifecycle, "_v2_transition", remove_admission)
+    result = runtime_lifecycle.cutover(**kwargs)
+
+    assert result["status"] == "runtime_lifecycle_recovery_hold", result
+    assert not runtime_lifecycle._v2_journal_path(kwargs["home"]).exists()
+    assert actions == []
+    assert generation.exists()
 
 
 def test_public_recover_resumes_after_own_atomic_file_restore_replace(

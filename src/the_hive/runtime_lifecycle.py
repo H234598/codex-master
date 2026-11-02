@@ -4494,7 +4494,7 @@ def _canary_unit_binding(
     )
 
 
-def _bind_cutover_inputs(home: Path) -> _BoundCutover:
+def _bind_cutover_inputs(home: Path, *, source: Path | None = None) -> _BoundCutover:
     """Bind exactly the source, pre-runtime and unit state before mutation."""
 
     release_root, units, state_root, legacy_launcher = _home_paths(home)
@@ -4520,7 +4520,7 @@ def _bind_cutover_inputs(home: Path) -> _BoundCutover:
         *pricing_units,
     ):
         _bound_path_from_home(home, path)
-    repository = Path(__file__).resolve().parents[2]
+    repository = source or Path(__file__).resolve().parents[2]
     sources = (
         repository / "scripts" / "the-hive-hive-hourly-probe-install",
         repository / "src" / "the_hive" / "usage_snapshot.py",
@@ -6001,6 +6001,14 @@ def _v2_recovery_files_are_bound(
                 if old["present"]
                 else None
             )
+            installed_digest = installed_snapshots.get(path_string)
+            if installed_digest is not None:
+                installed_snapshot = _v2_capture_managed_file(path, mode)
+                if (
+                    hashlib.sha256(_d320_canonical_json(installed_snapshot)).hexdigest()
+                    == installed_digest
+                ):
+                    continue
             if current == old_bytes:
                 if not _v2_file_snapshot_identity_matches(path, old):
                     expected_inverse = inverse_reservations.get(path_string)
@@ -6020,14 +6028,6 @@ def _v2_recovery_files_are_bound(
                 if current == post_bytes:
                     if not _v2_file_snapshot_identity_matches(path, recorded_post):
                         return False
-                    continue
-            installed_digest = installed_snapshots.get(path_string)
-            if installed_digest is not None:
-                installed_snapshot = _v2_capture_managed_file(path, mode)
-                if (
-                    hashlib.sha256(_d320_canonical_json(installed_snapshot)).hexdigest()
-                    == installed_digest
-                ):
                     continue
             reserved_digest = inverse_reservations.get(path_string)
             temporary = _v2_restore_temp_path(payload, path)
@@ -6427,8 +6427,58 @@ def _v2_remove_journaled_effect(
             os.close(parent_fd)
 
 
+def _v2_recovery_input(
+    home: Path,
+    payload: Mapping[str, object],
+    source: Path | None,
+    status: int | None,
+    systemctl: Systemctl,
+) -> tuple[_BoundCutover, str]:
+    if not isinstance(source, Path):
+        raise _error("runtime_lifecycle_recovery_hold")
+    try:
+        info = source.lstat()
+        canonical = source.is_absolute() and source.resolve(strict=True) == source
+    except (OSError, ValueError) as exc:
+        raise _error("runtime_lifecycle_recovery_hold") from exc
+    expected = {unit: dict(state) for unit, state in payload["manager_pre"].items()}
+    service = expected[_NEW_SERVICE]
+    if (
+        not canonical
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o7022
+        or payload["phase"] not in {"INSTALLED", "RECOVERING"}
+        or type(status) is not int
+        or not 1 <= status <= 255
+        or service.get("LoadState") != "loaded"
+        or service.get("ActiveState") != "failed"
+        or service.get("Result") != "exit-code"
+    ):
+        raise _error("runtime_lifecycle_recovery_hold")
+    service["ExecMainStatus"] = str(status)
+    owner = list(_source_tree_binding(Path(__file__).resolve().parents[2]))
+    bound = _bind_systemd_states(_bind_cutover_inputs(home, source=source), systemctl)
+    if dict(bound.states) != expected:
+        raise _error("runtime_lifecycle_recovery_hold")
+    admitted = {
+        "journal_id": payload["journal_id"],
+        "transaction_id": payload["transaction_id"],
+        "plan_sha256": payload["plan_sha256"],
+        "original_source": [bound.source_commit, bound.source_tree_digest],
+        "original_source_path": str(source),
+        "executing_owner": owner,
+        "manager_states": expected,
+    }
+    return bound, hashlib.sha256(_d320_canonical_json(admitted)).hexdigest()
+
+
 def _v2_recover_phase(
-    *, home: Path, plan_sha256: str, systemctl: Systemctl
+    *,
+    home: Path,
+    plan_sha256: str,
+    systemctl: Systemctl,
+    recovery: tuple[Path | None, int | None] = (None, None),
 ) -> dict[str, object]:
     _v2_require_existing_lifecycle_lock(home)
     with _lifecycle_lock(home) as lease:
@@ -6447,7 +6497,11 @@ def _v2_recover_phase(
             }
         if phase == "BLOCKED":
             raise _error("runtime_lifecycle_recovery_hold")
-        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        admission = None
+        if any(value is not None for value in recovery):
+            bound, admission = _v2_recovery_input(home, payload, *recovery, systemctl)
+        else:
+            bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
         target = payload["target"]
         info = home.lstat()
         if (
@@ -6497,7 +6551,7 @@ def _v2_recover_phase(
 
         current_states = dict(bound.states)
         pre_states = payload["manager_pre"]
-        if not _v2_recovery_manager_states_are_bound(
+        if admission is None and not _v2_recovery_manager_states_are_bound(
             payload, current_states, pre_states
         ):
             raise _error("runtime_lifecycle_recovery_hold")
@@ -6525,6 +6579,15 @@ def _v2_recover_phase(
                     != sealed["generation_identity_sha256"]
                 ):
                     raise _error("runtime_lifecycle_recovery_hold")
+                if phase in {"SEALED", "RECOVERING"}:
+                    try:
+                        from the_hive.runtime_layout import RuntimeLayout
+
+                        candidate = RuntimeLayout.from_runtime_root(generation_path)
+                    except Exception as exc:
+                        raise _error("runtime_lifecycle_recovery_hold") from exc
+                    if candidate.manifest_digest != sealed["manifest_digest"]:
+                        raise _error("runtime_lifecycle_recovery_hold")
         temp_to_target = {
             str(_v2_setup_temp_path(payload, Path(path))): path
             for path in _v2_expected_effects(
@@ -6569,6 +6632,17 @@ def _v2_recover_phase(
                 if item["path"] == str(generation_path) and not item["present"]:
                     continue
                 prior = baseline[item["path"]]
+                if (
+                    phase == "RECOVERING"
+                    and item["path"] == str(generation_path)
+                    and item["present"]
+                    and not prior["present"]
+                    and any(
+                        step["action"] == "generation_published"
+                        for step in payload["steps"]
+                    )
+                ):
+                    continue
                 if _v2_effect_identity_digest(item) == _v2_effect_identity_digest(
                     prior
                 ):
@@ -6609,14 +6683,6 @@ def _v2_recover_phase(
                     != sealed["generation_identity_sha256"]
                 ):
                     raise _error("runtime_lifecycle_recovery_hold")
-                try:
-                    from the_hive.runtime_layout import RuntimeLayout
-
-                    candidate = RuntimeLayout.from_runtime_root(generation_path)
-                except Exception as exc:
-                    raise _error("runtime_lifecycle_recovery_hold") from exc
-                if candidate.manifest_digest != payload["sealed"]["manifest_digest"]:
-                    raise _error("runtime_lifecycle_recovery_hold")
         elif phase in {"INSTALLED", "ACTIVATED", "OBSERVED"}:
             sealed = payload["sealed"]
             if not isinstance(sealed, Mapping):
@@ -6628,7 +6694,11 @@ def _v2_recover_phase(
                 or identity.get("manifest_digest") != sealed["manifest_digest"]
             ):
                 raise _error("runtime_lifecycle_recovery_hold")
-            if phase == "INSTALLED" and current_states != pre_states:
+            if (
+                phase == "INSTALLED"
+                and current_states != pre_states
+                and admission is None
+            ):
                 raise _error("runtime_lifecycle_recovery_hold")
         elif phase == "RECOVERING":
             # Resume is allowed only while each managed byte and manager state
@@ -6638,7 +6708,32 @@ def _v2_recover_phase(
         else:
             raise _error("runtime_lifecycle_recovery_hold")
 
-        if phase != "RECOVERING":
+        if phase == "RECOVERING":
+            steps = payload["steps"]
+            starts = [step for step in steps if step["action"] == "recovery_started"]
+            if len(starts) != 1:
+                raise _error("runtime_lifecycle_recovery_hold")
+            prefix = steps[: steps.index(starts[0])]
+            if not prefix or prefix[-1]["phase"] == "RECOVERING":
+                raise _error("runtime_lifecycle_recovery_hold")
+            if admission is not None and prefix[-1]["phase"] != "INSTALLED":
+                raise _error("runtime_lifecycle_recovery_hold")
+            predecessor = dict(payload)
+            predecessor.update(
+                phase=prefix[-1]["phase"],
+                sequence=prefix[-1]["sequence"],
+                steps=prefix,
+                recovery_count=payload["recovery_count"] - 1,
+            )
+            try:
+                default_digest = hashlib.sha256(
+                    D320CutoverJournalV2.from_payload(predecessor).to_bytes()
+                ).hexdigest()
+            except D320CutoverJournalError as exc:
+                raise _error("runtime_lifecycle_recovery_hold") from exc
+            if starts[0]["sha256"] != (admission or default_digest):
+                raise _error("runtime_lifecycle_recovery_hold")
+        else:
             journal = _v2_transition(
                 home,
                 journal,
@@ -6646,9 +6741,13 @@ def _v2_recover_phase(
                 phase="RECOVERING",
                 action="recovery_started",
                 effect=str(_v2_journal_path(home)),
-                digest=hashlib.sha256(journal.to_bytes()).hexdigest(),
+                digest=admission or hashlib.sha256(journal.to_bytes()).hexdigest(),
                 updates={"recovery_count": int(payload["recovery_count"]) + 1},
             )
+        if admission is not None:
+            _, fresh = _v2_recovery_input(home, journal.payload, *recovery, systemctl)
+            if fresh != admission or _v2_load_journal(home) != journal:
+                raise _error("runtime_lifecycle_recovery_hold")
         _v2_remove_owned_stage(
             home,
             payload,
@@ -10548,6 +10647,8 @@ def cutover(
     plan_sha256: str | None = None,
     phase: str | None = None,
     systemctl: Systemctl | None = None,
+    recovery_source: Path | None = None,
+    recovery_exec_main_status: int | None = None,
 ) -> dict[str, object]:
     """Consume only a fresh public plan before entering any transaction body."""
 
@@ -10562,6 +10663,13 @@ def cutover(
             "raw_output": "not_returned",
         }
     selected_systemctl = systemctl or _systemctl_default
+    if phase != "recover" and (
+        recovery_source is not None or recovery_exec_main_status is not None
+    ):
+        return {
+            "status": "runtime_lifecycle_recovery_hold",
+            "raw_output": "not_returned",
+        }
     if phase == "recover":
         try:
             journal = _v2_load_journal(home)
@@ -10576,7 +10684,10 @@ def cutover(
                     "raw_output": "not_returned",
                 }
             return _v2_recover_phase(
-                home=home, plan_sha256=plan_sha256, systemctl=selected_systemctl
+                home=home,
+                plan_sha256=plan_sha256,
+                systemctl=selected_systemctl,
+                recovery=(recovery_source, recovery_exec_main_status),
             )
         except RuntimeLifecycleError as exc:
             return {"status": str(exc), "raw_output": "not_returned"}
@@ -10654,6 +10765,8 @@ def main() -> int:
         child.add_argument("--home", type=Path, required=True)
         if command == "cutover":
             child.add_argument("--plan-sha256")
+            child.add_argument("--recovery-source", type=Path)
+            child.add_argument("--recovery-exec-main-status", type=int)
             child.add_argument(
                 "--phase",
                 choices=("install", "activate", "observe", "commit", "recover"),
@@ -10664,6 +10777,8 @@ def main() -> int:
             home=arguments.home,
             plan_sha256=arguments.plan_sha256,
             phase=arguments.phase,
+            recovery_source=arguments.recovery_source,
+            recovery_exec_main_status=arguments.recovery_exec_main_status,
         )
     else:
         operation = {
