@@ -4868,8 +4868,7 @@ def _v2_phase_plan(
             if (
                 timer.get("UnitFileState") != "enabled"
                 or timer.get("ActiveState") != "active"
-                or legacy_timer.get("UnitFileState") != "disabled"
-                or legacy_timer.get("ActiveState") != "inactive"
+                or not _legacy_timer_is_stopped(legacy_timer)
                 or legacy_service.get("ActiveState") != "inactive"
             ):
                 raise _error("runtime_lifecycle_manager_state_changed")
@@ -5739,8 +5738,7 @@ def _v2_activate_phase(
         if (
             states[_NEW_TIMER].get("UnitFileState") != "enabled"
             or states[_NEW_TIMER].get("ActiveState") != "active"
-            or states[_LEGACY_TIMER].get("UnitFileState") != "disabled"
-            or states[_LEGACY_TIMER].get("ActiveState") != "inactive"
+            or not _legacy_timer_is_stopped(states[_LEGACY_TIMER])
             or states[_LEGACY_SERVICE].get("ActiveState") != "inactive"
         ):
             raise _error("runtime_lifecycle_manager_readback_failed")
@@ -5779,8 +5777,7 @@ def _v2_observe_phase(
             or identity.get("manifest_digest") != sealed["manifest_digest"]
             or states[_NEW_TIMER].get("UnitFileState") != "enabled"
             or states[_NEW_TIMER].get("ActiveState") != "active"
-            or states[_LEGACY_TIMER].get("UnitFileState") != "disabled"
-            or states[_LEGACY_TIMER].get("ActiveState") != "inactive"
+            or not _legacy_timer_is_stopped(states[_LEGACY_TIMER])
             or states[_LEGACY_SERVICE].get("ActiveState") != "inactive"
         ):
             raise _error("runtime_lifecycle_manager_state_changed")
@@ -7532,6 +7529,18 @@ def _state_is_enabled(state: Mapping[str, str]) -> bool:
 
 def _state_is_active(state: Mapping[str, str]) -> bool:
     return state.get("ActiveState") == "active"
+
+
+def _legacy_timer_is_stopped(state: Mapping[str, str]) -> bool:
+    return (
+        _valid_bound_unit_state(state)
+        and state.get("ActiveState") == "inactive"
+        and (
+            state.get("UnitFileState") == "disabled"
+            or state.get("LoadState") == "not-found"
+            and state.get("UnitFileState") == ""
+        )
+    )
 
 
 def _canary_show(systemctl: Systemctl, unit: str) -> Mapping[str, str]:
