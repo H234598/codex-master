@@ -4900,7 +4900,16 @@ def _v2_qualification_record_reason(plan: Mapping[str, object]) -> str | None:
     qualification = plan.get("qualification")
     if not isinstance(qualification, Mapping):
         return "runtime_lifecycle_qualification_record_invalid"
-    record = _read_canary_qualification_record(_canary_runtime_root())
+    target = plan.get("target")
+    if (
+        not isinstance(target, Mapping)
+        or not isinstance(target.get("realpath"), str)
+        or not os.path.isabs(target["realpath"])
+    ):
+        return "runtime_lifecycle_qualification_record_invalid"
+    record = _read_canary_qualification_record(
+        _canary_runtime_root(Path(target["realpath"]))
+    )
     if record is None:
         return "runtime_lifecycle_qualification_record_missing"
     issued_at = record.get("issued_at_unix_ns")
@@ -5041,7 +5050,7 @@ def plan(*, home: Path, systemctl: Systemctl | None = None) -> dict[str, object]
                     reason_codes.append(
                         "runtime_release_compatibility_profile_unvalidated"
                     )
-        qualification_root = _canary_runtime_root()
+        qualification_root = _canary_runtime_root(home)
         qualification_record = _read_canary_qualification_record(qualification_root)
         qualification: dict[str, object]
         if qualification_record is None:
@@ -9604,8 +9613,17 @@ def _valid_manager_api_contract(value: object) -> bool:
     )
 
 
-def _canary_runtime_root() -> Path:
-    return _user_runtime_directory() / _CANARY_RUNTIME_ROOT_NAME
+def _canary_runtime_root(home: Path) -> Path:
+    _validate_canary_home(home)
+    root = home / ".local" / "lib" / _CANARY_RUNTIME_ROOT_NAME
+    _bound_path_from_home(home, root)
+    _private_directory(root.parent)
+    try:
+        if root.lstat().st_dev != root.parent.lstat().st_dev:
+            raise _error("runtime_canary_root_invalid")
+    except FileNotFoundError:
+        pass
+    return root
 
 
 def _read_canary_qualification_record(root: Path) -> Mapping[str, object] | None:
@@ -10279,9 +10297,10 @@ def canary(
     qualification_input: (
         tuple[_CanaryImage, str, str, Mapping[str, object] | None] | None
     ) = None
-    root = _canary_runtime_root()
+    root = Path()
     try:
         _validate_canary_home(home)
+        root = _canary_runtime_root(home)
         repository = Path(__file__).resolve().parents[2]
         source_commit, source_tree_digest = _source_tree_binding(repository)
         with _canary_lock(root) as lock_fd:
