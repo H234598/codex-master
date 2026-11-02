@@ -4799,8 +4799,156 @@ def _v2_post_matches(
     return current_copy == recorded_copy
 
 
+def _v2_digest(value: object) -> str:
+    return hashlib.sha256(_d320_canonical_json(value)).hexdigest()
+
+
+def _v2_inputs(
+    home: Path,
+    payload: Mapping[str, object],
+    handoff: tuple[Path | None, str | None],
+) -> _BoundCutover:
+    source, owner_pin = handoff
+    if any(value is not None for value in handoff):
+        try:
+            if (
+                payload["phase"] not in {"ACTIVATED", "OBSERVED"}
+                or not isinstance(source, Path)
+                or not source.is_absolute()
+                or source.resolve(strict=True) != source
+                or not isinstance(owner_pin, str)
+                or re.fullmatch(_SHA256_HEX_PATTERN, owner_pin) is None
+            ):
+                raise _error("runtime_lifecycle_source_changed")
+            info = source.lstat()
+            owner = list(_source_tree_binding(Path(__file__).resolve().parents[2]))
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o7022
+                or _v2_digest(owner) != owner_pin
+            ):
+                raise _error("runtime_lifecycle_source_changed")
+            bound = _bind_cutover_inputs(home, source=source)
+            if (
+                bound.source_commit != payload["source"]["commit"]
+                or bound.source_tree_digest != payload["source"]["tree_sha256"]
+            ):
+                raise _error("runtime_lifecycle_source_changed")
+        except (OSError, ValueError, RuntimeLifecycleError) as exc:
+            raise _error("runtime_lifecycle_source_changed") from exc
+    else:
+        bound = _bind_cutover_inputs(home)
+    if any(value is not None for value in handoff) and not _v2_completed_activation(
+        payload
+    ):
+        raise _error("runtime_lifecycle_qualification_record_unverified")
+    reason = _v2_qualification_record_reason(payload["plan"], payload)
+    if reason is not None:
+        raise _error(reason)
+    return bound
+
+
+def _v2_completed_activation(payload: Mapping[str, object] | None) -> bool:
+    if payload is None or payload["phase"] not in {"ACTIVATED", "OBSERVED"}:
+        return False
+    sealed = payload["sealed"]
+    home = Path(payload["target"]["realpath"])
+    # The closed loader already binds publication path and digest to the seal.
+    prior = next(
+        (
+            step["sequence"]
+            for step in payload["steps"]
+            if step["action"] == "generation_published" and step["phase"] == "INSTALLED"
+        ),
+        0,
+    )
+    if not prior:
+        return False
+    for unit, operation, arguments in (
+        (_NEW_SERVICE, "manager_reload_before_activation", ["daemon-reload"]),
+        (_NEW_TIMER, "new_timer_enable", ["enable", "--now", _NEW_TIMER]),
+    ):
+        digest = _v2_digest({"operation": operation, "arguments": arguments})
+        sequence = next(
+            (
+                step["sequence"]
+                for step in payload["steps"]
+                if step["phase"] == "ACTIVATED"
+                and step["action"] == "manager_mutation"
+                and step["effect"] == "manager:" + unit
+                and step["sha256"] == digest
+            ),
+            0,
+        )
+        if sequence <= prior:
+            return False
+        prior = sequence
+    if _target_binding(home) != payload["target"]:
+        raise _error("runtime_lifecycle_target_changed")
+    identity = _runtime_identity(home / ".local/lib/the-hive-runtime")
+    if (
+        not isinstance(identity, Mapping)
+        or any(
+            identity.get(key) != sealed[key]
+            for key in ("generation", "manifest_digest")
+        )
+        or sealed["generation"] != payload["source"]["commit"]
+    ):
+        raise _error("runtime_lifecycle_installed_runtime_changed")
+    _v2_verify_installed_outputs(home, sealed)
+    _verify_root_hook_effect_receipt(
+        generation=sealed["generation"], manifest_digest=sealed["manifest_digest"]
+    )
+    _verify_plugin_release_effect_receipt(
+        home=home,
+        generation=sealed["generation"],
+        manifest_digest=sealed["manifest_digest"],
+    )
+    return True
+
+
+def _v2_manager_contract_matches(
+    expected: object, current: object, historical: bool
+) -> bool:
+    for value in (expected, current):
+        if (
+            not isinstance(value, Mapping)
+            or not isinstance(value.get("unit_paths"), list)
+            or value.get("unit_path_sha256") != _v2_digest(value["unit_paths"])
+        ):
+            return False
+    if expected == current or not historical:
+        return expected == current
+    generators = {
+        str(_user_runtime_directory() / "systemd" / name)
+        for name in ("generator", "generator.early", "generator.late")
+    }
+    views = []
+    for value in (expected, current):
+        view = dict(value)
+        view.pop("unit_path_sha256")
+        view["unit_paths"] = [dict(row) for row in value["unit_paths"]]
+        for row in view["unit_paths"]:
+            if (
+                row.get("path") in generators
+                and type(row.get("ino")) is int
+                and row["ino"] > 0
+                and row.get("uid") == os.geteuid()
+                and type(row.get("mode")) is int
+                and not row["mode"] & 0o7022
+            ):
+                row.pop("ino")
+        views.append(view)
+    return views[0] == views[1]
+
+
 def _v2_phase_plan(
-    *, home: Path, journal: D320CutoverJournalV2, systemctl: Systemctl
+    *,
+    home: Path,
+    journal: D320CutoverJournalV2,
+    systemctl: Systemctl,
+    handoff=(None, None),
 ) -> dict[str, object]:
     payload = journal.payload
     phase = str(payload["phase"])
@@ -4827,7 +4975,7 @@ def _v2_phase_plan(
             or stat.S_IMODE(target.st_mode) != binding["mode"]
         ):
             raise _error("runtime_lifecycle_target_changed")
-        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        bound = _bind_systemd_states(_v2_inputs(home, payload, handoff), systemctl)
         if (
             bound.source_commit != payload["source"]["commit"]
             or bound.source_tree_digest != payload["source"]["tree_sha256"]
@@ -4896,7 +5044,9 @@ def _v2_phase_plan(
     }
 
 
-def _v2_qualification_record_reason(plan: Mapping[str, object]) -> str | None:
+def _v2_qualification_record_reason(
+    plan: Mapping[str, object], journal=None
+) -> str | None:
     qualification = plan.get("qualification")
     if not isinstance(qualification, Mapping):
         return "runtime_lifecycle_qualification_record_invalid"
@@ -4923,7 +5073,8 @@ def _v2_qualification_record_reason(plan: Mapping[str, object]) -> str | None:
     now = time.time_ns()
     if issued_at > now:
         return "runtime_lifecycle_qualification_record_invalid"
-    if now >= issued_at + _OWNER_RECEIPT_FRESHNESS_NS:
+    historical = _v2_completed_activation(journal)
+    if not historical and now >= issued_at + _OWNER_RECEIPT_FRESHNESS_NS:
         return "runtime_lifecycle_qualification_record_expired"
     if record.get("status") != "qualified":
         return "runtime_lifecycle_qualification_record_unqualified"
@@ -4963,7 +5114,11 @@ def _v2_qualification_record_reason(plan: Mapping[str, object]) -> str | None:
         or bindings.get("target") != plan.get("target")
         or bindings.get("manager_states_sha256")
         != _manager_states_digest(plan.get("manager_states"))
-        or bindings.get("manager_api_contract") != _manager_api_contract_snapshot()
+        or not _v2_manager_contract_matches(
+            bindings.get("manager_api_contract"),
+            _manager_api_contract_snapshot(),
+            historical,
+        )
     ):
         return "runtime_lifecycle_qualification_record_changed"
     candidate_manifest = bindings.get("candidate_manifest_digest")
@@ -4981,17 +5136,28 @@ def _v2_qualification_record_reason(plan: Mapping[str, object]) -> str | None:
     return None
 
 
-def plan(*, home: Path, systemctl: Systemctl | None = None) -> dict[str, object]:
+def plan(
+    *,
+    home: Path,
+    systemctl: Systemctl | None = None,
+    continuation_source: Path | None = None,
+    continuation_owner_sha256: str | None = None,
+) -> dict[str, object]:
     """Return a deterministic, read-only binding of the currently known inputs."""
 
     try:
         existing = _v2_load_journal(home)
+        handoff = (continuation_source, continuation_owner_sha256)
+        if any(value is not None for value in handoff):
+            if existing is None:
+                raise _error("runtime_lifecycle_source_changed")
+            _v2_inputs(home, existing.payload, handoff)
         if existing is not None and existing.payload["phase"] not in {
             "COMMITTED",
             "ROLLED_BACK",
         }:
             qualification_reason = _v2_qualification_record_reason(
-                existing.payload["plan"]
+                existing.payload["plan"], existing.payload
             )
             if qualification_reason is not None:
                 return {
@@ -5004,6 +5170,7 @@ def plan(*, home: Path, systemctl: Systemctl | None = None) -> dict[str, object]
                 home=home,
                 journal=existing,
                 systemctl=systemctl or _systemctl_default,
+                handoff=handoff,
             )
         bound = _bind_systemd_states(
             _bind_cutover_inputs(home), systemctl or _systemctl_default
@@ -5148,6 +5315,14 @@ def plan(*, home: Path, systemctl: Systemctl | None = None) -> dict[str, object]
             "raw_output": "not_returned",
         }
     except RuntimeLifecycleError as exc:
+        if str(exc) == "runtime_lifecycle_source_changed" and (
+            continuation_source is not None or continuation_owner_sha256 is not None
+        ):
+            return {
+                "status": "runtime_lifecycle_plan_blocked",
+                "reason_codes": [str(exc)],
+                "raw_output": "not_returned",
+            }
         return {"status": str(exc), "raw_output": "not_returned"}
 
 
@@ -5760,7 +5935,7 @@ def _v2_activate_phase(
 
 
 def _v2_observe_phase(
-    *, home: Path, plan_sha256: str, systemctl: Systemctl
+    *, home: Path, plan_sha256: str, systemctl: Systemctl, handoff=(None, None)
 ) -> dict[str, object]:
     _v2_require_existing_lifecycle_lock(home)
     with _lifecycle_lock(home) as lease:
@@ -5770,7 +5945,7 @@ def _v2_observe_phase(
         payload = journal.payload
         if payload["plan_sha256"] != plan_sha256:
             raise _error("runtime_lifecycle_plan_changed")
-        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        bound = _bind_systemd_states(_v2_inputs(home, payload, handoff), systemctl)
         if (
             bound.source_commit != payload["source"]["commit"]
             or bound.source_tree_digest != payload["source"]["tree_sha256"]
@@ -5792,7 +5967,7 @@ def _v2_observe_phase(
             raise _error("runtime_lifecycle_manager_state_changed")
         _v2_verify_installed_outputs(home, sealed)
         _observe_argumentless_installed_probe(home)
-        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        bound = _bind_systemd_states(_v2_inputs(home, payload, handoff), systemctl)
         _v2_verify_installed_outputs(home, sealed)
         post = _v2_capture_post(
             home, payload["source"]["commit"], payload["stage_name"], bound
@@ -5836,7 +6011,7 @@ def _v2_observe_phase(
 
 
 def _v2_commit_phase(
-    *, home: Path, plan_sha256: str, systemctl: Systemctl
+    *, home: Path, plan_sha256: str, systemctl: Systemctl, handoff=(None, None)
 ) -> dict[str, object]:
     _v2_require_existing_lifecycle_lock(home)
     with _lifecycle_lock(home) as lease:
@@ -5846,7 +6021,7 @@ def _v2_commit_phase(
         payload = journal.payload
         if payload["plan_sha256"] != plan_sha256:
             raise _error("runtime_lifecycle_plan_changed")
-        bound = _bind_systemd_states(_bind_cutover_inputs(home), systemctl)
+        bound = _bind_systemd_states(_v2_inputs(home, payload, handoff), systemctl)
         if (
             bound.source_commit != payload["source"]["commit"]
             or bound.source_tree_digest != payload["source"]["tree_sha256"]
@@ -5890,6 +6065,7 @@ def _v2_commit_phase(
                 digest=plugin_receipt_digest,
             )
             journal_path = str(_v2_journal_path(home))
+            _v2_inputs(home, journal.payload, handoff)
             journal = _v2_transition(
                 home,
                 journal,
@@ -10649,6 +10825,8 @@ def cutover(
     systemctl: Systemctl | None = None,
     recovery_source: Path | None = None,
     recovery_exec_main_status: int | None = None,
+    continuation_source: Path | None = None,
+    continuation_owner_sha256: str | None = None,
 ) -> dict[str, object]:
     """Consume only a fresh public plan before entering any transaction body."""
 
@@ -10663,6 +10841,22 @@ def cutover(
             "raw_output": "not_returned",
         }
     selected_systemctl = systemctl or _systemctl_default
+    handoff = (continuation_source, continuation_owner_sha256)
+    options = {}
+    if any(value is not None for value in handoff):
+        if (
+            phase not in {"observe", "commit"}
+            or recovery_source is not None
+            or recovery_exec_main_status is not None
+        ):
+            return {
+                "status": "runtime_lifecycle_source_changed",
+                "raw_output": "not_returned",
+            }
+        options = {
+            "continuation_source": continuation_source,
+            "continuation_owner_sha256": continuation_owner_sha256,
+        }
     if phase != "recover" and (
         recovery_source is not None or recovery_exec_main_status is not None
     ):
@@ -10691,7 +10885,14 @@ def cutover(
             )
         except RuntimeLifecycleError as exc:
             return {"status": str(exc), "raw_output": "not_returned"}
-    current = plan(home=home, systemctl=selected_systemctl)
+    current = plan(home=home, systemctl=selected_systemctl, **options)
+    failure = current.get("reason_codes", [current.get("status")])
+    if failure and failure[0] in {
+        "runtime_lifecycle_source_changed",
+        "runtime_lifecycle_root_hook_effect_unverified",
+        "runtime_lifecycle_plugin_effect_unverified",
+    }:
+        return {"status": failure[0], "raw_output": "not_returned"}
     if current.get("plan_sha256") != plan_sha256:
         return {
             "status": "runtime_lifecycle_plan_changed",
@@ -10726,12 +10927,14 @@ def cutover(
                 home=home,
                 plan_sha256=plan_sha256,
                 systemctl=selected_systemctl,
+                handoff=handoff,
             )
         if phase == "commit":
             return _v2_commit_phase(
                 home=home,
                 plan_sha256=plan_sha256,
                 systemctl=selected_systemctl,
+                handoff=handoff,
             )
         return {
             "status": "runtime_lifecycle_phase_unavailable",
@@ -10763,6 +10966,9 @@ def main() -> int:
     for command in ("canary", "cutover", "plan", "status", "verify"):
         child = commands.add_parser(command)
         child.add_argument("--home", type=Path, required=True)
+        if command in {"cutover", "plan"}:
+            child.add_argument("--continuation-source", type=Path)
+            child.add_argument("--continuation-owner-sha256")
         if command == "cutover":
             child.add_argument("--plan-sha256")
             child.add_argument("--recovery-source", type=Path)
@@ -10779,6 +10985,8 @@ def main() -> int:
             phase=arguments.phase,
             recovery_source=arguments.recovery_source,
             recovery_exec_main_status=arguments.recovery_exec_main_status,
+            continuation_source=arguments.continuation_source,
+            continuation_owner_sha256=arguments.continuation_owner_sha256,
         )
     else:
         operation = {
@@ -10787,7 +10995,15 @@ def main() -> int:
             "status": status,
             "verify": verify,
         }[arguments.command]
-        result = operation(home=arguments.home)
+        options = (
+            {
+                "continuation_source": arguments.continuation_source,
+                "continuation_owner_sha256": arguments.continuation_owner_sha256,
+            }
+            if arguments.command == "plan"
+            else {}
+        )
+        result = operation(home=arguments.home, **options)
     print(json.dumps(result, sort_keys=True))
     status_value = result.get("status")
     if arguments.command == "plan":
