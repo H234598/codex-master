@@ -430,7 +430,10 @@ def _d320_json_value(
                 elif not isinstance(key, str):
                     _d320_fail("d320_json_type_forbidden")
                 stack.append(("mapping", iterator, depth))
-                stack.append(("value", child, int(depth) + 1))
+                if semantic and key == "bytes_b64" and isinstance(child, str):
+                    _d320_text(child, minimum=0, maximum=_D320_MAX_ENVELOPE_BYTES)
+                else:
+                    stack.append(("value", child, int(depth) + 1))
                 continue
             if action == "list":
                 iterator, depth = parts
@@ -483,6 +486,15 @@ def _d320_normalize_json_value(
     """Copy one untrusted JSON graph while applying its cumulative bounds."""
 
     active: set[int] = set()
+    text_bytes = 0
+
+    def text(item: object, *, maximum: int = 4096) -> str:
+        nonlocal text_bytes
+        result = _d320_text(item, minimum=0, maximum=maximum)
+        text_bytes += len(result.encode("utf-8"))
+        if text_bytes > _D320_MAX_ENVELOPE_BYTES:
+            _d320_fail("d320_envelope_too_large")
+        return result
 
     def normalize(item: object, depth: int) -> object:
         if item is None or isinstance(item, bool) or isinstance(item, int):
@@ -490,7 +502,7 @@ def _d320_normalize_json_value(
         if isinstance(item, float):
             _d320_fail("d320_float_forbidden")
         if isinstance(item, str):
-            return _d320_text(item, minimum=0)
+            return text(item)
         if not isinstance(item, (list, Mapping)):
             _d320_fail("d320_json_type_forbidden")
         if depth > _D320_MAX_CONTAINER_DEPTH:
@@ -520,10 +532,14 @@ def _d320_normalize_json_value(
                 except StopIteration:
                     break
                 _d320_visit_json_entry(budget)
-                key = _d320_text(key, minimum=0)
+                key = text(key)
                 if key in result:
                     _d320_fail("d320_duplicate_json_key")
-                result[key] = normalize(child, depth + 1)
+                result[key] = (
+                    text(child, maximum=_D320_MAX_ENVELOPE_BYTES)
+                    if key == "bytes_b64" and isinstance(child, str)
+                    else normalize(child, depth + 1)
+                )
             return result
         finally:
             active.remove(identifier)
@@ -7778,7 +7794,9 @@ def _canary_evidence_result(
 
 
 def _canary_runtime_qualification_status(
-    *, image: _CanaryImage, manager_state: Mapping[str, str],
+    *,
+    image: _CanaryImage,
+    manager_state: Mapping[str, str],
     payload: Mapping[str, object] | None = None,
 ) -> str:
     """Qualify only strict service-green or exact pilot-blocked v4 evidence."""
@@ -7795,7 +7813,10 @@ def _canary_runtime_qualification_status(
     service_checks = payload.get("service_checks")
     commands = payload.get("commands")
     pilot = payload.get("global_pilot_readiness")
-    if not all(isinstance(value, Mapping) for value in (checks, service_checks, commands, pilot)):
+    if not all(
+        isinstance(value, Mapping)
+        for value in (checks, service_checks, commands, pilot)
+    ):
         return "unknown"
     expected_checks = {
         "runtime_layout": True,
@@ -7832,6 +7853,7 @@ def _canary_runtime_features_qualification_status(
     try:
         payload = payload if payload is not None else _canary_health_payload(image)
         from the_hive.hive.hourly_probe import valid_probe_record
+
         if not valid_probe_record(payload) or payload.get("schema_version") != 4:
             return "fail"
         checks = payload.get("checks")
@@ -7848,7 +7870,8 @@ def _canary_runtime_features_qualification_status(
             or commands.get("runtime_status") is not True
             or _canary_diagnostic_value(
                 diagnostics.get("runtime_status"), command_ready=True
-            ) != "ok"
+            )
+            != "ok"
         ):
             return "unknown"
     except (RuntimeLifecycleError, D320CutoverJournalError):
@@ -7871,14 +7894,18 @@ def _canary_qualification_diagnostic(
     commands = payload.get("commands")
     service_checks = payload.get("service_checks")
     pilot = payload.get("global_pilot_readiness")
-    if not all(isinstance(value, Mapping) for value in (checks, commands, service_checks, pilot)):
+    if not all(
+        isinstance(value, Mapping)
+        for value in (checks, commands, service_checks, pilot)
+    ):
         raise _error("runtime_canary_evidence_invalid")
     failed_checks = sorted(
         name for name in check_names if name in checks and checks[name] is not True
     )
     missing_checks = sorted(name for name in check_names if name not in checks)
     failed_commands = sorted(
-        name for name in command_names
+        name
+        for name in command_names
         if name in commands and commands[name] is not True
     )
     missing_commands = sorted(name for name in command_names if name not in commands)
@@ -8887,7 +8914,14 @@ def _parse_health(
         value.get("schema_version") == 4
         and isinstance(service_checks, Mapping)
         and frozenset(service_checks)
-        == {"runtime_surface", "configuration", "repository", "principals", "state", "usage"}
+        == {
+            "runtime_surface",
+            "configuration",
+            "repository",
+            "principals",
+            "state",
+            "usage",
+        }
         and all(item is True for item in service_checks.values())
     )
     service_alarm_cleared = (
@@ -8897,7 +8931,14 @@ def _parse_health(
         and service_alarm.get("reason_codes") == []
     )
     gate_allowed = probe_spawn_gate(value).get("allowed") is True
-    return True, legacy_green, legacy_alarm, service_green, service_alarm_cleared, gate_allowed
+    return (
+        True,
+        legacy_green,
+        legacy_alarm,
+        service_green,
+        service_alarm_cleared,
+        gate_allowed,
+    )
 
 
 def _runtime_identity(release_root: Path) -> dict[str, object] | None:
@@ -9168,9 +9209,7 @@ def _observe_argumentless_installed_probe(home: Path) -> None:
             else None
         )
         expected_returncode = (
-            0
-            if probe_spawn_gate(health, now=finished_at).get("allowed") is True
-            else 1
+            0 if probe_spawn_gate(health, now=finished_at).get("allowed") is True else 1
         )
         if (
             not valid_probe_record(health)
@@ -9389,7 +9428,14 @@ def verify(
         and not _state_is_active(old_timer_state)
         and not _state_is_active(old_service_state)
     )
-    health_valid, health_v3_green, legacy_alarm_cleared, service_green, service_alarm_cleared, gate_allowed = _parse_health(state_root)
+    (
+        health_valid,
+        health_v3_green,
+        legacy_alarm_cleared,
+        service_green,
+        service_alarm_cleared,
+        gate_allowed,
+    ) = _parse_health(state_root)
     v2 = _d296_and_v2_accepted()
     enabled, active = _state_is_enabled(timer_state), _state_is_active(timer_state)
     observed = _observation_matches(home=home, state_root=state_root, identity=identity)
@@ -9425,7 +9471,9 @@ def verify(
         "runtime_identity": identity
         or {"generation": None, "manifest_digest": None, "consumer_pin": False},
         "checks": checks,
-        "product_status": "service_ready_request_required" if service_ready else "blocked",
+        "product_status": "service_ready_request_required"
+        if service_ready
+        else "blocked",
         "product_checks": product_checks,
         "legacy_product_checks": legacy_product_checks,
         "raw_output": "not_returned",

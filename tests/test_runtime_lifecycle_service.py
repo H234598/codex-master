@@ -208,8 +208,16 @@ def _canary_health(code: str) -> bytes:
                     "usage": False,
                 },
                 "service_alarm": {
-                    "scope": "hive", "status": "active",
-                    "reason_codes": ["configuration", "principals", "repository", "state", "usage", "alarm_owner_unavailable"],
+                    "scope": "hive",
+                    "status": "active",
+                    "reason_codes": [
+                        "configuration",
+                        "principals",
+                        "repository",
+                        "state",
+                        "usage",
+                        "alarm_owner_unavailable",
+                    ],
                     "owner": None,
                 },
                 "commands": {
@@ -225,7 +233,11 @@ def _canary_health(code: str) -> bytes:
                 "alarm": {
                     "scope": "hive",
                     "status": "active",
-                    "reason_codes": ["hive_doctor", "hive_runtime", "alarm_owner_unavailable"],
+                    "reason_codes": [
+                        "hive_doctor",
+                        "hive_runtime",
+                        "alarm_owner_unavailable",
+                    ],
                     "owner": None,
                 },
                 "global_pilot_readiness": {
@@ -279,11 +291,17 @@ def _canary_green_health() -> bytes:
     }
     payload["service_checks"] = {name: True for name in payload["service_checks"]}
     payload["service_alarm"] = {
-        **payload["alarm"], "status": "cleared", "reason_codes": []
+        **payload["alarm"],
+        "status": "cleared",
+        "reason_codes": [],
     }
     payload["global_pilot_readiness"] = {
-        "schema_version": 1, "pilot": "ready", "generation_id": "1" * 32,
-        "freshness": "fresh", "candidate_count": 1, "reason_codes": [],
+        "schema_version": 1,
+        "pilot": "ready",
+        "generation_id": "1" * 32,
+        "freshness": "fresh",
+        "candidate_count": 1,
+        "reason_codes": [],
         "raw_output": "not_returned",
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
@@ -317,28 +335,54 @@ def _canary_isolated_health() -> bytes:
     }
     payload["service_checks"]["usage"] = False
     payload["service_alarm"] = {
-        **payload["alarm"], "status": "active", "reason_codes": ["usage"]
+        **payload["alarm"],
+        "status": "active",
+        "reason_codes": ["usage"],
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 
-def test_health_v4_parse_keeps_service_readiness_separate_from_legacy_authority(tmp_path):
+def test_health_v4_parse_keeps_service_readiness_separate_from_legacy_authority(
+    tmp_path,
+):
     payload = json.loads(_canary_green_health())
     payload["checked_at"] = datetime.now(UTC).isoformat()
     health = tmp_path / "hive-hourly-health.json"
     health.write_text(json.dumps(payload))
     health.chmod(0o600)
-    assert runtime_lifecycle._parse_health(tmp_path) == (True, False, False, True, True, True)
+    assert runtime_lifecycle._parse_health(tmp_path) == (
+        True,
+        False,
+        False,
+        True,
+        True,
+        True,
+    )
     legacy = dict(payload)
     legacy["schema_version"] = 3
     del legacy["service_checks"]
     del legacy["service_alarm"]
     health.write_text(json.dumps(legacy))
-    assert runtime_lifecycle._parse_health(tmp_path) == (True, False, False, False, False, False)
-    with pytest.raises(runtime_lifecycle.RuntimeLifecycleError, match="runtime_canary_evidence_invalid"):
-        runtime_lifecycle._canary_evidence_result(image=object(), manager_state={
-            "ActiveState": "active", "Result": "success", "ExecMainStatus": "0"
-        }, payload=legacy)
+    assert runtime_lifecycle._parse_health(tmp_path) == (
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError, match="runtime_canary_evidence_invalid"
+    ):
+        runtime_lifecycle._canary_evidence_result(
+            image=object(),
+            manager_state={
+                "ActiveState": "active",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+            payload=legacy,
+        )
 
 
 def _fake_canary_image(root: Path, code: str) -> object:
@@ -1775,8 +1819,12 @@ def test_canary_accepts_a_valid_fail_closed_live_usage_state(tmp_path: Path) -> 
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
     health.chmod(0o600)
-    with pytest.raises(runtime_lifecycle.RuntimeLifecycleError, match="runtime_canary_evidence_invalid"):
-        runtime_lifecycle._canary_evidence_result(image=image, manager_state=manager_state)
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError, match="runtime_canary_evidence_invalid"
+    ):
+        runtime_lifecycle._canary_evidence_result(
+            image=image, manager_state=manager_state
+        )
     assert (
         runtime_lifecycle._canary_runtime_qualification_status(
             image=image, manager_state=manager_state
@@ -2764,6 +2812,8 @@ def test_public_install_rejects_unavailable_or_untrusted_lifecycle_lock(
     "crash_point",
     [
         None,
+        "long_existing_wrappers",
+        "long_existing_wrappers_recovery",
         "after_setup",
         "actual_preseal",
         "before_setup_callback",
@@ -2789,6 +2839,19 @@ def test_public_install_persists_intent_before_installer_effects(
     crash_point: str | None,
 ) -> None:
     bound, old_states = _bound_failure_fixture(tmp_path)
+    if crash_point in {"long_existing_wrappers", "long_existing_wrappers_recovery"}:
+        originals = []
+        for path, content, mode in bound.files:
+            if mode == 0o755 and content is not None:
+                content += b"#" + b"x" * 19_278 + b"\n"
+                path.write_bytes(content)
+            originals.append((path, content, mode))
+        bound = replace(bound, files=tuple(originals))
+        crash_point = (
+            None
+            if crash_point == "long_existing_wrappers"
+            else "after_manager_reload_before_activation"
+        )
     home = bound.home
     monkeypatch.setattr(
         runtime_lifecycle,
@@ -4661,7 +4724,9 @@ def test_verify_separates_green_runtime_from_blocked_product_authority(
     )
     monkeypatch.setattr(runtime_lifecycle, "_d296_and_v2_accepted", lambda: True)
     monkeypatch.setattr(
-        runtime_lifecycle, "_parse_health", lambda _root: (True, False, False, False, False, False)
+        runtime_lifecycle,
+        "_parse_health",
+        lambda _root: (True, False, False, False, False, False),
     )
     monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: False)
     monkeypatch.setattr(
@@ -4693,7 +4758,8 @@ def test_verify_separates_green_runtime_from_blocked_product_authority(
         "probe_gate_allowed": False,
     }
     assert result["legacy_product_checks"] == {
-        "health_v3_green": False, "queen_alarm_cleared": False
+        "health_v3_green": False,
+        "queen_alarm_cleared": False,
     }
 
 
@@ -4762,7 +4828,12 @@ def test_observation_receipt_accepts_only_a_fresh_consistent_launcher_result(
 
     monkeypatch.setattr(runtime_lifecycle, "run_bounded", run_service_green)
     runtime_lifecycle._observe_argumentless_installed_probe(home)
-    assert runtime_lifecycle._observation_matches(home=home, state_root=state_root, identity=identity) is True
+    assert (
+        runtime_lifecycle._observation_matches(
+            home=home, state_root=state_root, identity=identity
+        )
+        is True
+    )
 
     def run_inconsistent(arguments, **_kwargs):
         calls.append(tuple(arguments))
@@ -4783,12 +4854,22 @@ def test_observation_receipt_accepts_only_a_fresh_consistent_launcher_result(
     receipt = state_root / "runtime-lifecycle-probe-observation.json"
     before = receipt.read_bytes()
     for fault in ("stale", "alarm_owner", "red_exit_zero"):
+
         def run_invalid(arguments, **_kwargs):
-            payload = json.loads(_canary_isolated_health() if fault == "red_exit_zero" else _canary_green_health())
-            payload["checked_at"] = (datetime.now(UTC) - timedelta(minutes=1) if fault == "stale" else datetime.now(UTC)).isoformat()
+            payload = json.loads(
+                _canary_isolated_health()
+                if fault == "red_exit_zero"
+                else _canary_green_health()
+            )
+            payload["checked_at"] = (
+                datetime.now(UTC) - timedelta(minutes=1)
+                if fault == "stale"
+                else datetime.now(UTC)
+            ).isoformat()
             if fault == "alarm_owner":
                 payload["service_alarm"]["owner"] = {
-                    **payload["service_alarm"]["owner"], "principal_id": "foreign-queen"
+                    **payload["service_alarm"]["owner"],
+                    "principal_id": "foreign-queen",
                 }
             health = state_root / "hive-hourly-health.json"
             health.write_text(json.dumps(payload), encoding="utf-8")
@@ -4796,7 +4877,10 @@ def test_observation_receipt_accepts_only_a_fresh_consistent_launcher_result(
             return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
         monkeypatch.setattr(runtime_lifecycle, "run_bounded", run_invalid)
-        with pytest.raises(runtime_lifecycle.RuntimeLifecycleError, match="^runtime_lifecycle_probe_result_invalid$"):
+        with pytest.raises(
+            runtime_lifecycle.RuntimeLifecycleError,
+            match="^runtime_lifecycle_probe_result_invalid$",
+        ):
             runtime_lifecycle._observe_argumentless_installed_probe(home)
         assert receipt.read_bytes() == before
 
@@ -6099,6 +6183,100 @@ def test_d332_evidence_blob_and_snapshot_are_purely_validated() -> None:
     absent["size"] = 0
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.ByteSnapshotV1.from_mapping(absent)
+
+
+@pytest.mark.parametrize("size", (3072, 3073, 19_278, 1_048_576))
+@pytest.mark.parametrize("kind", ("blob", "snapshot"))
+@pytest.mark.parametrize("direct_bytes", (False, True))
+def test_journal_binary_fields_round_trip_beyond_generic_text_bound(
+    size: int, kind: str, direct_bytes: bool
+) -> None:
+    content = b"x" * size
+    value = (
+        _d332_blob("blob", content)
+        if kind == "blob"
+        else _d332_snapshot("legacy_launcher", content)
+    )
+    carrier_type = (
+        runtime_lifecycle.EvidenceBlobV1
+        if kind == "blob"
+        else runtime_lifecycle.ByteSnapshotV1
+    )
+    carrier = (
+        carrier_type(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+        if direct_bytes
+        else carrier_type.from_mapping(value)
+    )
+
+    assert carrier.to_mapping() == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        {"ordinary": "x" * 4097},
+        {"x" * 4097: "value"},
+        {"bytes_b64": ["x" * 4097]},
+        {"bytes_b64": {"nested": "x" * 4097}},
+    ),
+)
+@pytest.mark.parametrize("walker", ("semantic", "canonical"))
+def test_journal_binary_exception_does_not_expand_other_text_fields(
+    value: object, walker: str
+) -> None:
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError, match="d320_text_invalid"
+    ):
+        if walker == "semantic":
+            runtime_lifecycle._d320_json_value(value)
+        else:
+            runtime_lifecycle._d320_canonical_json(value)
+
+
+def test_journal_binary_text_budget_counts_repeated_references_before_dump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repeated = {"bytes_b64": base64.b64encode(b"x" * 1_048_576).decode("ascii")}
+
+    def reject_dump(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("oversized binary graph reached serialization")
+
+    monkeypatch.setattr(runtime_lifecycle.json, "dumps", reject_dump)
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError, match="d320_envelope_too_large"
+    ):
+        runtime_lifecycle._d320_canonical_json([repeated] * 4)
+
+
+def test_journal_v1_large_snapshot_round_trip() -> None:
+    payload = _d332_payload()
+    precutover = payload["precutover"]
+    assert isinstance(precutover, dict)
+    precutover["mcp_launcher"] = _d332_snapshot("mcp_launcher", b"x" * 19_278)
+    journal = runtime_lifecycle.D320CutoverJournalV1.from_payload(payload)
+
+    assert (
+        runtime_lifecycle.D320CutoverJournalV1.from_bytes(journal.to_bytes()) == journal
+    )
+
+
+def test_journal_binary_blob_limit_remains_enforced() -> None:
+    value = _d332_blob("blob", b"x" * 1_048_577)
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError, match="d320_integer_out_of_bounds"
+    ):
+        runtime_lifecycle.EvidenceBlobV1.from_mapping(value)
+
+
+def test_journal_binary_snapshot_aggregate_limit_remains_enforced() -> None:
+    value = _d332_snapshot("legacy_launcher", b"x")
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError,
+        match="d320_evidence_aggregate_too_large",
+    ):
+        runtime_lifecycle._d320_validate_snapshot(
+            value, aggregate=[runtime_lifecycle._D320_MAX_AGGREGATE_BYTES]
+        )
 
 
 def test_d332_transition_and_step_require_exact_phase_data() -> None:
@@ -7492,7 +7670,12 @@ def test_d336_envelope_limit_applies_to_factory_and_direct_constructor() -> None
         index = int(step["index"])
         for field in ("preconditions", "readback", "adapter_receipt", "inverse"):
             step[field] = _d332_blob(f"{field}-{index}", raw)
-    payload_bytes = runtime_lifecycle._d320_canonical_json(payload)
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError,
+        match="d320_envelope_too_large",
+    ):
+        runtime_lifecycle._d320_canonical_json(payload)
+    payload_bytes = runtime_lifecycle._d320_syntax_json(payload)
     assert (
         len(payload_bytes) + runtime_lifecycle._D320_ENVELOPE_FIXED_BYTES
         > runtime_lifecycle._D320_MAX_ENVELOPE_BYTES
@@ -9141,8 +9324,7 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
         )
         assert blocked["status"] == "runtime_lifecycle_plan_blocked", blocked
         assert (
-            "runtime_lifecycle_qualification_record_missing"
-            in blocked["reason_codes"]
+            "runtime_lifecycle_qualification_record_missing" in blocked["reason_codes"]
         )
         return
     assert canary_result["status"] == "runtime_canary_green", canary_result
