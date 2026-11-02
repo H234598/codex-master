@@ -2814,6 +2814,8 @@ def test_public_install_rejects_unavailable_or_untrusted_lifecycle_lock(
         None,
         "long_existing_wrappers",
         "long_existing_wrappers_recovery",
+        "shared_config_ancestors",
+        "shared_config_ancestors_recovery",
         "after_setup",
         "actual_preseal",
         "before_setup_callback",
@@ -2839,6 +2841,17 @@ def test_public_install_persists_intent_before_installer_effects(
     crash_point: str | None,
 ) -> None:
     bound, old_states = _bound_failure_fixture(tmp_path)
+    shared_config_identities = {}
+    if crash_point in {"shared_config_ancestors", "shared_config_ancestors_recovery"}:
+        for directory in (bound.home / ".config", bound.home / ".config/systemd"):
+            directory.chmod(0o755)
+            info = directory.stat()
+            shared_config_identities[directory] = (info.st_dev, info.st_ino, 0o755)
+        crash_point = (
+            None
+            if crash_point == "shared_config_ancestors"
+            else "after_manager_reload_before_activation"
+        )
     if crash_point in {"long_existing_wrappers", "long_existing_wrappers_recovery"}:
         originals = []
         for path, content, mode in bound.files:
@@ -3621,6 +3634,9 @@ def test_public_install_persists_intent_before_installer_effects(
         assert states == old_states | {
             unit: states[unit] for unit in runtime_lifecycle._PRICING_UNITS
         } | {foreign_unit: foreign_state}
+        for directory, identity in shared_config_identities.items():
+            info = directory.stat()
+            assert (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)) == identity
         return
     assert activation["status"] == "runtime_lifecycle_activation_complete", activation
     assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "ACTIVATED"
@@ -3741,6 +3757,9 @@ def test_public_install_persists_intent_before_installer_effects(
         )
         return
     assert committed["status"] == "runtime_lifecycle_commit_complete", committed
+    for directory, identity in shared_config_identities.items():
+        info = directory.stat()
+        assert (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)) == identity
     assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "COMMITTED"
     committed_steps = runtime_lifecycle._v2_load_journal(home).payload["steps"]
     assert (
@@ -9017,6 +9036,75 @@ def test_runtime_lifecycle_v2_rejects_unbound_post_and_step_evidence(
 
     with pytest.raises(runtime_lifecycle.D320CutoverJournalError):
         runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+
+
+@pytest.mark.parametrize("kind", ["config", "config_systemd", "units", "release_root"])
+@pytest.mark.parametrize("mode", [0o700, 0o755, 0o775, 0o1700])
+def test_runtime_lifecycle_v2_shared_config_ancestor_modes(
+    tmp_path: Path, kind: str, mode: int
+) -> None:
+    home = tmp_path / "ancestor-home"
+    payload = _runtime_v2_payload(home)
+    effects = payload["extra_effects"]
+    assert isinstance(effects, list)
+    source = payload["source"]
+    assert isinstance(source, dict)
+    stage_name = payload["stage_name"]
+    assert isinstance(stage_name, str)
+    path = next(Path(effect["path"]) for effect in effects if effect["kind"] == kind)
+    path.mkdir(mode=0o700, parents=True)
+    for parent in path.parents:
+        if parent == home:
+            break
+        parent.chmod(0o700)
+    path.chmod(mode)
+    payload["extra_effects"] = runtime_lifecycle._v2_capture_effects(
+        home, source["commit"], stage_name
+    )
+    accepted = mode == 0o700 or (kind in {"config", "config_systemd"} and mode == 0o755)
+    if not accepted:
+        with pytest.raises(
+            runtime_lifecycle.D320CutoverJournalError,
+            match="d320_v2_identity_directory_invalid",
+        ):
+            runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+        return
+    journal = runtime_lifecycle.D320CutoverJournalV2.from_payload(payload)
+    assert (
+        runtime_lifecycle.D320CutoverJournalV2.from_bytes(journal.to_bytes()) == journal
+    )
+    journal_effects = journal.payload["extra_effects"]
+    assert isinstance(journal_effects, list)
+    identity = next(
+        effect["identity"] for effect in journal_effects if effect["kind"] == kind
+    )
+    assert identity["mode"] == mode
+    captured_digest = runtime_lifecycle._v2_effect_identity_digest(
+        {"identity": identity}
+    )
+    recorded = {
+        "extra_effects": runtime_lifecycle._v2_capture_effects(
+            home, source["commit"], stage_name
+        )
+    }
+    assert runtime_lifecycle._v2_post_matches(recorded, recorded)
+    path.chmod(0o700 if mode == 0o755 else 0o755)
+    current = {
+        "extra_effects": runtime_lifecycle._v2_capture_effects(
+            home, source["commit"], stage_name
+        )
+    }
+    assert not runtime_lifecycle._v2_post_matches(current, recorded)
+    changed = next(
+        effect for effect in current["extra_effects"] if effect["kind"] == kind
+    )
+    assert runtime_lifecycle._v2_effect_identity_digest(changed) != captured_digest
+    identity["uid"] += 1
+    with pytest.raises(
+        runtime_lifecycle.D320CutoverJournalError,
+        match="d320_v2_identity_owner_invalid",
+    ):
+        runtime_lifecycle._v2_validate_identity(kind, identity, owner_uid=os.geteuid())
 
 
 def test_runtime_lifecycle_v2_intent_round_trips_without_v1_fallback(
