@@ -357,10 +357,16 @@ def _file_state(root_fd, relative, uid, gid, mode, *, allow_empty=False):
         os.close(directory)
 
 
-def _legacy_backups(parent, uid, gid):
+def _legacy_backups(parent, uid, gid, *, exclude=None):
     result = {}
     for name in sorted(os.listdir(parent)):
-        if re.fullmatch(r"\.v1\.backup-[0-9a-f]{40}", name) is None:
+        if (
+            name == exclude
+            or re.fullmatch(
+                r"\.v1\.(?:backup-[0-9a-f]{40}|previous-[0-9a-f]{32})", name
+            )
+            is None
+        ):
             continue
         backup = _directory(parent, name, uid, gid, 0o755)
         try:
@@ -424,7 +430,11 @@ def _legacy_backups(parent, uid, gid):
 def _check_legacy_backup_pin(parent, state, uid, gid):
     _need(
         state.get("legacy_backups_sha256", _sha(_canonical({})))
-        == _sha(_canonical(_legacy_backups(parent, uid, gid))),
+        == _sha(
+            _canonical(
+                _legacy_backups(parent, uid, gid, exclude=state.get("stage_name"))
+            )
+        ),
         "hook_abi_gate_snapshot_changed",
     )
 
@@ -453,10 +463,24 @@ def _inspect_root_state_once(parent_path, root_uid, root_gid, *, lock_held=False
             ".root-hook-abi-upgrade-v1.json",
         }
         transaction_names = {
-            name
-            for name in names
-            if re.fullmatch(r"\.v1\.(?:stage|previous)-[0-9a-f]{32}", name)
+            name for name in names if re.fullmatch(r"\.v1\.stage-[0-9a-f]{32}", name)
         }
+        try:
+            marker_raw, _marker_info = _file_state(
+                parent, ".root-hook-abi-upgrade-v1.json", root_uid, root_gid, 0o644
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            marker = _json(marker_raw)
+            if isinstance(marker, dict):
+                transaction_names.update(
+                    name
+                    for name in (marker.get("stage_name"), marker.get("backup_name"))
+                    if isinstance(name, str)
+                    and name in names
+                    and re.fullmatch(r"\.v1\.previous-[0-9a-f]{32}", name)
+                )
         legacy_backups = _legacy_backups(parent, root_uid, root_gid)
         _need(
             len(transaction_names) <= 1

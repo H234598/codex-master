@@ -259,6 +259,108 @@ def _legacy_backup_fixture(tmp_path):
     return home, parent, generation, pin
 
 
+def _native_previous_fixture(tmp_path):
+    _, parent, _, _ = _legacy_backup_fixture(tmp_path)
+    generation_id = "c" * 40
+    home, _, generation, pin = _fixture(tmp_path / "previous-current", generation_id)
+    assert _install(home, parent, pin, generation_id) == "upgraded"
+    return home, parent, generation, pin
+
+
+def _archive_fingerprint(root):
+    result = {}
+    for path in [root, *root.rglob("*")]:
+        info = path.lstat()
+        result[path.relative_to(root).as_posix()] = (
+            info.st_dev,
+            info.st_ino,
+            info.st_uid,
+            info.st_gid,
+            stat.S_IMODE(info.st_mode),
+            info.st_nlink,
+            _sha(path.read_bytes()) if stat.S_ISREG(info.st_mode) else None,
+        )
+    return result
+
+
+def test_native_previous_archives_survive_followup_and_reverse_upgrades(
+    safe_tmp_path, monkeypatch
+):
+    from the_hive import runtime_lifecycle
+
+    fixture_abi = str(safe_tmp_path / "root/hook-abi/v1/launcher")
+    monkeypatch.setitem(GATE, "ABI", fixture_abi)
+    monkeypatch.setitem(GATE["install"].__globals__, "ABI", fixture_abi)
+    _, parent, old_generation, _ = _native_previous_fixture(safe_tmp_path)
+    preserved = {
+        path.name: _archive_fingerprint(path)
+        for path in parent.iterdir()
+        if path.name.startswith((".v1.backup-", ".v1.previous-"))
+    }
+    shutil.rmtree(old_generation)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_PARENT", parent)
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_UID", os.getuid())
+    monkeypatch.setattr(runtime_lifecycle, "_ROOT_HOOK_ABI_GID", os.getgid())
+    for index, generation_id in enumerate(("e" * 40, GENERATION), start=2):
+        home, _, _, pin = _fixture(safe_tmp_path / str(index), generation_id)
+        assert _install(home, parent, pin, generation_id) == "upgraded"
+        snapshot = GATE["_inspect_root_state"](
+            parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+        )
+        assert snapshot["root_state"]["binding"]["generation"] == generation_id
+        assert len(list(parent.glob(".v1.previous-*"))) == index
+        for name, expected in preserved.items():
+            assert _archive_fingerprint(parent / name) == expected
+        preserved = {
+            path.name: _archive_fingerprint(path)
+            for path in parent.iterdir()
+            if path.name.startswith((".v1.backup-", ".v1.previous-"))
+        }
+        receipt_digest = runtime_lifecycle._verify_root_hook_effect_receipt(
+            generation=generation_id, manifest_digest=pin
+        )
+        assert receipt_digest == _sha(
+            (parent / "root-hook-effect-receipt-v1.json").read_bytes()
+        )
+        assert _install(home, parent, pin, generation_id) == "already_installed"
+        assert not list(parent.glob(".v1.stage-*"))
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_native_previous_archive_pin_covers_receipt_refresh(
+    safe_tmp_path, monkeypatch, drift
+):
+    home, parent, _, pin = _native_previous_fixture(safe_tmp_path)
+    snapshot = GATE["_inspect_root_state"](
+        parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
+    )
+    globals_ = GATE["install"].__globals__
+
+    def interrupt(*_args, **_kwargs):
+        raise GATE["GateError"]("injected_native_previous_refresh")
+
+    with monkeypatch.context() as scoped:
+        scoped.setitem(globals_, "_receipt_needs_refresh", lambda *_args: True)
+        scoped.setitem(globals_, "_write_effect_receipt", interrupt)
+        with pytest.raises(GATE["GateError"], match="injected_native_previous_refresh"):
+            _install(home, parent, pin, "c" * 40, snapshot["root_state_sha256"])
+    marker_path = parent / ".root-hook-abi-upgrade-v1.json"
+    marker = marker_path.read_bytes()
+    assert json.loads(marker)["stage_name"] is None
+    if drift:
+        archive = next(parent.glob(".v1.previous-*"))
+        (archive / "hook_abi_v1_core.py").write_bytes(b"CHANGED = 1\n")
+        with pytest.raises(GATE["GateError"], match="hook_abi_gate_snapshot_changed"):
+            _install(home, parent, pin, "c" * 40, snapshot["root_state_sha256"])
+        assert marker_path.read_bytes() == marker
+    else:
+        assert (
+            _install(home, parent, pin, "c" * 40, snapshot["root_state_sha256"])
+            == "already_installed"
+        )
+        assert json.loads(marker_path.read_bytes())["status"] == "committed"
+
+
 @pytest.mark.parametrize("target_present", [False, True])
 def test_legacy_root_backups_are_bound_and_preserved(safe_tmp_path, target_present):
     _, parent, _, _ = _legacy_backup_fixture(safe_tmp_path)
@@ -291,10 +393,11 @@ def test_legacy_root_backups_are_bound_and_preserved(safe_tmp_path, target_prese
     current = GATE["_inspect_root_state"](
         parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
     )
-    assert (
-        current["root_state"]["legacy_backups"]
-        == snapshot["root_state"]["legacy_backups"]
-    )
+    assert {
+        name: current["root_state"]["legacy_backups"][name]
+        for name in snapshot["root_state"]["legacy_backups"]
+    } == snapshot["root_state"]["legacy_backups"]
+    assert len(list(parent.glob(".v1.previous-*"))) == int(target_present)
     committed = json.loads((parent / ".root-hook-abi-upgrade-v1.json").read_bytes())
     assert "legacy_backups_sha256" not in committed
 
@@ -321,13 +424,19 @@ def test_legacy_root_backup_drift_invalidates_snapshot(safe_tmp_path, drift):
 
 
 @pytest.mark.parametrize(
-    "invalid", ["symlink", "mode", "owner", "name", "hardlink", "extra", "allowlist"]
+    "invalid",
+    ["symlink", "mode", "owner", "name", "hardlink", "extra", "allowlist", "stage"],
 )
+@pytest.mark.parametrize("factory", [_legacy_backup_fixture, _native_previous_fixture])
 def test_legacy_root_backups_reject_untrusted_objects(
-    safe_tmp_path, monkeypatch, invalid
+    safe_tmp_path, monkeypatch, invalid, factory
 ):
-    _, parent, _, _ = _legacy_backup_fixture(safe_tmp_path)
-    backup = parent / (".v1.backup-" + "b" * 40)
+    _, parent, _, _ = factory(safe_tmp_path)
+    backup = (
+        next(parent.glob(".v1.previous-*"))
+        if factory is _native_previous_fixture
+        else parent / (".v1.backup-" + "b" * 40)
+    )
     if invalid == "symlink":
         backup.rename(safe_tmp_path / "held-backup")
         backup.symlink_to(safe_tmp_path / "held-backup", target_is_directory=True)
@@ -352,8 +461,10 @@ def test_legacy_root_backups_reject_untrusted_objects(
         os.link(backup / "hook_abi_v1_core.py", safe_tmp_path / "extra-link")
     elif invalid == "extra":
         (backup / "unexpected").write_bytes(b"untrusted\n")
-    else:
+    elif invalid == "allowlist":
         next((backup / "allowlists").iterdir()).rename(backup / "allowlists/bad.json")
+    else:
+        shutil.copytree(parent / "v1", parent / (".v1.stage-" + "f" * 32))
     with pytest.raises((GATE["GateError"], OSError)):
         GATE["_inspect_root_state"](
             parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
@@ -361,16 +472,22 @@ def test_legacy_root_backups_reject_untrusted_objects(
 
 
 @pytest.mark.parametrize("during_commit", [False, True])
+@pytest.mark.parametrize("factory", [_legacy_backup_fixture, _native_previous_fixture])
 def test_legacy_root_backup_pin_survives_pending_resume(
-    safe_tmp_path, monkeypatch, during_commit
+    safe_tmp_path, monkeypatch, during_commit, factory
 ):
-    _, parent, _, _ = _legacy_backup_fixture(safe_tmp_path)
+    _, parent, _, _ = factory(safe_tmp_path)
     snapshot = GATE["_inspect_root_state"](
         parent_path=parent, root_uid=os.getuid(), root_gid=os.getgid()
     )
-    next_generation = "c" * 40
+    next_generation = "e" * 40
     next_home, _, _, next_pin = _fixture(safe_tmp_path / "next", next_generation)
-    backup_file = parent / (".v1.backup-" + "b" * 40) / "hook_abi_v1_core.py"
+    archive = (
+        next(parent.glob(".v1.previous-*"))
+        if factory is _native_previous_fixture
+        else parent / (".v1.backup-" + "b" * 40)
+    )
+    backup_file = archive / "hook_abi_v1_core.py"
     globals_ = GATE["install"].__globals__
     write_receipt = globals_["_write_effect_receipt"]
 
