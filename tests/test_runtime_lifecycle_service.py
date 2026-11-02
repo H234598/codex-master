@@ -10787,6 +10787,475 @@ def test_recovery_checks_native_same_bytes_replacement_before_original_inode(
     )
 
 
+class _ContinuationFixtureFinished(Exception):
+    pass
+
+
+def _continuation_public_flow(tmp_path, monkeypatch, inspect=None, *, expired=False):
+    """Reuse the unchanged public install/activate flow, then hand off its owner."""
+    baseline = _manager_api_contract_fixture()
+    generator_root = runtime_lifecycle._user_runtime_directory() / "systemd"
+    for index, name in enumerate(("generator", "generator.early", "generator.late")):
+        baseline["unit_paths"].append(
+            {
+                "path": str(generator_root / name),
+                "dev": 4,
+                "ino": 20 + index,
+                "uid": os.geteuid(),
+                "mode": 0o755,
+            }
+        )
+
+    def hashed(value):
+        value["unit_path_sha256"] = hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(value["unit_paths"])
+        ).hexdigest()
+        return value
+
+    baseline = hashed(baseline)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_manager_api_contract_fixture",
+        lambda: copy.deepcopy(baseline),
+    )
+    activate = runtime_lifecycle._v2_activate_phase
+    cutover = runtime_lifecycle.cutover
+    public_plan = runtime_lifecycle.plan
+    witness = tmp_path / "continuation-source"
+    witness.mkdir(mode=0o700)
+    actor_root = Path(runtime_lifecycle.__file__).resolve().parents[2]
+    actor_pin = ("d" * 40, "e" * 64)
+    owner_sha = hashlib.sha256(
+        runtime_lifecycle._d320_canonical_json(list(actor_pin))
+    ).hexdigest()
+
+    def activated(**kwargs):
+        result = activate(**kwargs)
+        assert result["status"] == "runtime_lifecycle_activation_complete", result
+        home = kwargs["home"]
+        journal = runtime_lifecycle._v2_load_journal(home)
+        original_pin = (
+            journal.payload["source"]["commit"],
+            journal.payload["source"]["tree_sha256"],
+        )
+        bindings = {witness: original_pin, actor_root: actor_pin}
+
+        def source_binding(path):
+            value = bindings[path]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        binder = runtime_lifecycle._bind_cutover_inputs
+
+        def bound_inputs(target, *, source=None):
+            bound = binder(target)
+            commit, tree = source_binding(source or actor_root)
+            return replace(bound, source_commit=commit, source_tree_digest=tree)
+
+        monkeypatch.setattr(runtime_lifecycle, "_source_tree_binding", source_binding)
+        monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", bound_inputs)
+        monkeypatch.setattr(runtime_lifecycle, "plan", public_plan)
+        current = copy.deepcopy(baseline)
+        for row in current["unit_paths"][1:]:
+            row["ino"] += 100
+        hashed(current)
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "_manager_api_contract_snapshot",
+            lambda: copy.deepcopy(current),
+        )
+        if expired:
+            record = runtime_lifecycle._read_canary_qualification_record(
+                runtime_lifecycle._canary_runtime_root(home)
+            )
+            now = (
+                record["issued_at_unix_ns"]
+                + runtime_lifecycle._OWNER_RECEIPT_FRESHNESS_NS
+                + 1
+            )
+            monkeypatch.setattr(runtime_lifecycle.time, "time_ns", lambda: now)
+        options = {
+            "continuation_source": witness,
+            "continuation_owner_sha256": owner_sha,
+        }
+        call = {
+            "home": home,
+            "plan_sha256": journal.payload["plan_sha256"],
+            "phase": "observe",
+            "systemctl": kwargs["systemctl"],
+            **options,
+        }
+        context = {
+            "home": home,
+            "call": call,
+            "options": options,
+            "cutover": cutover,
+            "bindings": bindings,
+            "actor_root": actor_root,
+            "witness": witness,
+            "current": current,
+            "hashed": hashed,
+            "journal": journal,
+        }
+        if inspect is not None:
+            inspect(context)
+
+        def continued(**arguments):
+            if arguments.get("phase") in {"observe", "commit"}:
+                arguments.update(options)
+            return cutover(**arguments)
+
+        monkeypatch.setattr(runtime_lifecycle, "cutover", continued)
+        return result
+
+    monkeypatch.setattr(runtime_lifecycle, "_v2_activate_phase", activated)
+    test_public_install_persists_intent_before_installer_effects(
+        tmp_path, monkeypatch, "absent_legacy_units"
+    )
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_public_continuation_finishes_after_own_generator_reload(
+    tmp_path, monkeypatch, expired
+):
+    _continuation_public_flow(tmp_path, monkeypatch, expired=expired)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_source",
+        "missing_owner",
+        "malformed_owner",
+        "wrong_owner",
+        "relative_source",
+        "symlink_source",
+        "unsafe_source",
+        "dirty_owner",
+        "dirty_witness",
+        "wrong_original_tree",
+        "wrong_phase",
+        "recovery_override",
+    ],
+)
+def test_public_continuation_rejects_unbound_inputs(tmp_path, monkeypatch, case):
+    def inspect(context):
+        arguments = dict(context["call"])
+        if case == "missing_source":
+            arguments.pop("continuation_source")
+        elif case == "missing_owner":
+            arguments.pop("continuation_owner_sha256")
+        elif case == "malformed_owner":
+            arguments["continuation_owner_sha256"] = "not-a-digest"
+        elif case == "wrong_owner":
+            arguments["continuation_owner_sha256"] = "0" * 64
+        elif case == "relative_source":
+            arguments["continuation_source"] = Path("relative")
+        elif case == "symlink_source":
+            alias = tmp_path / "alias"
+            alias.symlink_to(context["witness"], target_is_directory=True)
+            arguments["continuation_source"] = alias
+        elif case == "unsafe_source":
+            context["witness"].chmod(0o777)
+        elif case in {"dirty_owner", "dirty_witness"}:
+            path = (
+                context["actor_root"] if case == "dirty_owner" else context["witness"]
+            )
+            context["bindings"][path] = runtime_lifecycle.RuntimeLifecycleError(
+                "runtime_lifecycle_source_changed"
+            )
+        elif case == "wrong_original_tree":
+            commit, _tree = context["bindings"][context["witness"]]
+            context["bindings"][context["witness"]] = (commit, "f" * 64)
+        elif case == "wrong_phase":
+            arguments["phase"] = "recover"
+        elif case == "recovery_override":
+            arguments["recovery_source"] = context["witness"]
+        path = runtime_lifecycle._v2_journal_path(context["home"])
+        before = path.read_bytes()
+        result = context["cutover"](**arguments)
+        assert result["status"] == "runtime_lifecycle_source_changed", result
+        assert path.read_bytes() == before
+        raise _ContinuationFixtureFinished
+
+    with pytest.raises(_ContinuationFixtureFinished):
+        _continuation_public_flow(tmp_path, monkeypatch, inspect)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "bus",
+        "generator_dev",
+        "generator_uid",
+        "generator_mode",
+        "generator_presence",
+        "other_path_inode",
+        "path_order",
+        "path_hash",
+        "reload_without_enable",
+    ],
+)
+def test_public_continuation_rejects_unrelated_manager_drift(
+    tmp_path, monkeypatch, case
+):
+    def inspect(context):
+        current = context["current"]
+        if case == "bus":
+            current["bus"]["ino"] += 1
+        elif case.startswith("generator_"):
+            field = case.removeprefix("generator_")
+            if field == "presence":
+                current["unit_paths"][-1].update(
+                    dev=None, ino=None, uid=None, mode=None
+                )
+            else:
+                current["unit_paths"][-1][field] += 1
+        elif case == "other_path_inode":
+            current["unit_paths"][0]["ino"] = 999
+        elif case == "path_order":
+            current["unit_paths"].reverse()
+        if case == "path_hash":
+            current["unit_path_sha256"] = "0" * 64
+        else:
+            context["hashed"](current)
+        path = runtime_lifecycle._v2_journal_path(context["home"])
+        if case == "reload_without_enable":
+            payload = context["journal"].payload
+            assert (
+                payload["steps"][-1]["effect"]
+                == "manager:" + runtime_lifecycle._NEW_TIMER
+            )
+            payload["steps"].pop()
+            payload["sequence"] -= 1
+            path.write_bytes(
+                runtime_lifecycle.D320CutoverJournalV2.from_payload(payload).to_bytes()
+            )
+        before = path.read_bytes()
+        result = context["cutover"](**context["call"])
+        assert result["status"] != "runtime_lifecycle_observation_complete", result
+        assert path.read_bytes() == before
+        assert (
+            runtime_lifecycle._v2_load_journal(context["home"]).payload["phase"]
+            == "ACTIVATED"
+        )
+        raise _ContinuationFixtureFinished
+
+    with pytest.raises(_ContinuationFixtureFinished):
+        _continuation_public_flow(tmp_path, monkeypatch, inspect)
+
+
+@pytest.mark.parametrize("point", ["lease", "probe", "commit"])
+def test_public_continuation_revalidates_owner_during_phase(
+    tmp_path, monkeypatch, point
+):
+    def inspect(context):
+        def change_owner():
+            context["bindings"][context["actor_root"]] = ("f" * 40, "f" * 64)
+
+        if point == "lease":
+            load = runtime_lifecycle._v2_load_journal
+            calls = 0
+
+            def raced_load(home):
+                nonlocal calls
+                value = load(home)
+                calls += 1
+                if calls == 2:
+                    change_owner()
+                return value
+
+            monkeypatch.setattr(runtime_lifecycle, "_v2_load_journal", raced_load)
+        elif point == "probe":
+            monkeypatch.setattr(
+                runtime_lifecycle,
+                "_observe_argumentless_installed_probe",
+                lambda _home: change_owner(),
+            )
+        else:
+            monkeypatch.setattr(
+                runtime_lifecycle,
+                "_observe_argumentless_installed_probe",
+                lambda _home: None,
+            )
+            assert (
+                context["cutover"](**context["call"])["status"]
+                == "runtime_lifecycle_observation_complete"
+            )
+            context["call"]["phase"] = "commit"
+            verify = runtime_lifecycle._verify_plugin_release_effect_receipt
+
+            def raced_receipt(**kwargs):
+                value = verify(**kwargs)
+                if sys._getframe(1).f_code.co_name == "_v2_commit_phase":
+                    change_owner()
+                return value
+
+            monkeypatch.setattr(
+                runtime_lifecycle,
+                "_verify_plugin_release_effect_receipt",
+                raced_receipt,
+            )
+        result = context["cutover"](**context["call"])
+        assert result["status"] == "runtime_lifecycle_source_changed", result
+        expected = "OBSERVED" if point == "commit" else "ACTIVATED"
+        assert (
+            runtime_lifecycle._v2_load_journal(context["home"]).payload["phase"]
+            == expected
+        )
+        raise _ContinuationFixtureFinished
+
+    with pytest.raises(_ContinuationFixtureFinished):
+        _continuation_public_flow(tmp_path, monkeypatch, inspect)
+
+
+@pytest.mark.parametrize("owner", ["root", "plugin"])
+def test_public_continuation_requires_current_owner_receipts(
+    tmp_path, monkeypatch, owner
+):
+    def inspect(context):
+        error = (
+            "runtime_lifecycle_root_hook_effect_unverified"
+            if owner == "root"
+            else "runtime_lifecycle_plugin_effect_unverified"
+        )
+
+        def expired_receipt(**_kwargs):
+            raise runtime_lifecycle.RuntimeLifecycleError(error)
+
+        name = (
+            "_verify_root_hook_effect_receipt"
+            if owner == "root"
+            else "_verify_plugin_release_effect_receipt"
+        )
+        monkeypatch.setattr(runtime_lifecycle, name, expired_receipt)
+        path = runtime_lifecycle._v2_journal_path(context["home"])
+        before = path.read_bytes()
+        assert context["cutover"](**context["call"])["status"] == error
+        assert path.read_bytes() == before
+        raise _ContinuationFixtureFinished
+
+    with pytest.raises(_ContinuationFixtureFinished):
+        _continuation_public_flow(tmp_path, monkeypatch, inspect, expired=True)
+
+
+def test_continuation_manager_comparison_checks_expected_path_hash():
+    expected = _manager_api_contract_fixture()
+    actual = copy.deepcopy(expected)
+    expected["unit_path_sha256"] = "0" * 64
+    assert not runtime_lifecycle._v2_manager_contract_matches(expected, actual, True)
+
+
+@pytest.mark.parametrize("unsafe", ["uid", "mode"])
+def test_continuation_manager_comparison_requires_owned_safe_generators(unsafe):
+    expected = _manager_api_contract_fixture()
+    row = {
+        "path": str(
+            runtime_lifecycle._user_runtime_directory() / "systemd/generator.late"
+        ),
+        "dev": 4,
+        "ino": 20,
+        "uid": os.geteuid(),
+        "mode": 0o755,
+    }
+    row[unsafe] = os.geteuid() + 1 if unsafe == "uid" else 0o777
+    expected["unit_paths"].append(row)
+    actual = copy.deepcopy(expected)
+    actual["unit_paths"][-1]["ino"] += 1
+    for value in (expected, actual):
+        value["unit_path_sha256"] = hashlib.sha256(
+            runtime_lifecycle._d320_canonical_json(value["unit_paths"])
+        ).hexdigest()
+    assert not runtime_lifecycle._v2_manager_contract_matches(expected, actual, True)
+
+
+@pytest.mark.parametrize("receipt", ["valid", "root", "plugin"])
+def test_public_continuation_rejects_incomplete_activation_with_fresh_contract(
+    tmp_path, monkeypatch, receipt
+):
+    def inspect(context):
+        for row in context["current"]["unit_paths"][1:]:
+            row["ino"] -= 100
+        context["hashed"](context["current"])
+        path = runtime_lifecycle._v2_journal_path(context["home"])
+        payload = context["journal"].payload
+        assert (
+            payload["steps"][-1]["effect"] == "manager:" + runtime_lifecycle._NEW_TIMER
+        )
+        payload["steps"].pop()
+        payload["sequence"] -= 1
+        path.write_bytes(
+            runtime_lifecycle.D320CutoverJournalV2.from_payload(payload).to_bytes()
+        )
+        before = path.read_bytes()
+        probes = []
+        monkeypatch.setattr(
+            runtime_lifecycle,
+            "_observe_argumentless_installed_probe",
+            lambda _home: probes.append("probe"),
+        )
+        if receipt != "valid":
+
+            def missing_receipt(**_kwargs):
+                raise runtime_lifecycle.RuntimeLifecycleError(
+                    "runtime_lifecycle_"
+                    + ("root_hook" if receipt == "root" else "plugin")
+                    + "_effect_unverified"
+                )
+
+            name = (
+                "_verify_root_hook_effect_receipt"
+                if receipt == "root"
+                else "_verify_plugin_release_effect_receipt"
+            )
+            monkeypatch.setattr(runtime_lifecycle, name, missing_receipt)
+        result = context["cutover"](**context["call"])
+        assert result["status"] != "runtime_lifecycle_observation_complete", result
+        assert probes == []
+        assert path.read_bytes() == before
+        raise _ContinuationFixtureFinished
+
+    with pytest.raises(_ContinuationFixtureFinished):
+        _continuation_public_flow(tmp_path, monkeypatch, inspect)
+
+
+@pytest.mark.parametrize("command", ["plan", "observe", "commit"])
+def test_cli_continuation_options_reach_public_owner(monkeypatch, capsys, command):
+    calls = []
+    result = {
+        "plan": "runtime_lifecycle_plan_ready",
+        "observe": "runtime_lifecycle_observation_complete",
+        "commit": "runtime_lifecycle_commit_complete",
+    }[command]
+
+    def operation(**kwargs):
+        calls.append(kwargs)
+        return {"status": result}
+
+    argv = [
+        "the-hive-runtime-service",
+        "plan" if command == "plan" else "cutover",
+        "--home",
+        "/private-home",
+        "--continuation-source",
+        "/original-source",
+        "--continuation-owner-sha256",
+        "a" * 64,
+    ]
+    if command != "plan":
+        argv.extend(["--phase", command, "--plan-sha256", "b" * 64])
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        runtime_lifecycle, "plan" if command == "plan" else "cutover", operation
+    )
+    assert runtime_lifecycle.main() == 0
+    assert len(calls) == 1
+    assert calls[0]["continuation_source"] == Path("/original-source")
+    assert calls[0]["continuation_owner_sha256"] == "a" * 64
+    assert json.loads(capsys.readouterr().out)["status"] == result
+
+
 def _recovery_handoff_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     sources = []
     for name in ("original", "owner"):
