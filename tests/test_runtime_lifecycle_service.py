@@ -637,7 +637,9 @@ def _patch_canary_source(
 ) -> Path:
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir(mode=0o700)
-    monkeypatch.setattr(runtime_lifecycle, "_canary_runtime_root", lambda: runtime_root)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canary_runtime_root", lambda _home: runtime_root
+    )
     monkeypatch.setattr(runtime_lifecycle, "_canonical_codex_client_path", lambda: None)
     monkeypatch.setattr(
         runtime_lifecycle,
@@ -660,6 +662,81 @@ def _patch_canary_source(
     return runtime_root
 
 
+def test_canary_owner_uses_target_image_filesystem(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    library = home / ".local" / "lib"
+    library.mkdir(mode=0o700, parents=True)
+    home.chmod(0o700)
+
+    root = runtime_lifecycle._canary_runtime_root(home)
+
+    assert root == library / "the-hive-runtime-canary"
+    assert root.parent.stat().st_dev == library.stat().st_dev
+    assert not root.exists()
+    with runtime_lifecycle._canary_lock(root):
+        assert root.stat().st_dev == library.stat().st_dev
+
+
+def test_canary_owner_path_failure_stays_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+
+    def unavailable(*_args: object) -> Path:
+        raise runtime_lifecycle.RuntimeLifecycleError("runtime_canary_root_invalid")
+
+    monkeypatch.setattr(runtime_lifecycle, "_canary_runtime_root", unavailable)
+    result = runtime_lifecycle.canary(home=home)
+
+    assert result["status"] == "runtime_canary_failed"
+    assert result["error_code"] == "runtime_canary_root_invalid"
+
+
+@pytest.mark.parametrize("case", ["missing", "writable", "symlink", "other_device"])
+def test_canary_owner_rejects_untrusted_target_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    home = tmp_path / "home"
+    library = home / ".local" / "lib"
+    library.mkdir(mode=0o700, parents=True)
+    home.chmod(0o700)
+    root = library / "the-hive-runtime-canary"
+    if case == "missing":
+        library.rmdir()
+    elif case == "writable":
+        library.chmod(0o777)
+    elif case == "symlink":
+        root.symlink_to(library, target_is_directory=True)
+    else:
+        root.mkdir(mode=0o700)
+        original = Path.lstat
+
+        def different_device(path: Path):
+            info = original(path)
+            if path == root:
+                return SimpleNamespace(
+                    st_mode=info.st_mode, st_uid=info.st_uid, st_dev=info.st_dev + 1
+                )
+            return info
+
+        monkeypatch.setattr(Path, "lstat", different_device)
+    with pytest.raises(runtime_lifecycle.RuntimeLifecycleError):
+        runtime_lifecycle._canary_runtime_root(home)
+
+
+@pytest.mark.parametrize(
+    "target", [None, {}, {"realpath": 1}, {"realpath": "relative"}]
+)
+def test_qualification_rejects_invalid_target_before_storage_read(
+    target: object,
+) -> None:
+    result = runtime_lifecycle._v2_qualification_record_reason(
+        {"qualification": {}, "target": target}
+    )
+    assert result == "runtime_lifecycle_qualification_record_invalid"
+
+
 def test_canary_image_is_source_and_manifest_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -676,7 +753,13 @@ def test_canary_image_is_source_and_manifest_bound(
         "_source_tree_binding",
         lambda _repository: (commit, "e" * 64),
     )
-    invocation = tmp_path / "invocation"
+    home = tmp_path / "home"
+    library = home / ".local" / "lib"
+    library.mkdir(mode=0o700, parents=True)
+    home.chmod(0o700)
+    owner = runtime_lifecycle._canary_runtime_root(home)
+    owner.mkdir(mode=0o700)
+    invocation = owner / "invocation"
     invocation.mkdir(mode=0o700)
     image = runtime_lifecycle._prepare_canary_image(
         repository=ROOT,
@@ -696,6 +779,17 @@ def test_canary_image_is_source_and_manifest_bound(
     assert manifest["generation"] == commit
     assert manifest["commit"] == commit
     assert image.manifest_digest == layout.manifest_digest
+    productive_stage = library / "productive-stage"
+    productive_stage.mkdir(mode=0o700)
+    installer = runpy.run_path(str(ROOT / "scripts/the-hive-hive-hourly-probe-install"))
+    installer["_build_runtime_image"](
+        repository=ROOT, stage=productive_stage, generation=commit, commit=commit
+    )
+    productive_layout = RuntimeLayout.from_runtime_root(productive_stage)
+    assert productive_layout.manifest_digest == image.manifest_digest
+    assert (productive_stage / ".the-hive-runtime-manifest.json").read_bytes() == (
+        layout.root / ".the-hive-runtime-manifest.json"
+    ).read_bytes()
     launcher = (
         image.release_root
         / "generations"
@@ -1060,7 +1154,7 @@ def test_canary_health_keeps_strict_d320_json_contract(
     home.mkdir(mode=0o700)
     _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
     monkeypatch.setattr(
-        runtime_lifecycle, "_canary_runtime_root", lambda: tmp_path / "runtime"
+        runtime_lifecycle, "_canary_runtime_root", lambda _home: tmp_path / "runtime"
     )
     prepare_image = runtime_lifecycle._prepare_canary_image
 
@@ -1917,7 +2011,9 @@ def test_canary_source_rebind_stops_before_manager_entry_and_cleans_image(
     home.mkdir(mode=0o700)
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir(mode=0o700)
-    monkeypatch.setattr(runtime_lifecycle, "_canary_runtime_root", lambda: runtime_root)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_canary_runtime_root", lambda _home: runtime_root
+    )
     calls = 0
 
     def source(_repository: Path) -> tuple[str, str]:
@@ -3850,7 +3946,7 @@ def test_public_plan_is_deterministic_and_reports_missing_profile_without_effect
     monkeypatch.setattr(
         runtime_lifecycle,
         "_canary_runtime_root",
-        lambda: tmp_path / "runtime-owner" / "the-hive-runtime-canary",
+        lambda _home: tmp_path / "runtime-owner" / "the-hive-runtime-canary",
     )
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
@@ -4090,7 +4186,7 @@ def test_public_plan_holds_for_present_unvalidated_profile_without_effects(
     home.mkdir(mode=0o700)
     qualification_root = tmp_path / "uncreated-canary-root"
     monkeypatch.setattr(
-        runtime_lifecycle, "_canary_runtime_root", lambda: qualification_root
+        runtime_lifecycle, "_canary_runtime_root", lambda _home: qualification_root
     )
     HookSessionPinStoreV1.create_at(
         home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
@@ -9226,7 +9322,7 @@ def test_public_resume_requires_current_qualification_record(
     runtime_lifecycle._v2_journal_path(home).chmod(0o600)
     qualification_root = tmp_path / "missing-qualification-root"
     monkeypatch.setattr(
-        runtime_lifecycle, "_canary_runtime_root", lambda: qualification_root
+        runtime_lifecycle, "_canary_runtime_root", lambda _home: qualification_root
     )
     phase_calls: list[str] = []
     monkeypatch.setattr(
@@ -9387,7 +9483,7 @@ def test_public_plan_accepts_current_owner_qualified_structural_profile(
     )
     qualification_root = tmp_path / "qualification-owner"
     monkeypatch.setattr(
-        runtime_lifecycle, "_canary_runtime_root", lambda: qualification_root
+        runtime_lifecycle, "_canary_runtime_root", lambda _home: qualification_root
     )
     prepared_images: list[runtime_lifecycle._CanaryImage] = []
     prepared_health_payloads: list[Mapping[str, object]] = []
@@ -9855,6 +9951,7 @@ def test_public_resume_rebinds_qualification_record(
         runtime_lifecycle._d320_canonical_json(payload["plan"])
     ).hexdigest()
     _lifecycle_state(home)
+    (home / ".local" / "lib").mkdir(mode=0o700)
     path = runtime_lifecycle._v2_journal_path(home)
     path.write_bytes(
         runtime_lifecycle._d320_journal_envelope(
