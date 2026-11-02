@@ -2816,6 +2816,7 @@ def test_public_install_rejects_unavailable_or_untrusted_lifecycle_lock(
         "long_existing_wrappers_recovery",
         "shared_config_ancestors",
         "shared_config_ancestors_recovery",
+        "absent_legacy_units",
         "after_setup",
         "actual_preseal",
         "before_setup_callback",
@@ -2841,6 +2842,28 @@ def test_public_install_persists_intent_before_installer_effects(
     crash_point: str | None,
 ) -> None:
     bound, old_states = _bound_failure_fixture(tmp_path)
+    absent_legacy_units = crash_point == "absent_legacy_units"
+    if absent_legacy_units:
+        originals = []
+        for path, content, mode in bound.files:
+            if path.name in {
+                runtime_lifecycle._LEGACY_SERVICE,
+                runtime_lifecycle._LEGACY_TIMER,
+            }:
+                path.unlink()
+                content = None
+            originals.append((path, content, mode))
+        bound = replace(bound, files=tuple(originals), legacy_present=False)
+        for unit in (
+            runtime_lifecycle._LEGACY_SERVICE,
+            runtime_lifecycle._LEGACY_TIMER,
+        ):
+            old_states[unit] = {
+                "LoadState": "not-found",
+                "UnitFileState": "",
+                "ActiveState": "inactive",
+            }
+        crash_point = None
     shared_config_identities = {}
     if crash_point in {"shared_config_ancestors", "shared_config_ancestors_recovery"}:
         for directory in (bound.home / ".config", bound.home / ".config/systemd"):
@@ -3652,13 +3675,19 @@ def test_public_install_persists_intent_before_installer_effects(
         and step["sha256"] == "c" * 64
         for step in activation_steps
     )
-    assert manager_effects == [
+    expected_manager_effects = [
         ("daemon-reload",),
         ("stop", runtime_lifecycle._LEGACY_SERVICE),
         ("disable", "--now", runtime_lifecycle._LEGACY_TIMER),
         ("enable", "--now", runtime_lifecycle._NEW_TIMER),
         ("daemon-reload",),
     ]
+    if absent_legacy_units:
+        expected_manager_effects = [
+            ("daemon-reload",),
+            ("enable", "--now", runtime_lifecycle._NEW_TIMER),
+        ]
+    assert manager_effects == expected_manager_effects
     assert all(foreign_unit not in command for command in manager_effects)
 
     if crash_point == "observe_failure":
@@ -3761,6 +3790,17 @@ def test_public_install_persists_intent_before_installer_effects(
         info = directory.stat()
         assert (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)) == identity
     assert runtime_lifecycle._v2_load_journal(home).payload["phase"] == "COMMITTED"
+    if absent_legacy_units:
+        for unit in (
+            runtime_lifecycle._LEGACY_SERVICE,
+            runtime_lifecycle._LEGACY_TIMER,
+        ):
+            assert states[unit] == {
+                "LoadState": "not-found",
+                "UnitFileState": "",
+                "ActiveState": "inactive",
+            }
+            assert not (bound.units / unit).exists()
     committed_steps = runtime_lifecycle._v2_load_journal(home).payload["steps"]
     assert (
         sum(
@@ -3768,6 +3808,36 @@ def test_public_install_persists_intent_before_installer_effects(
             for step in committed_steps
         )
         == 2
+    )
+
+
+@pytest.mark.parametrize(
+    ("load", "unit_file", "active", "expected"),
+    [
+        ("loaded", "disabled", "inactive", True),
+        ("not-found", "", "inactive", True),
+        ("not-found", "disabled", "inactive", True),
+        ("loaded", "", "inactive", False),
+        ("not-found", "", "active", False),
+        ("loaded", "disabled", "active", False),
+        ("loaded", "enabled", "inactive", False),
+        ("loaded", "enabled-runtime", "inactive", False),
+        ("loaded", "masked", "inactive", False),
+        ("loaded", "static", "inactive", False),
+        ("loaded", "indirect", "inactive", False),
+        ("unknown", "disabled", "inactive", False),
+        ("not-found", "unknown", "inactive", False),
+        ("not-found", "", "unknown", False),
+    ],
+)
+def test_legacy_timer_accepts_only_bound_stopped_states(
+    load: str, unit_file: str, active: str, expected: bool
+) -> None:
+    assert (
+        runtime_lifecycle._legacy_timer_is_stopped(
+            {"LoadState": load, "UnitFileState": unit_file, "ActiveState": active}
+        )
+        is expected
     )
 
 

@@ -183,7 +183,7 @@ def _read_regular(directory: int, name: str) -> bytes:
     try:
         descriptor = os.open(
             name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=directory,
         )
         before = os.fstat(descriptor)
@@ -426,7 +426,9 @@ class HookSessionPinStoreV1:
         for name in names:
             if name == _LOCK_NAME:
                 continue
-            if not _BINDING_NAME.fullmatch(name):
+            temporary = re.fullmatch(r"\.([0-9a-f]{64}\.json)\.[a-z0-9_]{8}\.tmp", name)
+            canonical_name = temporary[1] if temporary else name
+            if not _BINDING_NAME.fullmatch(canonical_name):
                 raise _invalid()
             try:
                 raw = _read_regular(directory, name)
@@ -435,6 +437,10 @@ class HookSessionPinStoreV1:
                 )
             except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
                 raise _invalid() from exc
+            if temporary:
+                # Unpublished writes never supply pin or retention authority.
+                _validated_binding(value, expected_name=canonical_name)
+                continue
             if value.get("schema") == _RETIREMENT_SCHEMA:
                 _validated_retirement(value, expected_name=name)
                 continue

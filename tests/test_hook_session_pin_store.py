@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -52,6 +55,202 @@ def test_pin_store_creates_private_nofollow_lock_and_digest_bound_binding(
         ).hexdigest()
     )
     assert store.bindings() == {"session-a": binding}
+
+
+def _unpublished_touch(store: HookSessionPinStoreV1) -> Path:
+    from the_hive import hook_session_pin_store as pins
+
+    pending = dict(_bind(store))
+    pending.update(last_seen_at_unix_ns=20, store_generation=2)
+    path = store.state_root / f".{pins._binding_name('session-a')}.abcdefgh.tmp"
+    path.write_bytes(pins._canonical_json(store._with_digest(pending)))
+    path.chmod(0o600)
+    return path
+
+
+def test_interrupted_write_temp_preserves_canonical_pin_lifecycle(
+    tmp_path: Path,
+) -> None:
+    from the_hive import hook_session_pin_store as pins
+
+    store = _store(tmp_path)
+    original = _bind(store)
+    canonical = store.state_root / pins._binding_name("session-a")
+
+    def interrupted_writer() -> None:
+        def crash_before_replace(*_args, **_kwargs):
+            os._exit(73)
+
+        pins.os.replace = crash_before_replace
+        _bind(store, now=20)
+
+    writer = multiprocessing.get_context("fork").Process(target=interrupted_writer)
+    writer.start()
+    writer.join(timeout=10)
+    if writer.is_alive():
+        writer.kill()
+        writer.join()
+    assert writer.exitcode == 73
+    temporaries = list(store.state_root.glob(".*.json.*.tmp"))
+    assert len(temporaries) == 1
+    temporary = temporaries[0]
+    before = temporary.stat()
+    raw = temporary.read_bytes()
+
+    assert store.bindings() == {"session-a": original}
+    assert store.retained_generations(now_unix_ns=20) == {"generation-a"}
+    assert _bind(store, now=30)["store_generation"] == 2
+    store.end_session(session_id="session-a", now_unix_ns=40)
+    assert store.retained_generations(now_unix_ns=40 + DAY_NS - 1) == {"generation-a"}
+    assert store.retained_generations(now_unix_ns=40 + DAY_NS) == set()
+    store.resume_session(
+        session_id="session-a",
+        generation="generation-a",
+        runtime_manifest_digest="sha256:" + "c" * 64,
+        hooks=HOOKS,
+        now_unix_ns=50,
+    )
+    assert store.retained_generations(now_unix_ns=50) == {"generation-a"}
+    retired = store._with_digest(
+        {
+            "schema": "HookSessionRetirementV1",
+            "session_id": "session-a",
+            "original_sha256": "sha256:"
+            + hashlib.sha256(canonical.read_bytes()).hexdigest(),
+            "transaction_id": "a" * 64,
+            "retired_at_unix_ns": 60,
+            "lifecycle_sha256": "sha256:" + "b" * 64,
+        }
+    )
+    canonical.write_bytes(pins._canonical_json(retired))
+    assert store.bindings() == {}
+    assert store.retained_generations(now_unix_ns=60) == set()
+    canonical.unlink()
+    assert store.bindings() == {}
+    assert store.retained_generations(now_unix_ns=70) == set()
+    after = temporary.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_mtime_ns,
+    )
+    assert temporary.read_bytes() == raw
+
+
+def test_unpublished_other_release_never_adds_pin_authority(tmp_path: Path) -> None:
+    from the_hive import hook_session_pin_store as pins
+
+    store = _store(tmp_path)
+    temporary = _unpublished_touch(store)
+    pending = json.loads(temporary.read_bytes())
+    pending["generation"] = "unpublished-other-generation"
+    temporary.write_bytes(pins._canonical_json(store._with_digest(pending)))
+    assert store.retained_generations(now_unix_ns=30) == {"generation-a"}
+    assert store.bindings()["session-a"]["generation"] == "generation-a"
+    (store.state_root / pins._binding_name("session-a")).unlink()
+    assert store.bindings() == {}
+    assert store.retained_generations(now_unix_ns=30) == set()
+    assert temporary.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "foreign_name",
+        "long_suffix",
+        "name_mismatch",
+        "json",
+        "duplicate",
+        "digest",
+        "schema",
+        "nonobject",
+        "mode",
+        "owner",
+        "hardlink",
+        "symlink",
+        "directory",
+        "oversize",
+        "canonical_corrupt",
+    ],
+)
+def test_invalid_write_temp_stays_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    from the_hive import hook_session_pin_store as pins
+
+    store = _store(tmp_path)
+    path = _unpublished_touch(store)
+    canonical = store.state_root / pins._binding_name("session-a")
+    if invalid == "foreign_name":
+        path = path.rename(path.with_name("unexpected.tmp"))
+    elif invalid == "long_suffix":
+        path = path.rename(path.with_name(path.name.replace("abcdefgh", "abcdefghi")))
+    elif invalid == "name_mismatch":
+        path = path.rename(path.with_name("." + "0" * 64 + ".json.abcdefgh.tmp"))
+    elif invalid == "json":
+        path.write_bytes(b"{")
+    elif invalid == "duplicate":
+        path.write_bytes(b'{"schema":"first","schema":"second"}')
+    elif invalid == "nonobject":
+        path.write_bytes(b"[]")
+    elif invalid in {"digest", "schema"}:
+        value = json.loads(path.read_bytes())
+        value["content_digest" if invalid == "digest" else "schema"] = "invalid"
+        path.write_bytes(pins._canonical_json(value))
+    elif invalid == "mode":
+        path.chmod(0o644)
+    elif invalid == "owner":
+        fstat = pins.os.fstat
+
+        def foreign_owner(descriptor: int):
+            info = fstat(descriptor)
+            if os.readlink(f"/proc/self/fd/{descriptor}") == str(path):
+                fields = list(info)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return info
+
+        monkeypatch.setattr(pins.os, "fstat", foreign_owner)
+    elif invalid == "hardlink":
+        os.link(path, store.state_root.parent / "other-link")
+    elif invalid == "symlink":
+        path.unlink()
+        path.symlink_to(canonical)
+    elif invalid == "directory":
+        path.unlink()
+        path.mkdir(mode=0o700)
+    elif invalid == "oversize":
+        path.write_bytes(b"x" * (64 * 1024 + 1))
+    elif invalid == "canonical_corrupt":
+        canonical.write_bytes(b"{")
+    with pytest.raises(HookSessionPinStoreError):
+        store.bindings()
+    assert path.exists()
+
+
+def test_fifo_write_temp_is_rejected_without_blocking(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    path = _unpublished_touch(store)
+    path.unlink()
+    os.mkfifo(path, mode=0o600)
+
+    def reader() -> None:
+        try:
+            store.bindings()
+        except HookSessionPinStoreError:
+            os._exit(0)
+        os._exit(1)
+
+    process = multiprocessing.get_context("fork").Process(target=reader)
+    process.start()
+    process.join(timeout=5)
+    blocked = process.is_alive()
+    if blocked:
+        process.kill()
+        process.join()
+    assert not blocked
+    assert process.exitcode == 0
 
 
 def test_cutover_retirement_preserves_reference_and_denies_id_reuse(tmp_path):
