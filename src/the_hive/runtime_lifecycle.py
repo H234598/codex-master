@@ -3519,7 +3519,7 @@ def _read_regular_at(
             or before.st_gid != owner_gid
             or before.st_nlink != 1
             or stat.S_IMODE(before.st_mode) != mode
-            or before.st_size <= 0
+            or before.st_size < (0 if name == ".root-hook-abi-owner.lock" else 1)
             or before.st_size > 65536
         ):
             raise _error("runtime_lifecycle_root_hook_effect_unverified")

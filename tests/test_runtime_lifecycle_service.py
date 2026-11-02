@@ -11242,7 +11242,7 @@ def test_runtime_lifecycle_v2_owner_evidence_uses_only_fixed_receipt_paths(
 
 def _root_hook_effect_fixture(root: Path, *, issued_at_unix_ns: int) -> tuple[str, str]:
     lock = root / ".root-hook-abi-owner.lock"
-    lock.write_bytes(b"\n")
+    lock.write_bytes(b"")
     lock.chmod(0o644)
     target = root / "v1"
     (target / "allowlists").mkdir(parents=True, mode=0o755)
@@ -11342,6 +11342,41 @@ def _root_hook_effect_fixture(root: Path, *, issued_at_unix_ns: int) -> tuple[st
     )
     (root / ".root-hook-abi-upgrade-v1.json").chmod(0o644)
     return generation, manifest_digest
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "root-hook-effect-receipt-v1.json",
+        ".root-hook-abi-upgrade-v1.json",
+        "launcher",
+        "hook_session_pin_store.py",
+        "hook_abi_v1_core.py",
+        "allowlist.json",
+        ".root-hook-abi-owner.lock.extra",
+    ],
+)
+def test_root_hook_reader_rejects_empty_nonlock_files(
+    tmp_path: Path, name: str
+) -> None:
+    target = tmp_path / name
+    target.write_bytes(b"")
+    target.chmod(0o644)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(
+            runtime_lifecycle.RuntimeLifecycleError,
+            match="runtime_lifecycle_root_hook_effect_unverified",
+        ):
+            runtime_lifecycle._read_regular_at(
+                parent_fd,
+                name,
+                owner_uid=os.geteuid(),
+                owner_gid=os.getegid(),
+                mode=0o644,
+            )
+    finally:
+        os.close(parent_fd)
 
 
 def test_root_hook_receipt_consumer_binds_fresh_physical_effect(
