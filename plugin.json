@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codex-master",
+  "version": "0.10.5",
+  "description": "The Hive plugin for controlling a sleeping Agentinnen fleet through a data-sparse local MCP server, for GitHub Copilot CLI.",
+  "author": {
+    "name": "teladi"
+  },
+  "homepage": "https://github.com/H234598/codex-master",
+  "repository": "https://github.com/H234598/codex-master",
+  "license": "MIT",
+  "keywords": [
+    "copilot",
+    "mcp",
+    "tmux",
+    "agents",
+    "fleet",
+    "skills"
+  ]
+}

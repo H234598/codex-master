@@ -1659,3 +1659,55 @@ class NativeRegistryCleanupTest(unittest.TestCase):
             self.assertLess(len(remaining), len(history))
             self.assertEqual(remaining, history[-len(remaining) :])
             self.assertEqual(stored["sessions"], [])
+
+
+BRIDGE = REPO_ROOT / "com.github.copilot" / "hooks" / "copilot_bridge.py"
+
+
+def _load_bridge():
+    spec = importlib.util.spec_from_file_location("copilot_bridge", BRIDGE)
+    if spec is None or spec.loader is None:
+        raise ImportError(str(BRIDGE))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class CopilotBridgeTest(unittest.TestCase):
+    def test_maps_copilot_subagent_tools_to_codex_contract(self) -> None:
+        bridge = _load_bridge()
+        self.assertEqual(
+            bridge.route_for({"hook_event_name": "PreToolUse", "tool_name": "task"}),
+            ("native_spawn_admission.py", "spawn_agent"),
+        )
+        self.assertEqual(
+            bridge.route_for({"hook_event_name": "PreToolUse", "tool_name": "write_agent"}),
+            ("native_bee_event.py", "send_input"),
+        )
+        self.assertEqual(
+            bridge.route_for({"hook_event_name": "PostToolUse", "tool_name": "read_agent"}),
+            ("native_bee_event.py", "wait_agent"),
+        )
+
+    def test_ignores_unrelated_tools(self) -> None:
+        bridge = _load_bridge()
+        self.assertIsNone(
+            bridge.route_for({"hook_event_name": "PreToolUse", "tool_name": "bash"})
+        )
+
+    def test_denies_spawn_when_admission_cannot_run(self) -> None:
+        bridge = _load_bridge()
+        payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "task"})
+        stdout = io.StringIO()
+        with (
+            patch.object(bridge.subprocess, "run", side_effect=OSError("boom")),
+            patch.object(
+                bridge.sys,
+                "stdin",
+                SimpleNamespace(buffer=io.BytesIO(payload.encode("utf-8"))),
+            ),
+            patch.object(bridge.sys, "stdout", stdout),
+        ):
+            self.assertEqual(bridge.main(), 0)
+        specific = json.loads(stdout.getvalue())["hookSpecificOutput"]
+        self.assertEqual(specific["permissionDecision"], "deny")
